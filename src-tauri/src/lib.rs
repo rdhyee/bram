@@ -15680,6 +15680,69 @@ fn set_shell_window_title<R: tauri::Runtime>(app: &AppHandle<R>) {
     }
 }
 
+// issue-403: several Brams run as several identical Dock icons, and the
+// Dock's hover label is the app name, not the window title. A badge with the
+// project folder's name tells them apart at a glance. Badges are designed for
+// counts, so cap the text. macOS middle-truncates a long badge itself (12
+// chars rendered as "onre…-int…"), so stay near what the Dock shows whole.
+const DOCK_BADGE_MAX_CHARS: usize = 9;
+
+fn dock_badge_label(project_root: Option<&Path>) -> Option<String> {
+    let name = project_root?.file_name()?.to_string_lossy().into_owned();
+    if name.is_empty() {
+        return None;
+    }
+    if name.chars().count() <= DOCK_BADGE_MAX_CHARS {
+        return Some(name);
+    }
+    let head: String = name.chars().take(DOCK_BADGE_MAX_CHARS - 1).collect();
+    Some(format!("{}…", head))
+}
+
+// set_badge_label is macOS-only in tauri 2.11 (#[cfg(target_os = "macos")]);
+// elsewhere the window title stays the only indicator.
+fn set_shell_dock_badge<R: tauri::Runtime>(app: &AppHandle<R>) {
+    #[cfg(target_os = "macos")]
+    {
+        let label = dock_badge_label(project_root(Some(app)).as_deref());
+        if let Some(window) = app.get_webview_window("main") {
+            if let Err(err) = window.set_badge_label(label) {
+                eprintln!("[bram] failed to set dock badge: {}", err);
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = app;
+}
+
+#[cfg(test)]
+mod dock_badge_tests {
+    use super::dock_badge_label;
+    use std::path::Path;
+
+    #[test]
+    fn dock_badge_uses_project_folder_name() {
+        assert_eq!(
+            dock_badge_label(Some(Path::new("/Users/raymondyee/C/src/wtdickens"))),
+            Some("wtdickens".to_string())
+        );
+    }
+
+    #[test]
+    fn dock_badge_caps_long_names() {
+        assert_eq!(
+            dock_badge_label(Some(Path::new("/x/onrealm-integration"))),
+            Some("onrealm-…".to_string())
+        );
+    }
+
+    #[test]
+    fn dock_badge_absent_without_project() {
+        assert_eq!(dock_badge_label(None), None);
+        assert_eq!(dock_badge_label(Some(Path::new("/"))), None);
+    }
+}
+
 #[cfg(test)]
 mod shell_window_title_tests {
     use super::{shell_window_title_parts, title_path_with_home};
@@ -68435,6 +68498,7 @@ pub fn run() {
             // else, including a second Bram instance.
             let startup_project_root = project_root(Some(app.handle()));
             set_shell_window_title(app.handle());
+            set_shell_dock_badge(app.handle());
             let previous_port = startup_project_root
                 .as_ref()
                 .and_then(|p| std::fs::read_to_string(p.join("resources/.bram-port")).ok())
