@@ -16334,6 +16334,14 @@ fn pty_spawn(
     // spawns) inherits BRAM_MENU_TOKEN; the /__menu/permission route requires
     // it, so an agent running OUTSIDE Bram can't POST menus into this pane.
     command.env("BRAM_MENU_TOKEN", menu_session_token());
+    // shellrc-greeting-under-policy-none: tell the shell which startup policy
+    // it runs under, so app/shell/claude-code-shellrc can greet accurately --
+    // under `none` the agent is managed externally (#389) and there is no
+    // header switcher to point at.
+    command.env(
+        "BRAM_STARTUP_POLICY",
+        configured_startup_policy(&app).as_str(),
+    );
     // Propagate trace toggle + log path into the PTY child so hook
     // processes (bram-guard) can write [hook] records into the same trace
     // file as the host. See trace-category-hook.
