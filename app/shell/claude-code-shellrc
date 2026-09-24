@@ -4,6 +4,15 @@
 # the current provider host-side, so launching claude or codex by hand here
 # does NOT update Bram's UI -- use the header switcher to change providers.
 #
+# Exception: under "Do not start an agent" (shell.startupPolicy "none",
+# exported by the host as BRAM_STARTUP_POLICY) the agent is managed outside
+# Bram (e.g. by herdr), the header shows "Agent managed externally" instead of
+# a switcher, and the greeting says so.
+#
 # No shell functions wrap claude/codex any more: the host owns current-agent
 # state and types launch commands itself.
-echo "Bram manages the agent here - use the header switcher to change providers."
+if [ "$BRAM_STARTUP_POLICY" = "none" ]; then
+  echo "The agent here is managed outside Bram (e.g. herdr). Bram shows its work; change agents where it runs."
+else
+  echo "Bram manages the agent here - use the header switcher to change providers."
+fi
