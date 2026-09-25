@@ -332,6 +332,9 @@ window._xsLogs = window._xsLogs || [];
             previous: stored,
             elapsedMs: Date.now() - bootedAt,
           });
+          try {
+            if (window.__bramSendFollowupRoute) window.__bramSendFollowupRoute(h, stored);
+          } catch (e) {}
         }
       }, 500);
     } catch (e) {}
@@ -661,6 +664,7 @@ window.toTurn = function (text) {
       at: new Date().toISOString(),
     });
   } catch (e) {}
+  try { if (window.__bramSendFollowupSend) window.__bramSendFollowupSend(s); } catch (e) {}
   // Send the text RAW. Per-transport normalization is the host's job now
   // (docs/turn-transport-redesign.md step 6): the host collapses whitespace
   // only for small inline sends, while substantial/image-bearing sends ride
@@ -1696,8 +1700,6 @@ window.__bramGateBarLabel = function (sel) {
 window.__bramGateHasText = function () {
   return String(window.__bramMessageAgentText || "").trim().length > 0;
 };
-window.__bramW2ShareMode = "together";
-window.__bramW2SetShareMode = function (m) { window.__bramW2ShareMode = m || "together"; };
 window.__bramW2CloseMap = {};
 window.__bramW2SetCloseMap = function (m) { window.__bramW2CloseMap = m || {}; };
 
@@ -1899,21 +1901,9 @@ window.__bramGateAct = function (kind, items, sel, shareMode, claim) {
   // Selection is literal user intent. Shared-file handling may change how the
   // agent prepares the commit, but never which ids this action authorizes.
   var ids0 = sel || [];
-  // gate-withholds-futile-joint-commit-offer, Start side: under the
-  // one-at-a-time choice, each click starts only the FIRST selected item —
-  // its own claim and capture boundary — so per-item commits stay possible
-  // on the shared file. The rest stay ticked; the next click starts the
-  // next. This is the one sanctioned narrowing of the selection-is-intent
-  // rule above, and it is itself the user's explicit choice via the radio.
-  var startNarrowed = false;
-  if (
-    kind === "start" &&
-    window.__bramW2StartMode === "one" &&
-    window.__bramStartChoiceNeeded(items, ids0, claim)
-  ) {
-    ids0 = [ids0[0]];
-    startNarrowed = true;
-  }
+  // issue-404-serial-gate-bar-first-cut: no narrowing. A gate button acts
+  // on everything ticked; the one-at-a-time radio that used to narrow Start
+  // to the first selected item is gone (#404, #273).
   // issue-343: the trace comes FIRST — the old order (guard, then trace)
   // made a click with an empty selection a perfectly silent no-op, which is
   // exactly the evidence signature Andrew reported: no click line, no
@@ -1938,7 +1928,6 @@ window.__bramGateAct = function (kind, items, sel, shareMode, claim) {
     count: ids0.length,
     op: ids0.length ? "act" : "empty-selection",
     store: (window.__bramW2Selection || []).length,
-    startMode: startNarrowed ? "one" : undefined,
     cautioned: cautioned,
   });
   if (!ids0.length) return;
@@ -2037,6 +2026,7 @@ window.__bramGateAct = function (kind, items, sel, shareMode, claim) {
 window.__bramGateGoTranscript = function () {
   try {
     if (String(window.location.hash || "").indexOf("/transcript") < 0) {
+      if (window.__bramSendFollowup) window.__bramSendFollowup.autoAt = Date.now();
       window.location.hash = "#/transcript";
     }
   } catch (e) {}
@@ -4263,29 +4253,17 @@ window.__bramFirstRunLanding = function (enhance) {
   return true;
 };
 
-window.__bramW2StartMode = "one";
-window.__bramW2SetStartMode = function (m) {
-  window.__bramW2StartMode = m || "one";
-  return window.__bramW2StartMode;
-};
+// issue-404-serial-gate-bar-first-cut: the start-time mode is gone; this
+// reset survives only for its selection-change duty below.
 window.__bramW2ResetStartMode = function () {
-  window.__bramW2StartMode = "one";
   // issue-368: a selection change also disarms any pending commit caution —
   // a first click's arm must not carry over to green-light a different
   // selection's commit. Folded here (rather than a second statement in the
   // gate bar's ChangeListener) so the markup handler stays a single call.
   if (window.__bramGateCautionClear) window.__bramGateCautionClear("selection-changed");
-  return "one";
+  return "together";
 };
 
-// The combined-commit option's label, count-aware and execution-neutral:
-// "start" here means ONE AUTHORIZATION CLICK, never parallel execution
-// (which is the agent's business and provider-dependent), so the label
-// hangs on the consequence — commit granularity — per Jon's field review.
-window.__bramStartAllLabel = function (sel) {
-  var n = (sel || []).length;
-  return (n === 2 ? "Start both now" : "Start all " + n + " now") + " — one combined commit";
-};
 // separate-authorization-from-claim: one click, two meanings. On a fresh item
 // it starts work; on an item whose agent stopped mid-apply — authorization
 // still live, nothing running — it picks the work back up, and calling that
@@ -4328,12 +4306,8 @@ window.__bramStartVerb = function (items, sel, claim) {
 // discomfort) -- the same ordinal collision __bramNameList below was
 // written to avoid. What a button applies to moves to its tooltip
 // (__bramGateScopeTooltip), where the question actually arises.
-window.__bramStartButtonLabel = function (items, sel, claim, mode) {
-  var verb = window.__bramStartVerb(items, sel, claim);
-  if (mode === "one" && window.__bramStartChoiceNeeded(items, sel, claim)) {
-    return verb + " one";
-  }
-  return verb;
+window.__bramStartButtonLabel = function (items, sel, claim) {
+  return window.__bramStartVerb(items, sel, claim);
 };
 
 // The tooltip carrying what the ticked rows' button applies to: names up to
@@ -4367,16 +4341,13 @@ window.__bramPushWithheldNote = function (status) {
   return "These commits ride " + b + "; they reach " + (status.pushWithheld.defaultBranch || "main") + " through its PR.";
 };
 
-window.__bramGateScopeTooltip = function (sel, kind, items, claim, mode) {
+window.__bramGateScopeTooltip = function (sel, kind, branch) {
   // gate-tooltips-multiline: Markdown lines, joined like the Worklist strip
   // tooltip (__bramWorklist2StripTooltip) -- one long single-line tooltip ran
   // past its edge. Rendered via tooltipMarkdown on the gate buttons.
   var ids = sel || [];
   var n = ids.length;
   if (!n) return "Tick one or more items first.";
-  if (kind === "start" && mode === "one" && window.__bramStartChoiceNeeded(items, sel, claim)) {
-    return ["Starts one of the " + n + " selected items now.", "The others wait for separate commits."].join("\n\n");
-  }
   var lines = [];
   if (kind === "start-commit") {
     lines.push("One click: start, then commit when done.");
@@ -4387,6 +4358,11 @@ window.__bramGateScopeTooltip = function (sel, kind, items, claim, mode) {
     lines.push(ids.map(function (id) { return "- `" + id + "`"; }).join("\n"));
   } else {
     lines.push("Applies to the " + n + " selected items.");
+  }
+  // issue-404-serial-gate-bar-first-cut: where a commit lands, shown where
+  // the commit decision is made.
+  if ((kind === "commit" || kind === "start-commit") && branch) {
+    lines.push("→ `" + branch + "`");
   }
   return lines.join("\n\n");
 };
@@ -4474,135 +4450,82 @@ window.__bramStartConsequence = function (items, sel, claim) {
     if (!n) return "";
     var sharedPaths = window.__bramSelectionSharedFilePaths(items, sel, claim);
     var what = sharedPaths.length === 1 ? sharedPaths[0] : n + " files";
+    // issue-404-serial-gate-bar-first-cut: consequence plus the dependable
+    // alternative, with no talk of clicks (how claims are recorded is
+    // Bram's business). "Start and commit one before starting the other" is
+    // the reliable meaning of "separately" now that same-tree hunk
+    // separation is frozen (#273).
     return (
-      "These share " + what + " -- started together in one click they can " +
-      "only be committed together afterward. Start them in separate clicks " +
-      "to keep per-item commits possible."
+      "These share " + what + ". Started together, they'll be committed " +
+      "together. To commit them separately, start and commit one before " +
+      "starting the other."
     );
   }
 
-  // All begun. Find items Commit is withheld from: `proposed` with no
-  // exclusive changed path (applied items skip exclusivity, mirroring
-  // __bramSelectionAllCommittable), and collect who blocks them.
-  var blocked = [];
+  // All begun. gate-note-planned-overlap-is-not-a-change: the one thing
+  // worth saying first is "nothing to commit", for begun items with no
+  // changes at all. A path another begun item merely DECLARES is a plan,
+  // not a change -- counting split.sharedDeclared here sent route A
+  // (2026-09-24: two items whose work lived in worktrees, clean checkout)
+  // into "entangled in a shared file ... ask the agent to separate their
+  // edits".
+  //
+  // The entangled/withheld copy that followed is gone. Since #327,
+  // __bramSelectionAllCommittable offers Commit whenever each item has
+  // changes of its own, exclusive OR shared, so that copy -- computed
+  // without selection context -- told users Commit was withheld while the
+  // button was lit; and its advice was the hunk separation #273 froze. A
+  // selection missing a joint partner is refused by
+  // __bramSelectionJointMissing, which has its own gate note.
   var empty = [];
-  var blockerSet = {};
-  var sharedPathSet = {};
   for (var b = 0; b < begun.length; b++) {
     var itb = byId[begun[b]];
     if ((itb.status || "proposed") === "applied") continue;
     var split = window.__bramItemChangedSplit(itb, list, claim);
-    if (split.exclusive.length) continue;
-    // issue-351: zero changes is NOT entanglement. An empty change set has
-    // a vacuously empty exclusive list, and with no blockers the `mutual`
-    // arm below fired the "entangled in shared files" copy on a lone item
-    // with an empty CHANGES column — sending the user to separate edits
-    // that do not exist. The ordinary state of a freshly begun item gets
-    // the ordinary sentence instead.
     var hasAnyChange =
       (itb.changeSummary && itb.changeSummary.changed > 0) ||
-      split.shared.length > 0 ||
-      split.sharedDeclared.length > 0;
-    if (!hasAnyChange) {
-      empty.push(itb.id);
-      continue;
-    }
-    blocked.push(itb.id);
-    var paths = split.shared.concat(split.sharedDeclared);
-    for (var p = 0; p < paths.length; p++) sharedPathSet[paths[p]] = true;
-    var files = itb.changedFiles || [];
-    for (var f = 0; f < files.length; f++) {
-      var sharers = (files[f] && files[f].sharedWith) || [];
-      for (var w = 0; w < sharers.length; w++) {
-        var o = byId[sharers[w]];
-        if (o && o.id !== itb.id && window.__bramWorklist2Begun(o, claim)) {
-          blockerSet[o.id] = true;
-        }
-      }
-    }
+      split.exclusive.length > 0 ||
+      split.shared.length > 0;
+    if (!hasAnyChange) empty.push(itb.id);
   }
-  if (empty.length && !blocked.length) {
+  if (empty.length) {
     return (
       window.__bramNameList(empty) +
       (empty.length === 1 ? " has" : " have") +
       " no changes yet — nothing to commit."
     );
   }
-  if (blocked.length) {
-    var who = Object.keys(blockerSet);
-    var pathCount = Object.keys(sharedPathSet).length;
-    // Advise committing a blocker first only when some blocker is itself
-    // committable alone; mutually-entangled proposed items have no such
-    // exit, and "commit X first" would name another withheld button.
-    var advisable = [];
-    var mutual = true;
-    for (var a = 0; a < who.length; a++) {
-      if (blocked.indexOf(who[a]) !== -1) continue;
-      mutual = false;
-      var oa = byId[who[a]];
-      if (!oa) continue;
-      if (window.__bramSelectionAllCommittable(list, [oa.id], claim)) {
-        advisable.push(oa.id);
+
+  // All begun, with changes. Speak only when a file they share actually has
+  // uncommitted changes: those edits are mixed, and the dependable way to
+  // land them is one commit (#273 froze same-tree separation; #404's voice).
+  // gate-remove-commit-share-radio: several committable items commit as ONE
+  // commit (one approval, one worklist-commit; #272). Say so, with the
+  // serial path for separate commits.
+  var oneCommit = chosen.length >= 2
+    ? "Commit makes one commit for these " + chosen.length + " items. To commit them separately, commit one at a time."
+    : "";
+  if (!n) return oneCommit;
+  var sharedPaths2 = window.__bramSelectionSharedFilePaths(items, sel, claim);
+  var changedShared = sharedPaths2.filter(function (p) {
+    for (var c = 0; c < chosen.length; c++) {
+      var files = (byId[chosen[c]] && byId[chosen[c]].changedFiles) || [];
+      for (var f = 0; f < files.length; f++) {
+        if (files[f] && files[f].path === p &&
+            ((files[f].added || 0) > 0 || (files[f].removed || 0) > 0)) {
+          return true;
+        }
       }
     }
-    if (mutual) {
-      return (
-        window.__bramNameList(blocked) + "'s edits are entangled in " +
-        (pathCount === 1 ? "a shared file" : "shared files") +
-        "; " + (blocked.length === 2 ? "neither" : "none") +
-        " has exclusive changes, so Commit is withheld. Ask the agent to " +
-        "separate their edits."
-      );
-    }
-    var head =
-      window.__bramNameList(blocked) + "'s changes share " +
-      (pathCount === 1 ? "a file" : "files") + " with " +
-      window.__bramNameList(who) +
-      "'s, so nothing is exclusively " +
-      (blocked.length === 1 ? "its" : "their") +
-      " own and Commit is withheld. ";
-    if (advisable.length) {
-      // No repeated names in the guidance half: the blockers were just named,
-      // so refer back -- unless advisable is a strict subset of them, where
-      // the pronoun would be ambiguous and the names earn their keep.
-      var advRef =
-        advisable.length === who.length
-          ? (advisable.length === 1 ? "it alone" : "only those")
-          : (advisable.length === 1 ? advisable[0] + " alone" : "only " + window.__bramNameList(advisable));
-      return (
-        head + "Select " + advRef +
-        " to commit first, or ask the agent to separate their edits."
-      );
-    }
-    return head + "Ask the agent to separate their edits.";
-  }
-
-  // All begun, all committable: the radio group carries the granularity
-  // choice; the line only flags that shared edits are already mixed.
-  //
-  // avoid-futile-joint-commit: "you can commit together or ask the agent to
-  // separate them" is only true when there is a per-item interval to
-  // separate FROM. When the selection is jointly attributed (host-reported
-  // via jointWith -- these items were approved together in one click and
-  // share a single capture boundary), separation was never available, and
-  // the radio group's split Option is disabled for exactly this reason (see
-  // WorklistGateBar.xmlui). Say so instead of repeating the false promise.
-  if (!n) return "";
-  if (window.__bramSelectionJointShared(items, sel)) {
-    return (
-      "These share " + (n === 1 ? "a file" : n + " files") + ". " +
-      (begun.length === 2 ? "Both" : "All") +
-      " were started together in one click, so their shared-file edits can " +
-      "only be committed together -- or ask the agent to separate them " +
-      "(it parks one item's changes, you Drop that item, commit the other, " +
-      "then it restores and re-proposes)."
-    );
-  }
+    return false;
+  });
+  if (!changedShared.length) return oneCommit;
+  var whatChanged = changedShared.length === 1
+    ? changedShared[0]
+    : changedShared.length + " files";
   return (
-    "These share " + (n === 1 ? "a file" : n + " files") + ". " +
-    (begun.length === 2 ? "Both" : "All") +
-    " already have changes on disk; their edits in shared files mix. " +
-    "You can commit together or ask the agent to separate them."
+    "These share " + whatChanged + ", which has uncommitted changes. " +
+    "Commit them together."
   );
 };
 
@@ -4644,16 +4567,128 @@ window.__bramTranscriptUnmount = function (atBottom, total, agentId) {
 // arrival - the remount means no prop transition ever fires (zero
 // cause=stream-switch traces in the field, ever).
 window.__bramMountFollow = function (state, agentId) {
-  if (!state) return true;
-  if (String(state.stream || "") !== String(agentId || "")) {
+  var follow = true;
+  if (state && String(state.stream || "") !== String(agentId || "")) {
     window.__bramIframeTrace("follow-state", {
       op: "stream-switch-mount",
       from: String(state.stream || "") || "main",
       to: String(agentId || "") || "main",
     });
-    return true;
+  } else if (state) {
+    follow = state.atBottom !== false;
   }
-  return state.atBottom !== false;
+  // send-followup: remember how this mount landed, for op=arrive.
+  if (window.__bramSendFollowup) {
+    window.__bramSendFollowup.landed = {
+      at: Date.now(), value: follow ? "follow" : "restore-reading",
+    };
+  }
+  return follow;
+};
+
+// trace-send-followup-for-transcript-autoswitch: an observe-only record of
+// what happens after a pane send, so the Transcript auto-switch policy can
+// be decided from evidence rather than intuition (per tab, per send kind,
+// with or without a screenshot, and against a saved scrollback position).
+// Ops: send, arrive, arrive-corrected, leave, turn-end -- field meanings in
+// docs/trace-vocabulary.md (send-followup). Nothing here changes behavior.
+// Turns typed straight into the terminal never reach toTurn, so they show
+// up only as turn-end lines with a large (or -1) sinceSendMs.
+window.__bramSendFollowup = {
+  seq: 0,
+  last: null,     // { id, at, tab, arrived }
+  arrival: null,  // { sendId, at, landed, corrected }
+  autoAt: 0,      // __bramGateGoTranscript moved the pane
+  chipAt: 0,      // the "▼ N new" chip was clicked
+  landed: null,   // { at, value } from the latest __bramMountFollow
+  wasWorking: false,
+};
+
+window.__bramSendFollowupTab = function (route) {
+  var r = String(route || "").replace(/^#?\/?/, "").split(/[/?]/)[0];
+  return r || "root";
+};
+
+window.__bramSendFollowupSend = function (text) {
+  var s = window.__bramSendFollowup;
+  var t = String(text || "");
+  var route = "";
+  try { route = String(location.hash || ""); } catch (e) {}
+  var vr = window.__bramVisibleRange || null;
+  var m = /^\s*(approved|drop|iterate|skip-worklist|voice):/.exec(t);
+  s.seq += 1;
+  s.last = {
+    id: "s" + Date.now().toString(36) + "-" + s.seq,
+    at: Date.now(),
+    tab: window.__bramSendFollowupTab(route),
+    arrived: false,
+  };
+  window.__bramIframeTrace("send-followup", {
+    op: "send",
+    sendId: s.last.id,
+    tab: s.last.tab,
+    kind: m ? m[1] : "chat",
+    hasImage: /\.(png|jpe?g|gif|webp|heic)\b/i.test(t),
+    savedReading: !!(vr && vr.atBottom === false),
+  });
+};
+
+window.__bramSendFollowupRoute = function (route, previous) {
+  var s = window.__bramSendFollowup;
+  var now = Date.now();
+  var to = window.__bramSendFollowupTab(route);
+  if (window.__bramSendFollowupTab(previous) === "transcript" && s.arrival) {
+    window.__bramIframeTrace("send-followup", {
+      op: "leave", sendId: s.arrival.sendId, dwellMs: now - s.arrival.at, tab: to,
+    });
+    s.arrival = null;
+  }
+  var last = s.last;
+  if (to !== "transcript" || !last || last.arrived || last.tab === "transcript") return;
+  if (now - last.at > 120000) return;
+  last.arrived = true;
+  // The route poll runs every 500ms, so a switch the pane made itself is
+  // seen within ~0.5s of its stamp.
+  var via = now - s.autoAt < 2000 ? "auto" : (now - s.chipAt < 2000 ? "chip" : "nav");
+  var sendId = last.id;
+  var delayMs = now - last.at;
+  // Let the Transcript mount (and __bramMountFollow decide) before reading
+  // how the arrival landed.
+  setTimeout(function () {
+    var landed = s.landed && Math.abs(s.landed.at - now) < 3000 ? s.landed.value : "unknown";
+    s.arrival = { sendId: sendId, at: now, landed: landed, corrected: false };
+    window.__bramIframeTrace("send-followup", {
+      op: "arrive", sendId: sendId, delayMs: delayMs, via: via, landed: landed,
+    });
+  }, 800);
+};
+
+window.__bramSendFollowupScrollBottom = function () {
+  var a = window.__bramSendFollowup.arrival;
+  if (!a || a.landed !== "restore-reading" || a.corrected) return;
+  var ms = Date.now() - a.at;
+  if (ms > 30000) return;
+  a.corrected = true;
+  window.__bramIframeTrace("send-followup", {
+    op: "arrive-corrected", sendId: a.sendId, scrolledToBottomMs: ms,
+  });
+};
+
+window.__bramSendFollowupStatus = function (v) {
+  var s = window.__bramSendFollowup;
+  var working = !!(v && v.state === "working");
+  if (s.wasWorking && !working) {
+    var route = "";
+    try { route = String(location.hash || ""); } catch (e) {}
+    window.__bramIframeTrace("send-followup", {
+      op: "turn-end",
+      sendId: s.last ? s.last.id : "",
+      sinceSendMs: s.last ? Date.now() - s.last.at : -1,
+      tab: window.__bramSendFollowupTab(route),
+      unseen: window.__bramUnseenCount || 0,
+    });
+  }
+  s.wasWorking = working;
 };
 
 window.__bramOverlapIndex = function (items, claim) {
@@ -7597,6 +7632,9 @@ window.subscribeTauriEvent("__bramNativeToolbarPtyMenuUnsub",
     window.subscribeTauriEvent("__bramAgentStatusExternalUnsub",
       "agent-status-changed", function (e) {
         lastValue = (e && e.payload) || null;
+        try {
+          if (window.__bramSendFollowupStatus) window.__bramSendFollowupStatus(lastValue);
+        } catch (e2) {}
         if (!window.bramAgentMenu) {
           window.__bramIframeTrace("agent-header-status-loaded", {
             state: (lastValue && lastValue.state) || "",
@@ -9812,6 +9850,7 @@ window.bramSubscribeTranscriptFindClear = (function () {
 // cause=unseen-jump. The markup pairs this call with
 // navigate('/transcript'); same-route navigation is a no-op.
 window.__bramUnseenJump = function () {
+  if (window.__bramSendFollowup) window.__bramSendFollowup.chipAt = Date.now();
   var onTranscript = false;
   try { onTranscript = String(location.hash || "").indexOf("/transcript") >= 0; } catch (e) { /* ignore */ }
   window.__bramClearTranscriptFind("unseen-jump");
@@ -9995,6 +10034,9 @@ window.__bramFollowClassify = function (cur, atEnd, agentId) {
     if (cur !== atEnd) {
       window.__bramFollowTransition(atEnd,
         atEnd ? "user-scroll-bottom" : "user-scroll-up", agentId);
+      if (atEnd && window.__bramSendFollowupScrollBottom) {
+        window.__bramSendFollowupScrollBottom();
+      }
     } else {
       window.__bramFollowAtBottom = atEnd !== false;
     }
@@ -12295,14 +12337,9 @@ window.__bramSelectionHasBegunShared = function (items, sel, claim) {
 window.__bramWithShareMode = function (text, mode, items, sel, claim) {
   var body = text || "";
   var chosen = sel || [];
-  var hasShared = window.__bramSelectionHasBegunShared(items, chosen, claim);
-  if (chosen.length > 1 && mode === "split" && hasShared) {
-    return (
-      (body ? body + "\n\n" : "") +
-      "split-shared-files: separate the selected items' shared-file changes " +
-      "so each selected item commits on its own; do not include unselected items."
-    );
-  }
+  // gate-remove-commit-share-radio: no "split" mode any more. The radio that
+  // chose it is gone; its only effect was the split-shared-files hunk
+  // separation #273 froze. `mode` is kept for the call shape.
   if (!window.__bramSelectionHasUnselectedShared(items, chosen, claim)) return body;
   return (
     (body ? body + "\n\n" : "") +
