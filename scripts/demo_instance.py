@@ -57,6 +57,8 @@ STARTERS = (
     "expired-authorization",
     "ambiguous-duplicate",
     "reedit-own-lines",
+    "multi-file",
+    "committed-outside",
 )
 
 # The ambiguous-duplicate fixture's stanza pair. Geometry is load-bearing:
@@ -89,6 +91,36 @@ atexit.register(_release_process_handles_at_exit)
 
 class DemoError(RuntimeError):
     """A safe, user-facing refusal or fixture error."""
+
+
+# The multi-file fixture's baseline: one begun item whose table needs rows of
+# every kind (modified, new, large, untouched) to show the file-row
+# disclosure triangle in all its states.
+def _multi_file_seeds(prefix: str) -> list[tuple[str, str]]:
+    root = f"demo/{prefix}"
+    return [
+        (
+            f"{root}/app.js",
+            "".join(f"function step{n}() {{ return {n}; }}\n" for n in range(1, 21)),
+        ),
+        (
+            f"{root}/styles.css",
+            "".join(f".row-{n} {{ padding: {n}px; }}\n" for n in range(1, 11)),
+        ),
+        (f"{root}/README.md", "# Demo\n\nA short readme.\n"),
+        (f"{root}/untouched.txt", "Listed by the item, never changed.\n"),
+    ]
+
+
+def starter_seeds(starter: str, prefix: str) -> list[tuple[str, str]]:
+    if starter == "multi-file":
+        return _multi_file_seeds(prefix)
+    if starter == "committed-outside":
+        return [
+            (f"demo/{prefix}-landed.txt", "landed: committed with plain git\n"),
+            (f"demo/{prefix}-reverted.txt", "reverted: nothing of the item survives\n"),
+        ]
+    return [starter_seed(starter, prefix)]
 
 
 def starter_seed(starter: str, prefix: str) -> tuple[str, str]:
@@ -363,14 +395,17 @@ class StarterBuilder:
     def item(
         self,
         item_id: str,
-        path: str,
+        path: str | Sequence[str],
         before: str,
         after: str,
         status: str = "applied",
+        begun_at_ms: int | None = None,
     ) -> None:
-        self.worklist.setdefault("items", []).append(
-            {"files": [path], "id": item_id, "status": status}
-        )
+        files = [path] if isinstance(path, str) else list(path)
+        entry: dict[str, Any] = {"files": files, "id": item_id, "status": status}
+        if begun_at_ms is not None:
+            entry["begunAtMs"] = begun_at_ms
+        self.worklist.setdefault("items", []).append(entry)
         draft = self.repo / "resources/worklist-drafts" / f"{item_id}.md"
         draft.parent.mkdir(parents=True, exist_ok=True)
         draft.write_text(f"# Before\n\n{before}\n\n# After\n\n{after}\n", encoding="utf-8")
@@ -486,6 +521,66 @@ class StarterBuilder:
         self.boundary([item_id])
         self.file(path, "".join(f"line {n}: second pass\n" for n in range(1, 6)))
         self.boundary([])
+
+    def starter_multi_file(self, prefix: str) -> None:
+        # One begun item over five files, one of each kind the files table
+        # renders: two modified, one new, one large diff, one listed but
+        # untouched (no diff, so no disclosure triangle).
+        root = f"demo/{prefix}"
+        item_id = f"{prefix}-feature"
+        files = [
+            f"{root}/app.js",
+            f"{root}/styles.css",
+            f"{root}/format.js",
+            f"{root}/README.md",
+            f"{root}/untouched.txt",
+        ]
+        self.item(
+            item_id,
+            files,
+            "A small app with a short readme.",
+            "Add a formatter, tweak two steps and a style, and write the readme out properly.",
+        )
+        self.boundary([item_id])
+        app = "".join(f"function step{n}() {{ return {n}; }}\n" for n in range(1, 21))
+        app = app.replace("return 3;", "return format(3);").replace("return 12;", "return format(12);")
+        self.file(f"{root}/app.js", "import { format } from './format.js';\n" + app)
+        css = "".join(f".row-{n} {{ padding: {n}px; }}\n" for n in range(1, 11))
+        self.file(f"{root}/styles.css", css.replace("padding: 4px", "padding: 6px"))
+        self.file(
+            f"{root}/format.js",
+            "export function format(n) {\n  return `#${n}`;\n}\n",
+        )
+        self.file(
+            f"{root}/README.md",
+            "# Demo\n\n"
+            + "".join(f"## Section {n}\n\nParagraph {n} of the longer readme.\n\n" for n in range(1, 21)),
+        )
+        self.boundary([])
+
+    def starter_committed_outside(self, prefix: str) -> None:
+        # judell/bram#406: work committed with plain git, outside the gate.
+        # Fixture commits are dated from 1_700_000_000 (_fixed_git_env), so:
+        # - landed: begun before the baseline commit that created its file,
+        #   which therefore counts as its landing commit;
+        # - reverted: begun after every fixture commit, file clean. Also
+        #   "clean", but no commit touched it since it began, so it must NOT
+        #   read as landed (it's a Drop).
+        self.item(
+            f"{prefix}-landed",
+            f"demo/{prefix}-landed.txt",
+            "The change was committed with plain git, outside the Worklist.",
+            "Should read as committed outside the Worklist, and clear in one click.",
+            begun_at_ms=1_699_999_000_000,
+        )
+        self.item(
+            f"{prefix}-reverted",
+            f"demo/{prefix}-reverted.txt",
+            "The item began, but its change was reverted before any commit.",
+            "Should not read as landed: nothing committed it since it began.",
+            status="proposed",
+            begun_at_ms=1_700_001_000_000,
+        )
 
     def starter_expired_authorization(self, prefix: str) -> None:
         path = f"demo/{prefix}.txt"
@@ -689,18 +784,23 @@ def add_starter(repo: Path, starter: str) -> None:
     builder = StarterBuilder(repo, scenario)
     occurrence = builder._occurrence(starter)
     prefix = builder._prefix(starter, occurrence)
-    path, seed = starter_seed(starter, prefix)
-    builder.file(path, seed)
+    seeds = starter_seeds(starter, prefix)
+    for path, seed in seeds:
+        builder.file(path, seed)
     # Extend the clean boundary with only this starter's baseline. Existing
     # dirty scenario work stays out of the new commit and remains in place.
     with temporary_index(repo, "HEAD") as env:
-        run_git(repo, "add", "--", path, env=env)
+        run_git(repo, "add", "--", *(path for path, _ in seeds), env=env)
         tree = run_git(repo, "write-tree", env=env)
     parent = run_git(repo, "rev-parse", "HEAD")
     boundary = _commit_tree(
         repo, tree, parent, f"Starter {starter}: clean baseline", occurrence + 100
     )
     run_git(repo, "update-ref", "HEAD", boundary)
+    # The baseline was committed through a temporary index, so the real index
+    # still lacks these paths: git status read them as staged deletions plus
+    # untracked files, never clean. Sync just these paths to the new HEAD.
+    run_git(repo, "reset", "-q", "--", *(path for path, _ in seeds))
     builder.add(starter)
 
 
@@ -731,10 +831,10 @@ def new_scenario(repo: Path, name: str, starters: Sequence[str], force: bool = F
         occurrences[starter] = occurrences.get(starter, 0) + 1
         n = occurrences[starter]
         prefix = starter if n == 1 else f"{starter}-{n}"
-        path, seed = starter_seed(starter, prefix)
-        target = repo / path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(seed, encoding="utf-8")
+        for path, seed in starter_seeds(starter, prefix):
+            target = repo / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(seed, encoding="utf-8")
     run_git(repo, "add", "--", "demo")
     run_git(
         repo,

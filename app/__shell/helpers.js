@@ -2033,6 +2033,11 @@ window.__bramGateGoTranscript = function () {
 };
 
 window.__bramClearComposer = function () {
+  // Every send that isn't a plain message clears the box here (feedback to
+  // selected items, Chat, gate buttons carrying text), so a mic recording
+  // into it stops here too. Missing this left the mic on after a feedback
+  // send (2026-09-26, 21:05:33).
+  window.__bramVoiceStopOnSend("message-agent");
   window.__bramSetMessageAgentText("");
   try { window.__bramRequestComposerClear(); } catch (e) {}
   try { window.__bramClearWorklistDraft(); } catch (e) {}
@@ -2053,6 +2058,7 @@ window.__bramSubmitMessageAgentComposer = function (box, mode) {
     voiceTarget: "message-agent",
   });
   if (!result || !result.submitted) return false;
+  window.__bramVoiceStopOnSend("message-agent");
   try { if (box && typeof box.setValue === "function") box.setValue(""); } catch (e) {}
   window.__bramClearWorklistDraft();
   return true;
@@ -2757,6 +2763,21 @@ window.__bramItemChangedSplit = function (item, items, claim, coSelected) {
 // The shared paths behind the strip's counts. Filenames only -- the row
 // stays a scan line and the paths are one hover away.
 window.__bramWorklist2StripTooltip = function (item, claim, items, attributionTotals) {
+  // issue-406: which commit took the work, by its subject (a bare SHA
+  // doesn't say whether it's the right one), and why the row counts as
+  // landed.
+  if (item && item.landed && item.landed.short) {
+    return (
+      "Committed outside the Worklist in `" + item.landed.short + "`" +
+      (item.landed.subject ? ": *" + item.landed.subject + "*" : "") +
+      "\n\nIts files have no uncommitted changes, and commits made outside the " +
+      "Worklist since the item began touched " +
+      (item.landed.planned ? item.landed.covered + " of its " + item.landed.planned + " planned files" : "them") +
+      ". Bram can check files, not whether the item's intent is done, so it " +
+      "can't tell whether the work is finished. If it is, clearing the row " +
+      "removes it from the board; the history entry keeps the commit."
+    );
+  }
   var split = window.__bramItemChangedSplit(item, items, claim);
   // For a committable row, the terse label dropped the on-disk total, the
   // shared paths, the plan denominator and the last-change time; the tooltip
@@ -2939,6 +2960,16 @@ window.__bramSelectionAllCommittable = function (items, sel, claim) {
     // withholding and the #337 selection-scoping both retire into this.
     var split = window.__bramItemChangedSplit(it, list, claim, chosen);
     if (!split.exclusive.length && !split.shared.length) return false;
+    // "Changes of its own" on a shared path means lines of its own, not just a
+    // changed path: a begun item with no work, sharing a file a neighbour
+    // edited, was offered Commit while its strip read "Will commit +0 −0"
+    // (2026-09-27, issue-406-chat-commit-everything-ready beside the #410
+    // fix). The host's attribution (willCommit) is the arbiter; the commit
+    // would only have been refused as empty (#366).
+    if (!split.exclusive.length) {
+      var wc = it.willCommit;
+      if (wc && (Number(wc.added) || 0) + (Number(wc.removed) || 0) === 0) return false;
+    }
   }
   return true;
 };
@@ -3378,23 +3409,6 @@ window.__bramOwnershipRows = function (patch, runs) {
     prevLine = h.n;
   }
   return out;
-};
-
-// issue-327 file-table experiment: map a Table row selection onto the keyed
-// diff-expansion store. Single-select master-detail per the documented
-// pattern (https://www.xmlui.org/docs/howto/build-a-master-detail-layout):
-// selecting a file row opens its Tabs, selecting another switches, an empty
-// selection closes. One expansion per item; diffKeys stays the source of
-// truth (Table selection is component-internal and positional, the
-// ExpandableItem class of state, so nothing but the highlight relies on it).
-window.__bramTableSelectDiff = function (keys, itemId, sel) {
-  var prefix = String(itemId) + "::";
-  var next = (keys || []).filter(function (k) {
-    return String(k).indexOf(prefix) !== 0;
-  });
-  var picked = sel && sel.length ? sel[sel.length - 1] : null;
-  if (picked && picked.path) next.push(window.__bramDiffExpansionKey(itemId, picked.path));
-  return next;
 };
 
 // issue-327 scoped diff: the scopes a file's Diff tab offers. "All changes" is
@@ -3837,25 +3851,29 @@ window.__bramWorklist2Strip = function (item, claim, items, attribution, attribu
     // 1 of 7 files changed, that file shared with issue-269), so omitting the
     // hint here would have left the very case that prompted the split showing
     // a Stalled icon above a line that never names Start.
-    var nShared = split.shared.length;
     // #336: this branch now also receives entangled APPLIED items (the
     // exclusivity check covers them since the short-circuit fell). Two
     // truths, both said: whether this item has work of its own here (the
     // old wording claimed "nothing" for an item with 70 attributed lines),
     // and WHO is blocking, so the absent Commit button names its cause.
-    var own = window.__bramOwnClause(item, attribution);
+    // Said plainly (Jon, 2026-09-27: "way too complicated to read at a
+    // glance … simplify dramatically"). The earlier line stacked the own
+    // clause, the shared-file count, the blockers and a Start-again tail, and
+    // for an item with no work read "Changes only on shared files · unique:
+    // +0 · …". The detail stays in the tooltip.
+    var wcShared = item.willCommit;
+    var ownLines = wcShared
+      ? (Number(wcShared.added) || 0) + (Number(wcShared.removed) || 0)
+      : null;
+    if (ownLines === 0 || !window.__bramOwnClause(item, attribution)) {
+      return withCloses("No changes of its own yet");
+    }
     var blockers = window.__bramItemShareBlockers(item, items, claim);
-    var head = own
-      ? "Changes only on shared files" + own
-      : "Nothing of its own changed";
     return withCloses(
-      head + " · " + nShared + " shared file" +
-        (nShared === 1 ? "" : "s") + " changed" +
-        (blockers.length
-          ? " with " + blockers.join(", ") + " — commit " +
-            (blockers.length === 1 ? "it" : "those") + " first"
-          : "") +
-        (window.__bramItemNeedsStart(item, claim) ? " · Start again" : ""),
+      blockers.length
+        ? "Shares its changed files with " + blockers.join(", ") + " · commit " +
+            (blockers.length === 1 ? "that" : "those") + " first"
+        : "Its changes are all in shared files",
     );
   }
   // The strip names the same state the icon does. Both branches used to return
@@ -3867,6 +3885,22 @@ window.__bramWorklist2Strip = function (item, claim, items, attribution, attribu
     // press a button that is already sitting in the footer, labelled -- the
     // strip's job is to name where the item IS, not to narrate the next click.
     return withCloses("Proposed");
+  }
+  // issue-406: its work was committed outside the Worklist (a plain git
+  // commit in chat or a terminal). The host sets `landed` only for a begun
+  // item whose files are clean and were touched by a commit since it began,
+  // so this must win over "nothing came of it", which would misstate it.
+  if (item.landed && item.landed.short) {
+    // The commit's subject lives in the tooltip, not the strip (Jon: "I
+    // don't see what this part of the message is adding").
+    // issue-410: report plan coverage and say what Bram can't tell (Jon: the
+    // earlier wording "does not convey that we don't know if all intended
+    // changes were made"). Files can be checked; the intent can't.
+    return withCloses(
+      "Committed outside the Worklist in " + item.landed.short +
+        window.__bramLandedCoverage(item.landed) +
+        ". Bram can't tell whether the work is finished; if it is, Clear it",
+    );
   }
   // Nothing on disk yet, and begun -- the two states the icon now separates.
   // Earlier this returned "" (brief, because begun-ness was transient), then
@@ -5964,6 +5998,9 @@ window.__bramHistoryDateRangeLine = function (group) {
 window.__bramHistoryPhaseLabel = function (phase) {
   if (phase && phase.kind === "feedback") return "Feedback";
   var summary = ((phase && phase.summary) || "").toLowerCase();
+  // issue-406: a row cleared because its work was committed outside the
+  // Worklist. Checked first: it isn't a gate commit.
+  if (summary.indexOf("cleared") >= 0) return "Cleared";
   if (summary.indexOf("committed") >= 0) return "Committed";
   if (summary.indexOf("applied") >= 0) return "Applied";
   if (summary.indexOf("proposed") >= 0) return "Proposed";
@@ -5987,7 +6024,7 @@ window.__bramHistoryCommitUrl = function (group) {
     var phase = phases[i] || {};
     var summary = (phase.summary || "").toLowerCase();
     var url = typeof phase.commitUrl === "string" ? phase.commitUrl.trim() : "";
-    if (url && summary.indexOf("committed") >= 0) return url;
+    if (url && (summary.indexOf("committed") >= 0 || summary.indexOf("cleared") >= 0)) return url;
   }
   return "";
 };
@@ -6002,7 +6039,7 @@ window.__bramHistoryCommitStatus = function (group) {
     var phase = phases[i] || {};
     var summary = (phase.summary || "").toLowerCase();
     var st = typeof phase.commitStatus === "string" ? phase.commitStatus : "";
-    if (st && summary.indexOf("committed") >= 0) return st;
+    if (st && (summary.indexOf("committed") >= 0 || summary.indexOf("cleared") >= 0)) return st;
   }
   return "";
 };
@@ -6055,6 +6092,7 @@ window.__bramHistoryItemFate = function (group) {
   var phases = (group && group.phases) || [];
   for (var i = phases.length - 1; i >= 0; i--) {
     var summary = ((phases[i] && phases[i].summary) || "").toLowerCase();
+    if (summary.indexOf("cleared") >= 0) return "Fate: cleared (its work was committed outside the Worklist).";
     if (summary.indexOf("committed") >= 0) return "Fate: committed.";
     if (summary.indexOf("dropped") >= 0 || summary.indexOf("pruned") >= 0) return "Fate: dropped.";
   }
@@ -8246,6 +8284,246 @@ window.bramSubscribeVoiceArrival = (function () {
     return factory;
   };
 })();
+
+// issue-407: live dictation preview. While a pane editor's 🎤 records,
+// main.js posts voice-into-partial ({ target, requestId, committed,
+// provisional }) after each sliding-window transcription. Keep the latest
+// and publish it; the delivered transcript (voice-into-result) or an idle
+// voice-state clears it. Editors show it under their input and still get
+// the final text through voice-into-result, unchanged.
+window.__bramVoicePartial = null;
+window.__bramVoiceLastParts = {};
+window.addEventListener("message", function (event) {
+  var d = event && event.data;
+  if (!d) return;
+  if (d.type === "voice-into-partial") {
+    window.__bramVoicePartial = {
+      target: String(d.target || ""),
+      requestId: d.requestId,
+      committed: String(d.committed || ""),
+      provisional: String(d.provisional || ""),
+      parts: Array.isArray(d.parts) ? d.parts : [],
+      openSeq: Number(d.openSeq) || 0,
+      at: Date.now(),
+    };
+    // Outlives the partial (cleared on delivery) so finalize can still
+    // count windows after an edit.
+    window.__bramVoiceLastParts[String(d.target || "")] = {
+      requestId: d.requestId,
+      parts: window.__bramVoicePartial.parts,
+    };
+  } else if (d.type === "voice-into-result" || (d.type === "voice-state" && d.state === "idle")) {
+    if (!window.__bramVoicePartial) return;
+    window.__bramVoicePartial = null;
+  } else {
+    return;
+  }
+  window.dispatchEvent(new CustomEvent("bram:voice-partial"));
+});
+window.bramSubscribeVoicePartial = (function () {
+  var factory;
+  return function () {
+    if (factory) return factory;
+    var subscribers = new Set();
+    window.addEventListener("bram:voice-partial", function () {
+      subscribers.forEach(function (fn) {
+        try { fn(); } catch (e) { console.error("[bram] voice-partial subscriber threw:", e); }
+      });
+    });
+    factory = function (emit) {
+      var fire = function () { emit(window.__bramVoicePartial); };
+      subscribers.add(fire);
+      fire();
+      return function () { subscribers.delete(fire); };
+    };
+    return factory;
+  };
+})();
+// The live text goes INTO the editor (Jon: "why not put the text into the
+// message box instead of below it"). The box's text from before the
+// dictation is kept per target; each partial rewrites the box as that text
+// plus the live transcript. When the transcript is delivered, the editor
+// calls __bramVoiceFinalizeInto, which sets pre-dictation text + final
+// transcript in one step, so the final text lands exactly once. A textarea can't gray out part of its text, so
+// provisional words look like the rest until they're replaced.
+window.__bramVoiceLiveBase = {};
+// Your edits win. Each window main.js transcribes has a number (seq); the
+// partial carries the committed parts with their numbers and the number of
+// the window still open. If the box no longer holds what dictation last
+// wrote, you edited it: your text becomes the new base, and only windows
+// you hadn't seen yet are added after it — erased text stays erased
+// (Jon: "I had to erase it … and it came back"). Clearing the box is an
+// edit like any other; dictation carries on into the empty box. Only a
+// send stops the mic (__bramVoiceStopOnSend).
+function __bramVoiceLiveText(rec, parts, provisional, openSeq) {
+  var words = [];
+  (parts || []).forEach(function (p) {
+    if (p && p.seq >= rec.fromSeq && p.text) words.push(p.text);
+  });
+  if (provisional && openSeq >= rec.fromSeq) words.push(provisional);
+  return words.join(" ");
+}
+function __bramVoiceJoin(base, text) {
+  var spacer = base && text && !/\s$/.test(base) ? " " : "";
+  return base + spacer + text;
+}
+// Adopt the box's current text as the base when it differs from what
+// dictation last wrote. Returns true when an edit was adopted.
+function __bramVoiceAdoptEdit(rec, box, target) {
+  if (rec.written === undefined) return false;
+  var cur = String(box.value || "");
+  // box.value can lag a setValue (the 311→597 duplication), so the value
+  // written just before the last one isn't an edit either.
+  // An empty box is never a lag, though: it's a send or a clear.
+  if (cur === rec.written || (cur.trim() && cur === rec.prevWritten)) return false;
+  rec.edited = true;
+  // The window that showed as provisional text is part of what you edited;
+  // skip it too, or its final text would bring the erased words back.
+  rec.fromSeq = rec.wHadProv ? rec.wOpenSeq + 1 : rec.wOpenSeq;
+  rec.base = cur;
+  rec.written = cur;
+  rec.prevWritten = undefined;
+  try { window.__bramIframeTrace && window.__bramIframeTrace("voice-trace", { stage: "live-edit-adopted", target: target, baseLen: cur.length, fromSeq: rec.fromSeq }); } catch (e) {}
+  return true;
+}
+// Sending while this box records stops the mic (the message box's send,
+// IsolatedDraftEditor.clear() — which every other 🎤 box's submit and
+// cancel buttons call — and a queue note's Send or Delete): the same voiceStop the 🎤
+// toggle uses, delivered through voice-arrival so the editor resets its 🎤.
+// The record is marked stopped first, so neither a late partial nor the
+// final transcript writes into the just-cleared box.
+window.__bramVoiceStopOnSend = function (target) {
+  if (!window._voiceSession || window._voiceSessionTarget !== target) return;
+  var rec = window.__bramVoiceLiveBase[target];
+  if (!rec || rec.requestId !== window._voiceSession) {
+    rec = { requestId: window._voiceSession, base: "", fromSeq: 0, edited: false };
+    window.__bramVoiceLiveBase[target] = rec;
+  }
+  rec.stopped = true;
+  try { window.__bramIframeTrace && window.__bramIframeTrace("voice-trace", { stage: "live-send-stop", target: target }); } catch (e) {}
+  window.voiceStop(function (t, meta) {
+    window.__bramSetLatestVoiceState(t, Object.assign({}, meta || {}, { target: target }));
+  });
+};
+function __bramVoiceTrackScroll(rec, el) {
+  rec.el = el;
+  rec.follow = true;
+  el.addEventListener("scroll", function () {
+    // Our own scrolls land at the bottom, so they keep following; scrolling
+    // up to read turns it off until you scroll back down.
+    rec.follow = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+  });
+}
+function __bramVoiceFollow(rec) {
+  var el = rec.el;
+  if (!el || !rec.follow) {
+    __bramVoiceScrollTrace(rec, "skip");
+    return;
+  }
+  var go = function () { el.scrollTop = el.scrollHeight; };
+  setTimeout(go, 0);
+  setTimeout(function () { go(); __bramVoiceScrollTrace(rec, "after"); }, 80);
+}
+// Trace only when the box is scrollable or following changed, to keep the
+// log quiet while the text still fits.
+function __bramVoiceScrollTrace(rec, stage) {
+  var el = rec.el;
+  var info = el
+    ? { sh: el.scrollHeight, st: Math.round(el.scrollTop), ch: el.clientHeight, follow: !!rec.follow }
+    : { hasEl: false };
+  var key = JSON.stringify([stage, info.follow, el ? el.scrollHeight > el.clientHeight : null]);
+  if (el && el.scrollHeight <= el.clientHeight && rec.lastScrollKey === key) return;
+  rec.lastScrollKey = key;
+  info.stage = "live-scroll-" + stage;
+  try { window.__bramIframeTrace && window.__bramIframeTrace("voice-trace", info); } catch (e) {}
+}
+window.__bramVoiceShowLive = function (box, partial, target) {
+  if (!box || !partial || !target || partial.target !== target) return;
+  // Only the current partial may write: delivery clears
+  // window.__bramVoicePartial synchronously, so a reaction to a stale
+  // partial that lands after __bramVoiceFinalizeInto can't re-add live text.
+  var cur = window.__bramVoicePartial;
+  if (!cur || cur.requestId !== partial.requestId || cur.at !== partial.at) return;
+  var rec = window.__bramVoiceLiveBase[target];
+  var first = !rec || rec.requestId !== partial.requestId;
+  if (first) {
+    rec = { requestId: partial.requestId, base: String(box.value || ""), fromSeq: 0, edited: false, stopped: false };
+    window.__bramVoiceLiveBase[target] = rec;
+  }
+  if (rec.stopped) return;
+  __bramVoiceAdoptEdit(rec, box, target);
+  var next = __bramVoiceJoin(rec.base, __bramVoiceLiveText(rec, partial.parts, partial.provisional, partial.openSeq));
+  rec.prevWritten = rec.written;
+  rec.written = next;
+  rec.wOpenSeq = partial.openSeq;
+  rec.wHadProv = !!partial.provisional;
+  // Keep the newest words in view when the text outgrows the box (Jon:
+  // "we don't scroll to the bottom … my words are not visible"), unless you
+  // scrolled up to read. Following is tracked from the element's own scroll
+  // events, and the scroll is applied after XMLUI has rendered the new value
+  // (and an autoSize box has grown). A single requestAnimationFrame right
+  // after setValue didn't scroll in Jon's test (cause unconfirmed; the
+  // live-scroll trace records scrollHeight/scrollTop to settle it).
+  // focus() may land after the first partial; pick the textarea up later.
+  if (!rec.el && document.activeElement && document.activeElement.tagName === "TEXTAREA") {
+    __bramVoiceTrackScroll(rec, document.activeElement);
+  }
+  try { box.setValue(next); } catch (e) {}
+  __bramVoiceFollow(rec);
+  // Dictating into a box means you're in it: on the first words, focus it
+  // with the caret at the end so Enter sends without a click first (Jon:
+  // "I can't press enter until I click into the message box"). Only the
+  // first time, so a caret you place to edit mid-dictation isn't moved.
+  if (first) {
+    try {
+      if (typeof box.focus === "function") box.focus();
+    } catch (e) {}
+    // The XMLUI TextArea API exposes no scroll method; the focused element
+    // is its DOM textarea, kept for scrolling.
+    var active = document.activeElement;
+    if (!rec.el && active && active.tagName === "TEXTAREA") {
+      __bramVoiceTrackScroll(rec, active);
+      __bramVoiceFollow(rec);
+    }
+  }
+};
+// Deliver the final transcript into a box that may be showing live text.
+// Computes base + final text from the record and sets it ONCE: a separate
+// restore-then-append read box.value back before XMLUI had applied the
+// restore, and appended onto the live text (first test: 311 chars became
+// 597, the dictation doubled). After an edit, the final text is the
+// windows you hadn't seen, not the whole transcript; after a send or clear
+// the box is left alone. With no live base on record, falls back to
+// __bramAppendVoiceToBox. Returns the new value, or false when nothing
+// was added (same contract as the append).
+window.__bramVoiceFinalizeInto = function (box, target, transcript) {
+  var rec = window.__bramVoiceLiveBase[target];
+  delete window.__bramVoiceLiveBase[target];
+  var last = window.__bramVoiceLastParts[target];
+  delete window.__bramVoiceLastParts[target];
+  if (!rec) return window.__bramAppendVoiceToBox(box, transcript);
+  if (!box) return false;
+  if (rec.stopped) {
+    try { window.__bramIframeTrace && window.__bramIframeTrace("voice-trace", { stage: "finalize-into-stopped", target: target }); } catch (e) {}
+    return false;
+  }
+  __bramVoiceAdoptEdit(rec, box, target);
+  var base = rec.base;
+  var text = transcript;
+  if (rec.edited) {
+    var parts = last && last.requestId === rec.requestId ? last.parts : [];
+    text = __bramVoiceLiveText(rec, parts, "", 0);
+  }
+  var cleaned = String(text || "").replace(/\r?\n/g, " ").replace(/[ \t]+/g, " ").trim();
+  var next = __bramVoiceJoin(base, cleaned);
+  try { box.setValue(next); } catch (e) { return false; }
+  try {
+    if (typeof box.focus === "function") box.focus();
+    if (typeof box.setSelectionRange === "function") box.setSelectionRange(next.length, next.length);
+  } catch (e) {}
+  try { window.__bramIframeTrace && window.__bramIframeTrace("voice-trace", { stage: "finalize-into", baseLen: base.length, transcriptLen: cleaned.length, nextLen: next.length, edited: rec.edited }); } catch (e) {}
+  return cleaned ? next : false;
+};
 
 // Parent → agent-pane bridge for whisper-server failure notices.
 // main.js posts { type: "bram-whisper-unavailable", reason, kind?, detail? }
@@ -13347,6 +13625,130 @@ window.__bramDiffExpanded = function (keys, itemId, path) {
   return (keys || []).indexOf(window.__bramDiffExpansionKey(itemId, path)) !== -1;
 };
 
+// The files table's disclosure triangle (Jon, 2026-09-26: "it is not nearly
+// obvious enough that those rows are expandable"). Blank where a row can't
+// expand: plan rows (not begun) and files with no diff. Otherwise ▼ when the
+// diff is open, ▶ when closed. It reads the same state as the diff body
+// (__bramDiffExpanded / __bramDiffForPath), so the two can't disagree.
+// Only one file's diff is open at a time, so while one is open the table
+// shows just that row (Jon: "we can make the display a lot more legible by
+// hiding the unexpanded rows"). Clicking its triangle again closes the
+// diff and brings the rest back. The note says rows are hidden, so the missing
+// files don't read as gone.
+// issue-406-offer-to-clear-landed-rows: rows whose work landed outside the
+// Worklist, offered for clearing in one click above the board. The host
+// re-verifies each id when the route runs and prunes only landed ones.
+// " · 3 of 4 planned files", or "" when the host sent no counts.
+window.__bramLandedCoverage = function (landed) {
+  if (!landed || !landed.planned) return "";
+  return " · " + landed.covered + " of " + landed.planned + " planned file" +
+    (landed.planned === 1 ? "" : "s");
+};
+window.__bramLandedIds = function (board) {
+  return ((board && board.items) || [])
+    .filter(function (i) { return i && i.landed; })
+    .map(function (i) { return i.id; });
+};
+window.__bramLandedNote = function (board) {
+  var n = window.__bramLandedIds(board).length;
+  if (!n) return "";
+  return n === 1
+    ? "1 item looks already committed"
+    : n + " items look already committed";
+};
+// Landed rows are tinted whenever they're on the board, which is exactly
+// when the "Clear it" / "Clear them" offer shows: the tint says which rows
+// the button would clear. Warn-tinted because clearing removes rows.
+window.__bramLandedRowTint = function (item) {
+  return item && item.landed ? "$color-warn-100" : "transparent";
+};
+// The button and its tooltip agree in number with the note beside them.
+window.__bramLandedButtonLabel = function (board) {
+  return window.__bramLandedIds(board).length === 1 ? "Clear it" : "Clear them";
+};
+window.__bramLandedButtonTooltip = function (board) {
+  return window.__bramLandedIds(board).length === 1
+    ? "Remove this row: its work is already in a commit"
+    : "Remove these rows: their work is already in a commit";
+};
+window.__bramClearLanded = function (board) {
+  var ids = window.__bramLandedIds(board);
+  if (!ids.length) return;
+  window
+    .fetch("/__worklist/clear-landed", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids: ids, via: "pane" }),
+    })
+    .catch(function () {});
+};
+
+// worklist-drag-reorder-and-link-labels: the Worklist rows' drag order.
+// __bramWorklistReorder posts the dropped order to the host and returns a
+// pending record the markup holds; __bramWorklistOrdered shows the board in
+// that order until the host's write lands (the board's version moves past
+// baseVersion) or the host refuses it (failed, set by the fetch below; the
+// host also emits worklist-changed on a refusal, so the board refetches
+// and this re-evaluates). Rows are matched by id, never by position.
+window.__bramWorklistReorder = function (newOrder, board) {
+  var ids = (newOrder || []).map(function (i) { return i && i.id; }).filter(Boolean);
+  var pending = { ids: ids, baseVersion: board && board.version, failed: false };
+  window
+    .fetch("/__worklist/reorder", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids: ids, baseVersion: pending.baseVersion }),
+    })
+    .then(function (r) { if (!r.ok) pending.failed = true; })
+    .catch(function () { pending.failed = true; });
+  return pending;
+};
+window.__bramWorklistOrdered = function (board, pending) {
+  var items = (board && board.items) || [];
+  if (!pending || pending.failed || !board || board.version !== pending.baseVersion) return items;
+  if (pending.ids.length !== items.length) return items;
+  var byId = {};
+  items.forEach(function (i) { byId[i.id] = i; });
+  var out = pending.ids.map(function (id) { return byId[id]; });
+  return out.every(Boolean) ? out : items;
+};
+
+window.__bramFilesTableRows = function (files, keys, itemId) {
+  var all = files || [];
+  var open = all.filter(function (f) {
+    return f && window.__bramDiffExpanded(keys, itemId, f.path);
+  });
+  return open.length ? open : all;
+};
+window.__bramFilesHiddenNote = function (files, keys, itemId) {
+  var all = files || [];
+  var shown = window.__bramFilesTableRows(all, keys, itemId).length;
+  if (shown >= all.length) return "";
+  return "Showing " + shown + " of " + all.length + " files. Click \u25BC to show them all.";
+};
+// The triangle is the click target (Jon: "treat the triangle as the active
+// site"): open this file's diff, closing any other of the item's, or close
+// it if it's already open. One file at a time, as row selection gave.
+window.__bramDiffToggleFile = function (keys, itemId, path) {
+  var key = window.__bramDiffExpansionKey(itemId, path);
+  var wasOpen = (keys || []).indexOf(key) !== -1;
+  var prefix = String(itemId) + "::";
+  var next = (keys || []).filter(function (k) {
+    return String(k).indexOf(prefix) !== 0;
+  });
+  if (!wasOpen) next.push(key);
+  return next;
+};
+window.__bramDiffToggleTooltip = function (keys, itemId, path) {
+  return window.__bramDiffExpanded(keys, itemId, path) ? "Hide this file's diff" : "Show this file's diff";
+};
+window.__bramDiffDisclosure = function (keys, itemId, path, begun, item) {
+  if (!begun || !window.__bramDiffForPath(item, path)) return "";
+  // Full-size ▼ / ▶, sized in markup to match the row's checkbox (the small
+  // ▾ / ▸ read as specks: "They need to be as big as the checkbox").
+  return window.__bramDiffExpanded(keys, itemId, path) ? "\u25BC" : "\u25B6";
+};
+
 // issue-326: refuse a board older than one already rendered.
 //
 // /__worklist already serves worklist.json's `version` (the field the guards
@@ -13501,6 +13903,9 @@ window.__bramQueueAdd = function (entries) {
 window.__bramQueueRemove = function (entries, idx, suppressTrace) {
   var next = (entries || []).slice();
   var removed = next[idx];
+  // Send and Delete both end here; the note's editor goes away, so a mic
+  // still recording into it would have nowhere to deliver.
+  if (removed && removed.id) window.__bramVoiceStopOnSend("queue-item:" + removed.id);
   if (!suppressTrace) {
     window.__bramIframeTrace("queue", { op: "delete", id: (removed && removed.id) || "", chars: String((removed && removed.text) || "").length });
   }

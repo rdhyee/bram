@@ -135,6 +135,8 @@ claims must say they are wrong). Record in
 premise that failed, what was verified, and what would make the item
 actionable again.
 
+- **A row reads "Committed outside the Worklist", or the user asks you to clear such rows** → read `.claude/bram-reference/worklist-mechanics.md` (§Rows committed outside the Worklist).
+
 **Drop removes the item, not the bytes — and orphaned changes are
 misattributed, not merely unattributed.** The pane reasons about
 changed files *through items* (the overlap index walks `item.files`,
@@ -226,6 +228,9 @@ read and capture `version`; write with `version: <captured + 1>`; on a
 `reason=stale-worklist-version` denial, re-read, rebase your change on
 the new contents, and retry. A file with no `version` is version 0, and
 the first write introducing `version: 1` is allowed.
+
+**Item order is the user's** (they drag to reorder): keep the order you
+read, and add new items at the end.
 
 **Prose lives only in the draft file.** Both guards reject inline
 `before` / `after` keys in `worklist.json`. Prose edits made in response to item
@@ -337,6 +342,13 @@ route through `resolve`.
   feedback; update the draft only if scope materially expanded.
 - Either way the item keeps its status; iterate never advances or
   commits on its own.
+
+**Edit only the addressed items' files, with the file tools.** Lines
+written in an addressed turn are credited to the addressed items, so when
+the change belongs in another item's files, say so and route it before
+editing. Use Edit / Write for tracked files so the guards can see them.
+
+- **Routing a change, or the guard says a file isn't in the addressed items' files** → read `.claude/bram-reference/worklist-mechanics.md` (§Routing edits to the right item).
 
 Feedback items arrive as `{id, feedbackRef}`: read the user's
 full-fidelity text from `resources/feedback-drafts/<feedbackRef>.md`
@@ -647,13 +659,7 @@ you never meet them.
   issue-close-sensitive work, especially over unrelated changes. Explain
   the benefit briefly. Not for small direct fixes or straightforward docs
   tweaks; never switch branches without clear consent.
-- **Notice sibling commits that should be squashed**, and flag it before
-  push. Two consecutive unpushed commits that are one feature: ask "`<sha1>` and `<sha2>` are
-  two halves of the same feature — want to squash them?" If yes and
-  both are unpushed: `git reset --soft HEAD~2` then `git commit -F
-  <new-msg>`; verify with `git log --oneline -3` and `git log --oneline
-  @{u}..HEAD`. Never squash pushed commits without explicit force-push
-  consent.
+- **Two unpushed commits look like one feature** → read `.claude/bram-reference/worklist-mechanics.md` (§Pushing: grace window and auto-rebase) before offering a squash.
 - **Don't rewrite a commit the worklist history has recorded.**
   `resources/worklist-history/` stores commit links by SHA, so rewriting
   any commit made through the gate orphans them permanently, pushed or
@@ -663,15 +669,9 @@ you never meet them.
   confirm with its short SHA and subject and stop. Don't recommend Push
   from remembered state; if push state matters, check `git log
   @{u}..HEAD` first. The Push button carries the true count.
-- **Post-commit push grace.** For 10 minutes after a gate commit both
-  guards allow `git push` (only), so "commit this, then push" works on an
-  emptied board. Push within it only when the user asked in the
-  approval; outside it, the Push path is the user's (the **Push** button
-  in the Commits tab).
-- **Push auto-rebases.** The Push button fetches and rebases on
-  `origin/<branch>` on non-fast-forward. Don't `git pull --rebase`
-  yourself; intervene only when it reports rebase conflicts (then a
-  manual rebase, resolve, push).
+- **Pushing is the user's** (the **Push** button in the Commits tab).
+  Push yourself only when the user asked in the approval.
+- **About to push, or a push reports rebase conflicts** → read `.claude/bram-reference/worklist-mechanics.md` (§Pushing: grace window and auto-rebase).
 
 ### Commit messages
 
@@ -780,10 +780,20 @@ Commit diffs are indexed but bounded (long lines elided, 256 KB cap);
 
 ## Logs, diagnostics and environment
 
-Behavior in Bram is answered by evidence, not inspection: when
-something goes wrong, first ask whether the trace already captured it,
-and use it before theorizing. A fix proposed without trace evidence
-should say so.
+Behavior is answered by evidence, not inspection. That holds for Bram
+and for the project's own app. When something goes wrong, first ask
+whether a log (Bram's trace, or the app's own) already captured it, and
+use it before theorizing. A fix proposed without log evidence should say
+so.
+
+**Offer instrumentation first.** You are far better at writing and
+reading structured logs than at inferring runtime behavior from code, so
+use that in the project's app too. When behavior is uncertain (a bug that
+won't reproduce, timing or ordering, a guessed threshold, a mechanism
+acting on inferred conditions), offer to add log lines, let the user run
+the app normally, and decide from the log. Say when you're proposing this
+instead of a fix; for a plain change, just make it. Log-line shape →
+`.claude/bram-reference/diagnostics.md` (§Log-first development).
 
 - **Before writing "can't test from here" or "unverifiable"**, exhaust
   on-disk evidence: rotated trace archives, `git log` / `git blame`,

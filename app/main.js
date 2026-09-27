@@ -2208,9 +2208,10 @@ listen("pty-send-sent", (e) => {
   });
 })();
 
-// Click-to-toggle voice. The toolbar 🎤 button toggles its own recording;
-// iframes (Workspace, etc.) drive the same recorder via voice-start/voice-stop
-// messages. Auto-starts whisper-server on first record click.
+// Click-to-toggle voice for the agent pane's 🎤 buttons, which drive this
+// recorder via voice-start/voice-stop messages. Auto-starts whisper-server on
+// first record click. (issue-407 retired the parent toolbar's 🎤, which
+// dictated into the terminal: little used, and confusing next to the pane's.)
 (() => {
   const WHISPER_HOST = "http://127.0.0.1:18080";
   const WHISPER_URL = WHISPER_HOST + "/inference";
@@ -2221,9 +2222,6 @@ listen("pty-send-sent", (e) => {
   const READY_POLL_MS = 300;
   const IFRAME_ORPHAN_GRACE_MS = 10000;
   const IFRAME_RECORDING_WATCHDOG_MS = 5 * 60 * 1000;
-
-  const toolbarBtn = document.getElementById("voice-toggle");
-  if (!toolbarBtn) return;
 
   // Structured voice-pipeline logging via the existing log_from_right_pane
   // command, so every stage shows up in cargo run stderr tagged with the
@@ -2252,8 +2250,7 @@ listen("pty-send-sent", (e) => {
   let audioChunks = [];
   let stream = null;
   // active === null         → idle
-  // active === "toolbar"    → toolbar mic; transcript → pty_write
-  // active === { source, requestId } → iframe round-trip; transcript → postMessage
+  // active === { source, requestId, voiceTarget } → pane round-trip; transcript → postMessage
   let active = null;
   let activeStopAtMs = null;
   let activeStopReceivedAtMs = null;
@@ -2261,17 +2258,9 @@ listen("pty-send-sent", (e) => {
   let activeRecorderStarted = false;
   let activeStopRequested = false;
   let activeWatchdogTimer = null;
-  // Synthetic requestId for toolbar sessions — keeps log entries correlated
-  // even though the toolbar path never receives an iframe-supplied id.
-  let toolbarRequestId = null;
   const currentRequestId = () =>
-    active === "toolbar"
-      ? toolbarRequestId
-      : active && typeof active === "object"
-        ? active.requestId
-        : null;
-  const activeKind = () =>
-    active === null ? null : active === "toolbar" ? "toolbar" : "iframe";
+    active && typeof active === "object" ? active.requestId : null;
+  const activeKind = () => (active === null ? null : "iframe");
   const activeAgeMs = () =>
     typeof activeStartedAtMs === "number" ? Date.now() - activeStartedAtMs : null;
 
@@ -2283,7 +2272,7 @@ listen("pty-send-sent", (e) => {
   };
 
   const postIframeVoiceState = (state, extra) => {
-    if (!active || active === "toolbar" || !active.source) return;
+    if (!active || !active.source) return;
     try {
       active.source.postMessage(
         Object.assign(
@@ -2308,13 +2297,13 @@ listen("pty-send-sent", (e) => {
 
   const resetActiveState = () => {
     clearActiveWatchdog();
+    abortLive();
     active = null;
     activeStopAtMs = null;
     activeStopReceivedAtMs = null;
     activeStartedAtMs = null;
     activeRecorderStarted = false;
     activeStopRequested = false;
-    toolbarRequestId = null;
   };
 
   const recoverStaleActiveRecording = (reason) => {
@@ -2351,13 +2340,12 @@ listen("pty-send-sent", (e) => {
     stopStream();
     audioChunks = [];
     resetActiveState();
-    if (toolbarBtn.dataset.state !== "idle") setToolbarState("idle");
   };
 
   const armIframeRecordingWatchdog = () => {
     clearActiveWatchdog();
     activeWatchdogTimer = setTimeout(() => {
-      if (active && active !== "toolbar" && !activeStopRequested) {
+      if (active && !activeStopRequested) {
         recoverStaleActiveRecording("iframe-watchdog-timeout");
       }
     }, IFRAME_RECORDING_WATCHDOG_MS);
@@ -2365,26 +2353,12 @@ listen("pty-send-sent", (e) => {
 
   const canRecoverStaleIframeForNewStart = (target) =>
     active &&
-    active !== "toolbar" &&
     target &&
     typeof target === "object" &&
     target.source &&
     active.source !== target.source &&
     typeof activeStartedAtMs === "number" &&
     Date.now() - activeStartedAtMs >= IFRAME_ORPHAN_GRACE_MS;
-
-  const setToolbarState = (state) => {
-    toolbarBtn.dataset.state = state;
-    toolbarBtn.innerHTML =
-      state === "recording"
-        ? "&#x23F9;"
-        : state === "processing"
-          ? '<span class="voice-spinner" aria-label="Processing voice input"></span>'
-        : state === "starting"
-          ? "&#x23F3;"
-          : "&#x1F3A4;";
-  };
-  setToolbarState("idle");
 
   const mediaRecorderConfig = () => {
     const opusWebm = "audio/webm;codecs=opus";
@@ -2494,7 +2468,7 @@ listen("pty-send-sent", (e) => {
 
   // Send startup and transcription failures to the agent-pane iframe
   // (same-origin tools-pane), which owns the toast surface. This covers every
-  // mic origin — toolbar, agent pane, and any target-app iframe. Startup
+  // mic origin — the agent pane or any target-app iframe. Startup
   // failures retain the original reason-only payload; post-recording failures
   // add a kind and server detail so the toast can explain what broke.
   const notifyWhisperUnavailable = (reason, kind, detail) => {
@@ -2559,10 +2533,458 @@ listen("pty-send-sent", (e) => {
     }
   };
 
+  // issue-407: live dictation. While the MediaRecorder records (unchanged,
+  // and still the source of the reserve full pass), a Web Audio tap on the
+  // same stream feeds a sliding window to whisper-server: every LIVE_STEP_MS
+  // the audio since the last commit is transcribed as provisional text; a
+  // pause (LIVE_PAUSE_MS under LIVE_RMS, with at least LIVE_MIN_FINAL_S of
+  // audio) or LIVE_MAX_WIN_S makes the next result final, which commits its
+  // text and drops its audio. One request at a time; the committed tail goes
+  // along as `prompt`. Measured in the #407 prototype: ~420 ms per request,
+  // matching a one-request pass over the whole recording word for word.
+  // On stop the live text is what gets delivered; localStorage
+  // bram.voice.fullPass === "1" (no UI, kept in reserve) sends the whole
+  // recording in one request instead, as before. If live capture can't
+  // start, the full pass is used automatically. localStorage
+  // bram.voice.pauseMs (no UI) overrides LIVE_PAUSE_MS for speakers who
+  // pause longer or shorter; voice-final logs every pause (pausesMs) so the
+  // default can be revisited from data.
+  const LIVE_RATE = 16000;
+  const LIVE_STEP_MS = 700;
+  // 700 ms broke sentences at thinking pauses (Jon: "a bit aggressive about
+  // stopping in the middle of the sentence"); a final window ends with a
+  // period and the next starts capitalized.
+  const LIVE_PAUSE_MS = 1200;
+  // Quiet this long after a sub-LIVE_MIN_VOICED_S blip means it was a blip.
+  const LIVE_BLIP_QUIET_MS = 700;
+  // Pauses shorter than this are gaps between words, not worth logging.
+  const LIVE_PAUSE_LOG_MIN_MS = 250;
+  const LIVE_MIN_FINAL_S = 1.5;
+  const LIVE_MAX_WIN_S = 12;
+  // At the cap, cut at the quietest block in this much trailing audio
+  // instead of at the very end, so the cut falls between words (a hard cut
+  // produced "prototyp ing", 2026-09-26). The rest stays for the next window.
+  const LIVE_CAP_LOOKBACK_S = 1.5;
+  // A request that hasn't answered by now is abandoned, so a stuck
+  // whisper-server costs seconds, not WebKit's ~60 s fetch timeout per
+  // request (seen 2026-09-26 when a full stderr pipe wedged the server).
+  const LIVE_REQUEST_TIMEOUT_MS = 15000;
+  const LIVE_RMS = 0.012;
+  const LIVE_SILENCE_KEEP_MS = 2000;
+  // A click or breath is one or two ~85 ms blocks over LIVE_RMS; speech is
+  // far more. Windows below this much voiced audio are never sent.
+  const LIVE_MIN_VOICED_S = 0.3;
+  // Whisper's stock output for near-silence. Only traced (silencePhrase on
+  // voice-window), never dropped: a 0.5 s cutoff deleted a deliberate
+  // "thank you" (0.43 s voiced) while the LIVE_MIN_VOICED_S gate alone kept
+  // every phantom out. If phantoms return, their voicedS sets the cutoff.
+  const LIVE_SILENCE_PHRASES = /^(thank you|thanks|thanks for watching|thank you for watching|bye|you)$/;
+  let live = null;
+
+  // Seconds of voiced audio in the first n samples of the window (all of it
+  // by default).
+  const liveVoicedS = (L, n = L.winLen) => {
+    let voiced = 0;
+    let o = 0;
+    for (const c of L.win) {
+      if (o >= n) break;
+      const k = Math.min(c.length, n - o);
+      if (c.voiced) voiced += k;
+      o += k;
+    }
+    return voiced / LIVE_RATE;
+  };
+  // Whether the window holds enough speech to transcribe; a window of
+  // silence and stray blips is dropped instead.
+  const liveHasSpeech = (L) => liveVoicedS(L) >= LIVE_MIN_VOICED_S;
+  const liveIsSilencePhrase = (text) =>
+    LIVE_SILENCE_PHRASES.test(
+      String(text || "")
+        .toLowerCase()
+        .replace(/[^a-z ]/g, "")
+        .trim(),
+    );
+  const liveDropWindow = (L) => {
+    L.win = [];
+    L.winLen = 0;
+    L.sentLen = 0;
+  };
+
+  const livePauseMs = () => {
+    try {
+      const v = Number(localStorage.getItem("bram.voice.pauseMs"));
+      if (v >= 300 && v <= 5000) return v;
+    } catch (_) {}
+    return LIVE_PAUSE_MS;
+  };
+
+  const fullPassReserved = () => {
+    try {
+      return localStorage.getItem("bram.voice.fullPass") === "1";
+    } catch (_) {
+      return false;
+    }
+  };
+
+  const liveResample = (input, fromRate) => {
+    if (fromRate === LIVE_RATE) return new Float32Array(input);
+    const ratio = fromRate / LIVE_RATE;
+    const out = new Float32Array(Math.floor(input.length / ratio));
+    for (let i = 0; i < out.length; i++) {
+      const x = i * ratio;
+      const j = Math.floor(x);
+      const f = x - j;
+      out[i] = input[j] * (1 - f) + (input[j + 1] !== undefined ? input[j + 1] : input[j]) * f;
+    }
+    return out;
+  };
+
+  const liveWav = (samples) => {
+    const buf = new ArrayBuffer(44 + samples.length * 2);
+    const v = new DataView(buf);
+    const s = (o, t) => {
+      for (let i = 0; i < t.length; i++) v.setUint8(o + i, t.charCodeAt(i));
+    };
+    s(0, "RIFF");
+    v.setUint32(4, 36 + samples.length * 2, true);
+    s(8, "WAVE");
+    s(12, "fmt ");
+    v.setUint32(16, 16, true);
+    v.setUint16(20, 1, true);
+    v.setUint16(22, 1, true);
+    v.setUint32(24, LIVE_RATE, true);
+    v.setUint32(28, LIVE_RATE * 2, true);
+    v.setUint16(32, 2, true);
+    v.setUint16(34, 16, true);
+    s(36, "data");
+    v.setUint32(40, samples.length * 2, true);
+    for (let i = 0; i < samples.length; i++) {
+      v.setInt16(44 + i * 2, Math.max(-1, Math.min(1, samples[i])) * 0x7fff, true);
+    }
+    return new Blob([buf], { type: "audio/wav" });
+  };
+
+  const liveClean = (t) =>
+    String(t || "")
+      .replace(/\[[^\]]*\]|\([^)]*\)/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+  // The running text goes to the pane editor that owns the recording.
+  const livePublish = () => {
+    if (!live) return;
+    const committed = live.committed.join(" ");
+    const provisional = live.provisional;
+    if (live.target && live.target.source) {
+      try {
+        live.target.source.postMessage(
+          {
+            type: "voice-into-partial",
+            requestId: live.target.requestId,
+            target: live.target.voiceTarget || "",
+            committed,
+            provisional,
+            parts: live.parts,
+            openSeq: live.seq,
+          },
+          "*",
+        );
+      } catch (_) {}
+    }
+  };
+
+  const liveFlat = (n) => {
+    const out = new Float32Array(n);
+    let o = 0;
+    for (const c of live.win) {
+      const k = Math.min(c.length, n - o);
+      out.set(c.subarray(0, k), o);
+      o += k;
+      if (o >= n) break;
+    }
+    return out;
+  };
+
+  // The sample index to cut a capped window at: the middle of the quietest
+  // block in the last LIVE_CAP_LOOKBACK_S, or the end if none is known.
+  const liveQuietCut = (L) => {
+    const from = L.winLen - LIVE_RATE * LIVE_CAP_LOOKBACK_S;
+    let o = 0;
+    let best = -1;
+    let bestRms = Infinity;
+    for (const c of L.win) {
+      const end = o + c.length;
+      if (end >= from && typeof c.rms === "number" && c.rms < bestRms) {
+        bestRms = c.rms;
+        best = o + Math.floor(c.length / 2);
+      }
+      o = end;
+    }
+    return best > 0 ? best : L.winLen;
+  };
+
+  const liveTranscribe = async (final, cutAt) => {
+    const L = live;
+    L.busy = true;
+    const n = cutAt || L.winLen;
+    const voicedS = liveVoicedS(L, n);
+    let silencePhrase = false;
+    L.sentLen = n;
+    const fd = new FormData();
+    fd.append("file", liveWav(liveFlat(n)), "live.wav");
+    fd.append("response_format", "json");
+    fd.append("temperature", "0.0");
+    fd.append("temperature_inc", "0.0");
+    fd.append("prompt", L.committed.join(" ").slice(-200));
+    const t0 = Date.now();
+    let status = null;
+    let timedOut = false;
+    const abort = new AbortController();
+    const timer = setTimeout(() => {
+      timedOut = true;
+      abort.abort();
+    }, LIVE_REQUEST_TIMEOUT_MS);
+    try {
+      const res = await fetch(WHISPER_URL, { method: "POST", body: fd, signal: abort.signal });
+      status = res.status;
+      const text = res.ok ? liveClean((await res.json()).text) : "";
+      if (live !== L) return;
+      L.latencies.push(Date.now() - t0);
+      if (final) {
+        silencePhrase = liveIsSilencePhrase(text);
+        if (text) {
+          L.committed.push(text);
+          L.parts.push({ seq: L.seq, text });
+        }
+        // Every final closes a window, kept or not; the pane counts windows
+        // to tell which text it already showed before an edit.
+        L.seq++;
+        let drop = n;
+        while (drop > 0 && L.win.length) {
+          if (L.win[0].length <= drop) {
+            drop -= L.win[0].length;
+            L.winLen -= L.win.shift().length;
+          } else {
+            const { voiced, rms } = L.win[0];
+            L.win[0] = L.win[0].subarray(drop);
+            L.win[0].voiced = voiced;
+            L.win[0].rms = rms;
+            L.winLen -= drop;
+            drop = 0;
+          }
+        }
+        L.sentLen = 0;
+        L.provisional = "";
+      } else {
+        L.provisional = text;
+      }
+      livePublish();
+    } catch (e) {
+      L.errors++;
+    } finally {
+      clearTimeout(timer);
+      voiceLog("voice-window", {
+        requestId: L.requestId,
+        final,
+        windowS: Math.round((n / LIVE_RATE) * 10) / 10,
+        voicedS: Math.round(voicedS * 100) / 100,
+        ...(silencePhrase ? { silencePhrase } : {}),
+        ...(cutAt ? { cut: "quiet" } : {}),
+        ...(timedOut ? { timedOut } : {}),
+        latencyMs: Date.now() - t0,
+        httpStatus: status,
+      });
+      L.busy = false;
+    }
+  };
+
+  const liveTick = async () => {
+    const L = live;
+    if (!L || L.stopped) return;
+    if (!L.busy && L.winLen > 0 && !liveHasSpeech(L)) {
+      // Too little voice to send. Once the quiet has lasted a pause, it was a
+      // blip, not the start of speech: drop it.
+      if (L.quietMs >= LIVE_BLIP_QUIET_MS) liveDropWindow(L);
+    } else if (!L.busy && L.winLen > 0) {
+      const secs = L.winLen / LIVE_RATE;
+      const fresh = L.winLen - L.sentLen;
+      const paused = L.quietMs >= L.pauseMs && secs >= LIVE_MIN_FINAL_S;
+      const capped = secs >= LIVE_MAX_WIN_S && !paused;
+      const final = capped || (paused && fresh > 0);
+      if (final || fresh >= LIVE_RATE * 0.3) {
+        L.pending = liveTranscribe(final, capped ? liveQuietCut(L) : 0);
+        await L.pending;
+      }
+    }
+    if (live === L && !L.stopped) L.timer = setTimeout(liveTick, LIVE_STEP_MS);
+  };
+
+  const liveFrame = (L, data, sampleRate) => {
+    if (L.stopped) return;
+    let sum = 0;
+    for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
+    const rms = Math.sqrt(sum / data.length);
+    const voiced = rms > LIVE_RMS;
+    if (voiced) {
+      // A pause inside speech just ended; keep its length for voice-final.
+      if (L.spoke && L.quietMs >= LIVE_PAUSE_LOG_MIN_MS && L.pauses.length < 500) {
+        L.pauses.push(Math.round(L.quietMs / 10) * 10);
+      }
+      L.spoke = true;
+      L.quietMs = 0;
+    }
+    else L.quietMs += (data.length / sampleRate) * 1000;
+    // Silence doesn't grow the window: not before the first word, and not
+    // after LIVE_SILENCE_KEEP_MS of quiet. Whisper invents "Thank you." from
+    // silence (seen in the first live test), so silence is never sent alone.
+    if (!voiced && (L.winLen === 0 || L.quietMs > LIVE_SILENCE_KEEP_MS)) return;
+    const c = liveResample(data, sampleRate);
+    c.voiced = voiced;
+    c.rms = rms;
+    L.win.push(c);
+    L.winLen += c.length;
+  };
+
+  const startLive = async (mediaStream, target, requestId) => {
+    const L = {
+      target,
+      requestId,
+      ctx: null,
+      nodes: [],
+      win: [],
+      winLen: 0,
+      sentLen: 0,
+      quietMs: 0,
+      pauseMs: livePauseMs(),
+      pauses: [],
+      spoke: false,
+      committed: [],
+      parts: [],
+      seq: 0,
+      provisional: "",
+      busy: false,
+      pending: null,
+      stopped: false,
+      timer: null,
+      latencies: [],
+      errors: 0,
+      capture: "",
+    };
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) throw new Error("no AudioContext");
+      L.ctx = new Ctx();
+      const src = L.ctx.createMediaStreamSource(mediaStream);
+      const mute = L.ctx.createGain();
+      mute.gain.value = 0;
+      mute.connect(L.ctx.destination);
+      let node = null;
+      if (L.ctx.audioWorklet && typeof AudioWorkletNode === "function") {
+        try {
+          await L.ctx.audioWorklet.addModule("voice-capture-worklet.js");
+          node = new AudioWorkletNode(L.ctx, "bram-voice-capture");
+          node.port.onmessage = (e) => liveFrame(L, e.data, L.ctx.sampleRate);
+          L.capture = "worklet";
+        } catch (e) {
+          voiceLog("voice-live-worklet-error", { requestId, error: String(e) });
+          node = null;
+        }
+      }
+      if (!node) {
+        node = L.ctx.createScriptProcessor(4096, 1, 1);
+        node.onaudioprocess = (e) => liveFrame(L, e.inputBuffer.getChannelData(0), L.ctx.sampleRate);
+        L.capture = "script-processor";
+      }
+      src.connect(node);
+      node.connect(mute);
+      L.nodes = [src, node, mute];
+      // A stop that arrived while the worklet loaded has already taken the
+      // full-pass path; don't attach a capture nobody will finish.
+      if (activeStopRequested || currentRequestId() !== requestId) {
+        stopLiveCapture(L);
+        voiceLog("voice-live-too-late", { requestId });
+        return;
+      }
+      live = L;
+      voiceLog("voice-live-start", {
+        requestId,
+        capture: L.capture,
+        sampleRate: L.ctx.sampleRate,
+        pauseMs: L.pauseMs,
+      });
+      L.timer = setTimeout(liveTick, LIVE_STEP_MS);
+    } catch (e) {
+      voiceLog("voice-live-unavailable", { requestId, error: String(e) });
+      try {
+        L.ctx && L.ctx.close();
+      } catch (_) {}
+      if (live === L) live = null;
+    }
+  };
+
+  const stopLiveCapture = (L) => {
+    L.stopped = true;
+    if (L.timer) clearTimeout(L.timer);
+    L.timer = null;
+    for (const n of L.nodes) {
+      try {
+        n.disconnect();
+      } catch (_) {}
+    }
+    try {
+      L.ctx && L.ctx.close();
+    } catch (_) {}
+  };
+
+  // Stop capturing, commit what's left, and return the live text.
+  const finishLive = async () => {
+    const L = live;
+    if (!L) return null;
+    stopLiveCapture(L);
+    if (L.pending) {
+      try {
+        await L.pending;
+      } catch (_) {}
+    }
+    if (L.winLen >= LIVE_RATE * 0.3 && liveHasSpeech(L)) await liveTranscribe(true);
+    // A successful final clears the provisional text. If it's still set, the
+    // last window never came back (whisper-server stuck or down): keep what
+    // was on screen rather than lose it. The 2026-09-26 hang delivered an
+    // empty result because nothing had been committed yet.
+    if (L.provisional) {
+      voiceLog("voice-live-kept-provisional", { requestId: L.requestId, chars: L.provisional.length });
+      L.committed.push(L.provisional);
+      L.parts.push({ seq: L.seq, text: L.provisional });
+      L.seq++;
+      L.provisional = "";
+      livePublish();
+    }
+    const text = L.committed.join(" ").trim();
+    const lat = L.latencies;
+    voiceLog("voice-final", {
+      requestId: L.requestId,
+      mode: "live",
+      capture: L.capture,
+      words: text ? text.split(/\s+/).length : 0,
+      windows: lat.length,
+      avgLatencyMs: lat.length ? Math.round(lat.reduce((a, b) => a + b, 0) / lat.length) : null,
+      errors: L.errors,
+      pauseMs: L.pauseMs,
+      pausesMs: L.pauses,
+    });
+    if (live === L) live = null;
+    return { text, errors: L.errors };
+  };
+
+  const abortLive = () => {
+    if (!live) return;
+    stopLiveCapture(live);
+    live = null;
+  };
+
   const deliverTranscript = (transcript) => {
     const reqId = currentRequestId();
     const text = String(transcript || "");
-    const focusTerminalAfterDelivery = active === "toolbar";
     const deliveredAtMs = Date.now();
     const stopToDeliverMs =
       typeof activeStopAtMs === "number" ? deliveredAtMs - activeStopAtMs : null;
@@ -2570,12 +2992,7 @@ listen("pty-send-sent", (e) => {
       requestId: reqId,
       stopAtMs: activeStopAtMs,
       stopToDeliverMs: stopToDeliverMs,
-      target:
-        active === "toolbar"
-          ? "toolbar"
-          : active && typeof active === "object"
-            ? "iframe"
-            : "none",
+      target: active && typeof active === "object" ? "iframe" : "none",
       transcriptLength: text.length,
       transcriptPreview: text.slice(0, 80),
     });
@@ -2600,49 +3017,19 @@ listen("pty-send-sent", (e) => {
           error: String(e),
         });
       }
-    } else if (active === "toolbar" && text) {
-      // Prefix with "voice: " so the receiving agent (typically Claude Code)
-      // can distinguish dictated content from typed input — see the
-      // verbal-vs-structured guardrail in app/__shell/conventions.md.
-      invoke("pty_write", {
-        data: "\x1b[200~voice: " + text + "\x1b[201~\r",
-      }).catch((e) => {
-        console.error("pty_write voice", e);
-        voiceLog("deliverTranscript-pty-error", {
-          requestId: reqId,
-          error: String(e),
-        });
-      });
     }
     postIframeVoiceState("idle", { transcriptLength: text.length });
     active = null;
     mediaRecorder = null;
     resetActiveState();
-    if (toolbarBtn.dataset.state !== "idle") setToolbarState("idle");
-    if (focusTerminalAfterDelivery) {
-      requestAnimationFrame(() => {
-        try {
-          term.focus();
-          voiceLog("deliverTranscript-terminal-focus", { requestId: reqId });
-        } catch (e) {
-          voiceLog("deliverTranscript-terminal-focus-error", {
-            requestId: reqId,
-            error: String(e),
-          });
-        }
-      });
-    }
   };
 
   const startRecording = async (target) => {
-    const incomingId =
-      target === "toolbar"
-        ? "toolbar-" + Date.now() + "-" + Math.random().toString(36).slice(2)
-        : target && target.requestId;
+    const incomingId = target && target.requestId;
     voiceLog("startRecording-enter", {
       requestId: incomingId,
-      target: target === "toolbar" ? "toolbar" : "iframe",
-      activeWas: active === null ? null : active === "toolbar" ? "toolbar" : "iframe",
+      target: "iframe",
+      activeWas: activeKind(),
     });
     if (active) {
       if (canRecoverStaleIframeForNewStart(target)) {
@@ -2654,7 +3041,7 @@ listen("pty-send-sent", (e) => {
           activeAgeMs: activeAgeMs(),
           activeWas: activeKind(),
         });
-        notifyVoiceBusy(target === "toolbar" ? "toolbar" : "iframe");
+        notifyVoiceBusy("iframe");
         // Already busy: tell the new requester nothing came of it.
         if (target && typeof target === "object" && target.source) {
           try {
@@ -2682,9 +3069,6 @@ listen("pty-send-sent", (e) => {
     activeStopRequested = false;
     activeStopAtMs = null;
     activeStopReceivedAtMs = null;
-    const isToolbar = target === "toolbar";
-    if (isToolbar) toolbarRequestId = incomingId;
-    if (isToolbar) setToolbarState("starting");
     postIframeVoiceState("starting");
     const serverResult = await ensureServerRunning();
     if (!serverResult.ready) {
@@ -2697,7 +3081,6 @@ listen("pty-send-sent", (e) => {
       postIframeVoiceState("idle", { reason: serverResult.reason || "whisper-unavailable" });
       const t = active;
       resetActiveState();
-      if (isToolbar) setToolbarState("idle");
       if (t && typeof t === "object" && t.source) {
         try {
           t.source.postMessage(
@@ -2729,7 +3112,6 @@ listen("pty-send-sent", (e) => {
       postIframeVoiceState("idle", { reason: "getUserMedia-error" });
       const t = active;
       resetActiveState();
-      if (isToolbar) setToolbarState("idle");
       if (t && typeof t === "object" && t.source) {
         try {
           t.source.postMessage(
@@ -2760,7 +3142,6 @@ listen("pty-send-sent", (e) => {
       stopStream();
       const t = active;
       resetActiveState();
-      if (isToolbar) setToolbarState("idle");
       if (t && typeof t === "object" && t.source) {
         try {
           t.source.postMessage(
@@ -2783,6 +3164,18 @@ listen("pty-send-sent", (e) => {
       const reqId = currentRequestId();
       const onstopAtMs = Date.now();
       stopStream();
+      // issue-407: the live text is what gets sent. The recorded blob is
+      // only the reserve: used when live produced nothing and had request
+      // errors (so a failed live pass doesn't lose the dictation).
+      if (live) {
+        const result = await finishLive();
+        if (result && (result.text || result.errors === 0)) {
+          audioChunks = [];
+          deliverTranscript(result.text);
+          return;
+        }
+        voiceLog("voice-live-fallback-full-pass", { requestId: reqId, errors: result ? result.errors : null });
+      }
       const blobType =
         (mediaRecorder && mediaRecorder.mimeType) ||
         (recorderConfig.options && recorderConfig.options.mimeType) ||
@@ -2887,9 +3280,8 @@ listen("pty-send-sent", (e) => {
     mediaRecorder.start();
     activeRecorderStarted = true;
     voiceLog("mediaRecorder-start", { requestId: incomingId });
-    if (isToolbar) {
-      setToolbarState("recording");
-    } else if (active && typeof active === "object" && active.source) {
+    if (!fullPassReserved()) startLive(stream, target, incomingId);
+    if (active && typeof active === "object" && active.source) {
       armIframeRecordingWatchdog();
       postIframeVoiceState("recording");
       try {
@@ -2933,28 +3325,6 @@ listen("pty-send-sent", (e) => {
     }
   };
 
-  toolbarBtn.addEventListener("click", () => {
-    const state = toolbarBtn.dataset.state;
-    if (active && active !== "toolbar") {
-      notifyVoiceBusy("toolbar");
-      return;
-    }
-    if (state === "recording") {
-      setToolbarState("processing");
-      stopRecording(Date.now(), "toolbar-click");
-    } else if (state === "idle") {
-      startRecording("toolbar");
-    }
-    // ignore clicks while starting or processing
-  });
-
-  window.addEventListener("keydown", (ev) => {
-    if (ev.key === "d" && ev.shiftKey && (ev.metaKey || ev.ctrlKey)) {
-      ev.preventDefault();
-      toolbarBtn.click();
-    }
-  });
-
   // iframe-driven flow: voice-start begins recording on the iframe's behalf;
   // voice-stop stops the (single in-flight) recording.
   window.addEventListener("message", (ev) => {
@@ -2972,7 +3342,6 @@ listen("pty-send-sent", (e) => {
       });
       if (
         !active ||
-        active === "toolbar" ||
         !d.requestId ||
         !ev.source ||
         active.source !== ev.source ||
@@ -2982,7 +3351,7 @@ listen("pty-send-sent", (e) => {
           requestId: d.requestId,
           stopAtMs: stopAtMs,
           activeWas:
-            active === null ? null : active === "toolbar" ? "toolbar" : "iframe",
+            activeKind(),
           activeRequestId: currentRequestId(),
           hasSource: !!ev.source,
           sourceMatches:
