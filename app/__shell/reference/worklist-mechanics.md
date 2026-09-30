@@ -464,6 +464,39 @@ the discipline for completing them serially.
   recorded: rewriting it orphans its history link (see "Don't rewrite a
   commit the worklist history has recorded" in the core conventions).
 
+## Recommending next steps
+
+When you recommend Drop or Commit steps on named items ("Drop `a` and `b`,
+then Commit `c`"), also post them as a plan, so the user can approve all of
+them with one click instead of ticking rows button by button (#413):
+
+```
+{"summary": "why, in a sentence", "steps": [
+  {"verb": "drop", "ids": ["a", "b"]},
+  {"verb": "commit", "ids": ["c"]}
+]}
+```
+
+POST it to `/__worklist/plan`, the same transport as the other worklist
+routes.
+
+- **The host checks it and refuses, naming the id,** if an id isn't on the
+  board, a commit id hasn't started (nothing to commit), or an id is named
+  in more than one step.
+- **The pane shows it above the gate row** as "Recommended: Drop a, b ·
+  Commit c", with **Do recommended** and a dismiss ×. It's shown only while
+  the board is unchanged since you posted it: any board change (a prune, an
+  advance, a reorder) makes it stale, and it disappears. Post again if it
+  still applies.
+- **The plan grants nothing.** **Do recommended** runs the gate buttons' own
+  paths for exactly those ids. Drops happen at once, host-direct, like a
+  feedback-less **Drop**. Commits arrive as an ordinary `approved:` commit
+  turn, like **Commit**, which you handle as usual.
+- **Say it in chat too.** The plan is the button's data; your message is the
+  reasoning. Don't post a plan the user hasn't seen described.
+- An empty `steps` list clears the plan. Push, PRs and other non-board steps
+  don't belong in it.
+
 ## Rows committed outside the Worklist
 
 When work lands through a plain `git commit` (typed in chat, or from a
@@ -478,6 +511,16 @@ as landed: begun, files clean against `HEAD`, and a commit **not made by the
 Worklist itself** since the item began touched them. It lists any others as
 refused. Rows it refuses still need the user's Drop. Cleared rows are
 recorded in history under *Items cleared*, linked to the landing commit.
+
+**When you commit an item's work yourself outside the gate** (a "just do
+it" or `skip-worklist:` turn, or a recovery commit after a refusal or a
+partial landing), clear the rows you landed with `clear-landed` in the
+**same turn**, without being asked. The user's go-ahead for the commit
+covers it, and the host verifies each row, so nothing on disk can be lost.
+Report any refused ids and leave them for the user's Drop. **Never use
+`mutate op:"prune"` for this:** it needs the authorization only a Drop click
+creates, so it fails (`authorization expired`, `id not in auth`), and the
+rows sit on the board (#413).
 
 ## Routing edits to the right item
 
@@ -497,6 +540,59 @@ right item commits.
 - **Use the file tools for tracked files.** The guards can see an Edit /
   Write target and check it; a `python3` or `sed` write is invisible to
   them. Shell writes are fine for scratch files and generated output.
+
+## Edits made in chat turns
+
+A chat turn (nothing selected, or **Chat**) is addressed to no item, so its
+edits are credited to no item, even when they're for an item that has
+begun. The gate builds an item's commit from the item's own turns, so work
+done between them is a gap it can't account for. This stays true until the
+gate carries unowned lines itself (#273).
+
+**Marking an item applied ends its claim, too.** `mutate op:"advance"`
+consumes the authorization, and edits made after it, even later in the same
+Start turn, are credited to no item, exactly like chat-turn edits. So finish
+every edit, and every test that might send you back to edit, before
+advancing. If a check after advancing turns up something to fix, don't edit:
+say so, and ask the user to send it as feedback on the item (an addressed
+turn opens a new claim), then edit in that turn. Apply-and-commit turns have
+no advance, so their edits stay claimed up to the commit.
+
+**Symptoms:**
+
+- **A partial landing.** The `worklist-commit` response carries
+  `residualPaths` entries with `"owner":"unowned"` and `retained: [id]`. Only
+  the lines from the item's own turns landed, and the commit message may
+  describe more than the commit holds.
+- **A refusal with a misleading reason.** Two shapes are on record, and both
+  blame "another begun item" that contributed nothing:
+  - "this item's changes are entirely shared with another begun item and it
+    has no claim interval to stage from";
+  - "the requested item's interval patch does not apply to HEAD — its change
+    is defined relative to another begun item's work".
+- **Before committing:** the row's Ownership tab lists lines under "no item".
+
+**Recovery:**
+
+- **Resetting the files and re-applying the diff in an addressed turn does
+  not work.** That turn is recorded relative to a tree that already holds
+  the unowned lines, so its patch doesn't apply to HEAD either.
+- **What works:** with the user's go-ahead, a plain `git commit` of the
+  item's files, then clearing the row with the "Committed outside the
+  Worklist" offer. Until `landed-detector-needs-item-work` lands, that offer
+  can also flag a begun item with no work of its own, and **Clear them**
+  ignores selection. If any flagged row isn't really done, Drop the finished
+  row alone instead.
+- Save the full diff as a patch in scratch space before trying anything, so
+  a failed attempt can't lose work.
+
+**Prevention:** when the user redirects begun work in chat, ask them to send
+it as feedback on the item (or press Start or Resume) before editing; and
+in a Start turn, advance only after the last edit and the last test.
+Receipts: judell/bram#273 (comments 5885260506 and 5897031890); for the
+advance case, `landed-detector-needs-item-work` (2026-09-29), where a
+regression fix written after the advance was left behind by `45c5239` and
+recovered outside the Worklist as `332bd7f`.
 
 ## Enforcement and security contract
 

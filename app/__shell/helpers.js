@@ -1337,8 +1337,8 @@ window.__bramTraceHelperTiming = function (name, t0, extra) {
 // name, remaining segments are a property path inside the parsed JSON
 // object. Used by the __bram-prefixed localStorage shim helpers below
 // so they can run in plain JS without re-entering XMLUI's statement
-// queue. `bram.worklistMessageDraft` reads
-// `JSON.parse(localStorage.bram).worklistMessageDraft`. Splitter keys
+// queue. `bram.worklistSubmittedMessage` reads
+// `JSON.parse(localStorage.bram).worklistSubmittedMessage`. Splitter keys
 // like `bram.splitter.worklist` are two-level.
 function __bramSplitKey(key) {
   var s = String(key);
@@ -1422,6 +1422,165 @@ function __bramWriteSS(key, value) {
 // loop for every statement in the body; now the entire body runs as
 // one plain-JS function call (one xs statement total).
 
+// localStorage is one store shared by every Bram window (one app, one
+// WebKit store), so a persisted key that belongs to a project must carry
+// the project in its name (docs/developing-bram.md, "Scope persisted keys
+// by project"; #279 did the same for the saved tab). Returns null when the
+// project isn't known: callers then neither read nor write, rather than
+// fall back to a slot every window shares. The key is flat, not the
+// dot-path form __bramWriteLS parses, because project paths can contain
+// dots. main.js sets window.__bramProjectKey before this pane loads.
+window.__bramProjectScopedKey = function (base) {
+  var projectKey = "";
+  try { projectKey = String((window.parent && window.parent.__bramProjectKey) || ""); } catch (e) {}
+  return projectKey ? base + ":" + projectKey : null;
+};
+
+// message-box-on-draft-editor-pattern: the message box's unsent draft is
+// saved by the host, like the Queue. POST /__draft/save writes
+// resources/.bram-message-draft.json in this project, so it's per project by
+// construction and survives relaunch (#271: unsent prose "must survive").
+// A sessionStorage copy (per window; survives a pane reload) gives the box
+// its text synchronously at mount. The host copy arrives async and fills an
+// empty box (__bramApplyDraftHydration, wired in MessageAgentComposer).
+// Two guards keep a stray write from wiping the saved draft:
+//  - nothing is saved to the host before it has been read (the Queue's
+//    click-before-hydrate race, #324); typed text is held until then;
+//  - an empty value from the box is saved only after this window has typed
+//    something that isn't just the restored text (traced as skipped
+//    "untyped-empty" otherwise). Sends and clears always save.
+// The box used to be emptied at mount by the composerClear ChangeListener;
+// see __bramComposerClearOnTick. The per-project localStorage key (ddafb42)
+// is read once, as this project's migration source, then removed. Every
+// write is traced.
+var __BRAM_MESSAGE_DRAFT_BASE = "bram.worklistMessageDraft";
+var __BRAM_MESSAGE_DRAFT_SS_KEY = "bram.worklistMessageDraft";
+var __bramDraftHydrated = false;
+var __bramDraftHostText = "";
+var __bramDraftBaseline = "";
+var __bramDraftTyped = false;
+var __bramDraftHeldForHost = null;
+
+function __bramDraftTrace(subkind, fields) {
+  try { window.__bramIframeTrace && window.__bramIframeTrace(subkind, fields); } catch (e) {}
+}
+
+function __bramDraftSaveToHost(text) {
+  __bramDraftHostText = text;
+  try {
+    fetch("/__draft/save", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: text }),
+    })
+      .then(function (r) {
+        if (!r.ok) throw new Error("draft save returned " + r.status);
+      })
+      .catch(function (e) {
+        __bramDraftTrace("draft-write", { via: "host-error", error: String(e) });
+      });
+  } catch (e) {}
+}
+
+function __bramWriteMessageDraft(value, via) {
+  var text = String(value || "");
+  var skipped = "";
+  if (via === "input") {
+    if (text && text !== __bramDraftBaseline) __bramDraftTyped = true;
+    if (!text && !__bramDraftTyped) skipped = "untyped-empty";
+  }
+  if (!skipped) {
+    __bramWriteSS(__BRAM_MESSAGE_DRAFT_SS_KEY, text);
+    if (__bramDraftHydrated) __bramDraftSaveToHost(text);
+    else __bramDraftHeldForHost = text;
+  }
+  var fields = { via: via, chars: text.length, recording: !!window._voiceSession };
+  if (skipped) fields.skipped = skipped;
+  else if (!__bramDraftHydrated) fields.held = true;
+  __bramDraftTrace("draft-write", fields);
+}
+
+// Read the host's copy once per pane load. If the host has none, move this
+// project's per-project localStorage draft (if any) over, then drop that key.
+var __bramDraftHydrateSubscribers = new Set();
+function __bramDraftHydrateDone(text, source) {
+  __bramDraftHydrated = true;
+  __bramDraftHostText = text;
+  if (source === "migrated") __bramDraftSaveToHost(text);
+  if (__bramDraftHeldForHost !== null) {
+    var held = __bramDraftHeldForHost;
+    __bramDraftHeldForHost = null;
+    __bramDraftSaveToHost(held);
+  }
+  __bramDraftTrace("draft-hydrate", { source: source, chars: text.length });
+  __bramDraftHydrateSubscribers.forEach(function (fn) {
+    try { fn(); } catch (e) { console.error("[bram] draft-hydrate subscriber threw:", e); }
+  });
+}
+try {
+  fetch("/__draft", { cache: "no-store" })
+    .then(function (r) {
+      if (!r.ok) throw new Error("draft read returned " + r.status);
+      return r.json();
+    })
+    .then(function (d) {
+      var text = String((d && d.text) || "");
+      var source = "host";
+      var key = window.__bramProjectScopedKey(__BRAM_MESSAGE_DRAFT_BASE);
+      if (key) {
+        try {
+          var legacy = localStorage.getItem(key) || "";
+          if (!text && legacy) {
+            text = legacy;
+            source = "migrated";
+          }
+          localStorage.removeItem(key);
+        } catch (e) {}
+      }
+      __bramDraftHydrateDone(text, source);
+    })
+    .catch(function (e) {
+      __bramDraftTrace("draft-hydrate", { source: "error", error: String(e) });
+      __bramDraftHydrateDone("", "error");
+    });
+} catch (e) {}
+
+// PushSource factory: emits once the host copy has been read (at once if it
+// already has), so the message box can fill itself.
+window.bramSubscribeDraftHydrated = (function () {
+  var factory;
+  var tick = 0;
+  return function () {
+    if (factory) return factory;
+    factory = function (emit) {
+      var fire = function () { tick += 1; emit(tick); };
+      __bramDraftHydrateSubscribers.add(fire);
+      if (__bramDraftHydrated) fire();
+      return function () { __bramDraftHydrateSubscribers.delete(fire); };
+    };
+    return factory;
+  };
+})();
+
+// Fill the message box from the host's copy if the box is still empty
+// (a relaunch, where sessionStorage had nothing). Never overwrites text.
+window.__bramApplyDraftHydration = function (box) {
+  if (!box || !__bramDraftHydrated) return;
+  var cur = "";
+  try { cur = String(box.value || ""); } catch (e) {}
+  var text = __bramDraftHostText;
+  if (!cur && text) {
+    __bramDraftBaseline = text;
+    try { box.setValue(text); } catch (e) {}
+    __bramDraftTrace("draft-hydrate-applied", { chars: text.length });
+  } else {
+    __bramDraftTrace("draft-hydrate-applied", {
+      chars: 0,
+      skipped: cur ? "box-not-empty" : "nothing-saved",
+    });
+  }
+};
+
 var __bramWorklistDraftPersistTimer = null;
 var __bramWorklistDraftPending = null;
 
@@ -1431,13 +1590,18 @@ function __bramFlushWorklistDraft() {
     __bramWorklistDraftPersistTimer = null;
   }
   if (__bramWorklistDraftPending !== null) {
-    __bramWriteLS("bram.worklistMessageDraft", __bramWorklistDraftPending);
+    __bramWriteMessageDraft(__bramWorklistDraftPending, "input");
     __bramWorklistDraftPending = null;
   }
 }
 
+// The box's value at mount: this window's sessionStorage copy (present after
+// a pane reload). After a relaunch it's empty, and hydration fills the box.
 window.__bramRestoreWorklistDraft = function () {
-  return __bramReadLS("bram.worklistMessageDraft", "");
+  var text = __bramReadSS(__BRAM_MESSAGE_DRAFT_SS_KEY, "");
+  if (text) __bramDraftBaseline = text;
+  __bramDraftTrace("draft-restore", { source: "session", chars: text.length, hydrated: __bramDraftHydrated });
+  return text;
 };
 
 window.__bramPersistWorklistDraft = function (text) {
@@ -1452,7 +1616,7 @@ window.__bramClearWorklistDraft = function () {
     __bramWorklistDraftPersistTimer = null;
   }
   __bramWorklistDraftPending = null;
-  __bramWriteLS("bram.worklistMessageDraft", "");
+  __bramWriteMessageDraft("", "clear");
 };
 
 window.__bramFlushWorklistDraft = __bramFlushWorklistDraft;
@@ -1555,6 +1719,20 @@ window.bramSubscribeMessageAgentText = (function () {
 // state before invoking it: the persisted draft cleared, but the live control
 // kept its value when the user returned to another tab.
 window.__bramComposerClearTick = Number(window.__bramComposerClearTick || 0);
+// The composerClear ChangeListener's handler. ChangeListener fires once at
+// mount with the PushSource's initial value (0), which used to empty the box
+// right after its draft was restored, on every reload and relaunch
+// (message-box-on-draft-editor-pattern; found with an Inspector export,
+// 2026-09-29). A real clear request always carries a tick of 1 or more.
+window.__bramComposerClearOnTick = function (box, change) {
+  var tick = change && change.newValue;
+  if (!(typeof tick === "number" && tick > 0)) {
+    __bramDraftTrace("composer-clear", { skipped: "mount", tick: tick == null ? null : tick });
+    return;
+  }
+  try { if (box && typeof box.setValue === "function") box.setValue(""); } catch (e) {}
+};
+
 window.bramSubscribeComposerClear = (function () {
   var factory;
   var subscribers = new Set();
@@ -1651,6 +1829,9 @@ window.__bramComposerPlaceholder = function (pathname, sel) {
 // markers, the same post-send transcript switch — so "message the items" is
 // one mechanism whichever surface invokes it.
 window.__bramSubmitFeedbackForSelection = function (box) {
+  if (window.__bramVoiceRepairWait("message-agent", function () {
+    window.__bramSubmitFeedbackForSelection(box);
+  })) return true;
   var sel = (window.__bramW2Selection || []).slice();
   if (!sel.length) return false;
   var message = "";
@@ -1897,6 +2078,82 @@ window.__bramGateCloseContradictionMessage = function (items, sel, claim, text) 
 //   drop           kind=drop
 //   iterate        a DIFFERENT call entirely (__bramWorklist2BatchIterate),
 //                  taking the raw feedback string rather than a fanned map
+// issue-413: the agent's recommended next steps, served on the board as
+// `plan` ({ summary, steps: [{ verb, ids }] }) by POST /__worklist/plan
+// while it still applies. The line names exactly what one click will do.
+function __bramPlanSteps(board) {
+  var plan = board && board.plan;
+  return (plan && Array.isArray(plan.steps)) ? plan.steps : [];
+}
+window.__bramPlanLine = function (board) {
+  var parts = __bramPlanSteps(board).map(function (s) {
+    var verb = s.verb === "drop" ? "Drop" : s.verb === "commit" ? "Commit" : String(s.verb || "");
+    return verb + " " + (s.ids || []).join(", ");
+  });
+  return parts.length ? "Recommended: " + parts.join(" · ") : "";
+};
+window.__bramPlanTooltip = function (board) {
+  var plan = board && board.plan;
+  var summary = String((plan && plan.summary) || "").trim();
+  var how = "Drops happen at once, like the Drop button. Commits go to the agent, like the Commit button.";
+  return summary ? summary + "\n\n" + how : how;
+};
+// Runs the plan through the gate buttons' own paths, for exactly the named
+// ids: feedback-less drops host-direct (POST /__worklist/drop, as Drop does),
+// commits through __bramGateAct("commit"), as Commit does. Then clears the
+// plan. It grants nothing the buttons don't.
+// The commit is sent only after the drop request settles. The authorization
+// record holds one kind at a time, so a commit click recorded while the drop
+// route was still working replaced the drop's authorization and its prune
+// was refused ("id not in auth"): found by the first click test,
+// 2026-09-29, where the dropped row stayed on the board.
+window.__bramDoRecommended = function (board, claim) {
+  var steps = __bramPlanSteps(board);
+  var dropIds = [];
+  var commitIds = [];
+  steps.forEach(function (s) {
+    var ids = s.ids || [];
+    if (s.verb === "drop") dropIds = dropIds.concat(ids);
+    else if (s.verb === "commit") commitIds = commitIds.concat(ids);
+  });
+  window.__bramIframeTrace("click", {
+    target: "gatebar-do-recommended",
+    drop: dropIds.length,
+    commit: commitIds.length,
+  });
+  var items = (board && board.items) || [];
+  var commit = function () {
+    if (commitIds.length) window.__bramGateAct("commit", items, commitIds, "together", claim);
+  };
+  window.__bramDismissPlan();
+  if (!dropIds.length) {
+    commit();
+    return;
+  }
+  window
+    .fetch("/__worklist/drop", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids: dropIds }),
+    })
+    .then(function (r) {
+      window.__bramIframeTrace("click", { target: "gatebar-do-recommended", op: "drop-done", status: r.status });
+    })
+    .catch(function (e) {
+      window.__bramIframeTrace("click", { target: "gatebar-do-recommended", op: "drop-failed", error: String(e) });
+    })
+    .then(commit);
+};
+window.__bramDismissPlan = function () {
+  window
+    .fetch("/__worklist/plan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ steps: [] }),
+    })
+    .catch(function () {});
+};
+
 window.__bramGateAct = function (kind, items, sel, shareMode, claim) {
   // Selection is literal user intent. Shared-file handling may change how the
   // agent prepares the commit, but never which ids this action authorizes.
@@ -2049,6 +2306,9 @@ window.__bramMessageAgentBlur = function () {
 };
 
 window.__bramSubmitMessageAgentComposer = function (box, mode) {
+  if (window.__bramVoiceRepairWait("message-agent", function () {
+    window.__bramSubmitMessageAgentComposer(box, mode);
+  })) return true;
   var message = "";
   try { message = String((box && box.value) || "").trim(); } catch (e) {}
   if (!message) return false;
@@ -2482,7 +2742,7 @@ window.__bramSubmitWorklistMessageFast = function (text, voiceTarget) {
   if (typeof window.toTurn === "function") window.toTurn(toSend);
   window.__bramIframeTrace("message-agent-submit", { stage: "after-toTurn", chars: toSend.length, sentAt: sentAt });
   var baseline = 0;
-  __bramWriteLS("bram.worklistMessageDraft", "");
+  __bramWriteMessageDraft("", "submit");
   __bramWriteLS("bram.worklistSubmittedMessage", userTyped);
   __bramWriteSS("bram.worklistSessionSubmittedMessage", userTyped);
   window.__bramSetWorklistSubmittedKind("message");
@@ -8392,6 +8652,51 @@ function __bramVoiceAdoptEdit(rec, box, target) {
 // toggle uses, delivered through voice-arrival so the editor resets its 🎤.
 // The record is marked stopped first, so neither a late partial nor the
 // final transcript writes into the just-cleared box.
+// Boundary repair (dictation-pauses-become-sentence-breaks): after each
+// pause, main.js transcribes the dictation's recent windows again as one,
+// so a pause doesn't come back as a sentence break, and marks the partial
+// `repairing` until that lands. A send made meanwhile waits (at most
+// __BRAM_VOICE_REPAIR_WAIT_MS) for the repaired text to reach the box, then
+// runs as usual. Returns true when it took the send over; `resend` runs it
+// later. A second Enter while waiting is absorbed, not sent twice.
+var __BRAM_VOICE_REPAIR_WAIT_MS = 2000;
+// The partial reaches the box through an XMLUI subscriber that renders
+// after this listener runs; give it that long before reading the box.
+var __BRAM_VOICE_REPAIR_SETTLE_MS = 250;
+var __bramVoiceRepairWaiting = false;
+var __bramVoiceRepairResending = false;
+window.__bramVoiceRepairWait = function (target, resend) {
+  if (__bramVoiceRepairResending) return false;
+  if (__bramVoiceRepairWaiting) return true;
+  var p = window.__bramVoicePartial;
+  if (!p || p.target !== target || !p.repairing) return false;
+  __bramVoiceRepairWaiting = true;
+  var t0 = Date.now();
+  var done = false;
+  var finish = function (reason) {
+    if (done) return;
+    done = true;
+    window.removeEventListener("bram:voice-partial", check);
+    clearTimeout(timer);
+    setTimeout(function () {
+      __bramVoiceRepairWaiting = false;
+      try { window.__bramIframeTrace && window.__bramIframeTrace("voice-trace", { stage: "send-repair-wait", target: target, reason: reason, waitedMs: Date.now() - t0 }); } catch (e) {}
+      __bramVoiceRepairResending = true;
+      try { resend(); } catch (e) {
+        console.error("[bram] send after repair wait failed:", e);
+      } finally {
+        __bramVoiceRepairResending = false;
+      }
+    }, __BRAM_VOICE_REPAIR_SETTLE_MS);
+  };
+  var check = function () {
+    var q = window.__bramVoicePartial;
+    if (!q || q.target !== target || !q.repairing) finish(q ? "repaired" : "delivered");
+  };
+  var timer = setTimeout(function () { finish("timeout"); }, __BRAM_VOICE_REPAIR_WAIT_MS);
+  window.addEventListener("bram:voice-partial", check);
+  return true;
+};
 window.__bramVoiceStopOnSend = function (target) {
   if (!window._voiceSession || window._voiceSessionTarget !== target) return;
   var rec = window.__bramVoiceLiveBase[target];
@@ -11452,6 +11757,40 @@ window.__bramSearchQuery = function (query, mode) {
   return stem ? stem : s;
 };
 
+// The user's own message, as typed: every single newline is a line break
+// (issue #412). CommonMark renders a lone `\n` as a soft break (a space), and
+// XMLUI's Markdown has no breaks option, so turn each lone `\n` into a hard
+// break by appending two spaces to the line before it. Two spaces, not a
+// trailing backslash: a hard break at the end of a block (the line before a
+// list item or heading) is ignored, whereas a backslash there renders as a
+// literal `\`. Fenced code keeps its lines untouched. Dictated text (`voice:`)
+// is left alone: Whisper's newlines mark pauses, not intent.
+window.__bramHardBreaks = function (text) {
+  if (typeof text !== "string" || text.indexOf("\n") < 0) return text;
+  if (/^\s*voice:/.test(text)) return text;
+  var lines = text.replace(/\r\n?/g, "\n").split("\n");
+  var fence = null; // {ch, len} while inside a fenced code block
+  for (var i = 0; i < lines.length - 1; i++) {
+    var line = lines[i];
+    var m = /^ {0,3}(`{3,}|~{3,})/.exec(line);
+    if (fence) {
+      if (m && m[1].charAt(0) === fence.ch && m[1].length >= fence.len &&
+          /^\s*$/.test(line.slice(m[0].length))) {
+        fence = null;
+      }
+      continue;
+    }
+    if (m) {
+      fence = { ch: m[1].charAt(0), len: m[1].length };
+      continue;
+    }
+    if (/^\s*$/.test(line) || /^\s*$/.test(lines[i + 1])) continue;
+    if (/ {2,}$/.test(line) || /\\$/.test(line)) continue;
+    lines[i] = line + "  ";
+  }
+  return lines.join("\n");
+};
+
 window.__bramSearchTerms = function (query) {
   var s = (query == null ? "" : String(query)).trim();
   if (s.length < 2) return [];
@@ -13043,7 +13382,7 @@ window.__bramApplySendRestore = function (snapshot, box) {
   } else {
     merged = existing + "\n\n" + text;
   }
-  __bramWriteLS("bram.worklistMessageDraft", merged);
+  __bramWriteMessageDraft(merged, "send-restore");
   if (box && typeof box.setValue === "function") {
     try { box.setValue(merged); } catch (e) {}
   }
@@ -13635,6 +13974,23 @@ window.__bramDiffExpanded = function (keys, itemId, path) {
 // hiding the unexpanded rows"). Clicking its triangle again closes the
 // diff and brings the rest back. The note says rows are hidden, so the missing
 // files don't read as gone.
+// issue-414: copy text to the clipboard from pane markup (the tools iframe
+// has allow="clipboard-write"). XMLUI has no copy action of its own. Pass
+// XMLUI's `toast` to report the outcome.
+window.__bramCopyText = function (text, toastApi) {
+  var s = String(text || "");
+  if (!s) return;
+  var say = function (msg) { if (typeof toastApi === "function") toastApi(msg); };
+  try {
+    navigator.clipboard.writeText(s).then(
+      function () { say("Copied " + s); },
+      function (e) { say("Couldn't copy: " + String(e)); }
+    );
+  } catch (e) {
+    say("Couldn't copy: " + String(e));
+  }
+};
+
 // issue-406-offer-to-clear-landed-rows: rows whose work landed outside the
 // Worklist, offered for clearing in one click above the board. The host
 // re-verifies each id when the route runs and prunes only landed ones.
@@ -13649,6 +14005,29 @@ window.__bramLandedIds = function (board) {
     .filter(function (i) { return i && i.landed; })
     .map(function (i) { return i.id; });
 };
+// issue-415: the Status tab's Guard section (GET /__guard/selftest).
+window.__bramGuardSelftestSummary = function (r) {
+  if (!r) return "";
+  if (!r.link) return "not installed: ~/.bram/bram-guard is missing";
+  if (r.ok) return "working: " + (r.cases || []).length + " cases as expected, registration current";
+  var failed = r.failed || [];
+  return "failing: " + failed.length + " check" + (failed.length === 1 ? "" : "s") + " (" + failed.join(", ") + ")";
+};
+window.__bramGuardRegistrationLine = function (r) {
+  var reg = (r && r.registration) || {};
+  var c = reg.claude || {};
+  var parts = [];
+  if (c.ok) parts.push("Claude: all matchers registered");
+  else {
+    var bits = [];
+    if ((c.missing || []).length) bits.push("not registered: " + c.missing.join(", "));
+    if ((c.extra || []).length) bits.push("unexpected: " + c.extra.join(", "));
+    parts.push("Claude: " + (bits.join("; ") || "registration not current"));
+  }
+  parts.push("Codex: " + ((reg.codex || {}).ok ? "hook current" : "hook not current (run Setup)"));
+  return parts.join(" · ");
+};
+
 window.__bramLandedNote = function (board) {
   var n = window.__bramLandedIds(board).length;
   if (!n) return "";
@@ -13656,29 +14035,30 @@ window.__bramLandedNote = function (board) {
     ? "1 item looks already committed"
     : n + " items look already committed";
 };
-// Landed rows are tinted whenever they're on the board, which is exactly
-// when the "Clear it" / "Clear them" offer shows: the tint says which rows
-// the button would clear. Warn-tinted because clearing removes rows.
+// Every flagged row is tinted (Jon: "we need a stronger indication of which
+// row or rows apply"). Warn-tinted because its Clear removes the row.
 window.__bramLandedRowTint = function (item) {
   return item && item.landed ? "$color-warn-100" : "transparent";
 };
-// The button and its tooltip agree in number with the note beside them.
-window.__bramLandedButtonLabel = function (board) {
-  return window.__bramLandedIds(board).length === 1 ? "Clear it" : "Clear them";
+// landed-row-clear-button: each flagged row carries its own Clear, which
+// clears just that row. It replaced a banner button that acted on ticked
+// flagged rows and sat dimmed the rest of the time (Jon: "I don't like the
+// fact that the mechanism to clear it exists here, but is inactive"). The
+// banner button before that cleared every flagged row regardless of the
+// selection, which could have removed a wrongly flagged one. The host
+// re-verifies the row before clearing it.
+window.__bramLandedRowClearTooltip = function (item) {
+  var sha = (item && item.landed && item.landed.short) || "a commit";
+  return "Remove this row: its work is already in " + sha;
 };
-window.__bramLandedButtonTooltip = function (board) {
-  return window.__bramLandedIds(board).length === 1
-    ? "Remove this row: its work is already in a commit"
-    : "Remove these rows: their work is already in a commit";
-};
-window.__bramClearLanded = function (board) {
-  var ids = window.__bramLandedIds(board);
-  if (!ids.length) return;
+window.__bramClearLandedOne = function (id) {
+  if (!id) return;
+  window.__bramIframeTrace("click", { target: "worklist-row-clear", id: id });
   window
     .fetch("/__worklist/clear-landed", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ids: ids, via: "pane" }),
+      body: JSON.stringify({ ids: [id], via: "pane" }),
     })
     .catch(function () {});
 };

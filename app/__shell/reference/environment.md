@@ -47,6 +47,19 @@ takes its own no-location path instead of hitting a denial after its
 feature detection passes. Test those features in a real browser at the
 same URL, not in this pane.
 
+## Where the user opens the target app
+
+When the user asks how to see or share the app, give them the address.
+`GET /__app-info` → `targetAppUrl` is the browser-safe URL: the declared
+`.bram.json` project server (`http://localhost:<port><path>`), or Bram's
+built-in server when the project serves a root `index.html`. It's `null`
+when there's no target app. In the pane, the header's **Open app ↗** button
+opens it, and the ⓘ dialog shows it with **Copy**. Don't hand out the
+embedded pane's `bramapp://` URL; a normal browser can't open it. A project
+whose app is the point can launch Bram minimized with the app opened:
+`bram <dir> --minimized --open-app[=<path>]`, or `.bram.json`
+`"launch": { "minimized": true, "openApp": "/route" }`.
+
 ## Live SQL views via `/query`
 
 When a managed project keeps data in SQLite, its target app (or the
@@ -100,6 +113,17 @@ On GitLab projects the parallel `glab` commands apply (`glab issue note
 (`closesIssues`, `issue-<N>-` ids, automatic close-on-push) is
 forge-agnostic and identical on both. Every body you post needs the
 signature (see the core conventions); build it in a body file first.
+
+**Edit a comment by its id, never with `gh issue comment --edit-last`.**
+Bram posts its own forge comments (the close-on-push "Closed by …" note,
+lifecycle mirrors) through the same account you post through, so "the last
+comment by this account" can be Bram's, not yours. On 2026-09-29 an
+`--edit-last` meant for an agent's comment on judell/bram#413 overwrote
+Bram's close comment, which the user pushed a minute before. Keep the id
+from the URL `gh issue comment` prints, and edit with
+`gh api -X PATCH repos/<owner>/<repo>/issues/comments/<id> -F body=@<file>`;
+on GitLab, `glab api` against the note's id. Before editing, confirm the id
+is yours: its body opens with your signature.
 
 Bram internals, for diagnosing Bram itself — the forge adapter:
 https://github.com/judell/bram/blob/main/docs/forge-adapter.md

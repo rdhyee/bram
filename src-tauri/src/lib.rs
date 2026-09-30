@@ -87,6 +87,17 @@ struct PtyState {
     writer: Box<dyn Write + Send>,
     // issue-405: the terminal shell's pid, so quitting can hang up its
     // process group (hangup_pty_jobs). None if the platform can't say.
+    //
+    // Unix-only in effect: hangup_pty_jobs is #[cfg(unix)], and its
+    // non-unix twin is an explicit no-op, so on Windows nothing reads this
+    // and rustc's dead-code warning is correct. Renaming to _shell_pid or
+    // dropping the field would break the unix path that genuinely uses it,
+    // and a blanket #[allow(dead_code)] would also mask a future real
+    // disuse; scoping the allowance to the platform where the reader is
+    // compiled out keeps the check live on unix. Mirror of the
+    // #[cfg_attr(not(windows), allow(dead_code))] already used elsewhere
+    // in this file for the same shape.
+    #[cfg_attr(not(unix), allow(dead_code))]
     shell_pid: Option<u32>,
 }
 
@@ -367,6 +378,9 @@ struct ProjectConfig {
     // transcript content).
     #[serde(default)]
     db: Option<String>,
+    // issue-414: start minimized and/or open the target app in the browser.
+    #[serde(default)]
+    launch: Option<LaunchConfig>,
 }
 // (The transitional `guards.rustAuthority` toggle was retired by
 // retire-python-hooks-rust-only: the Rust bram-guard is the only
@@ -579,30 +593,190 @@ fn encode_path_for_filename_ascii_lossy(p: &std::path::Path) -> String {
 
 fn determine_project_root() -> PathBuf {
     let args: Vec<String> = std::env::args().collect();
-    let candidate: PathBuf = if args.len() >= 2 && !args[1].starts_with('-') {
-        PathBuf::from(&args[1])
-    } else {
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    // issue-414: launch flags may come before or after PROJECT_DIR, so the
+    // project is the first argument that isn't a flag.
+    let candidate: PathBuf = match args.iter().skip(1).find(|a| !a.starts_with('-')) {
+        Some(dir) => PathBuf::from(dir),
+        None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     };
     let canonical = candidate.canonicalize().unwrap_or(candidate);
     strip_unc_prefix(canonical)
 }
 
+// issue-414: launch options for projects whose target app is the point and
+// Bram is plumbing (tau-extractor-sandbox: teammates open the app, not the
+// terminal). From the command line (CLI_LAUNCH, parsed in parse_cli_flags)
+// or .bram.json "launch"; command-line flags win.
+#[derive(Clone, Default, serde::Deserialize)]
+struct LaunchConfig {
+    #[serde(default)]
+    minimized: Option<bool>,
+    // true, or a route such as "/architecture".
+    #[serde(default, rename = "openApp")]
+    open_app: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Default)]
+struct LaunchOpts {
+    minimized: Option<bool>,
+    // Some(None): open the app's own URL; Some(Some(route)): open that route.
+    open_app: Option<Option<String>>,
+}
+
+static CLI_LAUNCH: OnceLock<LaunchOpts> = OnceLock::new();
+
+fn is_launch_flag(arg: &str) -> bool {
+    arg == "--minimized" || arg == "--open-app" || arg.starts_with("--open-app=")
+}
+
+fn parse_launch_flags(args: &[String]) -> LaunchOpts {
+    let mut opts = LaunchOpts::default();
+    for a in args.iter().skip(1) {
+        if a == "--minimized" {
+            opts.minimized = Some(true);
+        } else if a == "--open-app" {
+            opts.open_app = Some(None);
+        } else if let Some(route) = a.strip_prefix("--open-app=") {
+            let route = route.trim();
+            opts.open_app = Some(if route.is_empty() {
+                None
+            } else {
+                Some(route.to_string())
+            });
+        }
+    }
+    opts
+}
+
+// The scheme://host:port part of a URL, so a route can replace its path.
+fn url_origin(url: &str) -> &str {
+    let after = url.find("://").map(|i| i + 3).unwrap_or(0);
+    match url[after..].find('/') {
+        Some(j) => &url[..after + j],
+        None => url,
+    }
+}
+
+// Whether something is listening at the URL's host and port.
+fn url_answers(url: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    let origin = url_origin(url);
+    let hostport = origin.split("://").nth(1).unwrap_or(origin);
+    let with_port = if hostport.contains(':') {
+        hostport.to_string()
+    } else {
+        format!("{}:80", hostport)
+    };
+    let Ok(addrs) = with_port.to_socket_addrs() else {
+        return false;
+    };
+    addrs.into_iter().any(|a| {
+        std::net::TcpStream::connect_timeout(&a, std::time::Duration::from_millis(500)).is_ok()
+    })
+}
+
+fn apply_launch_options<R: tauri::Runtime>(app: &AppHandle<R>, root: Option<&Path>) {
+    let cli = CLI_LAUNCH.get().cloned().unwrap_or_default();
+    let cfg = root
+        .and_then(load_project_config)
+        .and_then(|c| c.launch)
+        .unwrap_or_default();
+    let minimized = cli.minimized.or(cfg.minimized).unwrap_or(false);
+    let open_app = cli.open_app.clone().or_else(|| match &cfg.open_app {
+        Some(serde_json::Value::Bool(true)) => Some(None),
+        Some(serde_json::Value::String(s)) if !s.trim().is_empty() => {
+            Some(Some(s.trim().to_string()))
+        }
+        _ => None,
+    });
+    if !minimized && open_app.is_none() {
+        return;
+    }
+    let app = app.clone();
+    std::thread::spawn(move || {
+        if minimized {
+            // After a beat: macOS can ignore a minimize sent before the
+            // window is first shown.
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            let ok = app
+                .get_webview_window("main")
+                .map(|w| w.minimize().is_ok())
+                .unwrap_or(false);
+            append_bram_trace_line(&app, "launch", &format!("op=minimized ok={}", ok));
+        }
+        let Some(route) = open_app else { return };
+        // Wait for the target app to be served: a declared project server
+        // can take a while to start.
+        let started = std::time::Instant::now();
+        let deadline = std::time::Duration::from_secs(60);
+        loop {
+            if let Some(base) = target_app_browser_url(&app) {
+                let url = match route.as_deref() {
+                    Some(r) => {
+                        let r = if r.starts_with('/') {
+                            r.to_string()
+                        } else {
+                            format!("/{}", r)
+                        };
+                        format!("{}{}", url_origin(&base), r)
+                    }
+                    None => base.clone(),
+                };
+                if url_answers(&url) {
+                    let res = app.opener().open_url(url.clone(), None::<String>);
+                    append_bram_trace_line(
+                        &app,
+                        "launch",
+                        &format!(
+                            "op=open-app url={} waitedMs={} ok={}",
+                            url,
+                            started.elapsed().as_millis(),
+                            res.is_ok()
+                        ),
+                    );
+                    return;
+                }
+            }
+            if started.elapsed() > deadline {
+                let reason = if target_app_browser_url(&app).is_some() {
+                    "not-answering"
+                } else {
+                    "no-target-app"
+                };
+                append_bram_trace_line(
+                    &app,
+                    "launch",
+                    &format!("op=open-app-timeout reason={}", reason),
+                );
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+    });
+}
+
 fn parse_cli_flags() {
     let args: Vec<String> = std::env::args().collect();
+    let _ = CLI_LAUNCH.set(parse_launch_flags(&args));
     if args.len() < 2 {
         return;
     }
     match args[1].as_str() {
         "-h" | "--help" => {
             println!(
-                "Usage: bram [PROJECT_DIR]\n\n\
+                "Usage: bram [PROJECT_DIR] [--minimized] [--open-app[=<route>]]\n\n\
                  Tauri shell that pairs a terminal with an XMLUI surface.\n\n\
                  Arguments:\n  \
                    [PROJECT_DIR]    Path to the XMLUI project to load (defaults to current directory)\n\n\
                  Options:\n  \
-                   -h, --help       Print this help and exit\n  \
-                   -V, --version    Print version and exit"
+                   --minimized          Start with the Bram window minimized\n  \
+                   --open-app[=<route>] Once the target app is served, open it in the system\n                       \
+                   browser, optionally at a route (e.g. /architecture)\n  \
+                   -h, --help           Print this help and exit\n  \
+                   -V, --version        Print version and exit\n\n\
+                 A project can set the same in .bram.json:\n  \
+                   \"launch\": {{ \"minimized\": true, \"openApp\": \"/architecture\" }}\n\
+                 Command-line flags win over .bram.json."
             );
             std::process::exit(0);
         }
@@ -633,6 +807,7 @@ fn parse_cli_flags() {
                 }
             }
         }
+        s if is_launch_flag(s) => {}
         s if s.starts_with('-') => {
             eprintln!("bram: unknown option '{}'", s);
             eprintln!("Try 'bram --help' for more information.");
@@ -39638,6 +39813,56 @@ const CLAUDE_GUARD_MATCHERS: [&str; 4] = ["Write", "Edit", "Bash", "mcp__.*"];
 // reads it as current, so `claudeNeedsSetup` stays false, Setup never runs, and
 // the migration that would split it never fires. Same class of bug as the
 // presence-based check that hid the stale `py -3` commands in #247.
+// issue-415: the same reading as guard_matcher_shape_current, reported
+// rather than judged: which of CLAUDE_GUARD_MATCHERS carry the guard command,
+// and which other matchers do (legacy "Write|Edit", or none at all), so the
+// self-test can say "Bash not registered" instead of "needs Setup".
+fn guard_matcher_report(
+    value: &serde_json::Value,
+    expected_command: &str,
+) -> (Vec<String>, Vec<String>) {
+    let mut present: Vec<String> = Vec::new();
+    let mut extra: Vec<String> = Vec::new();
+    if let Some(arr) = value
+        .get("hooks")
+        .and_then(|h| h.get("PreToolUse"))
+        .and_then(|p| p.as_array())
+    {
+        for entry in arr {
+            let carries_guard = entry
+                .get("hooks")
+                .and_then(|h| h.as_array())
+                .map(|hooks| {
+                    hooks.iter().any(|h| {
+                        h.get("command").and_then(|c| c.as_str()) == Some(expected_command)
+                    })
+                })
+                .unwrap_or(false);
+            if !carries_guard {
+                continue;
+            }
+            let m = entry
+                .get("matcher")
+                .and_then(|m| m.as_str())
+                .unwrap_or("(none)")
+                .to_string();
+            if CLAUDE_GUARD_MATCHERS.contains(&m.as_str()) {
+                if !present.contains(&m) {
+                    present.push(m);
+                }
+            } else if !extra.contains(&m) {
+                extra.push(m);
+            }
+        }
+    }
+    let missing = CLAUDE_GUARD_MATCHERS
+        .iter()
+        .filter(|m| !present.iter().any(|p| p == *m))
+        .map(|m| m.to_string())
+        .collect();
+    (missing, extra)
+}
+
 fn guard_matcher_shape_current(value: &serde_json::Value, expected_command: &str) -> bool {
     let Some(arr) = value
         .get("hooks")
@@ -61022,6 +61247,15 @@ fn route_request<R: tauri::Runtime>(
                     obj.insert("repo".to_string(), serde_json::Value::String(slug));
                 }
             }
+            // issue-414: where a person opens this project's app, so an agent
+            // or a start script can say exactly where to go. null when the
+            // project has no target app.
+            obj.insert(
+                "targetAppUrl".to_string(),
+                target_app_browser_url(app)
+                    .map(serde_json::Value::String)
+                    .unwrap_or(serde_json::Value::Null),
+            );
         }
         let body = serde_json::to_vec(&v).unwrap_or_default();
         return (200, "application/json; charset=utf-8", body);
@@ -61121,13 +61355,28 @@ fn route_request<R: tauri::Runtime>(
         return (200, "application/json; charset=utf-8", body);
     }
 
+    // issue-415: probe the installed guard chain; see guard_selftest.
+    if path == "__guard/selftest" {
+        let body = serde_json::to_vec(&guard_selftest(app)).unwrap_or_default();
+        return (200, "application/json; charset=utf-8", body);
+    }
+
     if path == "__right-pane-info" {
         #[derive(serde::Serialize)]
         struct RightPaneInfo<'a> {
             url: &'a str,
             default_right_pane: &'a str,
             spawned: Option<&'a ServerConfig>,
+            // issue-414: the browser-safe address (or null), and whether the
+            // project has a target app at all, for the header's Open app ↗.
+            #[serde(rename = "browserUrl")]
+            browser_url: Option<String>,
+            #[serde(rename = "hasTargetApp")]
+            has_target_app: bool,
         }
+        // Computed before taking the locks below: it takes them itself.
+        let browser_url = target_app_browser_url(app);
+        let has_target_app = browser_url.is_some();
         let pane_state = app.state::<PaneUrlsState>();
         let urls = pane_state.0.lock().unwrap();
         let spawn_state = app.state::<SpawnedServerState>();
@@ -61136,6 +61385,8 @@ fn route_request<R: tauri::Runtime>(
             url: &urls.right_pane,
             default_right_pane: &urls.default_right_pane,
             spawned: spawned_guard.as_ref().map(|s| &s.config),
+            browser_url,
+            has_target_app,
         };
         let body = serde_json::to_vec(&info).unwrap_or_default();
         return (200, "application/json; charset=utf-8", body);
@@ -61296,6 +61547,33 @@ fn route_request<R: tauri::Runtime>(
         append_bram_trace_line(app, "queue", &format!("op=read version={} n={}", ver, n));
         let bytes =
             serde_json::to_vec(&doc).unwrap_or_else(|_| b"{\"entries\":[],\"version\":0}".to_vec());
+        return (200, "application/json; charset=utf-8", bytes);
+    }
+
+    // message-box-on-draft-editor-pattern: the message box's unsent draft,
+    // persisted by the host like the Queue (per project by construction,
+    // survives relaunch). GET returns { text } (empty when there is none);
+    // writes go through POST /__draft/save.
+    if path == "__draft" {
+        let Some(dpath) = project_resource_path(app, MESSAGE_DRAFT_FILE) else {
+            return (
+                500,
+                "text/plain; charset=utf-8",
+                b"no project root".to_vec(),
+            );
+        };
+        let text = std::fs::read(&dpath)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|d| d.get("text").and_then(|t| t.as_str()).map(String::from))
+            .unwrap_or_default();
+        append_bram_trace_line(
+            app,
+            "draft",
+            &format!("op=read chars={}", text.chars().count()),
+        );
+        let bytes = serde_json::to_vec(&serde_json::json!({ "text": text }))
+            .unwrap_or_else(|_| b"{\"text\":\"\"}".to_vec());
         return (200, "application/json; charset=utf-8", bytes);
     }
 
@@ -62606,6 +62884,13 @@ fn route_request<R: tauri::Runtime>(
         observe_pending_advances(app, &doc);
         observe_worklist_attribution(app, &doc);
         observe_state_mirror_divergence(app, &doc);
+        // issue-413: the agent's recommended next steps, while they still
+        // apply to this board.
+        if let Some(plan) = worklist_plan_current(app, &doc) {
+            if let Some(obj) = doc.as_object_mut() {
+                obj.insert("plan".to_string(), plan);
+            }
+        }
         let body = serde_json::to_vec(&doc).unwrap_or_default();
         return (200, "application/json; charset=utf-8", body);
     }
@@ -63186,6 +63471,627 @@ fn drain_worklist_intent<R: tauri::Runtime>(app: &AppHandle<R>) {
 // routes this handler once also served were deleted (delete-phase
 // tranche 1, #214): the host writes and clears the iterate sentinel on
 // the toTurn path. Refs #84, #91.
+// issue-415: live guard self-test. The guard's policy has unit tests, but the
+// installed chain (the ~/.bram/bram-guard link, the binary it points at, the
+// provider registration and its matchers) was only ever presumed; the two
+// real failures were there (a Bash matcher dropped for 3.5 weeks, #119; a
+// check shipped inert, xmlui-org/xmlui-mcp#33). This runs the installed
+// guard exactly as a provider does (`<link> guard <hook>`, payload on stdin)
+// against a throwaway fixture project, so no real file is touched, and
+// reports each case's actual decision. The fixture needs the authorization
+// marker (resources/.worklist-authorization.json, empty: present, granting
+// nothing), since without it the guard stands aside, and a GitHub-shaped
+// origin for the signature cases. It needs no port: none of these cases
+// consult the host (established by probing the installed guard, 2026-09-29).
+fn guard_selftest_fixture() -> Result<PathBuf, String> {
+    let dir = std::env::temp_dir().join(format!(
+        "bram-guard-selftest-{}-{}",
+        std::process::id(),
+        unix_now_ms()
+    ));
+    let w = |rel: &str, body: &str| -> Result<(), String> {
+        let p = dir.join(rel);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(&p, body).map_err(|e| e.to_string())
+    };
+    w(
+        "resources/worklist.json",
+        r#"{"version":1,"items":[{"id":"selftest-covered","status":"proposed","files":["src/covered.txt"]}]}"#,
+    )?;
+    w(
+        "resources/.worklist-authorization.json",
+        r#"{"kind":"","ids":[],"items":[]}"#,
+    )?;
+    w("src/covered.txt", "x\n")?;
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .current_dir(&dir)
+            .args(args)
+            .output()
+    };
+    git(&["init", "-q"]).map_err(|e| format!("git init: {}", e))?;
+    git(&[
+        "remote",
+        "add",
+        "origin",
+        "https://github.com/example/bram-guard-selftest.git",
+    ])
+    .map_err(|e| format!("git remote: {}", e))?;
+    Ok(dir)
+}
+
+// Run one case through the installed guard. Claude answers deny with exit 2
+// and a stderr message; Codex always exits 0 and answers deny as stdout JSON
+// (permissionDecision "deny"). Anything else is an error, not a decision.
+fn guard_selftest_run_case(
+    link: &Path,
+    hook: &str,
+    payload: &serde_json::Value,
+) -> (String, String) {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = match std::process::Command::new(link)
+        .args(["guard", hook])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                "error".to_string(),
+                format!("could not run the guard: {}", e),
+            )
+        }
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(payload.to_string().as_bytes());
+    }
+    let out = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(e) => return ("error".to_string(), e.to_string()),
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let short = |s: &str| s.trim().chars().take(200).collect::<String>();
+    let code = out.status.code();
+    if hook.starts_with("codex") {
+        if code != Some(0) {
+            return (
+                "error".to_string(),
+                format!("exit {:?}: {}", code, short(&stderr)),
+            );
+        }
+        let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_default();
+        if v.pointer("/hookSpecificOutput/permissionDecision")
+            .and_then(|d| d.as_str())
+            == Some("deny")
+        {
+            let reason = v
+                .pointer("/hookSpecificOutput/permissionDecisionReason")
+                .and_then(|r| r.as_str())
+                .unwrap_or("");
+            return ("deny".to_string(), short(reason));
+        }
+        return ("allow".to_string(), String::new());
+    }
+    match code {
+        Some(0) => ("allow".to_string(), String::new()),
+        Some(2) => ("deny".to_string(), short(&stderr)),
+        other => (
+            "error".to_string(),
+            format!("exit {:?}: {}", other, short(&stderr)),
+        ),
+    }
+}
+
+fn guard_selftest<R: tauri::Runtime>(app: &AppHandle<R>) -> serde_json::Value {
+    let link = guard_link_if_installed();
+    let mut cases: Vec<serde_json::Value> = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
+    match (&link, guard_selftest_fixture()) {
+        (None, _) => failed.push("guard-link".to_string()),
+        (Some(_), Err(e)) => {
+            failed.push("fixture".to_string());
+            cases.push(serde_json::json!({
+                "id": "fixture", "pass": false, "got": "error", "reason": e,
+            }));
+        }
+        (Some(link), Ok(dir)) => {
+            let root = dir.to_string_lossy().to_string();
+            let file = |rel: &str| dir.join(rel).to_string_lossy().to_string();
+            let os = if cfg!(windows) {
+                "Windows"
+            } else if cfg!(target_os = "macos") {
+                "macOS"
+            } else {
+                "Linux"
+            };
+            let signed = format!(
+                "Bram's Claude (Bram {}, main thread, selftest, {}, selftest) speaking from the Selftest project (github.com/example/bram-guard-selftest):\n\nguard self-test",
+                env!("CARGO_PKG_VERSION"),
+                os
+            );
+            let add = "*** Begin Patch\n*** Add File: src/uncovered.txt\n+y\n*** End Patch";
+            let update =
+                "*** Begin Patch\n*** Update File: src/covered.txt\n@@\n-x\n+y\n*** End Patch";
+            let specs: Vec<(&str, &str, &str, serde_json::Value)> = vec![
+                (
+                    "claude-write-covered",
+                    "claude-worklist",
+                    "allow",
+                    serde_json::json!({
+                    "tool_name": "Write", "cwd": root,
+                    "tool_input": {"file_path": file("src/covered.txt"), "content": "y"}}),
+                ),
+                (
+                    "claude-write-uncovered",
+                    "claude-worklist",
+                    "deny",
+                    serde_json::json!({
+                    "tool_name": "Write", "cwd": root,
+                    "tool_input": {"file_path": file("src/uncovered.txt"), "content": "y"}}),
+                ),
+                (
+                    "claude-edit-uncovered",
+                    "claude-worklist",
+                    "deny",
+                    serde_json::json!({
+                    "tool_name": "Edit", "cwd": root,
+                    "tool_input": {"file_path": file("src/uncovered.txt"), "old_string": "a", "new_string": "b"}}),
+                ),
+                (
+                    "claude-mcp-write-uncovered",
+                    "claude-worklist",
+                    "deny",
+                    serde_json::json!({
+                    "tool_name": "mcp__filesystem__write_file", "cwd": root,
+                    "tool_input": {"path": file("src/uncovered.txt"), "content": "y"}}),
+                ),
+                (
+                    "claude-forge-unsigned",
+                    "claude-worklist",
+                    "deny",
+                    serde_json::json!({
+                    "tool_name": "Bash", "cwd": root,
+                    "tool_input": {"command": "gh issue comment 5 --body \"guard self-test\""}}),
+                ),
+                (
+                    "claude-forge-signed",
+                    "claude-worklist",
+                    "allow",
+                    serde_json::json!({
+                    "tool_name": "Bash", "cwd": root,
+                    "tool_input": {"command": format!("gh issue comment 5 --body {}", serde_json::json!(signed))}}),
+                ),
+                (
+                    "codex-patch-uncovered",
+                    "codex-worklist",
+                    "deny",
+                    serde_json::json!({
+                    "tool_name": "apply_patch", "cwd": root, "tool_input": {"input": add}}),
+                ),
+                (
+                    "codex-patch-covered",
+                    "codex-worklist",
+                    "allow",
+                    serde_json::json!({
+                    "tool_name": "apply_patch", "cwd": root, "tool_input": {"input": update}}),
+                ),
+            ];
+            for (id, hook, expect, payload) in specs {
+                let (got, reason) = guard_selftest_run_case(link, hook, &payload);
+                let pass = got == expect;
+                if !pass {
+                    failed.push(id.to_string());
+                }
+                cases.push(serde_json::json!({
+                    "id": id, "hook": hook, "expect": expect, "got": got,
+                    "pass": pass, "reason": reason,
+                }));
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+    // Registration in the current project (Claude) and the user's Codex
+    // config, reported by name. The same settings file every status surface
+    // reads (claude_hook_settings_path), not .claude/settings.json, which
+    // carries no PreToolUse hooks.
+    let expected_cmd = expected_worklist_guard_command();
+    let settings_path = project_root(Some(app)).map(|r| claude_hook_settings_path(&r));
+    let (missing, extra) = match (&expected_cmd, &settings_path) {
+        (Some(cmd), Some(path)) => std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .map(|v| guard_matcher_report(&v, cmd))
+            .unwrap_or_else(|| {
+                (
+                    CLAUDE_GUARD_MATCHERS
+                        .iter()
+                        .map(|m| m.to_string())
+                        .collect(),
+                    Vec::new(),
+                )
+            }),
+        _ => (
+            CLAUDE_GUARD_MATCHERS
+                .iter()
+                .map(|m| m.to_string())
+                .collect(),
+            Vec::new(),
+        ),
+    };
+    let claude_ok = missing.is_empty() && extra.is_empty();
+    if !claude_ok {
+        failed.push("claude-registration".to_string());
+    }
+    let codex_ok = home_dir()
+        .map(|h| h.join(ENHANCE_CODEX_CONFIG_REL))
+        .map(|config| codex_hook_block_current(&config, link.as_deref()))
+        .unwrap_or(false);
+    if !codex_ok {
+        failed.push("codex-registration".to_string());
+    }
+    let ok = failed.is_empty();
+    append_bram_trace_line(
+        app,
+        "guard-selftest",
+        &format!(
+            "ok={} cases={} failed={} missing={} extra={}",
+            ok,
+            cases.len(),
+            if failed.is_empty() {
+                "-".to_string()
+            } else {
+                failed.join(",")
+            },
+            if missing.is_empty() {
+                "-".to_string()
+            } else {
+                missing.join(",")
+            },
+            if extra.is_empty() {
+                "-".to_string()
+            } else {
+                extra.join(",")
+            }
+        ),
+    );
+    serde_json::json!({
+        "ok": ok,
+        "link": link.map(|l| l.to_string_lossy().to_string()),
+        "cases": cases,
+        "failed": failed,
+        "registration": {
+            "claude": {
+                "ok": claude_ok,
+                "settings": settings_path.map(|p| p.to_string_lossy().to_string()),
+                "missing": missing,
+                "extra": extra,
+            },
+            "codex": { "ok": codex_ok },
+        },
+        "ranAtMs": unix_now_ms(),
+    })
+}
+
+#[cfg(test)]
+mod guard_selftest_tests {
+    use super::*;
+
+    // A guard that can't be run must read as an error, never as a decision:
+    // a dead chain has to fail the self-test, not pass it as "allow".
+    #[test]
+    fn unrunnable_guard_is_an_error_not_an_allow() {
+        let (got, reason) = guard_selftest_run_case(
+            Path::new("/nonexistent/bram-guard"),
+            "claude-worklist",
+            &serde_json::json!({ "tool_name": "Write" }),
+        );
+        assert_eq!(got, "error");
+        assert!(reason.starts_with("could not run the guard"), "{}", reason);
+        let (got, _) = guard_selftest_run_case(
+            Path::new("/nonexistent/bram-guard"),
+            "codex-worklist",
+            &serde_json::json!({ "tool_name": "apply_patch" }),
+        );
+        assert_eq!(got, "error");
+    }
+
+    // The regression #119 recorded: the guard registered under every matcher
+    // but Bash, plus a legacy combined matcher. The report names both.
+    #[test]
+    fn matcher_report_names_missing_and_extra() {
+        let cmd = "/home/u/.bram/bram-guard guard claude-worklist";
+        let settings = serde_json::json!({"hooks": {"PreToolUse": [
+            {"matcher": "Write", "hooks": [{"type": "command", "command": cmd}]},
+            {"matcher": "Edit", "hooks": [{"type": "command", "command": cmd}]},
+            {"matcher": "mcp__.*", "hooks": [{"type": "command", "command": cmd}]},
+            {"matcher": "Write|Edit", "hooks": [{"type": "command", "command": cmd}]},
+            {"matcher": "AskUserQuestion", "hooks": [{"type": "command", "command": "other"}]}
+        ]}});
+        let (missing, extra) = guard_matcher_report(&settings, cmd);
+        assert_eq!(missing, vec!["Bash".to_string()]);
+        assert_eq!(extra, vec!["Write|Edit".to_string()]);
+    }
+
+    #[test]
+    fn matcher_report_clean_when_all_registered() {
+        let cmd = "g guard claude-worklist";
+        let entries: Vec<serde_json::Value> = CLAUDE_GUARD_MATCHERS
+            .iter()
+            .map(|m| serde_json::json!({"matcher": m, "hooks": [{"command": cmd}]}))
+            .collect();
+        let settings = serde_json::json!({"hooks": {"PreToolUse": entries}});
+        let (missing, extra) = guard_matcher_report(&settings, cmd);
+        assert!(missing.is_empty() && extra.is_empty());
+        assert!(guard_matcher_shape_current(&settings, cmd));
+    }
+}
+
+// issue-414: the target app's address for a normal browser, or None when the
+// project has no target app. Same rule the Target app info dialog used
+// (d5a4970): a declared .bram.json project server is
+// http://localhost:<port><path>; otherwise the built-in loopback static
+// server (default_right_pane), but only when the project actually serves a
+// root index.html, which is what that server points at. The embedded pane's
+// own bramapp:// URL can't be opened by a browser, so it is never returned.
+fn target_app_browser_url<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<String> {
+    {
+        let spawn_state = app.state::<SpawnedServerState>();
+        let spawned = spawn_state.0.lock().ok()?;
+        if let Some(s) = spawned.as_ref() {
+            return Some(format!(
+                "http://localhost:{}{}",
+                s.config.port, s.config.path
+            ));
+        }
+    }
+    let root = project_root(Some(app))?;
+    if !root.join("index.html").is_file() {
+        return None;
+    }
+    let pane_state = app.state::<PaneUrlsState>();
+    let urls = pane_state.0.lock().ok()?;
+    let url = urls.default_right_pane.clone();
+    if url.is_empty() {
+        None
+    } else {
+        Some(url)
+    }
+}
+
+// issue-413: the agent's recommended next steps, as data the user can
+// approve with one click (Do recommended). The agent POSTs
+// { summary, steps: [{ verb: "drop" | "commit", ids: [...] }] }; the host
+// checks every id against the board and stores the plan with the board
+// version it was checked against. The plan grants nothing: the click runs
+// the same Drop and Commit paths the gate buttons do, which record their own
+// authorization. It is served on /__worklist only while that version is
+// current and every id is still on the board; a later board change makes it
+// stale. An empty steps list clears it (dismiss, or after the click).
+const WORKLIST_PLAN_FILE: &str = ".worklist-plan.json";
+
+fn worklist_plan_item<'a>(doc: &'a serde_json::Value, id: &str) -> Option<&'a serde_json::Value> {
+    doc.get("items")?
+        .as_array()?
+        .iter()
+        .find(|i| i.get("id").and_then(|v| v.as_str()) == Some(id))
+}
+
+fn worklist_plan_current<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    doc: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let path = project_resource_path(app, WORKLIST_PLAN_FILE)?;
+    let plan: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+    let board_version = doc.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
+    if plan.get("version").and_then(|v| v.as_u64()) != Some(board_version) {
+        return None;
+    }
+    let steps = plan.get("steps")?.as_array()?;
+    for step in steps {
+        for id in step.get("ids")?.as_array()? {
+            worklist_plan_item(doc, id.as_str()?)?;
+        }
+    }
+    Some(plan)
+}
+
+fn handle_worklist_plan<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    body: &[u8],
+) -> (u16, &'static str, Vec<u8>) {
+    let refuse = |msg: String| {
+        (
+            400,
+            "application/json; charset=utf-8",
+            serde_json::to_vec(&serde_json::json!({ "error": msg })).unwrap_or_default(),
+        )
+    };
+    let req: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => return refuse(format!("invalid JSON: {}", e)),
+    };
+    let Some(path) = project_resource_path(app, WORKLIST_PLAN_FILE) else {
+        return (
+            500,
+            "text/plain; charset=utf-8",
+            b"no project root".to_vec(),
+        );
+    };
+    let steps = req
+        .get("steps")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if steps.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        append_bram_trace_line(app, "worklist", "op=plan-clear");
+        emit_replayable_signal(app, "worklist-changed");
+        return (
+            200,
+            "application/json; charset=utf-8",
+            b"{\"ok\":true,\"cleared\":true}".to_vec(),
+        );
+    }
+    let doc = worklist_doc(app);
+    let mut clean_steps = Vec::new();
+    let mut summary_parts = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for step in &steps {
+        let verb = step.get("verb").and_then(|v| v.as_str()).unwrap_or("");
+        if verb != "drop" && verb != "commit" {
+            return refuse(format!(
+                "step verb must be \"drop\" or \"commit\", got {:?}",
+                verb
+            ));
+        }
+        let ids: Vec<String> = step
+            .get("ids")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if ids.is_empty() {
+            return refuse(format!("a {} step names no ids", verb));
+        }
+        for id in &ids {
+            // One step per id: "drop and commit X" can't both be meant.
+            if !seen.insert(id.clone()) {
+                return refuse(format!("{} is named in more than one step", id));
+            }
+            let Some(item) = worklist_plan_item(&doc, id) else {
+                return refuse(format!("{} is not on the board", id));
+            };
+            // Commit needs work to commit: the item has begun or is applied.
+            if verb == "commit" {
+                let applied = item.get("status").and_then(|v| v.as_str()) == Some("applied");
+                if !applied && item.get("begunAtMs").is_none() {
+                    return refuse(format!(
+                        "{} hasn't started, so there is nothing to commit",
+                        id
+                    ));
+                }
+            }
+        }
+        summary_parts.push(format!("{}={}", verb, ids.join(",")));
+        clean_steps.push(serde_json::json!({ "verb": verb, "ids": ids }));
+    }
+    let version = doc.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
+    let plan = serde_json::json!({
+        "summary": req.get("summary").and_then(|v| v.as_str()).unwrap_or(""),
+        "steps": clean_steps,
+        "version": version,
+        "postedAtMs": unix_now_ms(),
+    });
+    let pretty = serde_json::to_string_pretty(&plan).unwrap_or_else(|_| "{}".to_string());
+    if let Err(e) = std::fs::write(&path, format!("{}\n", pretty)) {
+        return (
+            500,
+            "application/json; charset=utf-8",
+            serde_json::to_vec(&serde_json::json!({ "error": e.to_string() })).unwrap_or_default(),
+        );
+    }
+    append_bram_trace_line(
+        app,
+        "worklist",
+        &format!(
+            "op=plan-post version={} steps={}",
+            version,
+            summary_parts.join(" ")
+        ),
+    );
+    emit_replayable_signal(app, "worklist-changed");
+    (
+        200,
+        "application/json; charset=utf-8",
+        serde_json::to_vec(&serde_json::json!({ "ok": true, "version": version }))
+            .unwrap_or_default(),
+    )
+}
+
+// message-box-on-draft-editor-pattern: the message box's draft file, under
+// the project's resources/ like the Queue's. Gitignored in this repo.
+const MESSAGE_DRAFT_FILE: &str = ".bram-message-draft.json";
+
+// POST /__draft/save { text }. Last writer wins: one message box per window,
+// and the pane never saves before it has read the saved draft (the guard is
+// client-side, __bramDraftHydrated in helpers.js), so a startup save can't
+// clobber it. An empty text removes the file.
+fn handle_draft_save<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    body: &[u8],
+) -> (u16, &'static str, Vec<u8>) {
+    let text = match serde_json::from_slice::<serde_json::Value>(body) {
+        Ok(v) => match v.get("text").and_then(|t| t.as_str()) {
+            Some(t) => t.to_string(),
+            None => {
+                return (
+                    400,
+                    "application/json; charset=utf-8",
+                    b"{\"error\":\"missing text\"}".to_vec(),
+                );
+            }
+        },
+        Err(e) => {
+            return (
+                400,
+                "application/json; charset=utf-8",
+                format!("{{\"error\":\"invalid JSON: {}\"}}", e).into_bytes(),
+            );
+        }
+    };
+    let Some(dpath) = project_resource_path(app, MESSAGE_DRAFT_FILE) else {
+        return (
+            500,
+            "text/plain; charset=utf-8",
+            b"no project root".to_vec(),
+        );
+    };
+    let result = if text.is_empty() {
+        match std::fs::remove_file(&dpath) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
+            _ => Ok(()),
+        }
+    } else {
+        if let Some(parent) = dpath.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let doc = serde_json::json!({ "text": text, "savedAtMs": unix_now_ms() });
+        let pretty = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".to_string());
+        std::fs::write(&dpath, format!("{}\n", pretty)).map_err(|e| e.to_string())
+    };
+    match result {
+        Ok(()) => {
+            append_bram_trace_line(
+                app,
+                "draft",
+                &format!("op=save chars={}", text.chars().count()),
+            );
+            (
+                200,
+                "application/json; charset=utf-8",
+                b"{\"ok\":true}".to_vec(),
+            )
+        }
+        Err(e) => {
+            append_bram_trace_line(app, "draft", &format!("op=save-error error={}", e));
+            (
+                500,
+                "application/json; charset=utf-8",
+                format!("{{\"error\":{}}}", serde_json::json!(e)).into_bytes(),
+            )
+        }
+    }
+}
+
 // issue-90-q-page: replace the queue file wholesale from the pane's working
 // copy. Body must be {"entries": [...]} — shape-checked, then persisted
 // pretty-printed for hand-inspection.
@@ -64301,6 +65207,63 @@ struct LandedInfo {
     planned: usize,
 }
 
+// landed-detector-needs-item-work: whether a claim interval owned by `id`
+// changed one of `paths`. Interval n runs from record n's tree to record
+// n+1's tree, or to the working tree for the newest (open) interval, and its
+// work belongs to record n's ids. Records owned by items still on the board
+// are kept by claim_intervals_partition, so the evidence is there for any
+// item this is asked about.
+//   Some(true)  — at least one of its intervals changed its paths;
+//   Some(false) — it has intervals, and none did: it did no work of its own;
+//   None        — it has no intervals, so there is no evidence either way
+//                 (work done and committed entirely outside the Worklist,
+//                 the case #406's offer exists for).
+fn item_interval_changed_paths<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    id: &str,
+    paths: &[String],
+) -> Option<bool> {
+    if id.is_empty() || paths.is_empty() {
+        return None;
+    }
+    let root = project_root(Some(app))?;
+    let text = std::fs::read_to_string(root.join(CLAIM_INTERVALS_REL)).ok()?;
+    let doc = serde_json::from_str::<serde_json::Value>(&text).ok()?;
+    let arr = doc.get("intervals").and_then(|v| v.as_array())?;
+    let mut owned_any = false;
+    let tree_of =
+        |rec: &serde_json::Value| rec.get("tree").and_then(|v| v.as_str()).map(String::from);
+    for (n, rec) in arr.iter().enumerate() {
+        let owns = rec
+            .get("ids")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).any(|x| x == id))
+            .unwrap_or(false);
+        if !owns {
+            continue;
+        }
+        owned_any = true;
+        let Some(base) = tree_of(rec) else { continue };
+        let end = arr.get(n + 1).and_then(tree_of);
+        let mut args: Vec<&str> = vec!["diff", "--name-only", base.as_str()];
+        if let Some(e) = end.as_deref() {
+            args.push(e);
+        }
+        args.push("--");
+        args.extend(paths.iter().map(|p| p.as_str()));
+        if let Ok(out) = git_run(app, &args) {
+            if !out.trim().is_empty() {
+                return Some(true);
+            }
+        }
+    }
+    if owned_any {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 fn worklist_item_landed<R: tauri::Runtime>(
     app: &AppHandle<R>,
     item: &serde_json::Value,
@@ -64357,6 +65320,18 @@ fn worklist_item_landed<R: tauri::Runtime>(
         );
     }
     let (sha, subject) = newest?;
+    // landed-detector-needs-item-work: a commit touching the item's files is
+    // not evidence that the item did the work. Without this, a begun item
+    // that never changed anything (issue-406-chat-commit-everything-ready,
+    // waiting on field evidence) was flagged landed because another item's
+    // commit outside the Worklist (0cca559) touched one of its planned files.
+    // Only positive evidence of no work rules it out: an item with no claim
+    // intervals at all keeps the old rule, since work done and committed
+    // entirely outside the Worklist leaves no interval to point to.
+    let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    if item_interval_changed_paths(app, id, paths) == Some(false) {
+        return None;
+    }
     let covered = paths
         .iter()
         .filter(|p| {
@@ -68718,6 +69693,22 @@ fn handle_http<R: tauri::Runtime>(app: &AppHandle<R>, mut request: tiny_http::Re
             let _ = request.as_reader().read_to_end(&mut buf);
             handle_queue_save(app, &buf)
         }
+    } else if path == "__worklist/plan" {
+        if method != "POST" {
+            (405, "text/plain; charset=utf-8", b"POST only".to_vec())
+        } else {
+            let mut buf = Vec::new();
+            let _ = request.as_reader().read_to_end(&mut buf);
+            handle_worklist_plan(app, &buf)
+        }
+    } else if path == "__draft/save" {
+        if method != "POST" {
+            (405, "text/plain; charset=utf-8", b"POST only".to_vec())
+        } else {
+            let mut buf = Vec::new();
+            let _ = request.as_reader().read_to_end(&mut buf);
+            handle_draft_save(app, &buf)
+        }
     } else if path == "__worklist/mutate" {
         if method != "POST" {
             (405, "text/plain; charset=utf-8", b"POST only".to_vec())
@@ -69528,6 +70519,8 @@ pub fn run() {
             let startup_project_root = project_root(Some(app.handle()));
             set_shell_window_title(app.handle());
             set_shell_dock_badge(app.handle());
+            // issue-414: --minimized / --open-app, or .bram.json "launch".
+            apply_launch_options(app.handle(), startup_project_root.as_deref());
             let previous_port = startup_project_root
                 .as_ref()
                 .and_then(|p| std::fs::read_to_string(p.join("resources/.bram-port")).ok())
