@@ -364,6 +364,8 @@ struct ProjectConfig {
     #[serde(default)]
     ui: Option<UiConfig>,
     #[serde(default)]
+    sessions: Option<SessionsConfig>,
+    #[serde(default)]
     traces: Option<TracesConfig>,
     #[serde(default)]
     menus: Option<MenusConfig>,
@@ -441,6 +443,19 @@ struct UiConfig {
     show_target_app: Option<bool>,
     #[serde(default, rename = "toolsPaneHotReload")]
     tools_pane_hot_reload: Option<bool>,
+}
+
+// suggest-fresh-session: when the agent may suggest starting a fresh session.
+// Per project, in `.bram.json` under `sessions`. Defaults (resolved in
+// settings_view_from_config): new item true, new issue true, topic shift false.
+#[derive(Default, Clone, serde::Deserialize)]
+struct SessionsConfig {
+    #[serde(default, rename = "suggestOnNewItem")]
+    suggest_on_new_item: Option<bool>,
+    #[serde(default, rename = "suggestOnNewIssue")]
+    suggest_on_new_issue: Option<bool>,
+    #[serde(default, rename = "suggestOnTopicShift")]
+    suggest_on_topic_shift: Option<bool>,
 }
 
 #[derive(Default, Clone, serde::Deserialize)]
@@ -3911,7 +3926,7 @@ fn emit_talk_session_changed_for_provider<R: tauri::Runtime>(
             // new-session-handoff-race: a surfaced session file proves an
             // agent CLI is running — release any awaiting-boot send hold
             // even if its boot bytes were missed (no-op when unarmed).
-            clear_agent_boot_hold(app, "session-surfaced");
+            note_agent_boot_evidence(app, "session-surfaced");
             // sessions-new-named-session: bind a queued title to the new
             // session. A deliberate Codex bootstrap reaches this path before
             // its first real user turn; later writes retry any failed rename.
@@ -8056,6 +8071,26 @@ fn askuserquestion_to_menu(value: &serde_json::Value, tool: &str) -> Option<PtyM
     if options.is_empty() {
         return None;
     }
+    // askuserquestion-card-type-something-and-chat: Claude Code appends two
+    // rows of its own after the agent's options (specimens 2026-06-17,
+    // 06-22, 09-30), which the hook payload doesn't carry. A digit acts
+    // immediately in this menu, so both answer with the bare key: N+1 opens
+    // Claude's free-text input (the card then types the text and Enter, per
+    // the 09-30 specimen), N+2 returns to chat. The card identifies them by
+    // position: they're always the last two.
+    let n = options.len();
+    options.push(MenuOption {
+        key: (n + 1).to_string(),
+        label: "Type something.".to_string(),
+        answer_keys: Some((n + 1).to_string()),
+        description: Some("Write your own answer instead of choosing one above.".to_string()),
+    });
+    options.push(MenuOption {
+        key: (n + 2).to_string(),
+        label: "Chat about this".to_string(),
+        answer_keys: Some((n + 2).to_string()),
+        description: Some("Skip the question and go back to talking with the agent.".to_string()),
+    });
     let text = q0
         .get("question")
         .and_then(|q| q.as_str())
@@ -8074,6 +8109,59 @@ fn askuserquestion_to_menu(value: &serde_json::Value, tool: &str) -> Option<PtyM
         at_host_ms: None,
         signature_source: None,
     })
+}
+
+#[cfg(test)]
+mod askuserquestion_menu_tests {
+    use super::askuserquestion_to_menu;
+
+    #[test]
+    fn claudes_own_rows_follow_the_agents_options() {
+        let payload = serde_json::json!({
+            "tool_input": {"questions": [{
+                "question": "Which fruit?",
+                "options": [
+                    {"label": "Apple", "description": "red"},
+                    {"label": "Pear"}
+                ]
+            }]}
+        });
+        let menu = askuserquestion_to_menu(&payload, "AskUserQuestion").expect("menu");
+        let rows: Vec<(String, String, Option<String>)> = menu
+            .options
+            .iter()
+            .map(|o| (o.key.clone(), o.label.clone(), o.answer_keys.clone()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("1".into(), "Apple".into(), None),
+                ("2".into(), "Pear".into(), None),
+                ("3".into(), "Type something.".into(), Some("3".into())),
+                ("4".into(), "Chat about this".into(), Some("4".into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_the_type_something_key_opens_free_text() {
+        use super::menu_answer_opens_free_text as opens;
+        let payload = serde_json::json!({
+            "tool_input": {"questions": [{"question": "?", "options": [{"label": "A"}, {"label": "B"}]}]}
+        });
+        let menu = askuserquestion_to_menu(&payload, "AskUserQuestion").expect("menu");
+        assert!(opens(Some(&menu), "3"));
+        assert!(!opens(Some(&menu), "1"));
+        assert!(!opens(Some(&menu), "4"));
+        assert!(!opens(None, "3"));
+    }
+
+    #[test]
+    fn no_agent_options_still_means_no_menu() {
+        let payload =
+            serde_json::json!({"tool_input": {"questions": [{"question": "?", "options": []}]}});
+        assert!(askuserquestion_to_menu(&payload, "AskUserQuestion").is_none());
+    }
 }
 
 fn split_shell_words_limited(input: &str, limit: usize) -> Vec<String> {
@@ -16696,6 +16784,7 @@ fn pty_spawn(
                     if now.saturating_sub(guard_link_last_ensure_ms) >= 60_000 {
                         guard_link_last_ensure_ms = now;
                         let _ = guard::ensure_bram_guard_link();
+                        record_own_guard_target(&app_for_throughput);
                     }
                 }
                 // codex-trust-menu-arm-until-settled: commit an armed
@@ -17777,6 +17866,7 @@ fn drain_pty_intents<R: tauri::Runtime>(
     app: &AppHandle<R>,
     state: &State<'_, AppState>,
 ) -> Result<(), String> {
+    poll_agent_boot_settle(app);
     let Some(path) = pty_intent_file(app) else {
         return Ok(());
     };
@@ -17876,6 +17966,59 @@ fn drain_pty_intents<R: tauri::Runtime>(
                     remaining.push(line.to_string());
                     continue;
                 }
+                // boot-settle-wait-for-claude-bounce: re-check at write time.
+                // The hold released on evidence, but Claude may have turned
+                // its modes off since (22:10:09: released .414, OFF .441,
+                // written .473). Hold until they're back on, bounded like
+                // the boot hold itself.
+                if decision == BootHeldIntentDecision::Deliver
+                    && intent_provider == "claude"
+                    && BOOT_MODES_TRACKING.load(std::sync::atomic::Ordering::Relaxed)
+                    && !BOOT_MODES_ON.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    let now = unix_now_ms();
+                    let first = BOOT_MODES_OFF_AT_WRITE_SINCE_MS
+                        .compare_exchange(
+                            0,
+                            now,
+                            std::sync::atomic::Ordering::Relaxed,
+                            std::sync::atomic::Ordering::Relaxed,
+                        )
+                        .is_ok();
+                    let since =
+                        BOOT_MODES_OFF_AT_WRITE_SINCE_MS.load(std::sync::atomic::Ordering::Relaxed);
+                    if first && bram_trace_enabled() {
+                        append_bram_trace_line(
+                            app,
+                            "send-gate",
+                            "op=boot-settle-rearm reason=modes-off-at-write",
+                        );
+                    }
+                    if now.saturating_sub(since) < AGENT_BOOT_HOLD_EXPIRE_MS {
+                        held += 1;
+                        remaining.push(line.to_string());
+                        continue;
+                    }
+                    // Still off after the bound: hand the text back rather
+                    // than paste it into input that isn't listening.
+                    let id = intent
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("intent")
+                        .to_string();
+                    boot_restores.push((id.clone(), data.to_string()));
+                    if bram_trace_enabled() {
+                        append_bram_trace_line(
+                            app,
+                            "send-gate",
+                            &format!(
+                                "op=boot-held-restore id={} generation={} provider={} reason=modes-off-at-write",
+                                id, generation, intent_provider
+                            ),
+                        );
+                    }
+                    continue;
+                }
                 if decision != BootHeldIntentDecision::Deliver {
                     let expired = decision == BootHeldIntentDecision::RestoreExpired;
                     expire_boot_hold |= expired;
@@ -17923,7 +18066,19 @@ fn drain_pty_intents<R: tauri::Runtime>(
                     }
                     Ok(())
                 } else {
-                    pty_write_internal(app, state, data, "pty-intent-sendKeys")
+                    let r = pty_write_internal(app, state, data, "pty-intent-sendKeys");
+                    if r.is_ok()
+                        && data.contains('\r')
+                        && AUQ_FREE_TEXT_SINCE_MS.swap(0, std::sync::atomic::Ordering::Relaxed) > 0
+                        && bram_trace_enabled()
+                    {
+                        append_bram_trace_line(
+                            app,
+                            "send-gate",
+                            "op=free-text-closed reason=enter",
+                        );
+                    }
+                    r
                 }
             }
             "menuAnswer" => {
@@ -17933,7 +18088,24 @@ fn drain_pty_intents<R: tauri::Runtime>(
                     .and_then(|open| open.as_ref().map(|p| p.prompt_id.clone()));
                 let verdict = menu_answer_identity_verdict(current_prompt_id.as_deref(), prompt_id);
                 if verdict == MenuAnswerIdentityVerdict::Accept {
-                    pty_write_internal(app, state, data, "pty-intent-menuAnswer")
+                    let opens_free_text = turn_state_cell()
+                        .lock()
+                        .ok()
+                        .map(|t| menu_answer_opens_free_text(t.pending_menu.as_ref(), data))
+                        .unwrap_or(false);
+                    let r = pty_write_internal(app, state, data, "pty-intent-menuAnswer");
+                    if r.is_ok() && opens_free_text {
+                        AUQ_FREE_TEXT_SINCE_MS
+                            .store(unix_now_ms(), std::sync::atomic::Ordering::Relaxed);
+                        if bram_trace_enabled() {
+                            append_bram_trace_line(
+                                app,
+                                "send-gate",
+                                &format!("op=free-text-open key={}", data.trim()),
+                            );
+                        }
+                    }
+                    r
                 } else {
                     if bram_trace_enabled() {
                         append_bram_trace_line(
@@ -18744,19 +18916,30 @@ fn switch_agent(
     let has_session = SessionProvider::from_str(provider_key)
         .and_then(|p| latest_session_path_for_provider(&app, p).ok().flatten())
         .is_some();
-    let base_command = if provider_key == "codex" {
-        match codex_reload_target(&app) {
-            // A pinned reload target implies its session exists.
-            Some(target) => agent_resume_command("codex", &target.id),
-            None if has_session => agent_resume_command("codex", ""),
-            None => agent_launch_command("codex").map(str::to_string),
-        }
-    } else if has_session {
-        agent_resume_command(provider_key, "")
+    let pending = read_pending_session_title(&app, SessionProvider::Codex);
+    let pending_target = if provider_key == "codex" {
+        pending.as_ref().and_then(|rec| {
+            rec.session_id
+                .as_deref()
+                .and_then(|id| session_path_for_id(&app, SessionProvider::Codex, id))
+                .or_else(|| pending_codex_session_path(&app))
+                .and_then(|path| session_id_for_path(SessionProvider::Codex, &path))
+        })
     } else {
-        agent_launch_command(provider_key).map(str::to_string)
-    }
-    .ok_or("unknown agent provider")?;
+        None
+    };
+    let pin = if provider_key == "codex" {
+        codex_reload_target(&app)
+    } else {
+        None
+    };
+    let (base_command, pending_disposition) = provider_switch_launch(
+        provider_key,
+        has_session,
+        pin.as_ref().map(|target| target.id.as_str()),
+        pending.as_ref(),
+        pending_target.as_deref(),
+    );
     if !has_session && bram_trace_enabled() {
         append_bram_trace_line(
             &app,
@@ -18777,7 +18960,25 @@ fn switch_agent(
         append_bram_trace_line(
             &app,
             "agent-switch",
-            &format!("op=start provider={} command={}", provider_key, command),
+            &format!(
+                "op=start provider={} command={} pending={} requested_sid={} resume_sid={}",
+                provider_key,
+                command,
+                pending_disposition,
+                pending
+                    .as_ref()
+                    .filter(|rec| rec.provider == provider_key)
+                    .and_then(|rec| rec.session_id.as_deref())
+                    .unwrap_or("unbound"),
+                if pending_disposition == "restart-pending" {
+                    "none"
+                } else {
+                    pending_target
+                        .as_deref()
+                        .or_else(|| pin.as_ref().map(|target| target.id.as_str()))
+                        .unwrap_or("latest-or-fresh")
+                }
+            ),
         );
     }
     // NOT armed here, deliberately (#305, reverting the arm added by 597935b).
@@ -18849,12 +19050,22 @@ fn switch_agent(
                 }
             }
         }
-        let _ = pty_write_internal(
+        if let Err(error) = pty_write_internal(
             &waiter_app,
             &state,
             &format!("{}\r", command),
             "agent-switch-launch",
-        );
+        ) {
+            append_bram_trace_line(
+                &waiter_app,
+                "agent-switch",
+                &format!("op=launch-error provider={} error={}", provider_key, error),
+            );
+            return;
+        }
+        if let Some(id) = pending_target.as_deref() {
+            let _ = pin_codex_reload_target(&waiter_app, id);
+        }
         trace_agent_pty_step(&waiter_app, "switch", provider_key, "launch");
         // Switching providers must reset the transcript to the new provider's
         // latest session, not diff against the old cursor. Without this, the
@@ -18875,6 +19086,42 @@ fn switch_agent(
         }
     });
     Ok(())
+}
+
+// A pending named Codex launch outranks the previous-session pin. If the CLI
+// was interrupted before creating a rollout, there is nothing new to resume:
+// launch fresh again, keeping the title for its first confirmed session. Never
+// silently turn that request into `resume <previous>` or `resume --last`.
+fn provider_switch_launch(
+    provider: &str,
+    has_session: bool,
+    pinned_id: Option<&str>,
+    pending: Option<&PendingSessionTitle>,
+    pending_target: Option<&str>,
+) -> (String, &'static str) {
+    if provider == "codex" {
+        if let Some(rec) = pending.filter(|rec| rec.provider == "codex") {
+            return match pending_target {
+                Some(id) => (
+                    agent_resume_command(provider, id).unwrap(),
+                    "resume-pending",
+                ),
+                None => (
+                    new_session_launch_command(provider, &rec.title, None),
+                    "restart-pending",
+                ),
+            };
+        }
+        if let Some(id) = pinned_id {
+            return (agent_resume_command(provider, id).unwrap(), "none");
+        }
+    }
+    let command = if has_session {
+        agent_resume_command(provider, "").unwrap()
+    } else {
+        agent_launch_command(provider).unwrap().to_string()
+    };
+    (command, "none")
 }
 
 // Resolve a Codex rollout by the UUID in its session_meta record without the
@@ -19059,8 +19306,9 @@ fn resync_transcript_to_session<R: tauri::Runtime>(
     if current_provider(app) != Some(provider) {
         set_current_provider(app, provider, "session-resync");
     }
+    let touched_at = std::time::SystemTime::now();
     if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&path) {
-        let _ = file.set_modified(std::time::SystemTime::now());
+        let _ = file.set_modified(touched_at);
     }
     if bram_trace_enabled() {
         append_bram_trace_line(
@@ -19072,6 +19320,34 @@ fn resync_transcript_to_session<R: tauri::Runtime>(
                 id
             ),
         );
+    }
+    // resume-marks-session-current: the mtime touch alone doesn't make an
+    // explicitly resumed Claude session current. latest_claude_session_path's
+    // hysteresis keeps its cached pick while that file is <5s old, and the
+    // session just interrupted is exactly that fresh, so the footer and
+    // `[current]` kept naming it until the resumed session's next write
+    // (87s, 2026-09-30). The caller named this session, so the cache and
+    // last-active follow it now. Codex is left to its reload pin.
+    if provider == SessionProvider::Claude {
+        let cache_cell = LIVE_CLAUDE_SESSION.get_or_init(|| Mutex::new(None));
+        let mut cached = match cache_cell.lock() {
+            Ok(guard) => guard,
+            Err(error) => error.into_inner(),
+        };
+        *cached = Some((path.clone(), touched_at));
+        drop(cached);
+        remember_last_active_session(app, provider, id);
+        if bram_trace_enabled() {
+            append_bram_trace_line(
+                app,
+                "agent-switch",
+                &format!(
+                    "op=live-session-set provider={} session={} source=explicit-resume",
+                    session_provider_label(provider),
+                    id
+                ),
+            );
+        }
     }
     // Refresh session-list consumers (the Sessions tab and the transcript
     // header/footer meta lines) which key off sessions-list-changed, not
@@ -19257,7 +19533,6 @@ fn pending_session_title_abandoned_by_resume(
     resumed_session_id: &str,
 ) -> bool {
     rec.provider == session_provider_label(provider)
-        && rec.previous_session_id.as_deref() == Some(resumed_session_id)
         && rec.session_id.as_deref() != Some(resumed_session_id)
 }
 
@@ -19266,8 +19541,8 @@ fn pending_session_title_abandoned_by_resume(
 // the queued title can no longer be claimed and its synthetic `pending-...`
 // row would otherwise remain current for ten minutes. An explicit Sessions
 // reload of that previous conversation abandons the pending launch in the
-// same way. Retire only that exact previous-id match so an unrelated resume
-// cannot consume a still-viable title.
+// same way. Any explicitly resumed different session supersedes the pending
+// request; keeping it would label that old conversation with the new title.
 fn clear_pending_session_title_for_resume<R: tauri::Runtime>(
     app: &AppHandle<R>,
     provider: SessionProvider,
@@ -19293,10 +19568,11 @@ fn clear_pending_session_title_for_resume<R: tauri::Runtime>(
                 app,
                 "session-new",
                 &format!(
-                    "op=cancel-pending provider={} sid={} source={}",
+                    "op=cancel-pending provider={} sid={} source={} requested_sid={} disposition=abandoned",
                     session_provider_label(provider),
                     resumed_session_id,
-                    source
+                    source,
+                    rec.session_id.as_deref().unwrap_or("unbound")
                 ),
             );
         }
@@ -19329,19 +19605,52 @@ fn pending_codex_session_path<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<P
             if canonical_path_string(Path::new(&cwd)) != project_cwd {
                 return None;
             }
-            let modified = std::fs::metadata(&candidate).ok()?.modified().ok()?;
-            let modified_ms = system_time_ms(modified)?;
-            // Filesystems with coarse timestamp precision can round the new
-            // rollout's mtime just below the pending record's millisecond
-            // timestamp. A two-second allowance remains safely inside the
-            // ten-minute handoff window and the previous-UUID exclusion above.
-            if modified_ms + 2_000 < rec.created_at_ms {
+            let metadata = std::fs::metadata(&candidate).ok()?;
+            let modified = metadata.modified().ok()?;
+            // A recent write to an OLD rollout is not a new session. Use its
+            // birth time, not mtime, for both discovery and title binding.
+            if !pending_session_title_can_claim(
+                &rec,
+                &session_id,
+                true,
+                metadata.created().ok().and_then(system_time_ms),
+            ) {
                 return None;
             }
             Some((modified, candidate))
         })
         .max_by_key(|(modified, _)| *modified)
         .map(|(_, candidate)| candidate)
+}
+
+fn pending_session_title_can_claim(
+    rec: &PendingSessionTitle,
+    session_id: &str,
+    allow_claim: bool,
+    created_ms: Option<i64>,
+) -> bool {
+    if session_id.is_empty() {
+        return false;
+    }
+    if rec.session_id.as_deref() == Some(session_id) {
+        return true; // A confirmed/reserved identity may retry its rename.
+    }
+    allow_claim
+        && rec.previous_session_id.as_deref() != Some(session_id)
+        && created_ms.is_some_and(|created| created.saturating_add(2_000) >= rec.created_at_ms)
+}
+
+fn claim_pending_session_title(
+    rec: &mut PendingSessionTitle,
+    session_id: &str,
+    allow_claim: bool,
+    created_ms: Option<i64>,
+) -> bool {
+    if !pending_session_title_can_claim(rec, session_id, allow_claim, created_ms) {
+        return false;
+    }
+    rec.session_id = Some(session_id.to_string());
+    true
 }
 
 // Apply a queued title to a just-surfaced session. On rotation, claim the
@@ -19372,52 +19681,35 @@ fn apply_pending_session_title<R: tauri::Runtime>(
     // is only to stop it attaching to an unrelated much-later rotation.
     let stale = unix_now_ms() - rec.created_at_ms > 600_000;
     if rec.provider == want && !stale {
-        if let Some(target) = rec.session_id.as_deref() {
-            if target != new_sid {
-                // new-session-handoff-race: the reserved sid never surfaced —
-                // the launch failed and a DIFFERENT session rotated in while
-                // the title was pending. If that session's file was created
-                // after the New Session click, it is the replacement
-                // (typically the user's manual recovery launch): re-bind the
-                // queued title instead of leaving it orphaned against a
-                // session that never existed. A resumed older session has a
-                // pre-click file birth time and is left alone; so is the
-                // outgoing session itself.
-                let old_target = target.to_string();
-                if !allow_claim || rec.previous_session_id.as_deref() == Some(new_sid) {
-                    return;
-                }
-                let fresh = session_path_for_id(app, provider, new_sid)
-                    .and_then(|p| std::fs::metadata(p).ok())
-                    .and_then(|m| m.created().ok())
-                    .and_then(system_time_ms)
-                    .map(|created_ms| created_ms + 2_000 >= rec.created_at_ms)
-                    .unwrap_or(false);
-                if !fresh {
-                    return;
-                }
-                rec.session_id = Some(new_sid.to_string());
-                if let Ok(bytes) = serde_json::to_vec(&rec) {
-                    let _ = std::fs::write(&path, bytes);
-                }
-                if bram_trace_enabled() {
-                    append_bram_trace_line(
-                        app,
-                        "session-new",
-                        &format!(
-                            "op=rebound provider={} from={} sid={}",
-                            want, old_target, new_sid
-                        ),
-                    );
-                }
-            }
-        } else if allow_claim {
-            rec.session_id = Some(new_sid.to_string());
+        let created_ms = session_path_for_id(app, provider, new_sid)
+            .and_then(|p| std::fs::metadata(p).ok())
+            .and_then(|m| m.created().ok())
+            .and_then(system_time_ms);
+        let old_target = rec.session_id.clone();
+        if !claim_pending_session_title(&mut rec, new_sid, allow_claim, created_ms) {
+            return;
+        }
+        if old_target.as_deref() != Some(new_sid) {
             if let Ok(bytes) = serde_json::to_vec(&rec) {
                 let _ = std::fs::write(&path, bytes);
             }
-        } else {
-            return;
+            if bram_trace_enabled() {
+                append_bram_trace_line(
+                    app,
+                    "session-new",
+                    &format!(
+                        "op={} provider={} from={} sid={} evidence=rollout-birth",
+                        if old_target.is_some() {
+                            "rebound"
+                        } else {
+                            "claimed"
+                        },
+                        want,
+                        old_target.as_deref().unwrap_or("unbound"),
+                        new_sid
+                    ),
+                );
+            }
         }
         let rename_result = match provider {
             SessionProvider::Codex => pin_codex_reload_target(app, new_sid)
@@ -19464,9 +19756,10 @@ fn apply_pending_session_title<R: tauri::Runtime>(
 #[cfg(test)]
 mod pending_session_title_tests {
     use super::{
-        codex_session_is_visible, merge_pending_session_entry,
-        pending_session_title_abandoned_by_resume, session_change_snapshot, PendingSessionTitle,
-        SessionEntry, SessionProvider,
+        claim_pending_session_title, codex_session_is_visible, merge_pending_session_entry,
+        new_session_launch_command, pending_session_title_abandoned_by_resume,
+        pending_session_title_can_claim, provider_switch_launch, session_change_snapshot,
+        PendingSessionTitle, SessionEntry, SessionProvider,
     };
 
     #[test]
@@ -19484,7 +19777,7 @@ mod pending_session_title_tests {
             SessionProvider::Codex,
             "previous-codex-id"
         ));
-        assert!(!pending_session_title_abandoned_by_resume(
+        assert!(pending_session_title_abandoned_by_resume(
             &rec,
             SessionProvider::Codex,
             "different-codex-id"
@@ -19494,6 +19787,182 @@ mod pending_session_title_tests {
             SessionProvider::Claude,
             "previous-codex-id"
         ));
+    }
+
+    fn pending_codex() -> PendingSessionTitle {
+        PendingSessionTitle {
+            provider: "codex".into(),
+            title: "intelligent switching".into(),
+            created_at_ms: 10_000,
+            session_id: None,
+            previous_session_id: Some("old-codex".into()),
+        }
+    }
+
+    #[test]
+    fn unbound_codex_roundtrip_restarts_fresh_instead_of_resuming_previous() {
+        let rec = pending_codex();
+        assert_eq!(
+            new_session_launch_command("codex", &rec.title, None),
+            "codex"
+        );
+        // Switching away must not consume a different provider's request.
+        assert_eq!(
+            provider_switch_launch("claude", true, None, Some(&rec), None),
+            ("claude --continue".into(), "none")
+        );
+        assert!(!pending_session_title_abandoned_by_resume(
+            &rec,
+            SessionProvider::Claude,
+            "old-claude"
+        ));
+        // Both a persisted old pin and the --last fallback used to defeat New.
+        for pin in [Some("old-codex"), None] {
+            assert_eq!(
+                provider_switch_launch("codex", true, pin, Some(&rec), None),
+                ("codex".into(), "restart-pending")
+            );
+        }
+        assert!(!pending_session_title_can_claim(
+            &rec,
+            "old-codex",
+            true,
+            Some(10_001)
+        ));
+        assert!(pending_session_title_can_claim(
+            &rec,
+            "fresh-codex",
+            true,
+            Some(10_001)
+        ));
+    }
+
+    #[test]
+    fn discovered_pending_codex_outranks_old_pin_and_survives_rename_retry() {
+        let mut rec = pending_codex();
+        assert_eq!(
+            provider_switch_launch(
+                "codex",
+                true,
+                Some("old-codex"),
+                Some(&rec),
+                Some("fresh-codex")
+            ),
+            ("codex resume fresh-codex".into(), "resume-pending")
+        );
+        assert!(pending_session_title_can_claim(
+            &rec,
+            "fresh-codex",
+            true,
+            Some(10_001)
+        ));
+        assert!(claim_pending_session_title(
+            &mut rec,
+            "fresh-codex",
+            true,
+            Some(10_001)
+        ));
+        assert_eq!(rec.session_id.as_deref(), Some("fresh-codex"));
+        assert!(pending_session_title_can_claim(
+            &rec,
+            "fresh-codex",
+            false,
+            None
+        ));
+        assert!(!pending_session_title_abandoned_by_resume(
+            &rec,
+            SessionProvider::Codex,
+            "fresh-codex"
+        ));
+        assert!(pending_session_title_abandoned_by_resume(
+            &rec,
+            SessionProvider::Codex,
+            "another-old-session"
+        ));
+    }
+
+    #[test]
+    fn unbound_title_never_claims_an_old_rollout_on_rotation_or_outgoing_write() {
+        let mut rec = pending_codex();
+        assert!(!claim_pending_session_title(
+            &mut rec,
+            "old-codex",
+            true,
+            Some(10_001)
+        ));
+        assert!(!claim_pending_session_title(
+            &mut rec,
+            "another-old-session",
+            true,
+            Some(1)
+        ));
+        assert!(rec.session_id.is_none());
+        assert!(!pending_session_title_can_claim(
+            &rec,
+            "another-old-session",
+            true,
+            Some(1)
+        ));
+        assert!(!pending_session_title_can_claim(
+            &rec,
+            "unknown-birth",
+            true,
+            None
+        ));
+        assert!(!pending_session_title_can_claim(
+            &rec,
+            "fresh-codex",
+            false,
+            Some(10_001)
+        ));
+        assert!(!pending_session_title_can_claim(
+            &rec,
+            "",
+            true,
+            Some(10_001)
+        ));
+    }
+
+    #[test]
+    fn ordinary_provider_switch_and_claude_reserved_identity_are_unchanged() {
+        for (provider, expected) in [
+            ("claude", "claude --continue"),
+            ("codex", "codex resume --last"),
+        ] {
+            assert_eq!(
+                provider_switch_launch(provider, true, None, None, None).0,
+                expected
+            );
+            assert_eq!(
+                provider_switch_launch(provider, false, None, None, None).0,
+                provider
+            );
+        }
+        assert_eq!(
+            provider_switch_launch("codex", true, Some("pinned"), None, None).0,
+            "codex resume pinned"
+        );
+        let rec = PendingSessionTitle {
+            provider: "claude".into(),
+            session_id: Some("reserved".into()),
+            ..pending_codex()
+        };
+        assert_eq!(
+            new_session_launch_command("claude", &rec.title, rec.session_id.as_deref()),
+            "claude --name 'intelligent switching' --session-id reserved"
+        );
+        assert!(pending_session_title_can_claim(
+            &rec, "reserved", false, None
+        ));
+        assert!(!pending_session_title_abandoned_by_resume(
+            &rec,
+            SessionProvider::Claude,
+            "reserved"
+        ));
+        assert_eq!(
+            provider_switch_launch("codex", true, Some("old-codex"), Some(&rec), None).0,
+            "codex resume old-codex"
+        );
     }
 
     #[test]
@@ -19684,6 +20153,9 @@ fn create_new_session(
                         &format!("op=launch-timeout waited_ms={}", waited),
                     );
                 }
+                // A manual launch is now the only way on; let its boot
+                // bytes release the hold.
+                open_agent_boot_evidence(&waiter_app, "launch-timeout");
                 return;
             }
             Ok(waited) => {
@@ -19696,6 +20168,7 @@ fn create_new_session(
                 }
             }
         }
+        open_agent_boot_evidence(&waiter_app, "launch");
         let _ = pty_write_internal(
             &waiter_app,
             &state,
@@ -20230,6 +20703,34 @@ mod agent_startup_policy_tests {
         assert_eq!(merged["shell"]["args"], "--flag");
         assert_eq!(merged["shell"]["firstCommand"], "/status");
     }
+
+    // suggest-fresh-session: defaults, and a partial `sessions` save that
+    // flips one key without disturbing the other keys or other sections.
+    #[test]
+    fn sessions_settings_defaults_and_partial_save() {
+        let view = settings_view_from_config(None);
+        assert_eq!(view["sessions"]["suggestOnNewItem"], true);
+        assert_eq!(view["sessions"]["suggestOnNewIssue"], true);
+        assert_eq!(view["sessions"]["suggestOnTopicShift"], false);
+
+        let existing = serde_json::json!({
+            "ui": { "showTargetApp": true },
+            "shell": { "agent": "codex" }
+        });
+        let update = serde_json::json!({ "sessions": { "suggestOnTopicShift": true } });
+        let merged = merge_settings_into_config(existing, &update);
+        assert_eq!(merged["ui"]["showTargetApp"], true);
+        assert_eq!(merged["shell"]["agent"], "codex");
+        assert_eq!(merged["sessions"]["suggestOnTopicShift"], true);
+        assert!(merged["sessions"].get("suggestOnNewItem").is_none());
+
+        let cfg = serde_json::from_value::<ProjectConfig>(merged).unwrap();
+        let view = settings_view_from_config(Some(cfg));
+        assert_eq!(view["sessions"]["suggestOnNewItem"], true);
+        assert_eq!(view["sessions"]["suggestOnNewIssue"], true);
+        assert_eq!(view["sessions"]["suggestOnTopicShift"], true);
+        assert_eq!(view["ui"]["showTargetApp"], true);
+    }
 }
 
 fn trace_agent_pty_step<R: tauri::Runtime>(
@@ -20373,6 +20874,19 @@ fn settings_view_from_config(config: Option<ProjectConfig>) -> serde_json::Value
     let describe_commands = project_config_describe_commands(config.clone());
     let search_commit_depth = search_commit_depth_from_config(config.as_ref());
     let search_issue_limit = search_issue_limit_from_config(config.as_ref());
+    let sessions_cfg = config.as_ref().and_then(|c| c.sessions.clone());
+    let suggest_on_new_item = sessions_cfg
+        .as_ref()
+        .and_then(|s| s.suggest_on_new_item)
+        .unwrap_or(true);
+    let suggest_on_new_issue = sessions_cfg
+        .as_ref()
+        .and_then(|s| s.suggest_on_new_issue)
+        .unwrap_or(true);
+    let suggest_on_topic_shift = sessions_cfg
+        .as_ref()
+        .and_then(|s| s.suggest_on_topic_shift)
+        .unwrap_or(false);
     let (
         agent,
         args,
@@ -20462,6 +20976,11 @@ fn settings_view_from_config(config: Option<ProjectConfig>) -> serde_json::Value
         },
         "worklist": { "batchCommitActions": batch },
         "ui": { "showTargetApp": show_target_app, "toolsPaneHotReload": tools_pane_hot_reload },
+        "sessions": {
+            "suggestOnNewItem": suggest_on_new_item,
+            "suggestOnNewIssue": suggest_on_new_issue,
+            "suggestOnTopicShift": suggest_on_topic_shift
+        },
         "traces": {
             "enabled": tracing_enabled,
             "inspectorTap": inspector_tap,
@@ -21819,7 +22338,8 @@ fn git_push_stderr_is_nonff(stderr: &str) -> bool {
 #[cfg(test)]
 mod git_push_output_tests {
     use super::{
-        bram_trace_push_output, git_push_stderr_is_missing_upstream, git_push_stderr_is_nonff,
+        bram_trace_push_output, git_output_autostash_conflicted, git_output_is_index_lock_busy,
+        git_push_stderr_is_missing_upstream, git_push_stderr_is_nonff, git_trace_excerpt,
         GitPushOutput,
     };
 
@@ -21905,6 +22425,44 @@ mod git_push_output_tests {
         assert!(out
             .combined_for_display()
             .contains("has no upstream branch policy exception"));
+    }
+
+    // pull-rebase-stash-safety: the texts below are git 2.48.1's own output,
+    // captured in a scratch repo (and, for the lock, in the 2026-09-30
+    // field failure).
+    #[test]
+    fn index_lock_busy_detected_only_for_the_lock_refusal() {
+        assert!(git_output_is_index_lock_busy(
+            "fatal: Unable to create '/Users/x/repo/.git/index.lock': File exists.\n\nAnother git process seems to be running in this repository"
+        ));
+        assert!(git_output_is_index_lock_busy(
+            "error: could not write index\nfatal: Cannot autostash"
+        ));
+        assert!(git_output_is_index_lock_busy(
+            "error: cannot lock ref 'refs/remotes/origin/main': is at 7ca12a3 but expected 3b65062"
+        ));
+        assert!(!git_output_is_index_lock_busy(
+            "error: could not apply 61d3807... local"
+        ));
+    }
+
+    #[test]
+    fn autostash_conflict_detected_from_success_output() {
+        assert!(git_output_autostash_conflicted(
+            "Created autostash: 7b747b9\nFast-forward\nApplying autostash resulted in conflicts.\nYour changes are safe in the stash.\n"
+        ));
+        assert!(!git_output_autostash_conflicted(
+            "Created autostash: 7b747b9\nFast-forward\nApplied autostash.\n"
+        ));
+    }
+
+    #[test]
+    fn git_trace_excerpt_is_one_line_and_bounded() {
+        let long = format!("line one\nline two {}", "x".repeat(400));
+        let excerpt = git_trace_excerpt(&long);
+        assert!(!excerpt.contains('\n'));
+        assert!(excerpt.starts_with("line one\\nline two"));
+        assert!(excerpt.chars().count() <= 302);
     }
 
     #[test]
@@ -22172,6 +22730,12 @@ fn repo_has_origin<R: tauri::Runtime>(app: &AppHandle<R>) -> bool {
 }
 
 fn git_status_summary<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<Vec<u8>, String> {
+    // pull-rebase-stash-safety: wait for an in-flight Pull/Push rebase
+    // rather than race it (see git_rebase_exclusive_cell).
+    let _exclusive = match git_rebase_exclusive_cell().lock() {
+        Ok(guard) => guard,
+        Err(error) => error.into_inner(),
+    };
     // local-repo-no-origin-first-class: without an origin the fetch (and
     // the whole route with it, via `?`) used to fatal — the exact error a
     // local-only repo showed for merely opening the Commits tab. ahead /
@@ -22303,30 +22867,231 @@ fn upstream_is_fast_forward<R: tauri::Runtime>(app: &AppHandle<R>, branch: &str)
     }
 }
 
-// Dirty check that ignores exec-bit mode-only changes (100755 <-> 100644).
-// On Windows those filemode flips are a benign git artifact (#208); counting
-// them as dirty forces an unnecessary auto-stash before a rebase.
-fn working_tree_dirty_ignoring_filemode<R: tauri::Runtime>(app: &AppHandle<R>) -> bool {
-    git_run(app, &["-c", "core.fileMode=false", "status", "--porcelain"])
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false)
+// pull-rebase-stash-safety: both rebase paths (Pull, and Push's auto-rebase)
+// now let git stash with `--autostash` instead of a manual
+// `stash push --include-untracked` / `stash pop`. The manual stash wasn't
+// atomic: on 2026-09-30 it hit a held `.git/index.lock` after it had already
+// written the stash and removed six untracked files, Bram read the error as
+// "nothing stashed", and the files sat orphaned in `stash@{0}`. Autostash
+// stashes tracked changes only (a rebase never needs untracked files moved)
+// and reapplies them itself, including on `git rebase --abort`.
+// `-c core.fileMode=false` keeps #208's point: on Windows, exec-bit-only
+// flips are a benign artifact and shouldn't count as changes to stash.
+const GIT_LOCK_RETRY_DELAYS_MS: &[u64] = &[150, 300, 600, 1200];
+
+// Three shapes, all git 2.48.1 and all seen in the synthetic test: most
+// commands name the lock file; rebase's autostash step reports only "could
+// not write index" / "Cannot autostash"; a fetch racing another fetch
+// reports "cannot lock ref". A retried rebase can meet a half-started one,
+// which rebase_with_autostash cleans up.
+fn git_output_is_index_lock_busy(text: &str) -> bool {
+    (text.contains("index.lock") && text.contains("File exists"))
+        || text.contains("could not write index")
+        || text.contains("cannot lock ref")
 }
 
-// Whether a prior auto-stash with the given label is still on the stash stack.
-// Used to refuse stacking a second debris stash on top of one a previous
-// failed cycle left behind (#208).
-fn has_stash_labeled<R: tauri::Runtime>(app: &AppHandle<R>, label: &str) -> bool {
+// Git exits 0 when a rebase succeeds but reapplying the autostash conflicts:
+// it leaves conflict markers in the working tree and keeps the stash. The
+// output text is the only signal (verified on git 2.48.1).
+fn git_output_autostash_conflicted(text: &str) -> bool {
+    text.contains("Applying autostash resulted in conflicts")
+}
+
+fn git_trace_excerpt(text: &str) -> String {
+    text.trim()
+        .chars()
+        .take(300)
+        .collect::<String>()
+        .replace('\n', "\\n")
+}
+
+// Run a git step, retrying while another git process holds `index.lock`.
+// A lock refusal happens before git changes anything, so the retry is safe.
+fn git_run_capture_lock_retry<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    args: &[&str],
+    category: &str,
+    step: &str,
+) -> GitPushOutput {
+    let mut out = git_run_capture_both(app, args);
+    for (attempt, delay_ms) in GIT_LOCK_RETRY_DELAYS_MS.iter().enumerate() {
+        if out.ok || !git_output_is_index_lock_busy(&out.combined_for_display()) {
+            break;
+        }
+        if bram_trace_enabled() {
+            append_bram_trace_line(
+                app,
+                category,
+                &format!(
+                    "op=lock-retry step={} attempt={} delay_ms={}",
+                    step,
+                    attempt + 1,
+                    delay_ms
+                ),
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(*delay_ms));
+        out = git_run_capture_both(app, args);
+    }
+    out
+}
+
+const AUTOSTASH_RETAINED_ADVICE: &str = "your uncommitted changes conflicted with the incoming commits. Git left conflict markers in the affected files and kept a copy of your changes in the stash. To keep both: edit each file to what you want, run `git restore --staged <file>`, then `git stash drop`. To take the incoming version instead: `git checkout HEAD -- <file>` (your changes stay in the stash; `git stash show -p` shows them)";
+
+const AUTOSTASH_PARKED_ADVICE: &str = "your uncommitted changes weren't reapplied (another git process held the index). They're safe in the stash: run `git stash list`, then `git stash pop`";
+
+// `git stash list` entries git itself parks there when it can't reapply an
+// autostash, for any reason. Comparing the count before and after is the
+// reliable signal; git's wording varies by cause (conflict, held lock).
+fn autostash_entry_count<R: tauri::Runtime>(app: &AppHandle<R>) -> usize {
     git_run(app, &["stash", "list"])
-        .map(|s| s.lines().any(|line| line.contains(label)))
-        .unwrap_or(false)
+        .map(|s| s.lines().filter(|l| l.ends_with(": autostash")).count())
+        .unwrap_or(0)
+}
+
+fn rebase_in_progress<R: tauri::Runtime>(app: &AppHandle<R>) -> bool {
+    let Some(root) = project_root(Some(app)) else {
+        return false;
+    };
+    ["rebase-merge", "rebase-apply"].iter().any(|dir| {
+        git_run(app, &["rev-parse", "--git-path", dir])
+            .map(|p| root.join(p.trim()).exists())
+            .unwrap_or(false)
+    })
+}
+
+struct AutostashRebase {
+    ok: bool,
+    text: String,
+    autostash_retained: bool,
+    // The rebase failed and Bram couldn't abort it (the synthetic test hit
+    // this with the index locked: `rebase --abort` fatals with "could not
+    // move back"), so the repo is left mid-rebase.
+    rebase_stuck: bool,
+}
+
+impl AutostashRebase {
+    fn failure_message(&self) -> String {
+        let mut msg = self.text.trim().to_string();
+        if self.rebase_stuck {
+            msg.push_str("\n\nA rebase is still in progress: Bram couldn't abort it. Run `git rebase --abort`.");
+        }
+        if self.autostash_retained {
+            msg.push_str("\n\nGit saved your uncommitted changes in the stash (`git stash list`). If `git status` shows them missing from your files, run `git stash pop`; if they're still there, the stash entry is a spare copy you can drop.");
+        }
+        msg
+    }
+
+    fn retained_advice(&self) -> &'static str {
+        if git_output_autostash_conflicted(&self.text) {
+            AUTOSTASH_RETAINED_ADVICE
+        } else {
+            AUTOSTASH_PARKED_ADVICE
+        }
+    }
+}
+
+// Shared by Pull and Push's auto-rebase: optionally fetch, then
+// `rebase --autostash <upstream>`, abort on failure, and report honestly
+// whether the user's changes came back and whether the rebase is over.
+// Serializes the autostash rebase against Bram's own status refresh
+// (git_status_summary), which every git change triggers and which runs
+// `git fetch` and index reads. In the synthetic test that refresh, racing a
+// pull, broke the fetch ("cannot lock ref"), the rebase ("could not write
+// index", after creating .git/rebase-merge) and the abort.
+fn git_rebase_exclusive_cell() -> &'static Mutex<()> {
+    static CELL: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(()))
+}
+
+fn rebase_with_autostash<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    upstream: &str,
+    fetch_first: bool,
+    category: &str,
+    op: &str,
+) -> AutostashRebase {
+    let _exclusive = match git_rebase_exclusive_cell().lock() {
+        Ok(guard) => guard,
+        Err(error) => error.into_inner(),
+    };
+    let before = autostash_entry_count(app);
+    let out = {
+        let fetch = if fetch_first {
+            Some(git_run_capture_lock_retry(
+                app,
+                &["fetch", "origin"],
+                category,
+                "fetch",
+            ))
+        } else {
+            None
+        };
+        match fetch {
+            Some(f) if !f.ok => f,
+            _ => {
+                let rebase_args: &[&str] = &[
+                    "-c",
+                    "core.fileMode=false",
+                    "rebase",
+                    "--autostash",
+                    upstream,
+                ];
+                git_run_capture_lock_retry(app, rebase_args, category, "rebase")
+            }
+        }
+    };
+    let text = out.combined_for_display();
+    let mut rebase_stuck = false;
+    if !out.ok && rebase_in_progress(app) {
+        // Aborting reapplies the autostash. Retried on a held lock, because
+        // a failed abort leaves the repo mid-rebase.
+        let _ = git_run_capture_lock_retry(app, &["rebase", "--abort"], category, "abort");
+        if rebase_in_progress(app) {
+            // A rebase that failed while starting can leave only
+            // .git/rebase-merge/autostash (no head-name), which --abort
+            // can't read. --quit clears it and moves the autostash to the
+            // stash list; the working tree is untouched.
+            let _ = git_run_capture_lock_retry(app, &["rebase", "--quit"], category, "quit");
+        }
+        rebase_stuck = rebase_in_progress(app);
+    }
+    let autostash_retained =
+        autostash_entry_count(app) > before || (out.ok && git_output_autostash_conflicted(&text));
+    if bram_trace_enabled() {
+        let line = if out.ok {
+            format!(
+                "op={} ok=true autostash_retained={}",
+                op, autostash_retained
+            )
+        } else {
+            format!(
+                "op={} ok=false exit={} autostash_retained={} rebase_stuck={} err={}",
+                op,
+                out.exit_code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                autostash_retained,
+                rebase_stuck,
+                git_trace_excerpt(&text)
+            )
+        };
+        append_bram_trace_line(app, category, &line);
+    }
+    AutostashRebase {
+        ok: out.ok,
+        text,
+        autostash_retained,
+        rebase_stuck,
+    }
 }
 
 // Rebase local commits on top of origin and retry push. Takes a fast-forward
 // fast path when origin has nothing HEAD lacks: a plain `git push`, no stash
-// and no rebase. Only when the branch has genuinely diverged does it stash any
-// uncommitted changes (filemode-insensitive), rebase, push, and pop the stash.
-// If the stash pop has conflicts, the stash is left in place so the user can
-// recover via `git stash list` / `git stash apply`.
+// and no rebase. Only when the branch has genuinely diverged does it rebase
+// with `--autostash` (tracked changes only, filemode-insensitive), then push.
+// If reapplying the autostash conflicts, git keeps the stash and the error
+// says so.
 fn auto_rebase_and_push<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     // no-origin-console-error-remaining-paths: the Push button is hidden in
     // a no-origin repo, but the route stays reachable (stale pane, curl) —
@@ -22363,122 +23128,74 @@ fn auto_rebase_and_push<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<(), Str
             &format!("op=push path=rebase branch={}", branch),
         );
     }
-    let dirty = working_tree_dirty_ignoring_filemode(app);
-    let mut stashed = false;
-    if dirty {
-        if has_stash_labeled(app, "bram-auto-rebase") {
-            return Err("a previous bram-auto-rebase stash is still present — resolve it (`git stash list` / `git stash pop` / `git stash drop`) before retrying the push".to_string());
-        }
-        git_run(
-            app,
-            &[
-                "stash",
-                "push",
-                "--include-untracked",
-                "-m",
-                "bram-auto-rebase",
-            ],
-        )
-        .map_err(|e| format!("auto-stash failed: {}", e))?;
-        stashed = true;
+    let upstream = format!("origin/{}", branch);
+    let rebase = rebase_with_autostash(app, &upstream, false, "git-push", "rebase");
+    if !rebase.ok {
+        return Err(format!(
+            "rebase conflicts (aborted — re-run the rebase manually or ask the agent, then push): {}",
+            rebase.failure_message()
+        ));
     }
-
-    let result: Result<(), String> = (|| {
-        let upstream = format!("origin/{}", branch);
-        match git_run(app, &["rebase", &upstream]) {
-            Ok(_) => {
-                let push_args: &[&str] = &["push"];
-                let out = git_run_capture_both(app, push_args);
-                trace_git_push_result(app, "rebase", push_args, &branch, &out);
-                if out.ok {
-                    Ok(())
-                } else {
-                    Err(out.combined_for_display())
-                }
-            }
-            Err(rebase_err) => {
-                let _ = git_run(app, &["rebase", "--abort"]);
-                Err(format!(
-                    "rebase conflicts (aborted, working tree clean — re-run the rebase manually or ask the agent, then push): {}",
-                    rebase_err.trim()
-                ))
-            }
-        }
-    })();
-
-    if stashed {
-        if let Err(pop_err) = git_run(app, &["stash", "pop"]) {
-            let prefix = result
-                .as_ref()
-                .err()
-                .cloned()
-                .unwrap_or_else(|| "push succeeded".to_string());
-            return Err(format!(
-                "{}; stash pop failed: {} (stash retained — recover with `git stash list` / `git stash apply`)",
-                prefix,
-                pop_err.trim()
-            ));
-        }
+    let autostash_retained = rebase.autostash_retained;
+    let push_args: &[&str] = &["push"];
+    let out = git_run_capture_both(app, push_args);
+    trace_git_push_result(app, "rebase", push_args, &branch, &out);
+    if !out.ok {
+        return Err(out.combined_for_display());
     }
-
-    result
+    if autostash_retained {
+        return Err(format!("push succeeded, but {}", rebase.retained_advice()));
+    }
+    Ok(())
 }
 
-fn pull_rebase_with_autostash<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+struct PullRebaseOutcome {
+    autostash_retained: bool,
+    advice: &'static str,
+}
+
+fn pull_rebase_with_autostash<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+) -> Result<PullRebaseOutcome, String> {
     // no-origin-console-error-remaining-paths: same clean refusal as the
     // push route — `git pull` in a no-origin repo fatals on 'origin'.
     if !repo_has_origin(app) {
         return Err("no remote configured — this is a local-only repository".to_string());
     }
-    let dirty = git_run(app, &["status", "--porcelain"])
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false);
-    let mut stashed = false;
-    if dirty {
-        git_run(
-            app,
-            &[
-                "stash",
-                "push",
-                "--include-untracked",
-                "-m",
-                "bram-pull-rebase",
-            ],
-        )
-        .map_err(|e| format!("auto-stash failed: {}", e))?;
-        stashed = true;
+    // Fetch, then rebase onto the upstream ref, rather than `git pull
+    // --rebase`: pull reads FETCH_HEAD after its own fetch, and the pane's
+    // /__git/status refresh (fired by every git change) runs its own `git
+    // fetch origin`, rewriting FETCH_HEAD mid-pull ("no such ref was
+    // fetched", "Cannot rebase onto multiple branches"; both seen in the
+    // synthetic test). `@{u}` is a ref, updated atomically.
+    let rebase = rebase_with_autostash(app, "@{u}", true, "git-pull", "pull-rebase");
+    if !rebase.ok {
+        return Err(rebase.failure_message());
     }
-
-    let result = git_run(app, &["pull", "--rebase"]).map(|_| ());
-    if result.is_err() {
-        let _ = git_run(app, &["rebase", "--abort"]);
-    }
-
-    if stashed {
-        if let Err(pop_err) = git_run(app, &["stash", "pop"]) {
-            let prefix = result
-                .as_ref()
-                .err()
-                .cloned()
-                .unwrap_or_else(|| "pull succeeded".to_string());
-            return Err(format!(
-                "{}; stash pop failed: {} (stash retained — recover with `git stash list` / `git stash apply`)",
-                prefix,
-                pop_err.trim()
-            ));
-        }
-    }
-
-    result
+    Ok(PullRebaseOutcome {
+        autostash_retained: rebase.autostash_retained,
+        advice: rebase.retained_advice(),
+    })
 }
 
 fn handle_git_pull_rebase<R: tauri::Runtime>(app: &AppHandle<R>) -> (u16, &'static str, Vec<u8>) {
     match pull_rebase_with_autostash(app) {
-        Ok(_) => (
-            200,
-            "application/json; charset=utf-8",
-            br#"{"ok":true}"#.to_vec(),
-        ),
+        Ok(outcome) => {
+            let body = if outcome.autostash_retained {
+                serde_json::json!({
+                    "ok": true,
+                    "autostashRetained": true,
+                    "message": format!("Pulled, but {}.", outcome.advice),
+                })
+            } else {
+                serde_json::json!({ "ok": true })
+            };
+            (
+                200,
+                "application/json; charset=utf-8",
+                body.to_string().into_bytes(),
+            )
+        }
         Err(e) => {
             eprintln!("[http /__git/pull-rebase] {}", e);
             (500, "text/plain; charset=utf-8", e.into_bytes())
@@ -35952,10 +36669,13 @@ static SEND_GATE_STALE_WARNED_MS: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(0);
 
 // The menu tool currently blocking pane sends, or None when sends may
-// flow. AskUserQuestion is exempt: Claude Code's composer accepts typed
-// input while a question is displayed and typing over it is a
-// legitimate answer path (2026-07-19 22:04:50 landed in <1s with the
-// question open); permission menus and pickers swallow pasted input.
+// flow. AskUserQuestion used to be exempt ("typing over it is a
+// legitimate answer path", 2026-07-19 22:04:50). It isn't any more: on
+// 2026-09-30 21:17:21Z (Claude Code 2.1.286) a pane send with the question
+// open had its paste ignored, and its Enter chose the highlighted option;
+// the answer was recorded as option 1 and the message was lost. Held like
+// any other menu, the send goes out after the question is answered; the
+// card's "Type something" row is the way to answer in your own words.
 // guard-double-escape-agent-exit: a pane-origin bare Esc is forwarded
 // only when it has a job — an open turn to interrupt (lenient PTY-chrome
 // phase check, so a genuine interrupt is never held; see the #210 scar in
@@ -35975,16 +36695,36 @@ fn pane_escape_has_job() -> bool {
         || PANE_MENU_DISPLAYED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+// askuserquestion-card-type-something-and-chat: choosing "Type something."
+// dismisses the menu at the digit, but Claude is still waiting for the
+// text. A held pane send released then lands in that input line and is
+// submitted as the answer (2026-09-30 21:27:51Z). So the gate stays shut
+// from that digit until an Enter is written, or for 30 s at most.
+static AUQ_FREE_TEXT_SINCE_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+const AUQ_FREE_TEXT_MAX_MS: i64 = 30_000;
+
+fn auq_free_text_open() -> bool {
+    let since = AUQ_FREE_TEXT_SINCE_MS.load(std::sync::atomic::Ordering::Relaxed);
+    since > 0 && unix_now_ms().saturating_sub(since) < AUQ_FREE_TEXT_MAX_MS
+}
+
+// Whether `answer` picks the pending AskUserQuestion's "Type something."
+// row: the second to last, per askuserquestion_to_menu.
+fn menu_answer_opens_free_text(menu: Option<&PtyMenu>, answer: &str) -> bool {
+    let Some(m) = menu else {
+        return false;
+    };
+    m.tool == "AskUserQuestion"
+        && m.options.len() >= 3
+        && m.options[m.options.len() - 2].key == answer.trim()
+}
+
 fn send_gate_blocking_menu_tool() -> Option<String> {
-    turn_state_cell().lock().ok().and_then(|t| {
-        t.pending_menu.as_ref().and_then(|m| {
-            if m.tool == "AskUserQuestion" {
-                None
-            } else {
-                Some(m.tool.clone())
-            }
-        })
-    })
+    turn_state_cell()
+        .lock()
+        .ok()
+        .and_then(|t| t.pending_menu.as_ref().map(|m| m.tool.clone()))
+        .or_else(|| auq_free_text_open().then(|| "AskUserQuestion".to_string()))
 }
 
 // new-session-handoff-race: from New Session click until the fresh agent CLI
@@ -36003,6 +36743,98 @@ static AGENT_BOOT_HOLD_GENERATION: std::sync::atomic::AtomicU64 =
 static AGENT_BOOT_RELEASED_GENERATION: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 const AGENT_BOOT_HOLD_EXPIRE_MS: i64 = 30_000;
+// new-session-first-message-boot-settle: evidence starts a settle window
+// instead of releasing at once. Claude Code enables its TUI modes, turns
+// them off, re-enables them and only then draws its input (2026-09-30
+// 20:25:56Z: the brief pasted into that ~300 ms gap was swallowed). The
+// hold releases once the window passes with no further mode toggle; the
+// drain tick (~300 ms) polls the deadline. AGENT_BOOT_HOLD_EXPIRE_MS
+// still bounds the whole hold.
+const AGENT_BOOT_SETTLE_MS: i64 = 400;
+static AGENT_BOOT_SETTLE_DEADLINE_MS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+static AGENT_BOOT_SETTLE_RESETS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+// Boot evidence counts only once the new CLI's launch command has been
+// typed. Before that the outgoing agent is still painting and tearing down,
+// and its bytes look exactly like boot evidence (2026-09-30 20:51:02.992Z:
+// Codex's own ?2026h, 1 ms after arming, then its exit's ?1004l, released
+// the hold 0.7 s before `codex` was launched; the brief was lost). #319
+// noted the same teardown source.
+static AGENT_BOOT_EVIDENCE_OPEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static AGENT_BOOT_EVIDENCE_IGNORED: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+// boot-settle-wait-for-claude-bounce: Claude Code enables its TUI modes,
+// turns them off, and turns them on again before its input is live. The
+// 400 ms quiet window guessed at that and lost at 2026-09-30 22:10Z, when
+// the OFF came 437 ms after the first ON. For Claude the release is now the
+// bounce itself: the first ON after an OFF. No timer decides readiness
+// (development-principles.md); AGENT_BOOT_HOLD_EXPIRE_MS only bounds the
+// wait. Codex doesn't bounce and keeps the quiet window, a known exception
+// until its own readiness evidence is found. The mode state is tracked from
+// the launch write onward, so a delivery can also be checked at write time.
+static BOOT_MODES_TRACKING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static BOOT_MODES_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static BOOT_MODES_SEEN_ON: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static BOOT_MODES_BOUNCED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static BOOT_MODES_OFF_AT_WRITE_SINCE_MS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct BootModes {
+    seen_on: bool,
+    on: bool,
+    bounced: bool,
+}
+
+// One focus-reporting toggle applied to the boot mode state. Returns the new
+// state and whether this toggle is the bounce's re-enable (ready).
+fn boot_modes_step(m: BootModes, on: bool) -> (BootModes, bool) {
+    if on {
+        let ready = m.bounced && !m.on;
+        (
+            BootModes {
+                seen_on: true,
+                on: true,
+                bounced: m.bounced,
+            },
+            ready,
+        )
+    } else {
+        (
+            BootModes {
+                seen_on: m.seen_on,
+                on: false,
+                bounced: m.bounced || m.seen_on,
+            },
+            false,
+        )
+    }
+}
+
+// Focus-reporting toggles in `buf`, in order, skipping any that end inside
+// the carried tail of the previous chunk.
+fn boot_focus_toggles(buf: &[u8], carry_len: usize) -> Vec<bool> {
+    let on: &[u8] = b"\x1b[?1004h";
+    let off: &[u8] = b"\x1b[?1004l";
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + on.len() <= buf.len() {
+        let w = &buf[i..i + on.len()];
+        let end = i + on.len();
+        if end > carry_len && (w == on || w == off) {
+            out.push(w == on);
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
 
 fn agent_boot_hold_provider_cell() -> &'static Mutex<String> {
     static CELL: OnceLock<Mutex<String>> = OnceLock::new();
@@ -36094,6 +36926,11 @@ fn arm_agent_boot_hold<R: tauri::Runtime>(app: &AppHandle<R>, provider: &str) {
     if let Ok(mut carry) = agent_boot_evidence_carry_cell().lock() {
         carry.clear();
     }
+    AGENT_BOOT_SETTLE_DEADLINE_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+    AGENT_BOOT_SETTLE_RESETS.store(0, std::sync::atomic::Ordering::Relaxed);
+    AGENT_BOOT_EVIDENCE_OPEN.store(false, std::sync::atomic::Ordering::Relaxed);
+    AGENT_BOOT_EVIDENCE_IGNORED.store(0, std::sync::atomic::Ordering::Relaxed);
+    set_boot_modes(false, BootModes::default());
     if bram_trace_enabled() {
         append_bram_trace_line(
             app,
@@ -36106,28 +36943,189 @@ fn arm_agent_boot_hold<R: tauri::Runtime>(app: &AppHandle<R>, provider: &str) {
     }
 }
 
-fn clear_agent_boot_hold<R: tauri::Runtime>(app: &AppHandle<R>, reason: &str) {
-    let since = AGENT_BOOT_HOLD_SINCE_MS.swap(0, std::sync::atomic::Ordering::Relaxed);
-    if since > 0 {
-        AGENT_BOOT_RELEASED_GENERATION.store(
-            AGENT_BOOT_HOLD_GENERATION.load(std::sync::atomic::Ordering::Relaxed),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+// Called just before the new CLI's launch command is written (or when the
+// launch gate times out and a manual launch is the only way on). Discards
+// anything the outgoing agent's bytes started.
+fn open_agent_boot_evidence<R: tauri::Runtime>(app: &AppHandle<R>, reason: &str) {
+    if !agent_boot_hold_active() {
+        return;
     }
-    if since > 0 && bram_trace_enabled() {
+    AGENT_BOOT_SETTLE_DEADLINE_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+    AGENT_BOOT_SETTLE_RESETS.store(0, std::sync::atomic::Ordering::Relaxed);
+    if let Ok(mut carry) = agent_boot_evidence_carry_cell().lock() {
+        carry.clear();
+    }
+    AGENT_BOOT_EVIDENCE_OPEN.store(true, std::sync::atomic::Ordering::Relaxed);
+    set_boot_modes(true, BootModes::default());
+    if bram_trace_enabled() {
         append_bram_trace_line(
             app,
             "send-gate",
             &format!(
-                "op=boot-evidence reason={} held_ms={}",
+                "op=boot-evidence-open reason={} ignored_before={}",
                 reason,
-                unix_now_ms().saturating_sub(since)
+                AGENT_BOOT_EVIDENCE_IGNORED.load(std::sync::atomic::Ordering::Relaxed)
             ),
         );
     }
 }
 
+fn set_boot_modes(tracking: bool, m: BootModes) {
+    use std::sync::atomic::Ordering::Relaxed;
+    BOOT_MODES_TRACKING.store(tracking, Relaxed);
+    BOOT_MODES_SEEN_ON.store(m.seen_on, Relaxed);
+    BOOT_MODES_ON.store(m.on, Relaxed);
+    BOOT_MODES_BOUNCED.store(m.bounced, Relaxed);
+    BOOT_MODES_OFF_AT_WRITE_SINCE_MS.store(0, Relaxed);
+}
+
+fn set_boot_modes_state(m: BootModes) {
+    use std::sync::atomic::Ordering::Relaxed;
+    BOOT_MODES_SEEN_ON.store(m.seen_on, Relaxed);
+    BOOT_MODES_ON.store(m.on, Relaxed);
+    BOOT_MODES_BOUNCED.store(m.bounced, Relaxed);
+}
+
+fn boot_modes() -> BootModes {
+    use std::sync::atomic::Ordering::Relaxed;
+    BootModes {
+        seen_on: BOOT_MODES_SEEN_ON.load(Relaxed),
+        on: BOOT_MODES_ON.load(Relaxed),
+        bounced: BOOT_MODES_BOUNCED.load(Relaxed),
+    }
+}
+
+fn boot_hold_is_claude() -> bool {
+    agent_boot_hold_provider() == "claude"
+}
+
+// Release the hold (both rules). Claude releases on the bounce; the quiet
+// window's poll calls this too.
+fn release_agent_boot_hold<R: tauri::Runtime>(app: &AppHandle<R>, rule: &str) {
+    AGENT_BOOT_SETTLE_DEADLINE_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+    let since = AGENT_BOOT_HOLD_SINCE_MS.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if since <= 0 {
+        return;
+    }
+    AGENT_BOOT_RELEASED_GENERATION.store(
+        AGENT_BOOT_HOLD_GENERATION.load(std::sync::atomic::Ordering::Relaxed),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    if bram_trace_enabled() {
+        let m = boot_modes();
+        append_bram_trace_line(
+            app,
+            "send-gate",
+            &format!(
+                "op=boot-settled rule={} bounced={} modes_on={} held_ms={} resets={}",
+                rule,
+                m.bounced,
+                m.on,
+                unix_now_ms().saturating_sub(since),
+                AGENT_BOOT_SETTLE_RESETS.load(std::sync::atomic::Ordering::Relaxed)
+            ),
+        );
+    }
+}
+
+// First boot evidence: start the settle window (no-op when unarmed, before
+// the launch, or already settling; later toggles go through
+// reset_agent_boot_settle).
+fn note_agent_boot_evidence<R: tauri::Runtime>(app: &AppHandle<R>, reason: &str) {
+    let since = AGENT_BOOT_HOLD_SINCE_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if since <= 0 {
+        return;
+    }
+    if !AGENT_BOOT_EVIDENCE_OPEN.load(std::sync::atomic::Ordering::Relaxed) {
+        let n = AGENT_BOOT_EVIDENCE_IGNORED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n == 0 && bram_trace_enabled() {
+            append_bram_trace_line(
+                app,
+                "send-gate",
+                &format!(
+                    "op=boot-evidence-ignored reason={} phase=pre-launch",
+                    reason
+                ),
+            );
+        }
+        return;
+    }
+    let now = unix_now_ms();
+    // Claude: no deadline; the bounce releases (i64::MAX marks "settling").
+    let deadline = if boot_hold_is_claude() {
+        i64::MAX
+    } else {
+        now + AGENT_BOOT_SETTLE_MS
+    };
+    if AGENT_BOOT_SETTLE_DEADLINE_MS
+        .compare_exchange(
+            0,
+            deadline,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        return;
+    }
+    if bram_trace_enabled() {
+        append_bram_trace_line(
+            app,
+            "send-gate",
+            &format!(
+                "op=boot-evidence reason={} held_ms={} release={}",
+                reason,
+                now.saturating_sub(since),
+                if boot_hold_is_claude() {
+                    "bounce".to_string()
+                } else {
+                    format!("quiet-window-{}ms", AGENT_BOOT_SETTLE_MS)
+                }
+            ),
+        );
+    }
+}
+
+// A mode toggle while settling: the TUI isn't done initializing.
+fn reset_agent_boot_settle<R: tauri::Runtime>(app: &AppHandle<R>, reason: &str) {
+    if boot_hold_is_claude() {
+        return;
+    }
+    if !agent_boot_hold_active()
+        || AGENT_BOOT_SETTLE_DEADLINE_MS.load(std::sync::atomic::Ordering::Relaxed) == 0
+    {
+        return;
+    }
+    AGENT_BOOT_SETTLE_DEADLINE_MS.store(
+        unix_now_ms() + AGENT_BOOT_SETTLE_MS,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let resets = AGENT_BOOT_SETTLE_RESETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if bram_trace_enabled() {
+        append_bram_trace_line(
+            app,
+            "send-gate",
+            &format!("op=boot-settle-reset reason={} resets={}", reason, resets),
+        );
+    }
+}
+
+// Release the hold once the settle window has passed quietly. Called from
+// the drain tick and after each scanned chunk.
+fn poll_agent_boot_settle<R: tauri::Runtime>(app: &AppHandle<R>) {
+    let deadline = AGENT_BOOT_SETTLE_DEADLINE_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if deadline == 0 || deadline == i64::MAX || unix_now_ms() < deadline {
+        return;
+    }
+    if !agent_boot_hold_active() {
+        return;
+    }
+    release_agent_boot_hold(app, "quiet-window");
+}
+
 fn cancel_agent_boot_hold<R: tauri::Runtime>(app: &AppHandle<R>, reason: &str) {
+    AGENT_BOOT_SETTLE_DEADLINE_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+    set_boot_modes(false, BootModes::default());
     let since = AGENT_BOOT_HOLD_SINCE_MS.swap(0, std::sync::atomic::Ordering::Relaxed);
     if since > 0 && bram_trace_enabled() {
         append_bram_trace_line(
@@ -36169,12 +37167,46 @@ fn agent_boot_evidence_match(buf: &[u8]) -> Option<&'static str> {
         .find_map(|(p, n)| buf.windows(p.len()).any(|w| w == *p).then_some(*n))
 }
 
+// Mode toggles that restart the settle window. Synchronized output
+// (?2026h/l) is deliberately absent: Codex brackets every paint with it,
+// so it would never let the window pass. It still counts as first
+// evidence through AGENT_BOOT_EVIDENCE.
+const AGENT_BOOT_SETTLE_TOGGLES: [(&[u8], &str); 8] = [
+    (b"\x1b[?1004h", "focus-reporting"),
+    (b"\x1b[?2031h", "theme-notify"),
+    (b"\x1b[?1049h", "alt-screen"),
+    (b"\x1b[?1004l", "focus-reporting-off"),
+    (b"\x1b[?2031l", "theme-notify-off"),
+    (b"\x1b[?2004l", "bracketed-paste-off"),
+    (b"\x1b[?1049l", "alt-screen-off"),
+    (b"\x1b[?2004h", "bracketed-paste"),
+];
+
+// The last settle toggle in `buf` whose match ends past `carry_len`, so a
+// sequence already seen at the tail of the previous chunk (kept as carry)
+// isn't counted again.
+fn agent_boot_settle_toggle(buf: &[u8], carry_len: usize) -> Option<&'static str> {
+    let mut best: Option<(usize, &'static str)> = None;
+    for (pat, name) in AGENT_BOOT_SETTLE_TOGGLES.iter() {
+        for (i, w) in buf.windows(pat.len()).enumerate() {
+            let end = i + pat.len();
+            if w == *pat && end > carry_len && best.map_or(true, |(e, _)| end > e) {
+                best = Some((end, *name));
+            }
+        }
+    }
+    best.map(|(_, n)| n)
+}
+
 fn agent_boot_evidence_scan<R: tauri::Runtime>(app: &AppHandle<R>, chunk: &[u8]) {
-    if !agent_boot_hold_active() {
+    if !agent_boot_hold_active() && !BOOT_MODES_TRACKING.load(std::sync::atomic::Ordering::Relaxed)
+    {
         return;
     }
     let mut buf: Vec<u8> = Vec::with_capacity(chunk.len() + 16);
+    let mut carry_len = 0;
     if let Ok(mut carry) = agent_boot_evidence_carry_cell().lock() {
+        carry_len = carry.len();
         buf.extend_from_slice(&carry);
         buf.extend_from_slice(chunk);
         let keep = buf.len().min(15);
@@ -36182,9 +37214,29 @@ fn agent_boot_evidence_scan<R: tauri::Runtime>(app: &AppHandle<R>, chunk: &[u8])
     } else {
         buf.extend_from_slice(chunk);
     }
-    if let Some(name) = agent_boot_evidence_match(&buf) {
-        clear_agent_boot_hold(app, name);
+    if BOOT_MODES_TRACKING.load(std::sync::atomic::Ordering::Relaxed) {
+        let mut m = boot_modes();
+        let mut ready = false;
+        for on in boot_focus_toggles(&buf, carry_len) {
+            let (next, r) = boot_modes_step(m, on);
+            m = next;
+            ready |= r;
+        }
+        set_boot_modes_state(m);
+        if ready && boot_hold_is_claude() && agent_boot_hold_active() {
+            release_agent_boot_hold(app, "bounce");
+            return;
+        }
     }
+    let settling = AGENT_BOOT_SETTLE_DEADLINE_MS.load(std::sync::atomic::Ordering::Relaxed) != 0;
+    if !settling {
+        if let Some(name) = agent_boot_evidence_match(&buf) {
+            note_agent_boot_evidence(app, name);
+        }
+    } else if let Some(name) = agent_boot_settle_toggle(&buf, carry_len) {
+        reset_agent_boot_settle(app, name);
+    }
+    poll_agent_boot_settle(app);
 }
 
 #[cfg(test)]
@@ -36203,6 +37255,63 @@ mod agent_boot_evidence_tests {
     #[test]
     fn shell_bracketed_paste_and_prompt_are_not_boot_evidence() {
         assert_eq!(m(b"PS> \x1b[?2004h"), None);
+    }
+
+    // new-session-first-message-boot-settle: Claude's 2026-09-30 boot bytes.
+    // boot-settle-wait-for-claude-bounce: the recorded focus-reporting
+    // sequences. 20:44 and 22:10 are the same shape (ON, OFF, ON) at
+    // different speeds, which is the point: only the order matters.
+    #[test]
+    fn claude_is_ready_at_the_bounce_re_enable_not_before() {
+        use super::{boot_modes_step as step, BootModes};
+        let m = BootModes::default();
+        let (m, r1) = step(m, true);
+        assert!(!r1, "first ON is evidence, not readiness");
+        let (m, r2) = step(m, false);
+        assert!(!r2 && m.bounced && !m.on, "OFF after ON is the bounce");
+        let (m, r3) = step(m, true);
+        assert!(r3 && m.on, "ON after the bounce is ready");
+        let (_, r4) = step(m, true);
+        assert!(!r4, "a repeated ON is not a second readiness signal");
+    }
+    #[test]
+    fn an_off_before_any_on_is_not_a_bounce() {
+        use super::{boot_modes_step as step, BootModes};
+        let (m, _) = step(BootModes::default(), false);
+        assert!(!m.bounced);
+        let (_, r) = step(m, true);
+        assert!(!r);
+    }
+    #[test]
+    fn focus_toggles_are_read_in_order_from_the_22_10_bytes() {
+        use super::boot_focus_toggles as t;
+        let chunk = b"\x1b[?2004h\x1b[?2031h\x1b[?1004h..\x1b[?1004l\x1b[?2031l\x1b[?2004l..\x1b[?2004h\x1b[?2031h\x1b[?1004h";
+        assert_eq!(t(chunk, 0), vec![true, false, true]);
+        assert_eq!(t(b"\x1b[?1004h rest", 8), Vec::<bool>::new());
+    }
+    #[test]
+    fn claude_mode_bounce_resets_the_settle_window() {
+        use super::agent_boot_settle_toggle as t;
+        assert_eq!(
+            t(b"\x1b[>4m\x1b[?1004l\x1b[?2031l\x1b[?2004l", 0),
+            Some("bracketed-paste-off")
+        );
+        assert_eq!(
+            t(b"\x1b[?2004h\x1b[?2031h\x1b[?1004h", 0),
+            Some("focus-reporting")
+        );
+    }
+    #[test]
+    fn synchronized_output_never_resets_the_settle_window() {
+        use super::agent_boot_settle_toggle as t;
+        assert_eq!(t(b"\x1b[?2026h paint \x1b[?2026l", 0), None);
+    }
+    #[test]
+    fn a_toggle_seen_in_the_carry_is_not_counted_again() {
+        use super::agent_boot_settle_toggle as t;
+        let buf = b"\x1b[?1004l plain text";
+        assert_eq!(t(buf, 8), None);
+        assert_eq!(t(buf, 7), Some("focus-reporting-off"));
     }
 }
 
@@ -39658,6 +40767,13 @@ const CLAUDE_CURL_ALLOW_PATTERNS: &[&str] = &[
     "Bash(curl -4 -sS --retry-connrefused --retry 3 --retry-delay 1 -X POST * \"http://127.0.0.1*__iterate*)",
     "Bash(curl -4 -sS --retry-connrefused --retry 3 --retry-delay 1 \"http://127.0.0.1*__issue*)",
     "Bash(curl -4 -sS --retry-connrefused --retry 3 --retry-delay 1 \"http://127.0.0.1*__enhance*)",
+    // suggest-fresh-session: the convention reads GET /__settings (the
+    // `sessions` switches) and posts to /__sessions/suggest. The POST entries
+    // name that one route, not `__sessions*`, so a later POST route under
+    // /__sessions is not pre-approved by accident.
+    "Bash(curl -4 -sS --retry-connrefused --retry 3 --retry-delay 1 \"http://127.0.0.1*__settings*)",
+    "Bash(curl -4 -sS --retry-connrefused --retry 3 --retry-delay 1 -X POST \"http://127.0.0.1*__sessions/suggest*)",
+    "Bash(curl -4 -sS --retry-connrefused --retry 3 --retry-delay 1 -X POST * \"http://127.0.0.1*__sessions/suggest*)",
 ];
 // Compact high-priority gate prose embedded in the Bram binary. Keep detailed
 // lifecycle rules in app/__shell/conventions.md to avoid drift.
@@ -41723,6 +42839,41 @@ fn codex_hook_toml_block(guard_link: Option<&Path>) -> Option<String> {
 // The registered shadow path, only when it already exists on disk —
 // status checks must not reference (or create) a link the guard's own
 // startup/Setup path hasn't installed yet.
+// guard-link-per-project: record this instance's guard in its project, so
+// whichever guard ~/.bram/bram-guard reaches can route this project's hooks
+// to it (guard::route_target). Written at launch (the ticker's first pass)
+// and re-checked with each 60 s re-link; only on change, and only in a
+// managed project (one with resources/). Not removed on exit: a stale entry
+// still names this project's own build, which is the guard it should get.
+fn record_own_guard_target<R: tauri::Runtime>(app: &AppHandle<R>) {
+    let Some(root) = project_root(Some(app)) else {
+        return;
+    };
+    if !root.join("resources").is_dir() {
+        return;
+    }
+    let Some(guard_bin) = guard::own_guard_binary() else {
+        return;
+    };
+    let want = format!("{}\n", guard_bin.display());
+    let path = root.join(guard::GUARD_TARGET_REL);
+    if std::fs::read_to_string(&path).ok().as_deref() == Some(want.as_str()) {
+        return;
+    }
+    let result = atomic_write_text(&path, &want);
+    if bram_trace_enabled() {
+        append_bram_trace_line(
+            app,
+            "guard",
+            &format!(
+                "op=target-recorded guard={} result={}",
+                guard_bin.display(),
+                if result.is_ok() { "ok" } else { "error" }
+            ),
+        );
+    }
+}
+
 fn guard_link_if_installed() -> Option<PathBuf> {
     let link = home_dir()?.join(".bram").join(if cfg!(windows) {
         "bram-guard.exe"
@@ -54918,6 +56069,78 @@ mod comment_permalink_tests {
     }
 }
 
+// awaiting-you-sweep-only-issues-that-involve-you (judell/bram#406): the sweep
+// listed every open issue where someone else moved last, which is right for
+// the repo owner and wrong for a collaborator (Raymond saw the owner's #409
+// in his Needs you now). Off-owner viewers keep only issues they are in.
+//
+// The owner comes from the ISSUE URL, deliberately not from git `origin`: a
+// collaborator working in a fork has `origin` = their fork while gh lists the
+// upstream's issues.
+fn issue_repo_owner(url: &str) -> Option<&str> {
+    let rest = url.strip_prefix("https://github.com/")?;
+    let owner = rest.split('/').next().unwrap_or("");
+    if owner.is_empty() {
+        None
+    } else {
+        Some(owner)
+    }
+}
+
+// Agents post through the human's account, so "the viewer filed it" also
+// covers the viewer's own agent on any machine. Assignees aren't in the
+// cached fields, but the notifications path already lanes assign/mention.
+fn issue_involves_viewer(rec: &serde_json::Value, login: &str) -> bool {
+    let is_viewer = |v: &serde_json::Value| {
+        v["author"]["login"]
+            .as_str()
+            .is_some_and(|l| l.eq_ignore_ascii_case(login))
+    };
+    if is_viewer(rec) {
+        return true;
+    }
+    rec["comments"]
+        .as_array()
+        .is_some_and(|cs| cs.iter().any(is_viewer))
+}
+
+#[cfg(test)]
+mod issue_sweep_scope_tests {
+    use super::*;
+
+    #[test]
+    fn owner_from_issue_url() {
+        assert_eq!(
+            issue_repo_owner("https://github.com/judell/bram/issues/409"),
+            Some("judell")
+        );
+        assert_eq!(
+            issue_repo_owner("https://gitlab.com/judell/bram/issues/1"),
+            None
+        );
+        assert_eq!(issue_repo_owner(""), None);
+        assert_eq!(issue_repo_owner("https://github.com//bram/issues/1"), None);
+    }
+
+    #[test]
+    fn involves_viewer_cases() {
+        let authored = serde_json::json!({"author": {"login": "RdHyee"}});
+        assert!(issue_involves_viewer(&authored, "rdhyee"));
+        let commented = serde_json::json!({
+            "author": {"login": "judell"},
+            "comments": [{"author": {"login": "rdhyee"}, "body": "me too"}]
+        });
+        assert!(issue_involves_viewer(&commented, "rdhyee"));
+        let untouched = serde_json::json!({
+            "author": {"login": "judell"},
+            "comments": [{"author": {"login": "someone"}, "body": "x"}]
+        });
+        assert!(!issue_involves_viewer(&untouched, "rdhyee"));
+        let no_comments = serde_json::json!({"author": {"login": "judell"}});
+        assert!(!issue_involves_viewer(&no_comments, "rdhyee"));
+    }
+}
+
 fn local_issue_sweep_items<R: tauri::Runtime>(
     app: &AppHandle<R>,
     skip_numbers: &std::collections::HashSet<u64>,
@@ -54950,6 +56173,7 @@ fn local_issue_sweep_items<R: tauri::Runtime>(
     // (no origin) keeps the project dimension on its honest default.
     let local_locator =
         project_root(Some(app)).and_then(|root| guard_policy::expected_repo_locator(&root));
+    let mut skipped = 0usize;
     for rec in &issues {
         let state = rec.get("state").and_then(|v| v.as_str()).unwrap_or("");
         if !state.eq_ignore_ascii_case("open") {
@@ -54978,6 +56202,13 @@ fn local_issue_sweep_items<R: tauri::Runtime>(
         };
         if last.is_empty() {
             continue;
+        }
+        let url = rec.get("url").and_then(|v| v.as_str()).unwrap_or("");
+        if let Some(owner) = issue_repo_owner(url) {
+            if !owner.eq_ignore_ascii_case(&login) && !issue_involves_viewer(rec, &login) {
+                skipped += 1;
+                continue;
+            }
         }
         // awaiting-cross-machine-agent-moves: a move by the local login used
         // to be filtered unconditionally — which made an agent posting from
@@ -55010,7 +56241,6 @@ fn local_issue_sweep_items<R: tauri::Runtime>(
             }
         }
         let title = rec.get("title").and_then(|v| v.as_str()).unwrap_or("");
-        let url = rec.get("url").and_then(|v| v.as_str()).unwrap_or("");
         // awaiting-open-links-to-comment: on this path no parsing is needed —
         // `gh issue list --json comments` already hands back each comment's
         // web permalink (…/issues/<n>#issuecomment-<id>), so Open lands on the
@@ -55092,6 +56322,13 @@ fn local_issue_sweep_items<R: tauri::Runtime>(
                 "activityAt": marker,
             }),
         ));
+    }
+    if skipped > 0 {
+        append_bram_trace_line(
+            app,
+            "needs-you",
+            &format!("op=sweep-scoped kept={} skipped={}", out.len(), skipped),
+        );
     }
     out
 }
@@ -55450,6 +56687,103 @@ fn write_needs_you_dismissed<R: tauri::Runtime>(
         if std::fs::write(&tmp, format!("{}\n", body)).is_ok() {
             let _ = std::fs::rename(&tmp, &path);
         }
+    }
+}
+
+// suggest-fresh-session: pure parse/validate of the POST body. `name` is
+// required; `whatsNext` is optional. Both are trimmed.
+fn parse_sessions_suggest_body(body: &[u8]) -> Result<(String, String), &'static str> {
+    let parsed: serde_json::Value = serde_json::from_slice(body).map_err(|_| "invalid json")?;
+    let field = |key: &str| {
+        parsed
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    let name = field("name");
+    if name.is_empty() {
+        return Err("name required");
+    }
+    Ok((name, field("whatsNext")))
+}
+
+// POST /__sessions/suggest {name, whatsNext} (suggest-fresh-session): the
+// agent asks the pane to open its New session dialog pre-filled. Nothing is
+// created here; the user still edits and clicks Create. The emit is a plain
+// (non-replayable) one on purpose: remembering it would make the frontend's
+// replayLatest re-open the dialog on every pane reload.
+fn handle_sessions_suggest<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    body: &[u8],
+) -> (u16, &'static str, Vec<u8>) {
+    let (name, text) = match parse_sessions_suggest_body(body) {
+        Ok(v) => v,
+        Err(msg) => {
+            return (
+                400,
+                "application/json; charset=utf-8",
+                serde_json::json!({ "error": msg }).to_string().into_bytes(),
+            )
+        }
+    };
+    append_bram_trace_line(
+        app,
+        "session-suggest",
+        &format!(
+            "op=posted name_len={} text_len={}",
+            name.chars().count(),
+            text.chars().count()
+        ),
+    );
+    let payload = serde_json::json!({
+        "name": name,
+        "whatsNext": text,
+        "atMs": unix_now_ms(),
+    });
+    trace_emit_payload(app, "session-suggest", &payload);
+    let _ = app.emit("session-suggest", payload);
+    (
+        200,
+        "application/json; charset=utf-8",
+        br#"{"ok":true}"#.to_vec(),
+    )
+}
+
+#[cfg(test)]
+mod sessions_suggest_tests {
+    use super::parse_sessions_suggest_body;
+
+    #[test]
+    fn valid_body_is_trimmed() {
+        let r = parse_sessions_suggest_body(br#"{"name":" fix-x ","whatsNext":"  do it\n"}"#);
+        assert_eq!(r, Ok(("fix-x".to_string(), "do it".to_string())));
+    }
+
+    #[test]
+    fn missing_or_blank_name_is_rejected() {
+        assert_eq!(
+            parse_sessions_suggest_body(br#"{"whatsNext":"x"}"#),
+            Err("name required")
+        );
+        assert_eq!(
+            parse_sessions_suggest_body(br#"{"name":"   "}"#),
+            Err("name required")
+        );
+    }
+
+    #[test]
+    fn missing_whats_next_is_empty() {
+        assert_eq!(
+            parse_sessions_suggest_body(br#"{"name":"a"}"#),
+            Ok(("a".to_string(), String::new()))
+        );
+    }
+
+    #[test]
+    fn invalid_json_is_rejected() {
+        assert_eq!(parse_sessions_suggest_body(b"nope"), Err("invalid json"));
     }
 }
 
@@ -63760,9 +65094,24 @@ fn guard_selftest<R: tauri::Runtime>(app: &AppHandle<R>) -> serde_json::Value {
             }
         ),
     );
+    // guard-link-per-project: where the shared link points right now, and
+    // which guard this project records for itself. When they differ, hooks
+    // here are routed (hook-events.log `route` lines).
+    let link_target = link
+        .as_ref()
+        .and_then(|l| std::fs::read_link(l).ok())
+        .map(|t| t.to_string_lossy().to_string());
+    let project_guard = project_root(Some(app))
+        .and_then(|root| std::fs::read_to_string(root.join(guard::GUARD_TARGET_REL)).ok())
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
     serde_json::json!({
         "ok": ok,
         "link": link.map(|l| l.to_string_lossy().to_string()),
+        "routing": {
+            "linkTarget": link_target,
+            "projectGuard": project_guard,
+        },
         "cases": cases,
         "failed": failed,
         "registration": {
@@ -69829,6 +71178,16 @@ fn handle_http<R: tauri::Runtime>(app: &AppHandle<R>, mut request: tiny_http::Re
             let mut buf = Vec::new();
             let _ = request.as_reader().read_to_end(&mut buf);
             handle_needs_you_dismiss(app, &buf)
+        }
+    } else if path == "__sessions/suggest" {
+        // suggest-fresh-session: the agent asks the pane to open its New
+        // session dialog pre-filled. POST only; creates nothing.
+        if method != "POST" {
+            (405, "text/plain; charset=utf-8", b"POST only".to_vec())
+        } else {
+            let mut buf = Vec::new();
+            let _ = request.as_reader().read_to_end(&mut buf);
+            handle_sessions_suggest(app, &buf)
         }
     } else if path == "__issue-close-queue/withdraw" {
         // issue-382-withdraw-queued-close: pane-initiated removal of a

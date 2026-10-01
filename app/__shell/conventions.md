@@ -126,12 +126,14 @@ configuration issue, a process restart, every check passed):
   resulting row. No special undo path.
 
 **Write the finding into the draft before reporting it in chat.** Chat
-does not outlive the turn; the draft does. "Nothing came of it"
-collapses three situations with opposite right answers: never got to
+does not outlive the turn; the draft does. "No changes in this repo"
+collapses four situations with different right answers: never got to
 it (**Start again**), worked it and found nothing to change (**Drop**),
-or found the item's premise **false** (**Drop**, and the draft's own
-claims must say they are wrong). Record in
-`resources/worklist-drafts/<id>.md` which of the three it is: the
+found the item's premise **false** (**Drop**, and the draft's own
+claims must say they are wrong), or **done elsewhere**: a PR in another
+repo, a server change, a forge action (**Drop**, and the draft links
+where the work landed). Record in
+`resources/worklist-drafts/<id>.md` which of the four it is: the
 premise that failed, what was verified, and what would make the item
 actionable again.
 
@@ -575,6 +577,57 @@ self-contained, carrying the evidence inline.
 
 - **Two sessions coordinating across a boundary (upstream, another machine, another agent)** → read `.claude/bram-reference/environment.md` (§Working across project boundaries).
 
+### Suggest a fresh session for a new line of work
+
+A long session that wanders across topics is hard to find and hard to
+resume. Bram's **+ New session** dialog (Sessions tab) starts a fresh
+session with a brief, but the user has to think of it. You are the one
+who sees a new line of work begin, so offer it.
+
+**When.** Read `GET /__settings` and look at `sessions`. Each trigger
+has its own switch:
+
+- `suggestOnNewItem`: you are about to propose a worklist item.
+- `suggestOnNewIssue`: you are about to file an issue.
+- `suggestOnTopicShift`: the conversation has moved to a significantly
+  different topic.
+
+If the switch is on **and** the new work is a different line from what
+this session has been doing, ask in one line whether to continue it in
+a fresh session. Work that belongs to the session's existing line gets
+no question. Ask in prose, whichever agent you are: a provider's own
+question tool would make Claude and Codex behave differently.
+
+**Limits.** Ask at most once per topic. After a no, don't ask again
+about that topic. Don't ask in a session that is still short. Ask
+**before** you propose the item or file the issue, not after.
+
+**On yes, hand the work over; don't start it here.** Do not propose the
+item or file the issue in this session: the new session is where it gets
+discussed and created. `POST /__sessions/suggest` with
+`{"name": …, "whatsNext": …}` (same curl shape as the other POST
+routes). The Sessions tab opens the New session dialog filled in with
+both. **They are suggestions for the user to edit, and nothing is
+created until the user clicks Create.** Say so: "I've filled in a
+suggested name and brief; edit them to say it your way, then click
+**Create**." Write `whatsNext` in the user's terms, framing the new
+work, not as instructions from you. Put in it what this session already
+settled about the work, so the new session doesn't have to rediscover
+it.
+
+**On no**, carry on here: propose the item or file the issue as usual.
+
+**Names are how sessions are found later.** A later search for a
+session to resume reads titles, so err toward verbose and descriptive:
+
+- Name the subject and the activity, with the distinctive terms someone
+  would search for months later: "screencast storyboarding: rough scene
+  list from a session transcript", not "test session" or "follow-up".
+- Include the stable nouns the work is about (a feature, a component, an
+  issue number such as `#412`), not only verbs.
+- Leave out ephemera (today's date, "part 2") unless they distinguish
+  the session.
+
 
 ## Signing agent-authored forge artifacts
 
@@ -822,7 +875,7 @@ instead of a fix; for a plain change, just make it. Log-line shape →
   explicitly (e.g. `--workers=2`); default worker-per-core has frozen
   every webview on the machine.
 
-- **Something misbehaves, or you're designing a mechanism that acts on inferred conditions** → read `.claude/bram-reference/diagnostics.md` (§Log-first development).
+- **Something misbehaves, or you're designing a mechanism that waits or acts on inferred conditions** → read `.claude/bram-reference/diagnostics.md` (§Log-first development) and `development-principles.md`.
 - **Debugging Bram itself (trace log, Inspector export, Status tab)** → read `.claude/bram-reference/diagnostics.md` (§Debugging Bram itself).
 - **Questions about Bram's guards, retired hook scripts, or bundled skills** → read `.claude/bram-reference/diagnostics.md` (§Guards, retired hooks, and bundled skills).
 - **Your project's markup wants to talk back to the agent (`toShell`, `toTurn`)** → read `.claude/bram-reference/environment.md` (§Target app helpers).

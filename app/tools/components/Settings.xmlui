@@ -156,6 +156,36 @@
 
       <ContentSeparator />
 
+      <!-- suggest-fresh-session: the host serves sessions.{suggestOnNewItem,
+           suggestOnNewIssue,suggestOnTopicShift} from GET /__settings. Same
+           save-on-change shape as the hot-reload switch below; the read goes
+           through window.__bramSuggestSetting so the defaults (true/true/false)
+           live in one place. https://www.xmlui.org/docs/reference/components/Checkbox -->
+      <VStack gap="$space-2">
+        <Heading level="h3">Suggest a fresh session</Heading>
+        <Text
+          color="$textColor-secondary"
+          fontSize="$fontSize-sm"
+          value="The agent can offer to continue new work in a fresh session. It always asks first." />
+        <Checkbox
+          label="When the agent is about to propose a new worklist item"
+          labelPosition="end"
+          initialValue="{window.__bramSuggestSetting(settingsValue, 'suggestOnNewItem')}"
+          onDidChange="(v) => saveSettings.execute({ sessions: { suggestOnNewItem: v } })" />
+        <Checkbox
+          label="When the agent is about to file a new issue"
+          labelPosition="end"
+          initialValue="{window.__bramSuggestSetting(settingsValue, 'suggestOnNewIssue')}"
+          onDidChange="(v) => saveSettings.execute({ sessions: { suggestOnNewIssue: v } })" />
+        <Checkbox
+          label="When the conversation shifts to a significantly different topic"
+          labelPosition="end"
+          initialValue="{window.__bramSuggestSetting(settingsValue, 'suggestOnTopicShift')}"
+          onDidChange="(v) => saveSettings.execute({ sessions: { suggestOnTopicShift: v } })" />
+      </VStack>
+
+      <ContentSeparator />
+
       <VStack gap="$space-4">
         <HStack
           width="fit-content"
@@ -182,6 +212,7 @@
         <Switch
           id="mirrorIssuesSwitch"
           label="Mirror Worklist lifecycle to GitHub issues"
+          labelPosition="end"
           initialValue="{!!(settingsValue &amp;&amp; settingsValue.mirrorWorklistLifecycleToIssue)}"
           onDidChange="(v) => saveSettings.execute({ mirrorWorklistLifecycleToIssue: v })" />
       </VStack>
@@ -208,11 +239,13 @@
         <Switch
           id="targetAppSwitch"
           label="Show target app"
+          labelPosition="end"
           initialValue="{settingsShowTargetApp(settingsValue)}"
           onDidChange="(v) => saveSettings.execute({ ui: { showTargetApp: v } })" />
         <Switch
           id="hotReloadSwitch"
           label="Agent-pane hot-reload"
+          labelPosition="end"
           initialValue="{settingsToolsPaneHotReload(settingsValue)}"
           onDidChange="(v) => saveSettings.execute({ ui: { toolsPaneHotReload: v } })" />
         <!-- issue-231: per-user preferences, localStorage-backed (not project
@@ -221,12 +254,14 @@
              dismiss tooltip echoes it. -->
         <Switch
           label="Show tips in the footer"
+          labelPosition="end"
           initialValue="{window.__bramTipsEnabled ? window.__bramTipsEnabled() : true}"
           onDidChange="(v) => window.__bramSetTipsEnabled(v)" />
         <!-- turn-complete-beep: per-user (localStorage) audio cue; toggling
              on plays the beep once as confirmation. -->
         <Switch
           label="Soft beep on menus and turn completion"
+          labelPosition="end"
           initialValue="{window.__bramBeepEnabled ? window.__bramBeepEnabled() : false}"
           onDidChange="(v) => window.__bramSetBeepEnabled(v)" />
         <VStack
@@ -250,6 +285,7 @@
              Search tab opens with all facet badges selected or none. -->
         <Switch
           label="Search badges start all on"
+          labelPosition="end"
           initialValue="{window.__bramSearchBadgesInitialAllOn ? window.__bramSearchBadgesInitialAllOn() : true}"
           onDidChange="(v) => window.__bramSetSearchBadgesInitialAllOn(v)" />
       </VStack>
@@ -281,6 +317,7 @@
           <Switch
             id="descriptionsSwitch"
             label="Tool Descriptions"
+            labelPosition="end"
             initialValue="{settingsDescribeCommands(settingsValue)}"
             onDidChange="(v) => saveSettings.execute({ ai: { describeCommands: v } })" />
         </VStack>
@@ -308,11 +345,13 @@
         <Switch
           id="tracingSwitch"
           label="Tracing enabled"
+          labelPosition="end"
           initialValue="{settingsTracingEnabled(settingsValue)}"
           onDidChange="(v) => saveSettings.execute({ traces: { enabled: v } })" />
         <Switch
           id="inspectorTapSwitch"
           label="Inspector trace tap"
+          labelPosition="end"
           initialValue="{settingsInspectorTap(settingsValue)}"
           onDidChange="(v) => saveSettings.execute({ traces: { inspectorTap: v } })" />
         <Form

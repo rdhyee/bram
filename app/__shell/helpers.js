@@ -775,6 +775,57 @@ window.sendKeys = function (text) {
 // immediate double-click window synchronously; the host independently checks
 // the identity against its current OpenPrompt before writing any bytes.
 if (!window.__bramSentMenuAnswerIds) window.__bramSentMenuAnswerIds = new Set();
+// askuserquestion-card-type-something-and-chat: in an AskUserQuestion card
+// the host appends Claude's own two rows last, so "Type something." is the
+// second to last. Position, not label, so an agent option that happens to
+// share the label isn't mistaken for it.
+window.__bramIsTypeSomethingRow = function (menu, item) {
+  var opts = (menu && menu.options) || [];
+  return !!(menu && menu.tool === "AskUserQuestion" && item &&
+    opts.length >= 3 && String(item.key) === String(opts.length - 1));
+};
+// A card row click. Returns the value for the card's typeSomethingKey var:
+// the row's key when it's the "Type something." row (opening the text box),
+// otherwise the current value, after sending the row's answer.
+// The returned value is the prompt id the text box is open for, so a box
+// opened for one question never shows on the next (2026-09-30 21:25: a box
+// left open from the previous question appeared without choosing 3).
+window.__bramMenuRowClick = function (menu, item, answerKeys, promptId, current) {
+  if (window.__bramIsTypeSomethingRow(menu, item)) return String(promptId || "");
+  window.__bramSendMenuAnswer(answerKeys, promptId);
+  return current;
+};
+window.__bramTypeSomethingKey = function (menu) {
+  var opts = (menu && menu.options) || [];
+  return opts.length >= 3 ? String(opts[opts.length - 2].key) : "";
+};
+// The chosen "Type something." row reads as selected while its box is open.
+window.__bramMenuRowVariant = function (menu, item, openFor, promptId) {
+  return openFor && openFor === promptId && window.__bramIsTypeSomethingRow(menu, item)
+    ? "solid"
+    : "outlined";
+};
+// Answer via Claude's free-text row, in the order the 2026-09-30 specimen
+// showed works when typed: the row's digit (which switches Claude to its
+// input at once), then the text, then Enter, as separate writes. One write
+// of all three would reach Claude as a single chunk and risks being read
+// as a paste instead of a menu shortcut. The text is one line: Enter would
+// submit early.
+window.__bramAnswerTypeSomething = function (key, text, promptId) {
+  var said = String(text || "").replace(/[\r\n]+/g, " ").trim();
+  window.__bramIframeTrace("menu-answer-client", {
+    op: "type-something",
+    promptId: String(promptId || ""),
+    key: String(key || ""),
+    textLength: said.length,
+  });
+  if (!said || !key) return;
+  window.__bramSendMenuAnswer(String(key), promptId);
+  setTimeout(function () {
+    window.sendKeys(said);
+    setTimeout(function () { window.sendKeys("\r"); }, 150);
+  }, 250);
+};
 window.__bramSendMenuAnswer = function (text, promptId) {
   var id = String(promptId || "");
   var data = String(text || "");
@@ -969,9 +1020,44 @@ window.__bramCreateNewSession = function (provider, title) {
     "new session"
   );
 };
-window.__bramCreateNewSessionClick = function (provider, name, toastApi) {
+// fresh-session-handoff-mock: the dialog's optional "what's next" is the
+// user's own words about the new work. Create wraps them in a brief that asks
+// the NEW session to build its own context (search history, read the session
+// being left) and settle the framing with the user before acting; there is
+// no handoff document and no back-and-forth in the old session. The brief
+// goes out as a plain toTurn, which the host's boot hold delivers as the new
+// session's first turn. Plain, so a ticked Worklist row can't turn it into
+// item feedback (the prototype's first run did).
+window.__bramNewSessionBrief = function (words, predecessor) {
+  var prev = predecessor && predecessor.id
+    ? "the session I just left (" + String(predecessor.provider || "") + " " + predecessor.id +
+      (predecessor.title ? ', "' + predecessor.title + '"' : "") + ")"
+    : "the session I just left (see the Sessions list)";
+  return [
+    "You're starting a new session for this line of work, in my words:",
+    "",
+    String(words || "").trim(),
+    "",
+    "Before anything else, build your context for it. Search the project history (/__search; the port is in resources/.bram-port) for what bears on it, and read " + prev + " where it's relevant.",
+    "",
+    "Then tell me what you found, with citations; what you looked for and didn't find; and what you think should frame this work. Don't change files or propose worklist items yet. We'll settle the framing together first.",
+  ].join("\n");
+};
+window.__bramCreateNewSessionClick = function (provider, name, toastApi, words, predecessor) {
+  var said = String(words || "").trim();
   if (typeof toastApi === "function") toastApi("Starting a new session…");
-  window.__bramCreateNewSession(provider, name).catch(function (e) {
+  window.__bramCreateNewSession(provider, name).then(function () {
+    if (!said) return;
+    var brief = window.__bramNewSessionBrief(said, predecessor);
+    window.__bramIframeTrace("new-session-client", {
+      op: "first-message-queued",
+      provider: String(provider || ""),
+      textLength: said.length,
+      briefLength: brief.length,
+      predecessor: (predecessor && predecessor.id) || "",
+    });
+    window.toTurn(brief);
+  }).catch(function (e) {
     if (toastApi && typeof toastApi.error === "function") {
       toastApi.error("Could not create session: " + String((e && e.message) || e));
     }
@@ -1013,6 +1099,9 @@ window.__bramSessionMetaLine = function (s) {
   if (!s) return "";
   var provider = String(s.provider || "").toUpperCase();
   var title = s.title || "(untitled)";
+  if (s.pending) {
+    return (provider ? provider + "  " : "") + title + "  ·  requested — session not yet confirmed";
+  }
   var id = String(s.id || "");
   var shortId = id.length > 12 ? id.slice(0, 12) : (id || "unknown");
   var when = "";
@@ -2823,7 +2912,7 @@ window.__bramEditorPlaceholder = function (lead, hasPaste, hasVoice) {
 
 window.__bramIsWorklistTextVoiceTarget = function (target) {
   var t = target || "";
-  return ["message-agent", "feedback", "new-item", "new-issue"].indexOf(t) !== -1
+  return ["message-agent", "feedback", "new-item", "new-issue", "new-session"].indexOf(t) !== -1
     || t.indexOf("feedback:") === 0
     || t.indexOf("queue-item:") === 0
     || t.indexOf("issue-comment:") === 0;
@@ -4149,7 +4238,7 @@ window.__bramWorklist2Strip = function (item, claim, items, attribution, attribu
   // issue-406: its work was committed outside the Worklist (a plain git
   // commit in chat or a terminal). The host sets `landed` only for a begun
   // item whose files are clean and were touched by a commit since it began,
-  // so this must win over "nothing came of it", which would misstate it.
+  // so this must win over "no changes in this repo", which would misstate it.
   if (item.landed && item.landed.short) {
     // The commit's subject lives in the tooltip, not the strip (Jon: "I
     // don't see what this part of the message is adding").
@@ -4183,12 +4272,17 @@ window.__bramWorklist2Strip = function (item, claim, items, attribution, attribu
     // So name the ambiguity and point at where the answer is. Since bc8e666 the
     // agent is REQUIRED to record which of the three it was in the draft before
     // reporting in chat, so the draft is not a guess -- it is the designated
-    // home for exactly this. The fact half (Green-lit <age>, nothing came of
-    // it) is unchanged; only the action tail moves.
+    // home for exactly this. Only the action tail moved then.
+    //
+    // issue-396: and the fact half was wrong in a fourth ending -- done, but
+    // outside what this board can commit (a PR in another repo, a server
+    // change, forge-only work). Raymond's case: a reviewed, approved PR in a
+    // nested repo read "nothing came of it". "No changes in this repo" is
+    // true in all four endings; the draft still says which one it was.
     var age = window.__bramGreenLitAge(item);
     return withCloses(
       "Green-lit" + (age ? " " + age : "") +
-        ", nothing came of it · the reason is in the draft — Start again, or Drop",
+        ", no changes in this repo · the reason is in the draft — Start again, or Drop",
     );
   }
   // issue-350-stranded-approval-reconciliation: the host marks an approved
@@ -9273,7 +9367,23 @@ window.bramSubscribeTauriEvent = (function () {
       function (e) {
         tick += 1;
         lastPayload = (e && e.payload) || null;
-        var snapshot = { tick: tick, payload: lastPayload };
+        var snapshot = { tick: tick, payload: lastPayload, name: eventName };
+        // awaiting-you-refetch-on-background-change: event-received's
+        // `subscribers` counts Tauri-listener registrations (one per cache
+        // key), not the PushSources behind it. push_subscribers is how many
+        // mounted PushSources this event actually reaches.
+        try {
+          if (typeof window.logToHost === "function") {
+            window.logToHost({
+              kind: "iframe-trace",
+              subkind: "push-fanout",
+              at: new Date().toISOString(),
+              event_name: eventName,
+              tick: tick,
+              push_subscribers: subscribers.size,
+            });
+          }
+        } catch (err) {}
         subscribers.forEach(function (fn) {
           try { fn(snapshot); } catch (err) {
             console.error("[bramSubscribeTauriEvent] subscriber threw:", err);
@@ -9290,7 +9400,7 @@ window.bramSubscribeTauriEvent = (function () {
           if (!data || !data.exists) return;
           tick += 1;
           lastPayload = data.payload || null;
-          var snapshot = { tick: tick, payload: lastPayload, replayed: true };
+          var snapshot = { tick: tick, payload: lastPayload, replayed: true, name: eventName };
           subscribers.forEach(function (fn) {
             try { fn(snapshot); } catch (err) {
               console.error("[bramSubscribeTauriEvent] replay subscriber threw:", err);
@@ -9301,7 +9411,7 @@ window.bramSubscribeTauriEvent = (function () {
     };
     var factory = function (emit) {
       var fire = function (snapshot) {
-        emit(snapshot || { tick: tick, payload: lastPayload });
+        emit(snapshot || { tick: tick, payload: lastPayload, name: eventName });
       };
       subscribers.add(fire);
       if (shouldReplayLatest) fire();
@@ -9317,12 +9427,34 @@ window.bramSubscribeTauriEvent = (function () {
 // null state as tick 0. Treat only a real host event (positive tick, not a
 // replay snapshot) as invalidation, then refetch each supplied DataSource.
 window.__bramRefetchOnLiveEvent = function (eventValue) {
-  if (!eventValue || !eventValue.tick || eventValue.replayed) return false;
-  for (var i = 1; i < arguments.length; i++) {
-    var source = arguments[i];
-    if (source && typeof source.refetch === "function") source.refetch();
+  var live = !!(eventValue && eventValue.tick && !eventValue.replayed);
+  var refetched = 0;
+  if (live) {
+    for (var i = 1; i < arguments.length; i++) {
+      var source = arguments[i];
+      if (source && typeof source.refetch === "function") {
+        source.refetch();
+        refetched += 1;
+      }
+    }
   }
-  return true;
+  // awaiting-you-refetch-on-background-change: splits the chain after
+  // push-fanout. No line = the ChangeListener never fired; refetched>0 with
+  // no host serve = refetch() didn't reach the host.
+  try {
+    if (typeof window.logToHost === "function" && eventValue) {
+      window.logToHost({
+        kind: "iframe-trace",
+        subkind: "live-refetch",
+        at: new Date().toISOString(),
+        event_name: eventValue.name || "",
+        tick: eventValue.tick || 0,
+        replayed: !!eventValue.replayed,
+        refetched: refetched,
+      });
+    }
+  } catch (err) {}
+  return live;
 };
 
 // External-driven AgentMenu bridge — emits the current pending menu
@@ -14028,6 +14160,16 @@ window.__bramGuardRegistrationLine = function (r) {
   return parts.join(" · ");
 };
 
+// guard-link-per-project: the shared ~/.bram/bram-guard link follows
+// whichever Bram re-pointed it last; this project's hooks are handed to the
+// guard it recorded when the two differ.
+window.__bramGuardRoutingLine = function (r) {
+  var g = (r && r.routing) || {};
+  if (!g.projectGuard) return "This project hasn't recorded its guard yet (it does within a minute of launch).";
+  if (!g.linkTarget || g.linkTarget === g.projectGuard) return "Hooks run this project's own guard: " + g.projectGuard;
+  return "The shared link points at " + g.linkTarget + " (another Bram); hooks here are routed to this project's guard: " + g.projectGuard;
+};
+
 window.__bramLandedNote = function (board) {
   var n = window.__bramLandedIds(board).length;
   if (!n) return "";
@@ -15114,3 +15256,91 @@ window.__bramSkipTip = function (id, tick) {
   if (id) window.__bramTipSkips[id] = true;
   return (Number(tick) || 0) + 1;
 };
+
+// suggest-fresh-session: sessions.* settings read for the Settings checkboxes.
+// Defaults mirror the host: new-item and new-issue on, topic-shift off.
+window.__bramSuggestSetting = function (settings, key) {
+  var s = settings && settings.sessions;
+  if (s && typeof s[key] === "boolean") return s[key];
+  return key !== "suggestOnTopicShift";
+};
+
+// suggest-fresh-session: the agent's session-suggest event (POST
+// /__sessions/suggest -> Tauri event {name, whatsNext, atMs}). Sessions is
+// mounted only while its tab shows, so the event may land first: it is held
+// in __bramSessionSuggestPending until Sessions subscribes, then handed over
+// once. Live-only subscription (replay=false) plus a staleness cap means a
+// pane reload or replayed event never re-opens a consumed suggestion.
+window.__bramSessionSuggestPending = null;
+window.__bramSessionSuggestSubscribers = new Set();
+window.__bramSessionSuggestLastAt = 0;
+window.__bramSessionSuggestIngest = function (payload) {
+  try {
+    var p = payload || {};
+    var at = Number(p.atMs) || 0;
+    if (!at || Date.now() - at > 60000 || at <= window.__bramSessionSuggestLastAt) return;
+    window.__bramSessionSuggestLastAt = at;
+    var sug = { at: at, name: String(p.name || ""), whatsNext: String(p.whatsNext || "") };
+    var delivered = false;
+    window.__bramSessionSuggestSubscribers.forEach(function (fn) {
+      try { fn(sug); delivered = true; } catch (e) {}
+    });
+    if (!delivered) window.__bramSessionSuggestPending = sug;
+    if (String(window.location.hash || "").indexOf("/sessions") < 0) window.location.hash = "#/sessions";
+  } catch (e) {}
+};
+// ONE factory, returned every time. The first version built a new function
+// per call, so the PushSource's `subscribe` prop changed identity on every
+// render of Sessions: it resubscribed and emitted on each one. Demo,
+// 2026-10-01 02:07–02:09Z: pane heartbeat drift 19–189 ms while Sessions
+// showed (10 ms idle elsewhere), and after the dialog closed the nav clicks
+// registered but the page never left Sessions until a reload. Every peer
+// (bramSubscribeTauriEvent, bramSubscribeAgentMenu) caches its factory.
+window.__bramSessionSuggestSubscribeCount = 0;
+window.__bramSubscribeSessionSuggest = function () {
+  return window.__bramSessionSuggestFactory;
+};
+window.__bramSessionSuggestFactory = function (emit) {
+  {
+    // Evidence for the loop above: a healthy mount subscribes once or twice.
+    var n = (window.__bramSessionSuggestSubscribeCount += 1);
+    if (n <= 5 || n % 100 === 0) {
+      window.__bramIframeTrace("new-session-client", { op: "suggest-subscribe", n: n });
+    }
+    var fire = function (sug) { emit(sug); };
+    window.__bramSessionSuggestSubscribers.add(fire);
+    var pending = window.__bramSessionSuggestPending;
+    window.__bramSessionSuggestPending = null;
+    // Hand a held suggestion over AFTER subscribe returns. Emitted inside
+    // subscribe it becomes the PushSource's starting value, which the
+    // ChangeListener never sees as a change (demo, 2026-10-01 01:57:26Z: the
+    // tab switched and the dialog stayed shut, no suggest-opened). The
+    // zero-delay timer is ordering, not a readiness guess.
+    var live = true;
+    if (pending && Date.now() - pending.at <= 60000) {
+      var handed = false;
+      setTimeout(function () { if (live) { handed = true; fire(pending); } }, 0);
+      // Unsubscribed before the handover (a mount that subscribes twice):
+      // put it back for the next subscriber rather than dropping it.
+      var putBack = function () {
+        if (!handed && !window.__bramSessionSuggestPending) window.__bramSessionSuggestPending = pending;
+      };
+      return function () { live = false; putBack(); window.__bramSessionSuggestSubscribers.delete(fire); };
+    }
+    return function () { live = false; window.__bramSessionSuggestSubscribers.delete(fire); };
+  };
+};
+// Lengths only, never the text. `edited` = name or text differs from the suggestion.
+window.__bramSuggestTrace = function (op, suggested, name, text, sugName, sugText) {
+  if (!suggested) return;
+  var n = String(name || ""), t = String(text || "");
+  var f = { op: op, name_len: n.length, text_len: t.length };
+  if (op === "suggest-created") {
+    f.suggested = true;
+    f.edited = n.trim() !== String(sugName || "").trim() || t.trim() !== String(sugText || "").trim();
+  }
+  window.__bramIframeTrace("new-session-client", f);
+};
+window.bramSubscribeTauriEvent("session-suggest", false)(function (snap) {
+  window.__bramSessionSuggestIngest(snap && snap.payload);
+});
