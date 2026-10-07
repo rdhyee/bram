@@ -146,6 +146,68 @@ class DemoInstanceTests(unittest.TestCase):
         self.assertFalse(apply_check(consume))
         self.assertTrue(apply_check(consume, [prepare]))
 
+    def test_every_starter_hydrates(self) -> None:
+        self.new("all", list(demo.STARTERS))
+        board = json.loads((self.repo / demo.WORKLIST).read_text())["items"]
+        for starter in demo.STARTERS:
+            self.assertTrue(
+                any(item["id"].startswith(starter) for item in board), starter
+            )
+
+    def test_new_file_left_out_has_untracked_file_and_shared_neighbour(self) -> None:
+        self.new("left-out", ["new-file-left-out"])
+        new = "demo/new-file-left-out-new.txt"
+        shared = "demo/new-file-left-out-shared.txt"
+        self.assertTrue((self.repo / new).is_file())
+        self.assertEqual(git(self.repo, "ls-files", "--", new), "")
+        self.assertIn(
+            new, git(self.repo, "ls-files", "--others", "--exclude-standard").splitlines()
+        )
+        # The shared file is tracked at HEAD and differs from it on disk.
+        self.assertEqual(git(self.repo, "ls-files", "--", shared), shared)
+        self.assertIn(shared, git(self.repo, "diff", "--name-only").splitlines())
+        # Two separable hunks: one per item.
+        diff = git(self.repo, "diff", "--unified=0", "--", shared)
+        self.assertEqual(diff.count("\n@@ "), 2)
+
+        items = {
+            item["id"]: item
+            for item in json.loads((self.repo / demo.WORKLIST).read_text())["items"]
+        }
+        self.assertEqual(
+            set(items), {"new-file-left-out-author", "new-file-left-out-neighbour"}
+        )
+        self.assertTrue(all(item["status"] == "applied" for item in items.values()))
+        self.assertEqual(items["new-file-left-out-author"]["files"], [new, shared])
+        # The neighbour edited the shared file without declaring it: declared
+        # sharing would make the pane isolate by hand and skip the
+        # hunk-by-hunk path this fixture exists to reach.
+        own = "demo/new-file-left-out-own.txt"
+        self.assertEqual(items["new-file-left-out-neighbour"]["files"], [own])
+        self.assertEqual(git(self.repo, "ls-files", "--", own), own)
+        self.assertNotIn(own, git(self.repo, "diff", "--name-only").splitlines())
+        claims = json.loads((self.repo / demo.CLAIMS).read_text())["intervals"]
+        windows = [record["ids"] for record in claims]
+        self.assertEqual(windows.count(["new-file-left-out-author"]), 2)
+        self.assertEqual(windows.count(["new-file-left-out-neighbour"]), 1)
+
+    def test_chat_edit_in_item_file_has_item_and_chat_lines_side_by_side(self) -> None:
+        self.new("chat-edit", ["chat-edit-in-item-file"])
+        path = "demo/chat-edit-in-item-file-file.txt"
+        self.assertEqual(git(self.repo, "ls-files", "--", path), path)
+        self.assertIn(path, git(self.repo, "diff", "--name-only").splitlines())
+        items = json.loads((self.repo / demo.WORKLIST).read_text())["items"]
+        self.assertEqual([item["id"] for item in items], ["chat-edit-in-item-file-author"])
+        claims = json.loads((self.repo / demo.CLAIMS).read_text())["intervals"]
+        author = ["chat-edit-in-item-file-author"]
+        self.assertEqual([record["ids"] for record in claims], [author, [], author, []])
+        trees = [record["tree"] for record in claims]
+        # First author window, the unclaimed chat turn, second author window.
+        for before, after in zip(trees, trees[1:]):
+            self.assertTrue(
+                git(self.repo, "diff", "--numstat", before, after, "--", path), (before, after)
+            )
+
     def test_reset_is_byte_and_ref_exact(self) -> None:
         self.new()
         (self.repo / "resources/.bram-port").write_text("55123\n")
@@ -285,6 +347,29 @@ class DemoInstanceTests(unittest.TestCase):
             stderr=subprocess.PIPE,
         )
         self.assertEqual(json.loads(proc.stdout)["activeScenario"], "wrapper")
+
+    def test_process_alive_answers_live_dead_and_unqueryable(self) -> None:
+        """demo-instance-liveness-on-windows.
+
+        `os.kill(pid, 0)` has no meaning on Windows and raised an uncaught
+        OSError, so `stop` and `launch` both died before acting — `stop`
+        without stopping anything. Both branches must keep one contract:
+        True when the process exists (including when it cannot be queried),
+        False when it does not.
+        """
+        self.assertTrue(demo._process_alive(os.getpid()), "this interpreter is live")
+
+        reaped = subprocess.Popen([sys.executable, "-c", "pass"])
+        reaped.wait()
+        self.assertFalse(demo._process_alive(reaped.pid), "an exited child is not live")
+
+        self.assertFalse(demo._process_alive(999_999), "an absurd pid is not live")
+
+        if os.name == "nt":
+            # pid 4 is the Windows System process: live, and not queryable by
+            # an unprivileged caller. This is the arm that mirrors POSIX's
+            # PermissionError, and the one a naive port gets wrong.
+            self.assertTrue(demo._process_alive(4), "System is live but unqueryable")
 
     def test_windows_launcher_carries_disk_serving_and_build_guards(self) -> None:
         script = SCRIPT.with_name("demo-instance.ps1").read_text()

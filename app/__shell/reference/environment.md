@@ -183,6 +183,65 @@ hit, this is the advice protocol (user-facing twin: the Bram README's
   security decision; the agent names the control and the consequences,
   the user clicks.
 
+## Voice input setup
+
+Bram's 🎤 dictation needs three things on the user's machine:
+
+- **`whisper-server`**, the speech engine (from whisper.cpp);
+- **the model**, `~/.local/share/whisper-models/ggml-small.en.bin`
+  (466 MB), which the engine loads at start;
+- **`ffmpeg`**, used only for the safety pass: when live dictation fails,
+  Bram transcribes the whole compressed recording, which `ffmpeg` converts
+  first. Without it dictation works; the rescue doesn't.
+
+When a 🎤 click finds one missing, Bram opens a setup dialog. Its
+**Install with the agent** button sends you a turn:
+
+```
+voice-setup: {"missing":["model","ffmpeg"],"found":{"whisper-server":"/opt/homebrew/bin/whisper-server"},"platform":"macos","arch":"aarch64","modelPath":"…","searched":["…"],"loginShell":"used"}
+```
+
+It means: the user asked you to install what's missing. Handle it this way:
+
+- **It's environment work, not a repo change.** No worklist item.
+- **Confirm first.** Re-check each missing component in the user's shell:
+  `command -v whisper-server`, `command -v ffmpeg`, and `ls` the
+  `modelPath`. If something the turn calls missing is installed after all,
+  say where. Bram looked in its own PATH plus the well-known directories
+  for the platform — `/opt/homebrew/bin` and `/usr/local/bin` on Unix, the
+  winget and scoop locations on Windows — and, on Unix only, the login
+  shell (`searched`, `loginShell`). A tool it missed there is a Bram bug to
+  report, not something to install twice. **A copy inside WSL does not
+  count as installed:** the engine runs natively on every platform, and
+  Bram cannot reach anything inside a WSL distro.
+- **Show the commands, then ask once** before running them. Installing
+  software and downloading 466 MB are the user's to approve.
+  - macOS: `brew install whisper-cpp` for the engine, `brew install ffmpeg`.
+    If `brew` itself is missing, say so and stop: installing Homebrew is
+    the user's call.
+  - The model, any platform:
+    `mkdir -p ~/.local/share/whisper-models && curl -L -o ~/.local/share/whisper-models/ggml-small.en.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin`
+  - Linux: the package manager for `ffmpeg`; the README's source build
+    (Voice input section) for `whisper-server`.
+  - Windows: `winget install Gyan.FFmpeg` for `ffmpeg`; for the engine,
+    the whisper.cpp release asset `whisper-blas-bin-x64.zip` extracted to a
+    directory on PATH (`%LOCALAPPDATA%\Programs\whisper\` is a reasonable
+    home — the exe needs its DLLs beside it, so it can't sit loose in a
+    searched directory). The CUDA assets are NVIDIA-only; don't suggest
+    them without checking the GPU. **A PATH change needs Bram relaunched**
+    before the 🎤 sees it, since a running process keeps its launch-time
+    environment.
+- **Report what happened,** then ask the user to click 🎤 again.
+- **If it still fails,** read the trace: each click writes
+  `[whisper] preflight binary=… model=… ffmpeg=… searched=… path=…` and
+  `[whisper] start convert=…` to `resources/bram-traces/bram-trace.log`,
+  and the pane writes `[iframe] subkind=voice-setup` lines for the dialog.
+  Those lines name what was found and where Bram looked.
+
+The same steps apply when a user says voice input won't start and no
+`voice-setup:` turn came (an older Bram, or the dialog was closed): grep
+the trace for `[whisper]` lines first.
+
 ## Working across project boundaries
 
 Some of the best work happens between two sessions that each hold
@@ -329,3 +388,54 @@ the core conventions).
 Act only in the repo whose session you're in. The thread is the
 transport, not a shortcut for reaching across and editing the other
 project directly.
+
+## Suggest a fresh session
+
+A long session that wanders across topics is hard to find and hard to
+resume. Bram's **+ New session** dialog (Sessions tab) starts a fresh
+session with a brief, but the user has to think of it. You are the one
+who sees a new line of work begin, so offer it.
+
+**When.** Read `GET /__settings` and look at `sessions`. Each trigger
+has its own switch:
+
+- `suggestOnNewItem`: you are about to propose a worklist item.
+- `suggestOnNewIssue`: you are about to file an issue.
+- `suggestOnTopicShift`: the conversation has moved to a significantly
+  different topic.
+
+If the switch is on **and** the new work is a different line from what
+this session has been doing, ask in one line whether to continue it in
+a fresh session. Work that belongs to the session's existing line gets
+no question. Ask in prose, whichever agent you are: a provider's own
+question tool would make Claude and Codex behave differently.
+
+**Limits.** Ask at most once per topic. After a no, don't ask again
+about that topic. Don't ask in a session that is still short. Ask
+**before** you propose the item or file the issue, not after.
+
+**On yes, hand the work over; don't start it here.** Do not propose the
+item or file the issue in this session: the new session is where it gets
+discussed and created. `POST /__sessions/suggest` with
+`{"name": …, "whatsNext": …}` (same curl shape as the other POST
+routes). The Sessions tab opens the New session dialog filled in with
+both. **They are suggestions for the user to edit, and nothing is
+created until the user clicks Create.** Say so: "I've filled in a
+suggested name and brief; edit them to say it your way, then click
+**Create**." Write `whatsNext` in the user's terms, framing the new
+work, not as instructions from you. Put in it what this session already
+settled about the work, so the new session doesn't have to rediscover
+it.
+
+**On no**, carry on here: propose the item or file the issue as usual.
+
+**Names are how sessions are found later.** A later search for a
+session to resume reads titles, so err toward verbose and descriptive:
+
+- Name the subject and the activity, with the distinctive terms someone
+  would search for months later: "screencast storyboarding: rough scene
+  list from a session transcript", not "test session" or "follow-up".
+- Include the stable nouns the work is about (a feature, a component, an
+  issue number such as `#412`), not only verbs.
+- Leave out ephemera (today's date, "part 2") unless they distinguish
+  the session.

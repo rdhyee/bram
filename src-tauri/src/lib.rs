@@ -244,54 +244,17 @@ fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-fn wsl_model_path_arg(model_path: &str) -> String {
-    if let Some(rest) = model_path.strip_prefix("~/") {
-        format!(
-            "\"$HOME/{}\"",
-            rest.replace('\\', "\\\\").replace('"', "\\\"")
-        )
-    } else {
-        shell_single_quote(model_path)
-    }
-}
-
-fn wsl_distro_args() -> Vec<String> {
-    match first_nonempty_env(&["BRAM_WSL_DISTRO"]) {
-        Some(distro) => vec!["-d".to_string(), distro, "--".to_string()],
-        None => Vec::new(),
-    }
-}
-
-fn command_output_lossy(output: &std::process::Output) -> String {
-    let mut text = String::new();
-    text.push_str(&String::from_utf8_lossy(&output.stdout));
-    text.push_str(&String::from_utf8_lossy(&output.stderr));
-    text.replace('\0', "").trim().to_string()
-}
-
 fn whisper_trace<R: tauri::Runtime>(app: &AppHandle<R>, body: &str) {
     eprintln!("[whisper] {}", body);
     append_bram_trace_line(app, "whisper", body);
 }
 
 fn trace_whisper_env<R: tauri::Runtime>(app: &AppHandle<R>) {
-    let mut body = format!(
+    let body = format!(
         "env platform={} arch={}",
         std::env::consts::OS,
         std::env::consts::ARCH
     );
-    if cfg!(target_os = "windows") {
-        let distro =
-            first_nonempty_env(&["BRAM_WSL_DISTRO"]).unwrap_or_else(|| "(default)".to_string());
-        let version = std::process::Command::new("wsl.exe")
-            .arg("--version")
-            .output()
-            .ok()
-            .map(|out| command_output_lossy(&out))
-            .and_then(|s| s.lines().next().map(|line| line.to_string()))
-            .unwrap_or_else(|| "(unavailable)".to_string());
-        body.push_str(&format!(" wsl_distro={} wsl_version={:?}", distro, version));
-    }
     whisper_trace(app, &body);
 }
 
@@ -456,6 +419,10 @@ struct SessionsConfig {
     suggest_on_new_issue: Option<bool>,
     #[serde(default, rename = "suggestOnTopicShift")]
     suggest_on_topic_shift: Option<bool>,
+    // provider-session-pair-offer: whether a switch that finds no partner
+    // offers to pair the two sessions or start a new one. Default on.
+    #[serde(default, rename = "pairAcrossProviders")]
+    pair_across_providers: Option<bool>,
 }
 
 #[derive(Default, Clone, serde::Deserialize)]
@@ -3820,6 +3787,11 @@ fn emit_talk_session_changed_for_provider<R: tauri::Runtime>(
     app: &AppHandle<R>,
     provider: Option<SessionProvider>,
 ) {
+    // provider-session-counterparts: a fresh launch after a switch pairs once
+    // its session has an id.
+    if let Some(p) = provider {
+        resolve_pending_pair(app, p);
+    }
     let correlation_id = next_talk_session_correlation_id();
     let at_host_ms = unix_now_ms();
     let mut payload = serde_json::json!({
@@ -5891,12 +5863,33 @@ fn terminal_attention_prompt_shape(stripped_tail: &str) -> Option<&'static str> 
         "trust all and continue",
         "press enter to confirm or esc to go back",
     ];
-    let lower = stripped_tail.to_lowercase();
+    // terminal-attention-slash-panel (#423): a Claude slash-command panel
+    // left open with no turn running. Specimen: Claude's /status panel,
+    // opened by `shell.firstCommand` on 2026-10-04 (demo trace 16:35:37Z,
+    // op=candidate preview="❯ /status ─── Se tings Status Config Usage Stats
+    // Version: 2.1.289 …"; footer "Esc to cancel" in Jon's screenshot).
+    // Claude's permission menus also say "Esc to cancel", but they appear
+    // inside an open turn, where the tracker never evaluates. Codex's /status
+    // prints and returns to its composer, so it has no entry here.
+    const SLASH_PANEL_MARKERS: &[&str] = &["esc to cancel", "status config usage stats"];
+    // Whitespace collapsed: the grid lays out tabs and footers with cursor
+    // moves that strip to irregular runs of spaces and line breaks.
+    let lower = stripped_tail
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
     if HOOKS_TRUST_MARKERS
         .iter()
         .any(|marker| lower.contains(marker))
     {
         return Some("hooks-trust");
+    }
+    if SLASH_PANEL_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return Some("slash-panel");
     }
     None
 }
@@ -6103,6 +6096,24 @@ mod terminal_attention_tests {
             assert_eq!(
                 terminal_attention_prompt_shape(line),
                 Some("hooks-trust"),
+                "{line:?} should classify on its own"
+            );
+        }
+    }
+
+    // The 2026-10-04 specimen: Claude's /status panel, typed as the first
+    // command, left open with the terminal hidden. Pinned as the candidate
+    // line logged it plus the footer from the screenshot, with the grid's
+    // irregular spacing.
+    #[test]
+    fn slash_panel_claude_status_specimen_2026_10_04() {
+        const TAIL: &str = "\u{276f} /status \u{2500}\u{2500}\u{2500}\u{2500}\n  Se tings   Status   Config   Usage   Stats\n\n  Version:          2.1.289\n  Session name:     Worklist item for concurrent messaging\n\n  Esc to cancel";
+        assert_eq!(terminal_attention_prompt_shape(TAIL), Some("slash-panel"));
+        for line in ["Esc to cancel", "Status   Config   Usage   Stats"] {
+            assert!(TAIL.contains(line), "specimen no longer contains {line:?}");
+            assert_eq!(
+                terminal_attention_prompt_shape(line),
+                Some("slash-panel"),
                 "{line:?} should classify on its own"
             );
         }
@@ -8109,6 +8120,25 @@ fn askuserquestion_to_menu(value: &serde_json::Value, tool: &str) -> Option<PtyM
         at_host_ms: None,
         signature_source: None,
     })
+}
+
+#[cfg(test)]
+mod item_turn_ids_tests {
+    use super::item_turn_ids as ids;
+    #[test]
+    fn reads_ids_from_each_item_turn_kind_and_nothing_else() {
+        assert_eq!(
+            ids(r#"approved: {"items":[{"id":"a","gate":"to apply"},{"id":"b"}]}"#),
+            vec!["a", "b"]
+        );
+        assert_eq!(ids(r#"drop: {"items":[{"id":"c"}]}"#), vec!["c"]);
+        assert_eq!(
+            ids(r#"  iterate: {"items":[{"id":"d","feedbackRef":"x"}]}"#),
+            vec!["d"]
+        );
+        assert!(ids("just a chat message").is_empty());
+        assert!(ids("approved: not json").is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -10993,6 +11023,8 @@ fn pty_menu_update<R: tauri::Runtime>(app: &AppHandle<R>, chunk: &[u8]) {
     // new-session-handoff-race: while pane sends are held awaiting a fresh
     // agent CLI, watch each chunk for TUI boot bytes (no-op when unarmed).
     agent_boot_evidence_scan(app, chunk);
+    // shell-reports-prompt-and-exit-status: the shell's own prompt/exec edges.
+    shell_marker_scan(app, chunk);
     // issue-305 (observe-only): track terminal-modal mode bytes.
     term_modal_scan(app, chunk);
     // codex-trust-menu-arm-until-settled: boot-prompt classification arms
@@ -14460,6 +14492,81 @@ fn attach_bram_issue_states<R: tauri::Runtime>(app: &AppHandle<R>, bytes: Vec<u8
     serde_json::to_vec(&arr).unwrap_or(bytes)
 }
 
+// issues-status-lightweight: /__issues served every row's raw `comments`
+// array — 2.77 MB of a 3.03 MB response for 423 issues (2026-10-06) — yet
+// no list consumer reads it: the row fields the Issues tab shows
+// (commentSummary, latestCommentAuthor, latestCommentAt, activityAt) are
+// derived from it before caching, and the detail modal loads comments via
+// /__issue. Strip at serve time only; the cache and index keep them.
+fn strip_issue_list_comments(bytes: Vec<u8>) -> Vec<u8> {
+    let Ok(mut arr) = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes) else {
+        return bytes;
+    };
+    for row in arr.iter_mut() {
+        if let Some(obj) = row.as_object_mut() {
+            obj.remove("comments");
+        }
+    }
+    serde_json::to_vec(&arr).unwrap_or(bytes)
+}
+
+// issues-status-lightweight: /__issues/status — number, state and updatedAt
+// only, from the same cached list. `numbers` empty means every issue; an
+// unknown number is simply absent.
+fn issue_status_rows(bytes: &[u8], numbers: &[u64]) -> Vec<u8> {
+    let arr: Vec<serde_json::Value> = serde_json::from_slice(bytes).unwrap_or_default();
+    let rows: Vec<serde_json::Value> = arr
+        .iter()
+        .filter_map(|row| {
+            let n = row.get("number").and_then(|v| v.as_u64())?;
+            if !numbers.is_empty() && !numbers.contains(&n) {
+                return None;
+            }
+            Some(serde_json::json!({
+                "number": n,
+                "state": row.get("state").cloned().unwrap_or(serde_json::Value::Null),
+                "updatedAt": row.get("updatedAt").cloned().unwrap_or(serde_json::Value::Null),
+            }))
+        })
+        .collect();
+    serde_json::to_vec(&rows).unwrap_or_else(|_| b"[]".to_vec())
+}
+
+#[cfg(test)]
+mod issue_list_slim_tests {
+    use super::*;
+
+    const LIST: &str = r#"[
+        {"number":1,"state":"OPEN","title":"a","updatedAt":"2026-10-01T00:00:00Z","comments":[{"body":"x"}],"commentSummary":"me: 1"},
+        {"number":2,"state":"CLOSED","title":"b","updatedAt":"2026-10-02T00:00:00Z"}
+    ]"#;
+
+    #[test]
+    fn strip_removes_comments_and_keeps_derived_fields() {
+        let out = strip_issue_list_comments(LIST.as_bytes().to_vec());
+        let v: Vec<serde_json::Value> = serde_json::from_slice(&out).unwrap();
+        assert!(v[0].get("comments").is_none());
+        assert_eq!(v[0]["commentSummary"], "me: 1");
+        assert_eq!(v[1]["title"], "b");
+    }
+
+    #[test]
+    fn status_rows_all_and_filtered() {
+        let all: Vec<serde_json::Value> =
+            serde_json::from_slice(&issue_status_rows(LIST.as_bytes(), &[])).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(
+            all[1],
+            serde_json::json!({"number":2,"state":"CLOSED","updatedAt":"2026-10-02T00:00:00Z"})
+        );
+        let one: Vec<serde_json::Value> =
+            serde_json::from_slice(&issue_status_rows(LIST.as_bytes(), &[1, 99])).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0]["state"], "OPEN");
+        assert!(one[0].get("title").is_none());
+    }
+}
+
 fn attach_pending_closes<R: tauri::Runtime>(app: &AppHandle<R>, arr: &mut Vec<serde_json::Value>) {
     let Some(path) = issue_close_queue_file(app) else {
         return;
@@ -17424,7 +17531,6 @@ fn pty_spawn(
         } else {
             format!("{} {}", base_command, args.trim())
         };
-        let payload = format!("{}\r", command);
         if launch.resume {
             if let Some(session_id) = launch.session_id.as_deref() {
                 clear_pending_session_title_for_resume(
@@ -17435,38 +17541,66 @@ fn pty_spawn(
                 );
             }
         }
-        if let Err(e) = pty_write_internal(&app, &state, &payload, "agent-autostart") {
-            eprintln!("[pty_spawn] failed to write agent autostart: {}", e);
-        } else {
-            if bram_trace_enabled() {
-                append_bram_trace_line(
-                    &app,
-                    "agent-switch",
-                    &format!(
-                        "op=autostart provider={} policy={} configured_policy={} first_unmanaged={} exact_session={} fallback={} command={}",
-                        provider,
-                        startup_policy.as_str(),
-                        configured_startup_policy.as_str(),
-                        first_unmanaged_launch,
-                        launch.session_id.as_deref().unwrap_or(""),
-                        launch.fallback,
-                        command
-                    ),
-                );
-            }
-            set_current_provider(&app, launch.provider, "autostart");
-            if let Some(session_id) = launch.session_id.as_deref() {
-                if launch.provider == SessionProvider::Codex {
-                    let _ = pin_codex_reload_target(&app, session_id);
+        let trace_command = command.clone();
+        let policy = startup_policy.as_str();
+        let configured_policy = configured_startup_policy.as_str();
+        let launch_provider = launch.provider;
+        let session_id = launch.session_id.clone();
+        let fallback = launch.fallback;
+        launch_agent_command(AgentLaunch {
+            app: app.clone(),
+            generation: begin_agent_launch(),
+            provider,
+            command,
+            source: "autostart",
+            trace_category: "agent-switch",
+            caller_hint: "agent-autostart",
+            // agent-launch-shared-routine: wait for the fresh shell's first
+            // prompt instead of typing ahead into it, where a prompt from a
+            // shell startup file could swallow the command. Windows sends no
+            // marker and keeps typing ahead, as before.
+            gate: !cfg!(windows),
+            first_command: true,
+            hook: Box::new(move |app, phase| {
+                if phase == LaunchPhase::Confirmed {
+                    if let Some(id) = live_session_id(app, launch_provider) {
+                        mark_session_entered(app, launch_provider, &id);
+                    }
+                    return;
                 }
-                // Make the exact resumed conversation current immediately;
-                // neither CLI is guaranteed to touch its JSONL before the
-                // tools pane asks for the first transcript.
-                resync_transcript_to_session(&app, launch.provider, session_id);
-            }
-            schedule_agent_switch_refresh(app.clone(), provider, "autostart");
-            schedule_agent_first_command(app.clone(), "autostart");
-        }
+                if phase != LaunchPhase::Written {
+                    return;
+                }
+                if bram_trace_enabled() {
+                    append_bram_trace_line(
+                        app,
+                        "agent-switch",
+                        &format!(
+                            "op=autostart provider={} policy={} configured_policy={} first_unmanaged={} exact_session={} fallback={} command={}",
+                            provider,
+                            policy,
+                            configured_policy,
+                            first_unmanaged_launch,
+                            session_id.as_deref().unwrap_or(""),
+                            fallback,
+                            trace_command
+                        ),
+                    );
+                }
+                set_current_provider(app, launch_provider, "autostart");
+                if let Some(session_id) = session_id.as_deref() {
+                    if launch_provider == SessionProvider::Codex {
+                        let _ = pin_codex_reload_target(app, session_id);
+                    }
+                    // Make the exact resumed conversation current
+                    // immediately; neither CLI is guaranteed to touch its
+                    // JSONL before the tools pane asks for the first
+                    // transcript.
+                    resync_transcript_to_session(app, launch_provider, session_id);
+                }
+                schedule_agent_switch_refresh(app.clone(), provider, "autostart");
+            }),
+        });
     }
     Ok(())
 }
@@ -17919,6 +18053,19 @@ fn drain_pty_intents<R: tauri::Runtime>(
     let mut held: usize = 0;
     let mut boot_restores: Vec<(String, String)> = Vec::new();
     let mut expire_boot_hold = false;
+    // pane-send-refuses-bare-shell: the shell's own report says it is back at
+    // its prompt and nothing has started since, so no agent is reading the
+    // terminal. A send typed now goes to bash, which runs it as commands
+    // (2026-08-28 04:16Z: a queued message wedged bash at PS2 and its
+    // fragments ran as `command not found`). Such sends are handed back to
+    // the message box instead. Judged by the shell, not by an agent's boot
+    // bytes, so it holds the same for Claude and Codex. Shells that send no
+    // marker (Windows) are never refused.
+    let shell_fg = shell_foreground();
+    let shell_in_foreground = shell_refuses_pane_send(shell_fg);
+    let launch_pending = agent_launch_pending();
+    let mut launch_held: usize = 0;
+    let mut shell_restores: Vec<(String, String)> = Vec::new();
 
     for line in content.lines() {
         if line.is_empty() {
@@ -18047,6 +18194,35 @@ fn drain_pty_intents<R: tauri::Runtime>(
                 held += 1;
                 remaining.push(line.to_string());
                 continue;
+            } else if shell_in_foreground {
+                let id = intent
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("intent")
+                    .to_string();
+                if bram_trace_enabled() {
+                    append_bram_trace_line(
+                        app,
+                        "send-gate",
+                        &format!(
+                            "op=refused reason=shell-foreground id={} kind={} status={} chars={}",
+                            id,
+                            kind,
+                            shell_fg
+                                .status
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| "?".into()),
+                            data.chars().count()
+                        ),
+                    );
+                }
+                shell_restores.push((id, data.to_string()));
+                continue;
+            } else if launch_pending {
+                held += 1;
+                launch_held += 1;
+                remaining.push(line.to_string());
+                continue;
             }
         }
         let write_result = match kind {
@@ -18136,30 +18312,52 @@ fn drain_pty_intents<R: tauri::Runtime>(
     if expire_boot_hold {
         cancel_agent_boot_hold(app, "expired");
     }
-    if !boot_restores.is_empty() {
-        let ids = boot_restores
-            .iter()
+    // One emit for both kinds of hand-back: two rapid `send-restore` emits
+    // coalesce in the iframe and drop all but the last text (#306).
+    if !boot_restores.is_empty() || !shell_restores.is_empty() {
+        let all = boot_restores.iter().chain(shell_restores.iter());
+        let ids = all
+            .clone()
             .map(|(id, _)| id.as_str())
             .collect::<Vec<_>>()
             .join("+");
-        let text = boot_restores
-            .iter()
+        let text = all
             .map(|(_, text)| text.as_str())
             .filter(|t| !t.is_empty())
             .collect::<Vec<_>>()
             .join("\n\n");
+        // `reason` lets the pane say why the text came back.
+        let reason = if shell_restores.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!("shell-foreground")
+        };
         let _ = app.emit(
             "send-restore",
-            serde_json::json!({"id":ids,"text":text,"aborted":false}),
+            serde_json::json!({"id":ids,"text":text,"aborted":false,"reason":reason}),
         );
-        append_strand_forensics_line(
-            app,
-            &format!(
-                "op=boot-held-restore entries={} chars={}",
-                boot_restores.len(),
-                text.chars().count()
-            ),
-        );
+        if !boot_restores.is_empty() {
+            append_strand_forensics_line(
+                app,
+                &format!(
+                    "op=boot-held-restore entries={} chars={}",
+                    boot_restores.len(),
+                    boot_restores
+                        .iter()
+                        .map(|(_, t)| t.chars().count())
+                        .sum::<usize>()
+                ),
+            );
+        }
+        if !shell_restores.is_empty() {
+            append_strand_forensics_line(
+                app,
+                &format!(
+                    "op=send-refused-shell-foreground entries={}",
+                    shell_restores.len()
+                ),
+            );
+        }
     }
     if held > 0 {
         // Keep the original hold start across repeated drains so the
@@ -18173,6 +18371,8 @@ fn drain_pty_intents<R: tauri::Runtime>(
         if bram_trace_enabled() {
             let reason = if blocking_tool.is_some() {
                 "menu-present"
+            } else if launch_held == held {
+                "launch-pending"
             } else {
                 "awaiting-agent-boot"
             };
@@ -18234,6 +18434,145 @@ fn drain_pty_intents<R: tauri::Runtime>(
 /// malformed payloads are left alone.
 fn record_iterate_inflight_sentinel<R: tauri::Runtime>(app: &AppHandle<R>, turn_text: &str) {
     record_prefixed_inflight_sentinel(app, turn_text, "iterate:", "iterate");
+}
+
+// item-last-session-switch-there: record, in the state-mirror ledger, which
+// session received an item's Start / Commit / Drop / feedback turn. This is
+// the write path (the turn is going to the PTY now), so the live session is
+// the receiving one. Ledger-only: worklist.json is untouched, and the ledger
+// writes nothing when the session matches the item's latest row.
+fn item_turn_ids(turn_text: &str) -> Vec<String> {
+    let trimmed = turn_text.trim_start();
+    let rest = ["approved:", "drop:", "iterate:"]
+        .iter()
+        .find_map(|p| trimmed.strip_prefix(p));
+    let Some(rest) = rest else {
+        return Vec::new();
+    };
+    serde_json::from_str::<serde_json::Value>(rest.trim_start())
+        .ok()
+        .and_then(|v| {
+            v.get("items").and_then(|a| a.as_array()).map(|arr| {
+                arr.iter()
+                    .filter_map(|it| it.get("id").and_then(|i| i.as_str()).map(String::from))
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+}
+
+fn record_item_session_stamp<R: tauri::Runtime>(app: &AppHandle<R>, turn_text: &str) {
+    let ids = item_turn_ids(turn_text);
+    if ids.is_empty() {
+        return;
+    }
+    let Some(provider) = current_provider(app) else {
+        return;
+    };
+    let Some(sid) = live_session_id(app, provider) else {
+        return;
+    };
+    let label = session_provider_label(provider);
+    let now = unix_now_ms();
+    let Some(conn) = worklist_state_open(app) else {
+        return;
+    };
+    let mut wrote = false;
+    for id in &ids {
+        let result = worklist_state::record_item_session(&conn, id, label, &sid, now);
+        if matches!(result, Ok(true)) {
+            wrote = true;
+        }
+        if bram_trace_enabled() {
+            match &result {
+                Ok(false) => {}
+                Ok(true) => append_bram_trace_line(
+                    app,
+                    "state-mirror",
+                    &format!(
+                        "op=session-stamp id={} session={} provider={} result=ok",
+                        id, sid, label
+                    ),
+                ),
+                Err(e) => append_bram_trace_line(
+                    app,
+                    "state-mirror",
+                    &format!(
+                        "op=session-stamp id={} session={} provider={} result=error detail={}",
+                        id, sid, label, e
+                    ),
+                ),
+            }
+        }
+    }
+    // lastSession rides the /__worklist payload but a stamp never touches
+    // worklist.json, so nothing else would tell the pane the board changed.
+    // Stamps are written only when the session differs, so this is rare.
+    if wrote {
+        emit_replayable_signal(app, "worklist-changed");
+    }
+}
+
+// Attach each item's recorded last session to the /__worklist payload as a
+// computed field (never written to the file): {provider, sessionId, atMs,
+// title, isCurrent}. A session that no longer resolves gets no field, so the
+// pane offers nothing rather than a dead switch.
+fn worklist_attach_last_sessions<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    doc: &mut serde_json::Value,
+) {
+    let Some(items) = doc.get_mut("items").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    if items.is_empty() {
+        return;
+    }
+    let Some(conn) = worklist_state_open(app) else {
+        return;
+    };
+    let cur_provider = current_provider(app);
+    let cur_sid = cur_provider.and_then(|p| live_session_id(app, p));
+    let mut codex_titles: Option<HashMap<String, String>> = None;
+    for item in items.iter_mut() {
+        let Some(id) = item.get("id").and_then(|v| v.as_str()).map(String::from) else {
+            continue;
+        };
+        let Ok(Some((label, sid, at))) = worklist_state::latest_item_session(&conn, &id) else {
+            continue;
+        };
+        let Some(provider) = SessionProvider::from_str(&label) else {
+            continue;
+        };
+        let Some(path) = session_path_for_id(app, provider, &sid) else {
+            continue;
+        };
+        // item-last-session-names-provider-and-session: resolve a Codex title
+        // the way the Sessions list does (session_index name first, then the
+        // first-message scan), so the gate line names the session as the user
+        // named it — not "Read and follow this Bram turn: …". The index is read
+        // at most once per board build, and only if some item needs it.
+        let title = match provider {
+            SessionProvider::Claude => claude_session_title(&path).ok().flatten(),
+            SessionProvider::Codex => codex_titles
+                .get_or_insert_with(|| codex_session_index().unwrap_or_default())
+                .get(&sid)
+                .cloned()
+                .or_else(|| codex_session_title(&path).ok().flatten()),
+        };
+        let is_current = cur_provider == Some(provider) && cur_sid.as_deref() == Some(sid.as_str());
+        if let Some(obj) = item.as_object_mut() {
+            obj.insert(
+                "lastSession".to_string(),
+                serde_json::json!({
+                    "provider": label,
+                    "sessionId": sid,
+                    "atMs": at,
+                    "title": title,
+                    "isCurrent": is_current,
+                }),
+            );
+        }
+    }
 }
 
 /// Shared body for the prefix-triggered sentinel writers: strip `prefix`,
@@ -18718,6 +19057,7 @@ fn write_pty_turn_intent<R: tauri::Runtime>(
     // the lifecycle detectors see exactly what the user submitted.
     record_codex_direct_edit_authorization(app, data);
     record_iterate_inflight_sentinel(app, data);
+    record_item_session_stamp(app, data);
     record_skip_worklist_authorization(app, data);
     record_proposing_intent(app, data);
     record_turn_context(app, data);
@@ -18729,6 +19069,7 @@ fn write_pty_turn_intent<R: tauri::Runtime>(
     } else {
         Vec::new()
     };
+    let user_text = data;
     let with_notes;
     let data: &str = if pending_notes.is_empty() {
         data
@@ -18736,11 +19077,12 @@ fn write_pty_turn_intent<R: tauri::Runtime>(
         with_notes = prepend_host_notes(data, &pending_notes);
         &with_notes
     };
-    // Envelope switch (docs/turn-transport-redesign.md step 6): substantial
-    // or image-bearing sends are persisted as an outbound-turn envelope and
-    // the PTY carries only a compact frame. Inline sends get the whitespace
-    // collapse toTurn used to apply client-side.
-    let payload = match frame_outbound_turn(app, data) {
+    // Envelope switch (docs/turn-transport-redesign.md step 6): substantial,
+    // image-bearing or multi-line typed sends are persisted as an
+    // outbound-turn envelope and the PTY carries only a compact frame.
+    // One-line inline sends, `voice:` and lifecycle payloads get the
+    // whitespace collapse toTurn used to apply client-side.
+    let payload = match frame_outbound_turn(app, data, user_text) {
         Some(frame) => frame,
         None => st_collapse_whitespace(data),
     };
@@ -18801,6 +19143,21 @@ fn sanitize_pty_turn_payload(data: &str) -> String {
         .collect()
 }
 
+// The bytes that clear whatever sits in the agent's composer before a turn
+// payload goes in. Escape first, then Ctrl-U: Ctrl-U clears a traditional
+// readline composer, while Claude Code's Ink/React input ignores Ctrl-U and
+// treats Escape as "discard current input". Belt and suspenders, because
+// `shell.agent` can point at either shape.
+//
+// windows-send-clear-loses-text: ONE constant for every platform. The Windows
+// branch used to send "\x15" alone — the key the line above says CC ignores —
+// so the clear did not clear and left pre-existing composer text to fuse with
+// the payload. Worse, it destroyed part of what it left: observed 2026-10-04,
+// a 76-byte stranded send reached the agent 19 characters short, with CC's
+// "Ctrl+Y to paste deleted text" hint in the settle frame. The two branches
+// drifted because the Escape was added here in a later fix and never mirrored.
+const COMPOSER_CLEAR: &str = "\x1b\x15";
+
 // split-paste-cr-and-submit-nudge: NO trailing CR here. The paste
 // (with terminator) and the submitting CR ride separate PTY writes —
 // a single burst let the CLI's paste parser coalesce the CR into paste
@@ -18808,7 +19165,7 @@ fn sanitize_pty_turn_payload(data: &str) -> String {
 // the payload sat rendered-but-unsubmitted in the composer for 61s
 // until a manual Enter; Knorrasaurus/pa11-campaign-app#7).
 fn bracketed_paste_turn_payload(data: &str) -> String {
-    format!("\x1b\x15\x1b[200~{}\x1b[201~", data)
+    format!("{}\x1b[200~{}\x1b[201~", COMPOSER_CLEAR, data)
 }
 
 // The raw PTY injection for a turn payload. Shared by the normal send
@@ -18819,16 +19176,18 @@ fn inject_turn_payload<R: tauri::Runtime>(
     data: &str,
 ) -> Result<(), String> {
     if cfg!(windows) {
-        pty_write_internal(app, state, "\x15", "pty-intent-toTurn-windows-clear")?;
+        // The payload rides raw rather than bracketed here (#300), but the
+        // clear is the same on every platform — see COMPOSER_CLEAR.
+        pty_write_internal(
+            app,
+            state,
+            COMPOSER_CLEAR,
+            "pty-intent-toTurn-windows-clear",
+        )?;
         pty_write_internal(app, state, data, "pty-intent-toTurn-windows-payload")?;
         std::thread::sleep(std::time::Duration::from_millis(200));
         pty_write_internal(app, state, "\r", "pty-intent-toTurn-windows-submit")
     } else {
-        // Ctrl-U for traditional readline shells; \x1b (Escape) for CC's
-        // Ink/React-based input which ignores Ctrl-U but treats Escape
-        // as "discard current input." Belt and suspenders so partial
-        // text typed into CC's input doesn't get concatenated with our
-        // bracketed paste.
         let wrapped = bracketed_paste_turn_payload(data);
         pty_write_internal(app, state, &wrapped, "pty-intent-toTurn")?;
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -18847,10 +19206,6 @@ const NEW_SESSION_PROMPT_TIMEOUT_MS: i64 = 45_000;
 const NEW_SESSION_PROMPT_POLL_MS: u64 = 100;
 const AGENT_RELAUNCH_SETTLE_MS: u64 = 1200;
 const AGENT_SESSION_REFRESH_MS: u64 = 3000;
-// Delay, measured from writing the launch command, before typing the
-// configured first command into the freshly-started agent's TUI. Gives the
-// CLI time to reach an interactive prompt; tune if /resume is dropped.
-const AGENT_FIRST_COMMAND_SETTLE_MS: u64 = 2500;
 // Delay after a cross-provider switch/reload before auto-reloading the agent
 // pane. Cross-provider has several independent provider caches (the active-agent
 // hint, mainAgentStatus.provider/verb, latest-session caches); flipping them all
@@ -18869,18 +19224,467 @@ const AGENT_CROSS_PROVIDER_RELOAD_MS: u64 = 2500;
 // Claude's farewell, #314). Extracted from the new-session waiter
 // (new-session-handoff-race) so the switch path stops being the one caller
 // that types on a timer.
-fn wait_for_shell_prompt_evidence() -> Result<i64, i64> {
-    std::thread::sleep(std::time::Duration::from_millis(AGENT_RELAUNCH_SETTLE_MS));
+//
+// shell-reports-prompt-and-exit-status: once the shell has sent a marker this
+// session, the marker decides (a `❯` prompt counts; agent output ending in `$`
+// doesn't). Ok carries which evidence fired: "marker" or "shape".
+//
+// agent-launch-shared-routine: the settle floor is for the shape guess only.
+// The marker state is already "busy" while the outgoing agent runs and turns
+// "at prompt" only when the shell reports it, so there is nothing to race.
+fn wait_for_shell_prompt_evidence() -> Result<(i64, &'static str), i64> {
+    if !shell_foreground().seen {
+        std::thread::sleep(std::time::Duration::from_millis(AGENT_RELAUNCH_SETTLE_MS));
+    }
     let started = unix_now_ms();
     loop {
-        if pty_tail_shows_shell_prompt() {
-            return Ok(unix_now_ms().saturating_sub(started));
+        if let Some(via) = shell_prompt_evidence(shell_foreground(), pty_tail_shows_shell_prompt())
+        {
+            return Ok((unix_now_ms().saturating_sub(started), via));
         }
         let waited = unix_now_ms().saturating_sub(started);
         if waited >= NEW_SESSION_PROMPT_TIMEOUT_MS {
             return Err(waited);
         }
         std::thread::sleep(std::time::Duration::from_millis(NEW_SESSION_PROMPT_POLL_MS));
+    }
+}
+
+// agent-launch-shared-routine: the one way the host types an agent command
+// into the terminal. Five sites used to do this, each with its own idea of
+// when it was safe (autostart typed ahead, reload slept 1.2 s, the first
+// command slept 2.5 s, switch and New Session gated on the prompt shape), and
+// the bug class recurred one call site at a time (#314 fixed two and missed
+// reload; c3d6320 needed two passes). Every launch now goes:
+//   gate    wait for the shell's prompt (marker, or the shape guess when no
+//           marker has ever arrived); on timeout type nothing
+//   write   the command, then mark the shell busy
+//   confirm the shell's own report: a prompt after this launch's `exec`
+//           within AGENT_LAUNCH_CONFIRM_MS means the agent exited, with
+//           its status; no prompt means it is running
+//   report  trace + a `launch-outcome` event; the first command is typed
+//           only after a confirmed launch
+// The decision never depends on an agent's boot bytes (#305: Codex can't
+// always produce them), so Claude and Codex are judged the same way.
+const AGENT_LAUNCH_CONFIRM_MS: i64 = 8000;
+const AGENT_LAUNCH_CONFIRM_POLL_MS: u64 = 100;
+
+// pane-send-held-until-launch-confirmed: from the launch write until the
+// routine settles it, pane sends are held. Until the agent is confirmed up,
+// bytes typed into the terminal may never be read by it: if it exits, they
+// stay in the tty and bash reads them as commands. The routine clears the
+// mark on every ending (a drop guard, so a panic can't leave it set); a mark
+// older than the confirm window plus this slack counts as cleared anyway.
+static AGENT_LAUNCH_PENDING_SINCE_MS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+// Which launch generation armed the pending mark: a superseded launch's
+// guard must not clear the mark a newer launch set.
+static AGENT_LAUNCH_PENDING_GEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+// provider-session-counterparts (found driving it, 2026-10-04): a launch can
+// be replaced before it is confirmed (a Sessions-tab resume, then a header
+// switch 6.5 s later). The switch's interrupt then ended the older agent, and
+// the older routine reported `launch-exited` for a launch that hadn't failed.
+// Every launching site takes a generation BEFORE it writes its interrupts;
+// a routine whose generation is no longer the latest stops quietly.
+static AGENT_LAUNCH_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn begin_agent_launch() -> u64 {
+    AGENT_LAUNCH_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+}
+
+fn agent_launch_is_current(generation: u64) -> bool {
+    AGENT_LAUNCH_GENERATION.load(std::sync::atomic::Ordering::SeqCst) == generation
+}
+const AGENT_LAUNCH_PENDING_SLACK_MS: i64 = 2000;
+
+fn launch_pending_holds(since_ms: i64, now_ms: i64) -> bool {
+    since_ms > 0
+        && now_ms.saturating_sub(since_ms) < AGENT_LAUNCH_CONFIRM_MS + AGENT_LAUNCH_PENDING_SLACK_MS
+}
+
+fn agent_launch_pending() -> bool {
+    launch_pending_holds(
+        AGENT_LAUNCH_PENDING_SINCE_MS.load(std::sync::atomic::Ordering::Relaxed),
+        unix_now_ms(),
+    )
+}
+
+struct LaunchPendingGuard(u64);
+
+impl LaunchPendingGuard {
+    fn arm(generation: u64) -> Self {
+        AGENT_LAUNCH_PENDING_GEN.store(generation, std::sync::atomic::Ordering::SeqCst);
+        AGENT_LAUNCH_PENDING_SINCE_MS.store(unix_now_ms(), std::sync::atomic::Ordering::SeqCst);
+        LaunchPendingGuard(generation)
+    }
+}
+
+impl Drop for LaunchPendingGuard {
+    fn drop(&mut self) {
+        if AGENT_LAUNCH_PENDING_GEN.load(std::sync::atomic::Ordering::SeqCst) == self.0 {
+            AGENT_LAUNCH_PENDING_SINCE_MS.store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+// Pause between typing the first command and its Enter (see
+// type_agent_first_command). Raw keystrokes, not a bracketed paste, so it
+// uses the Windows send path's 200 ms rather than the paste path's 50 ms.
+const AGENT_FIRST_COMMAND_SUBMIT_GAP_MS: u64 = 200;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LaunchConfirm {
+    // The shell came back after this launch's exec: the agent exited.
+    Exited(Option<i32>),
+    // No prompt since this launch's exec (or no exec yet).
+    Pending,
+    // No marker has ever arrived (Windows): exit can't be observed.
+    Unverifiable,
+}
+
+fn launch_confirm_state(fg: ShellForeground, written_from_ms: i64) -> LaunchConfirm {
+    if !fg.seen {
+        return LaunchConfirm::Unverifiable;
+    }
+    if fg.exec_ms >= written_from_ms && fg.at_prompt && fg.at_ms >= fg.exec_ms {
+        LaunchConfirm::Exited(fg.status)
+    } else {
+        LaunchConfirm::Pending
+    }
+}
+
+// The terminal's last words before the prompt that ended the agent: the
+// ANSI-stripped PTY tail minus its final (prompt) line, last 3 lines, one
+// line of text for the trace and the pane.
+fn launch_exit_tail(raw: &[u8]) -> String {
+    let stripped = strip_ansi(raw);
+    let text = String::from_utf8_lossy(&stripped);
+    let mut lines: Vec<&str> = text
+        .split(['\n', '\r'])
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    lines.pop();
+    let start = lines.len().saturating_sub(3);
+    let joined = lines[start..].join(" | ").replace('"', "'");
+    let mut out: String = joined.chars().take(240).collect();
+    if joined.chars().count() > 240 {
+        out.push('…');
+    }
+    out
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LaunchPhase {
+    // The gate passed; the command is about to be written.
+    BeforeWrite,
+    // The command was written.
+    Written,
+    // The gate timed out; nothing was written.
+    Timeout,
+    // The routine confirmed the agent is up (before the first command).
+    Confirmed,
+}
+
+struct AgentLaunch<R: tauri::Runtime> {
+    app: AppHandle<R>,
+    // From begin_agent_launch(), taken before the site's interrupts.
+    generation: u64,
+    provider: &'static str,
+    command: String,
+    // autostart | switch | reload | new-session
+    source: &'static str,
+    // The trace category the site has always used.
+    trace_category: &'static str,
+    caller_hint: &'static str,
+    gate: bool,
+    first_command: bool,
+    // The site's own work around the write (pins, refreshes, the boot hold).
+    hook: Box<dyn Fn(&AppHandle<R>, LaunchPhase) + Send>,
+}
+
+fn launch_agent_command<R: tauri::Runtime>(launch: AgentLaunch<R>) {
+    std::thread::spawn(move || run_agent_launch(launch));
+}
+
+fn emit_launch_outcome<R: tauri::Runtime>(
+    l: &AgentLaunch<R>,
+    outcome: &str,
+    status: Option<i32>,
+    tail: &str,
+) {
+    // agent-launch-failure-in-pane: replayable, because a cross-provider
+    // launch reloads the pane ~2.5 s later and an exit is reported ~0.2 s in;
+    // the pane's PushSource replays the latest outcome after that reload.
+    emit_replayable_payload(
+        &l.app,
+        "launch-outcome",
+        serde_json::json!({
+            "provider": l.provider,
+            "source": l.source,
+            "outcome": outcome,
+            "status": status,
+            "tail": tail,
+            "atMs": unix_now_ms(),
+        }),
+    );
+}
+
+fn run_agent_launch<R: tauri::Runtime>(l: AgentLaunch<R>) {
+    let app = &l.app;
+    let state = app.state::<AppState>();
+    let trace = |detail: String| {
+        if bram_trace_enabled() {
+            append_bram_trace_line(app, l.trace_category, &detail);
+        }
+    };
+    if l.gate {
+        match wait_for_shell_prompt_evidence() {
+            Err(waited) => {
+                trace(format!(
+                    "op=launch-timeout provider={} source={} waited_ms={}",
+                    l.provider, l.source, waited
+                ));
+                (l.hook)(app, LaunchPhase::Timeout);
+                emit_launch_outcome(&l, "timeout", None, "");
+                return;
+            }
+            Ok((waited, via)) => trace(format!(
+                "op=launch-gated provider={} source={} waited_ms={} via={}",
+                l.provider, l.source, waited, via
+            )),
+        }
+    }
+    if !agent_launch_is_current(l.generation) {
+        trace(format!(
+            "op=launch-superseded provider={} source={} stage=before-write",
+            l.provider, l.source
+        ));
+        return;
+    }
+    (l.hook)(app, LaunchPhase::BeforeWrite);
+    // Held pane sends wait for this to drop: after an exit they are then
+    // refused (the shell is at its prompt) and handed back; after a confirm,
+    // the first command is typed first and they flush behind it.
+    let _pending = LaunchPendingGuard::arm(l.generation);
+    let written_from = unix_now_ms();
+    if let Err(error) = pty_write_internal(app, &state, &format!("{}\r", l.command), l.caller_hint)
+    {
+        trace(format!(
+            "op=launch-error provider={} source={} error={}",
+            l.provider, l.source, error
+        ));
+        emit_launch_outcome(&l, "error", None, &error);
+        return;
+    }
+    shell_foreground_note_launch_written(written_from);
+    (l.hook)(app, LaunchPhase::Written);
+    loop {
+        let elapsed = unix_now_ms().saturating_sub(written_from);
+        // Checked before the shell's state: a newer launch's interrupt is what
+        // ends this agent, and its prompt must not read as this one's exit.
+        if !agent_launch_is_current(l.generation) {
+            trace(format!(
+                "op=launch-superseded provider={} source={} stage=confirm after_ms={}",
+                l.provider, l.source, elapsed
+            ));
+            return;
+        }
+        match launch_confirm_state(shell_foreground(), written_from) {
+            LaunchConfirm::Exited(status) => {
+                let raw = match pty_tail_cell().lock() {
+                    Ok(g) => g.clone(),
+                    Err(e) => e.into_inner().clone(),
+                };
+                let tail = launch_exit_tail(&raw);
+                trace(format!(
+                    "op=launch-exited provider={} source={} status={} after_ms={} tail=\"{}\"",
+                    l.provider,
+                    l.source,
+                    status.map(|s| s.to_string()).unwrap_or_else(|| "?".into()),
+                    elapsed,
+                    tail
+                ));
+                emit_launch_outcome(&l, "exited", status, &tail);
+                return;
+            }
+            LaunchConfirm::Pending if elapsed < AGENT_LAUNCH_CONFIRM_MS => {}
+            LaunchConfirm::Unverifiable if elapsed < AGENT_LAUNCH_CONFIRM_MS => {}
+            other => {
+                let via = if other == LaunchConfirm::Unverifiable {
+                    "no-marker"
+                } else {
+                    "no-prompt"
+                };
+                let exec_seen = shell_foreground().exec_ms >= written_from;
+                trace(format!(
+                    "op=launch-confirmed provider={} source={} via={} exec_seen={}",
+                    l.provider, l.source, via, exec_seen
+                ));
+                emit_launch_outcome(&l, "confirmed", None, "");
+                (l.hook)(app, LaunchPhase::Confirmed);
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(
+            AGENT_LAUNCH_CONFIRM_POLL_MS,
+        ));
+    }
+    if l.first_command {
+        type_agent_first_command(app, &state, l.source);
+    }
+}
+
+// A pinned Codex session is usable only while its rollout file exists. The
+// check used to happen as a side effect of latest_session_path_for_provider
+// (which clears a missing pin), so it held only while that lookup ran before
+// the pin was read; now the pin is checked where it is read.
+fn codex_pin_usable(target: &CodexReloadTarget) -> bool {
+    target.path.exists()
+}
+
+fn usable_codex_reload_target<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<CodexReloadTarget> {
+    let target = codex_reload_target(app)?;
+    if codex_pin_usable(&target) {
+        Some(target)
+    } else {
+        clear_codex_reload_target(app, &target.id, "target-missing", "");
+        None
+    }
+}
+
+#[cfg(test)]
+mod agent_launch_tests {
+    use super::{
+        codex_pin_usable, launch_confirm_state as confirm, launch_exit_tail, CodexReloadTarget,
+        LaunchConfirm, ShellForeground,
+    };
+
+    fn fg(at_prompt: bool, status: i32, at_ms: i64, exec_ms: i64) -> ShellForeground {
+        ShellForeground {
+            seen: true,
+            at_prompt,
+            status: Some(status),
+            at_ms,
+            exec_ms,
+        }
+    }
+
+    #[test]
+    fn prompt_after_this_launchs_exec_is_an_exit() {
+        assert_eq!(
+            confirm(fg(true, 1, 120, 110), 100),
+            LaunchConfirm::Exited(Some(1))
+        );
+    }
+
+    #[test]
+    fn running_agent_is_pending() {
+        assert_eq!(confirm(fg(false, 0, 90, 110), 100), LaunchConfirm::Pending);
+    }
+
+    #[test]
+    fn interrupt_prompts_before_the_write_are_not_an_exit() {
+        // The switch's Ctrl-C at a bare prompt draws prompts (status 1)
+        // before the launch is written; with no exec since, that's not an exit.
+        assert_eq!(confirm(fg(true, 1, 95, 50), 100), LaunchConfirm::Pending);
+    }
+
+    #[test]
+    fn no_marker_ever_is_unverifiable() {
+        assert_eq!(
+            confirm(ShellForeground::default(), 100),
+            LaunchConfirm::Unverifiable
+        );
+    }
+
+    #[test]
+    fn exit_tail_drops_the_prompt_line() {
+        let raw = b"\x1b[31mNo conversation found to continue\x1b[0m\r\n\x1b]7779;bram;prompt;1\x07bash-3.2$ ";
+        assert_eq!(launch_exit_tail(raw), "No conversation found to continue");
+    }
+
+    #[test]
+    fn launch_pending_holds_until_cleared_or_stale() {
+        use super::{launch_pending_holds as holds, AGENT_LAUNCH_CONFIRM_MS};
+        assert!(!holds(0, 1_000), "no launch pending");
+        assert!(holds(1_000, 1_500), "just written");
+        assert!(
+            holds(1_000, 1_000 + AGENT_LAUNCH_CONFIRM_MS),
+            "confirm window"
+        );
+        assert!(
+            !holds(1_000, 1_000 + AGENT_LAUNCH_CONFIRM_MS + 2_000),
+            "a mark the routine never cleared expires"
+        );
+    }
+
+    // provider-session-digest-for-codex: the header names the full
+    // transcript, so a partner can go past the digest when it needs to.
+    #[test]
+    fn catch_up_exchanges_are_not_new_work() {
+        use super::{catch_up_turn_text, drop_catch_up_exchanges};
+        let catch_up = catch_up_turn_text(
+            "Codex session 'X'",
+            4,
+            "resources/session-digests/codex-x.md",
+        );
+        let turns = vec![
+            serde_json::json!({"role": "user", "text": "real question"}),
+            serde_json::json!({"role": "assistant", "text": "real answer"}),
+            serde_json::json!({"role": "user", "text": catch_up}),
+            serde_json::json!({"role": "assistant", "text": "", "entries": [{"name": "Read"}]}),
+            serde_json::json!({"role": "assistant", "text": "Nothing substantive changed."}),
+        ];
+        let kept = drop_catch_up_exchanges(&turns);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[1]["text"], "real answer");
+        // Only a catch-up exchange: nothing new, so no digest and no notice.
+        assert!(drop_catch_up_exchanges(&turns[2..]).is_empty());
+    }
+
+    #[test]
+    fn session_digest_names_the_full_transcript_and_shows_turns() {
+        use super::{render_session_digest, SessionProvider};
+        let turns = vec![
+            serde_json::json!({"role": "user", "text": "fix the gate", "entries": []}),
+            serde_json::json!({"role": "assistant", "text": "Done.", "entries": [
+                {"name": "Edit", "description": "lib.rs: guard the gate"}
+            ]}),
+        ];
+        let body = render_session_digest(
+            SessionProvider::Claude,
+            "abc-123",
+            Some("Gate work"),
+            Some(std::path::Path::new(
+                "/home/u/.claude/projects/p/abc-123.jsonl",
+            )),
+            57,
+            &turns,
+        );
+        assert!(body.contains("# Claude session digest"));
+        assert!(body.contains("- Full transcript: /home/u/.claude/projects/p/abc-123.jsonl"));
+        assert!(body.contains("Turns in the session: 57; shown here: the last 2"));
+        assert!(body.contains("## user\n\nfix the gate"));
+        assert!(body.contains("- Edit: lib.rs: guard the gate"));
+    }
+
+    #[test]
+    fn missing_pin_file_is_not_usable() {
+        let dir = std::env::temp_dir().join(format!("bram-pin-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("rollout.jsonl");
+        std::fs::write(&path, b"{}").unwrap();
+        let target = CodexReloadTarget {
+            id: "x".into(),
+            path: path.clone(),
+            previous_path: None,
+            set_at: std::time::SystemTime::UNIX_EPOCH,
+        };
+        assert!(codex_pin_usable(&target));
+        std::fs::remove_file(&path).unwrap();
+        assert!(!codex_pin_usable(&target));
     }
 }
 
@@ -18928,8 +19732,40 @@ fn switch_agent(
     } else {
         None
     };
+    // provider-session-counterparts: the session being left, and its partner
+    // on the target side. A partner whose file is gone is skipped, and the
+    // switch falls back to today's order.
+    let target_provider = if provider_key == "codex" {
+        SessionProvider::Codex
+    } else {
+        SessionProvider::Claude
+    };
+    let leaving = current_provider(&app)
+        .filter(|p| *p != target_provider)
+        .and_then(|p| live_session_id(&app, p).map(|sid| (p, sid)));
+    let partner = leaving.as_ref().and_then(|(p, sid)| {
+        let conn = worklist_state_open(&app)?;
+        let id = worklist_state::session_partner(&conn, session_provider_label(*p), sid)
+            .ok()
+            .flatten()?;
+        if session_path_for_id(&app, target_provider, &id).is_some() {
+            Some(id)
+        } else {
+            if bram_trace_enabled() {
+                append_bram_trace_line(
+                    &app,
+                    "agent-switch",
+                    &format!(
+                        "op=partner-missing provider={} session={}",
+                        provider_key, id
+                    ),
+                );
+            }
+            None
+        }
+    });
     let pin = if provider_key == "codex" {
-        codex_reload_target(&app)
+        usable_codex_reload_target(&app)
     } else {
         None
     };
@@ -18939,6 +19775,7 @@ fn switch_agent(
         pin.as_ref().map(|target| target.id.as_str()),
         pending.as_ref(),
         pending_target.as_deref(),
+        partner.as_deref(),
     );
     if !has_session && bram_trace_enabled() {
         append_bram_trace_line(
@@ -18950,6 +19787,17 @@ fn switch_agent(
             ),
         );
     }
+    let resume_reason: &'static str = if pending_disposition != "none" {
+        pending_disposition
+    } else if partner.is_some() {
+        "partner"
+    } else if pin.is_some() {
+        "pin"
+    } else if has_session {
+        "latest"
+    } else {
+        "fresh"
+    };
     let args = configured_agent_args(&app);
     let command = if args.trim().is_empty() {
         base_command
@@ -18961,7 +19809,7 @@ fn switch_agent(
             &app,
             "agent-switch",
             &format!(
-                "op=start provider={} command={} pending={} requested_sid={} resume_sid={}",
+                "op=start provider={} command={} pending={} requested_sid={} resume_sid={} resume_reason={}",
                 provider_key,
                 command,
                 pending_disposition,
@@ -18975,25 +19823,36 @@ fn switch_agent(
                 } else {
                     pending_target
                         .as_deref()
+                        .or(partner.as_deref())
                         .or_else(|| pin.as_ref().map(|target| target.id.as_str()))
                         .unwrap_or("latest-or-fresh")
-                }
+                },
+                resume_reason
             ),
         );
     }
-    // NOT armed here, deliberately (#305, reverting the arm added by 597935b).
-    // The exposure is real — during the interrupt→launch window the foreground
-    // is (or becomes) a bare shell, and a pane send landing there EXECUTES —
-    // but the hold's release condition is unsatisfiable for Codex: it emits
-    // none of AGENT_BOOT_EVIDENCE's byte patterns, and the `session-surfaced`
-    // escape hatch waits for a rollout file Codex does not write until its
-    // first user turn, which is the very message being held. Holding here made
-    // every Codex switch swallow pane sends and flush them into the NEXT
-    // agent, silently — strictly worse than the shell exposure it prevents.
-    // `new_session` still arms it (that gap predates this release and its
-    // kickoff-into-PS2 failure is worse); both are fixed properly by
-    // issue-305-boot-hold-unsatisfiable, which releases on the prompt going
-    // away rather than on bytes one provider never sends.
+    // provider-session-counterparts: the session this launch resumes, when
+    // it is known now; a fresh launch's session gets its id only once its
+    // file appears, so that pair waits for the id to change (PENDING_PAIR).
+    let target_sid: Option<String> = match resume_reason {
+        "resume-pending" => pending_target.clone(),
+        "partner" => partner.clone(),
+        "pin" => pin.as_ref().map(|t| t.id.clone()),
+        "latest" => live_session_id(&app, target_provider),
+        _ => None,
+    };
+    let pair_from = leaving.clone();
+    // The boot hold is NOT armed here, deliberately (#305, reverting the arm
+    // added by 597935b): its release condition is boot bytes, and Codex emits
+    // none it accepts, so holding made every Codex switch swallow pane sends
+    // and flush them into the NEXT agent. The exposure it was meant to close —
+    // a pane send landing on the bare shell between the outgoing agent's exit
+    // and the new launch, where it would EXECUTE — is closed by
+    // pane-send-refuses-bare-shell instead: the send gate hands a send back to
+    // the message box whenever the shell's own marker says it is at its
+    // prompt, which needs nothing from either provider. (This comment used to
+    // defer to issue-305-boot-hold-unsatisfiable, which was dropped.)
+    let generation = begin_agent_launch();
     clear_stale_terminal_input_for_switch(&app, &state, "agent-switch");
     // Dismiss any open agent menu/picker first (e.g. a Claude `/resume` list
     // left open by a prior first-command). Claude exits only on two Ctrl+C at
@@ -19011,79 +19870,81 @@ fn switch_agent(
     // issue-314: the launch is no longer typed blind after a fixed settle —
     // the outgoing CLI's shutdown scales with session size, and on Windows
     // the 1.2 s timer typed `codex resume …` into Claude's farewell, which
-    // swallowed it and stranded the session at bare PowerShell. Gate on
-    // shell-prompt evidence in a spawned waiter (the new-session pattern);
-    // on timeout, type nothing — the boot hold stays armed and a manual
-    // launch releases it.
+    // swallowed it and stranded the session at bare PowerShell. The shared
+    // launch routine gates on the shell's prompt, confirms the agent came up,
+    // and on timeout types nothing.
     let session_provider = if provider_key == "codex" {
         SessionProvider::Codex
     } else {
         SessionProvider::Claude
     };
-    let waiter_app = app.clone();
-    std::thread::spawn(move || {
-        let state = waiter_app.state::<AppState>();
-        match wait_for_shell_prompt_evidence() {
-            Err(waited) => {
-                if bram_trace_enabled() {
-                    append_bram_trace_line(
-                        &waiter_app,
-                        "agent-switch",
-                        &format!(
-                            "op=launch-timeout provider={} waited_ms={}",
-                            provider_key, waited
-                        ),
-                    );
+    launch_agent_command(AgentLaunch {
+        app: app.clone(),
+        generation,
+        provider: provider_key,
+        command,
+        source: "switch",
+        trace_category: "agent-switch",
+        caller_hint: "agent-switch-launch",
+        gate: true,
+        first_command: true,
+        hook: Box::new(move |app, phase| {
+            if phase == LaunchPhase::Confirmed {
+                // Pairs are explicit only (the draft's decided answer): a
+                // switch never pairs on its own. When it fell back (no
+                // partner, no pending name), the pane offers Keep these
+                // together / Start a new session, if the setting is on.
+                let offer = matches!(resume_reason, "latest" | "pin") && pair_offers_enabled(app);
+                emit_pair_offer(
+                    app,
+                    pair_from.as_ref().filter(|_| offer),
+                    target_sid
+                        .clone()
+                        .filter(|_| offer)
+                        .map(|id| (target_provider, id)),
+                );
+                // provider-session-digest-for-codex: resuming a partner, write
+                // what it missed in the session being left, and offer the
+                // catch-up turn. Then mark the entered session.
+                let digest = if resume_reason == "partner" {
+                    pair_from
+                        .as_ref()
+                        .and_then(|(p, id)| write_session_digest(app, *p, id, true))
+                } else {
+                    None
+                };
+                emit_catch_up_offer(app, pair_from.as_ref(), Some(target_provider), digest);
+                if let Some(id) = target_sid.as_deref() {
+                    mark_session_entered(app, target_provider, id);
                 }
                 return;
             }
-            Ok(waited) => {
-                if bram_trace_enabled() {
-                    append_bram_trace_line(
-                        &waiter_app,
-                        "agent-switch",
-                        &format!(
-                            "op=launch-gated provider={} waited_ms={}",
-                            provider_key, waited
-                        ),
-                    );
-                }
+            if phase != LaunchPhase::Written {
+                return;
             }
-        }
-        if let Err(error) = pty_write_internal(
-            &waiter_app,
-            &state,
-            &format!("{}\r", command),
-            "agent-switch-launch",
-        ) {
-            append_bram_trace_line(
-                &waiter_app,
-                "agent-switch",
-                &format!("op=launch-error provider={} error={}", provider_key, error),
-            );
-            return;
-        }
-        if let Some(id) = pending_target.as_deref() {
-            let _ = pin_codex_reload_target(&waiter_app, id);
-        }
-        trace_agent_pty_step(&waiter_app, "switch", provider_key, "launch");
-        // Switching providers must reset the transcript to the new provider's
-        // latest session, not diff against the old cursor. Without this, the
-        // scheduled refresh emits an empty incremental (reset:false, len:0)
-        // because the cursor still matches, and the transcript keeps showing the
-        // previous provider's conversation until a manual reload. Clearing the new
-        // provider's tail cursor makes schedule_agent_switch_refresh's emit a full
-        // reset, mirroring resync_transcript_to_session on the reload path.
-        let crossing = current_provider(&waiter_app) != Some(session_provider);
-        schedule_agent_switch_refresh(waiter_app.clone(), provider_key, "switch");
-        schedule_agent_first_command(waiter_app.clone(), "switch");
-        if crossing {
-            // Flip the active-provider hint now, then reload the agent pane once the
-            // new agent settles, so the sessions list, banner, agent name and verb
-            // all switch instead of staying stale on the prior provider.
-            set_current_provider(&waiter_app, session_provider, "switch");
-            schedule_cross_provider_pane_reload(waiter_app.clone());
-        }
+            if let Some(id) = pending_target.as_deref() {
+                let _ = pin_codex_reload_target(app, id);
+            }
+            trace_agent_pty_step(app, "switch", provider_key, "launch");
+            // Switching providers must reset the transcript to the new
+            // provider's latest session, not diff against the old cursor.
+            // Without this, the scheduled refresh emits an empty incremental
+            // (reset:false, len:0) because the cursor still matches, and the
+            // transcript keeps showing the previous provider's conversation
+            // until a manual reload. Clearing the new provider's tail cursor
+            // makes schedule_agent_switch_refresh's emit a full reset,
+            // mirroring resync_transcript_to_session on the reload path.
+            let crossing = current_provider(app) != Some(session_provider);
+            schedule_agent_switch_refresh(app.clone(), provider_key, "switch");
+            if crossing {
+                // Flip the active-provider hint now, then reload the agent
+                // pane once the new agent settles, so the sessions list,
+                // banner, agent name and verb all switch instead of staying
+                // stale on the prior provider.
+                set_current_provider(app, session_provider, "switch");
+                schedule_cross_provider_pane_reload(app.clone());
+            }
+        }),
     });
     Ok(())
 }
@@ -19092,12 +19953,558 @@ fn switch_agent(
 // was interrupted before creating a rollout, there is nothing new to resume:
 // launch fresh again, keeping the title for its first confirmed session. Never
 // silently turn that request into `resume <previous>` or `resume --last`.
+// provider-session-counterparts: record that two sessions of different
+// providers go together (worklist_state::record_session_pair). Called once a
+// switch's launch is confirmed, or when an explicit cross-provider resume is.
+fn record_pair_for<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    a: &(SessionProvider, String),
+    b: &(SessionProvider, String),
+    source: &str,
+) {
+    if a.0 == b.0 {
+        return;
+    }
+    let (claude, codex) = match a.0 {
+        SessionProvider::Claude => (a.1.as_str(), b.1.as_str()),
+        SessionProvider::Codex => (b.1.as_str(), a.1.as_str()),
+    };
+    let Some(conn) = worklist_state_open(app) else {
+        return;
+    };
+    let result = worklist_state::record_session_pair(&conn, claude, codex, unix_now_ms(), source);
+    if bram_trace_enabled() {
+        let outcome = match &result {
+            Ok(true) => "ok".to_string(),
+            Ok(false) => "unchanged".to_string(),
+            Err(e) => format!("error detail={}", e),
+        };
+        append_bram_trace_line(
+            app,
+            "state-mirror",
+            &format!(
+                "op=pair-stamp claude={} codex={} source={} result={}",
+                claude, codex, source, outcome
+            ),
+        );
+    }
+}
+
+// provider-session-pair-offer: `sessions.pairAcrossProviders` (default on).
+fn pair_offers_enabled<R: tauri::Runtime>(app: &AppHandle<R>) -> bool {
+    project_root(Some(app))
+        .and_then(|root| load_project_config(&root))
+        .and_then(|c| c.sessions)
+        .and_then(|s| s.pair_across_providers)
+        .unwrap_or(true)
+}
+
+// provider-session-pair-offer: Keep these together, from the pair offer.
+fn pair_sessions_route<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    query: &str,
+) -> Result<Vec<u8>, String> {
+    let mut claude = String::new();
+    let mut codex = String::new();
+    // provider-session-digest-for-codex: the side the offer was about (the
+    // session you switched away from), whose digest the other side reads.
+    let mut from: Option<SessionProvider> = None;
+    for pair in query.split('&') {
+        if let Some(v) = pair.strip_prefix("claude=") {
+            claude = percent_decode(v);
+        } else if let Some(v) = pair.strip_prefix("codex=") {
+            codex = percent_decode(v);
+        } else if let Some(v) = pair.strip_prefix("from=") {
+            from = SessionProvider::from_str(&percent_decode(v));
+        }
+    }
+    if claude.is_empty() || codex.is_empty() {
+        return Err("claude and codex ids required".to_string());
+    }
+    record_pair_for(
+        app,
+        &(SessionProvider::Claude, claude.clone()),
+        &(SessionProvider::Codex, codex.clone()),
+        "offer-keep",
+    );
+    emit_pair_offer(app, None, None);
+    if let Some(fp) = from {
+        let (fid, tp) = match fp {
+            SessionProvider::Claude => (claude.clone(), SessionProvider::Codex),
+            SessionProvider::Codex => (codex.clone(), SessionProvider::Claude),
+        };
+        let digest = write_session_digest(app, fp, &fid, true);
+        emit_catch_up_offer(app, Some(&(fp, fid)), Some(tp), digest);
+    }
+    emit_replayable_signal(app, "sessions-list-changed");
+    Ok(br#"{"ok":true}"#.to_vec())
+}
+
+// provider-session-pair-offer: a session's title by id, for the offer line
+// and the Sessions tab's "paired with" label. None when the file is gone.
+fn session_title_by_id<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    provider: SessionProvider,
+    id: &str,
+) -> Option<String> {
+    let path = session_path_for_id(app, provider, id)?;
+    match provider {
+        SessionProvider::Claude => claude_session_title(&path).ok().flatten(),
+        // The thread name (Bram's or Codex's own, last entry wins) is what the
+        // Sessions list shows; the first user message is only a fallback.
+        SessionProvider::Codex => codex_session_index()
+            .ok()
+            .and_then(|titles| titles.get(id).cloned())
+            .or_else(|| codex_session_title(&path).ok().flatten()),
+    }
+}
+
+// provider-session-pair-offer: each /__sessions/list row whose session has a
+// partner gets `partner: {provider, id, title}` (computed, never stored).
+fn attach_session_partners<R: tauri::Runtime>(app: &AppHandle<R>, rows: &mut serde_json::Value) {
+    let Some(list) = rows.as_array_mut() else {
+        return;
+    };
+    let Some(conn) = worklist_state_open(app) else {
+        return;
+    };
+    for row in list.iter_mut() {
+        let provider = row
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let id = row
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let other = match provider.as_str() {
+            "claude" => SessionProvider::Codex,
+            "codex" => SessionProvider::Claude,
+            _ => continue,
+        };
+        let Ok(Some(partner)) = worklist_state::session_partner(&conn, &provider, &id) else {
+            continue;
+        };
+        let title = session_title_by_id(app, other, &partner);
+        if let Some(obj) = row.as_object_mut() {
+            obj.insert(
+                "partner".to_string(),
+                serde_json::json!({
+                    "provider": session_provider_label(other),
+                    "id": partner,
+                    "title": title,
+                }),
+            );
+        }
+    }
+}
+
+// provider-session-pair-offer: the Sessions tab's Unpair. Records an empty
+// partner for the session, which ends the pairing from both sides.
+fn unpair_session<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    session_id: &str,
+    provider: Option<SessionProvider>,
+) -> Result<Vec<u8>, String> {
+    let provider = provider.ok_or("provider required")?;
+    let conn = worklist_state_open(app).ok_or("state db unavailable")?;
+    let (claude, codex) = match provider {
+        SessionProvider::Claude => (session_id, ""),
+        SessionProvider::Codex => ("", session_id),
+    };
+    let wrote = worklist_state::record_session_pair(&conn, claude, codex, unix_now_ms(), "unpair")
+        .map_err(|e| e.to_string())?;
+    if bram_trace_enabled() {
+        append_bram_trace_line(
+            app,
+            "state-mirror",
+            &format!(
+                "op=pair-stamp claude={} codex={} source=unpair result={}",
+                claude,
+                codex,
+                if wrote { "ok" } else { "unchanged" }
+            ),
+        );
+    }
+    emit_replayable_signal(app, "sessions-list-changed");
+    Ok(br#"{"ok":true}"#.to_vec())
+}
+
+// provider-session-pair-offer: after a header switch that fell back to the
+// Codex pin or the most recent session (no partner), the pane offers to start
+// a new session for the one being left instead. Replayable, because a
+// cross-provider switch reloads the pane; any other switch clears it.
+fn emit_pair_offer<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    from: Option<&(SessionProvider, String)>,
+    to: Option<(SessionProvider, String)>,
+) {
+    let payload = match (from, to) {
+        (Some((fp, fid)), Some((tp, tid))) => serde_json::json!({
+            "active": true,
+            "fromProvider": session_provider_label(*fp),
+            "fromSessionId": fid,
+            "fromTitle": session_title_by_id(app, *fp, fid),
+            "toProvider": session_provider_label(tp),
+            "toSessionId": tid,
+            "toTitle": session_title_by_id(app, tp, &tid),
+            "atMs": unix_now_ms(),
+        }),
+        _ => serde_json::json!({ "active": false, "atMs": unix_now_ms() }),
+    };
+    if bram_trace_enabled() {
+        append_bram_trace_line(
+            app,
+            "agent-switch",
+            &format!(
+                "op=pair-offer active={}",
+                payload
+                    .get("active")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+            ),
+        );
+    }
+    emit_replayable_payload(app, "pair-offer", payload);
+}
+
+// provider-session-digest-for-codex ("catch the partner up"): pairing brings
+// you back to the right session but not up to date. When you leave a session
+// for its partner, Bram writes what the partner missed to
+// resources/session-digests/<provider>-<id>.md (gitignored) and the pane
+// offers one turn telling the partner to read it. The projection carries no
+// timestamps, so "what it missed" is counted: each switch that enters a
+// session records its turn total as an entry mark; leaving it later, the new
+// turns are total - mark. No mark yet: the latest SESSION_DIGEST_CAP turns.
+const SESSION_DIGEST_CAP: usize = 40;
+
+// The catch-up turn is written here, not in the pane, so the digest can
+// recognise it. Its exchange (the turn and the agent's replies up to the next
+// user turn) is left out of a later digest: otherwise each catch-up counts as
+// new work in the session that read it, and the partners catch each other up
+// on catching up (demo, 2026-10-04 18:51-18:53).
+const CATCH_UP_TURN_MARK: &str = "continued while you were away";
+
+fn catch_up_turn_text(from: &str, turns: usize, path: &str) -> String {
+    format!(
+        "Your partner {} {} ({} turn{}). Read `{}` (its header names the full transcript if you need more), then tell me in a few lines what changed before we go on.",
+        from,
+        CATCH_UP_TURN_MARK,
+        turns,
+        if turns == 1 { "" } else { "s" },
+        path
+    )
+}
+
+fn is_catch_up_turn(text: &str) -> bool {
+    text.trim_start().starts_with("Your partner ") && text.contains(CATCH_UP_TURN_MARK)
+}
+
+// Drop each catch-up exchange: the catch-up user turn and every turn up to
+// the next user turn.
+fn drop_catch_up_exchanges(turns: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    let mut skipping = false;
+    for t in turns {
+        if t.get("role").and_then(|r| r.as_str()) == Some("user") {
+            let text = t.get("text").and_then(|x| x.as_str()).unwrap_or("");
+            skipping = is_catch_up_turn(text);
+        }
+        if !skipping {
+            out.push(t.clone());
+        }
+    }
+    out
+}
+const SESSION_DIGEST_TEXT_CHARS: usize = 2000;
+
+fn session_digest_dir<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
+    project_resource_path(app, "session-digests")
+}
+
+fn session_digest_rel_path(provider: SessionProvider, id: &str) -> String {
+    format!(
+        "resources/session-digests/{}-{}.md",
+        session_provider_label(provider),
+        id
+    )
+}
+
+fn session_digest_marks_path<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
+    session_digest_dir(app).map(|d| d.join(".marks.json"))
+}
+
+fn read_session_digest_marks<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+) -> serde_json::Map<String, serde_json::Value> {
+    session_digest_marks_path(app)
+        .and_then(|p| std::fs::read(p).ok())
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+fn session_turns<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    provider: SessionProvider,
+    id: &str,
+) -> Option<(usize, Vec<serde_json::Value>)> {
+    let bytes = read_projected_turns(app, id, Some(provider), Some(SESSION_DIGEST_CAP)).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let total = v.get("total").and_then(|t| t.as_u64()).unwrap_or(0) as usize;
+    let turns = v
+        .get("turns")
+        .and_then(|t| t.as_array())
+        .cloned()
+        .unwrap_or_default();
+    Some((total, turns))
+}
+
+// Record a session's turn total as it is entered.
+fn mark_session_entered<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    provider: SessionProvider,
+    id: &str,
+) {
+    let Some((total, _)) = session_turns(app, provider, id) else {
+        return;
+    };
+    let Some(path) = session_digest_marks_path(app) else {
+        return;
+    };
+    let mut marks = read_session_digest_marks(app);
+    marks.insert(
+        format!("{}-{}", session_provider_label(provider), id),
+        serde_json::json!(total),
+    );
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&path, serde_json::Value::Object(marks).to_string());
+}
+
+fn clip_chars(s: &str, n: usize) -> String {
+    let mut out: String = s.chars().take(n).collect();
+    if s.chars().count() > n {
+        out.push_str(" …");
+    }
+    out
+}
+
+// The digest body: a header naming the full transcript, then the turns.
+fn render_session_digest(
+    provider: SessionProvider,
+    id: &str,
+    title: Option<&str>,
+    transcript: Option<&Path>,
+    total: usize,
+    turns: &[serde_json::Value],
+) -> String {
+    let who = if provider == SessionProvider::Codex {
+        "Codex"
+    } else {
+        "Claude"
+    };
+    let mut out = format!(
+        "# {} session digest\n\n- Title: {}\n- Session id: {}\n- Full transcript: {}\n- Turns in the session: {}; shown here: the last {}\n\nWritten by Bram for the partner session on the other provider. The full transcript is JSONL; read it only if this digest isn't enough.\n",
+        who,
+        title.unwrap_or("(none)"),
+        id,
+        transcript.map(|p| p.display().to_string()).unwrap_or_else(|| "(not found)".to_string()),
+        total,
+        turns.len()
+    );
+    for turn in turns {
+        let role = turn.get("role").and_then(|r| r.as_str()).unwrap_or("?");
+        out.push_str(&format!("\n## {}\n\n", role));
+        let text = turn
+            .get("text")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .trim();
+        if !text.is_empty() {
+            out.push_str(&clip_chars(text, SESSION_DIGEST_TEXT_CHARS));
+            out.push('\n');
+        }
+        if let Some(entries) = turn.get("entries").and_then(|e| e.as_array()) {
+            for e in entries {
+                let name = e.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                if name.is_empty() {
+                    continue;
+                }
+                let what = e
+                    .get("description")
+                    .or_else(|| e.get("nameDetail"))
+                    .or_else(|| e.get("summary"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                out.push_str(&format!("- {}: {}\n", name, clip_chars(what.trim(), 200)));
+            }
+        }
+    }
+    out
+}
+
+// Write the digest of the session being left. `since_mark`: count only the
+// turns added since it was entered (the partner's catch-up); otherwise the
+// latest SESSION_DIGEST_CAP. Returns (relative path, turns written); None
+// when nothing new happened or the session can't be read.
+fn write_session_digest<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    provider: SessionProvider,
+    id: &str,
+    since_mark: bool,
+) -> Option<(String, usize)> {
+    let (total, window) = session_turns(app, provider, id)?;
+    let mark = if since_mark {
+        read_session_digest_marks(app)
+            .get(&format!("{}-{}", session_provider_label(provider), id))
+            .and_then(|v| v.as_u64())
+            .map(|m| m as usize)
+    } else {
+        None
+    };
+    let new = match mark {
+        Some(m) => total.saturating_sub(m),
+        None => window.len(),
+    };
+    let candidates = drop_catch_up_exchanges(&window[window.len() - new.min(window.len())..]);
+    let take = candidates.len();
+    if bram_trace_enabled() && take == 0 {
+        append_bram_trace_line(
+            app,
+            "agent-switch",
+            &format!(
+                "op=digest-written provider={} session={} turns=0",
+                session_provider_label(provider),
+                id
+            ),
+        );
+    }
+    if take == 0 {
+        return None;
+    }
+    let turns = &candidates[..];
+    let title = session_title_by_id(app, provider, id);
+    let transcript = session_path_for_id(app, provider, id);
+    let body = render_session_digest(
+        provider,
+        id,
+        title.as_deref(),
+        transcript.as_deref(),
+        total,
+        turns,
+    );
+    let dir = session_digest_dir(app)?;
+    let _ = std::fs::create_dir_all(&dir);
+    let file = dir.join(format!("{}-{}.md", session_provider_label(provider), id));
+    std::fs::write(&file, body.as_bytes()).ok()?;
+    if bram_trace_enabled() {
+        append_bram_trace_line(
+            app,
+            "agent-switch",
+            &format!(
+                "op=digest-written provider={} session={} turns={} bytes={}",
+                session_provider_label(provider),
+                id,
+                take,
+                body.len()
+            ),
+        );
+    }
+    Some((session_digest_rel_path(provider, id), take))
+}
+
+// The pane's "Catch <partner> up" notice. Replayable (a cross-provider switch
+// reloads the pane); any switch without a digest clears it.
+fn emit_catch_up_offer<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    from: Option<&(SessionProvider, String)>,
+    to: Option<SessionProvider>,
+    digest: Option<(String, usize)>,
+) {
+    let payload = match (from, to, digest) {
+        (Some((fp, fid)), Some(tp), Some((path, turns))) => {
+            let title = session_title_by_id(app, *fp, fid);
+            let who = if *fp == SessionProvider::Codex {
+                "Codex"
+            } else {
+                "Claude"
+            };
+            let from = match title.as_deref() {
+                Some(t) => format!("{} session '{}'", who, t),
+                None => format!(
+                    "{} session {}",
+                    who,
+                    fid.chars().take(8).collect::<String>()
+                ),
+            };
+            serde_json::json!({
+                "active": true,
+                "fromProvider": session_provider_label(*fp),
+                "fromSessionId": fid,
+                "fromTitle": title,
+                "toProvider": session_provider_label(tp),
+                "path": path,
+                "turns": turns,
+                "turnText": catch_up_turn_text(&from, turns, &path),
+                "atMs": unix_now_ms(),
+            })
+        }
+        _ => serde_json::json!({ "active": false, "atMs": unix_now_ms() }),
+    };
+    emit_replayable_payload(app, "catch-up-offer", payload);
+}
+
+// A switch whose target session isn't known at launch (a fresh launch: the
+// new session has no id until its file appears) pairs when the provider's
+// live session first differs from what it was before the switch.
+struct PendingPair {
+    from: (SessionProvider, String),
+    to: SessionProvider,
+    baseline: Option<String>,
+    at_ms: i64,
+}
+
+static PENDING_PAIR: Mutex<Option<PendingPair>> = Mutex::new(None);
+const PENDING_PAIR_TTL_MS: i64 = 15 * 60 * 1000;
+
+fn resolve_pending_pair<R: tauri::Runtime>(app: &AppHandle<R>, provider: SessionProvider) {
+    let mut guard = match PENDING_PAIR.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    let Some(pending) = guard.as_ref() else {
+        return;
+    };
+    if pending.to != provider {
+        return;
+    }
+    if unix_now_ms().saturating_sub(pending.at_ms) > PENDING_PAIR_TTL_MS {
+        *guard = None;
+        return;
+    }
+    let Some(live) = live_session_id(app, provider) else {
+        return;
+    };
+    if pending.baseline.as_deref() == Some(live.as_str()) {
+        return;
+    }
+    let from = pending.from.clone();
+    *guard = None;
+    drop(guard);
+    record_pair_for(app, &from, &(provider, live), "switch-new-session");
+}
+
 fn provider_switch_launch(
     provider: &str,
     has_session: bool,
     pinned_id: Option<&str>,
     pending: Option<&PendingSessionTitle>,
     pending_target: Option<&str>,
+    partner_id: Option<&str>,
 ) -> (String, &'static str) {
     if provider == "codex" {
         if let Some(rec) = pending.filter(|rec| rec.provider == "codex") {
@@ -19112,6 +20519,14 @@ fn provider_switch_launch(
                 ),
             };
         }
+    }
+    // provider-session-counterparts: the session that goes with the one being
+    // left outranks the Codex pin and "most recent". A pending named session
+    // (above) still wins: the user just asked for it.
+    if let Some(id) = partner_id {
+        return (agent_resume_command(provider, id).unwrap(), "none");
+    }
+    if provider == "codex" {
         if let Some(id) = pinned_id {
             return (agent_resume_command(provider, id).unwrap(), "none");
         }
@@ -19421,7 +20836,33 @@ fn reload_agent_session(
     };
     clear_pending_session_title_for_resume(&app, session_provider, &session, "session-reload");
     cancel_agent_boot_hold(&app, "session-reload");
-    let command = agent_resume_command(provider_key, &session).ok_or("unknown agent provider")?;
+    // provider-session-counterparts: an explicit resume always wins over a
+    // pairing, and a cross-provider one re-pairs with the session being left.
+    let leaving = current_provider(&app)
+        .filter(|p| *p != session_provider)
+        .and_then(|p| live_session_id(&app, p).map(|sid| (p, sid)));
+    // agent-launch-shared-routine precondition: the session named must still
+    // exist. Resuming a deleted one makes the CLI print an error and exit,
+    // leaving a bare shell; start the provider fresh instead, as the switch
+    // and autostart paths do (c3d6320).
+    let session_exists = session_path_for_id(&app, session_provider, &session).is_some();
+    let command = if session_exists {
+        agent_resume_command(provider_key, &session).ok_or("unknown agent provider")?
+    } else {
+        if bram_trace_enabled() {
+            append_bram_trace_line(
+                &app,
+                "agent-switch",
+                &format!(
+                    "op=launch-fresh reason=no-session provider={} source=reload session={}",
+                    provider_key, session
+                ),
+            );
+        }
+        agent_launch_command(provider_key)
+            .ok_or("unknown agent provider")?
+            .to_string()
+    };
     if bram_trace_enabled() {
         append_bram_trace_line(
             &app,
@@ -19432,9 +20873,10 @@ fn reload_agent_session(
             ),
         );
     }
-    if provider_key == "codex" {
+    if provider_key == "codex" && session_exists {
         pin_codex_reload_target(&app, &session)?;
     }
+    let generation = begin_agent_launch();
     clear_stale_terminal_input_for_switch(&app, &state, "agent-reload");
     // Dismiss any open agent menu/picker first so both Ctrl+C land on an empty
     // prompt and the agent actually exits (see switch_agent for the full
@@ -19447,26 +20889,129 @@ fn reload_agent_session(
     std::thread::sleep(std::time::Duration::from_millis(AGENT_INTERRUPT_GAP_MS));
     pty_write_internal(&app, &state, "\x03", "agent-reload-interrupt-2")?;
     trace_agent_pty_step(&app, "reload", provider_key, "interrupt-2");
-    std::thread::sleep(std::time::Duration::from_millis(AGENT_RELAUNCH_SETTLE_MS));
-    pty_write_internal(
-        &app,
-        &state,
-        &format!("{}\r", command),
-        "agent-reload-launch",
-    )?;
-    trace_agent_pty_step(&app, "reload", provider_key, "launch");
-    // Point the transcript at the resumed session immediately rather than
-    // waiting for the agent's first write to make it most-recent (see
-    // resync_transcript_to_session).
-    let crossing = current_provider(&app) != Some(session_provider);
-    schedule_resync_transcript_to_session(app.clone(), session_provider, session.clone());
-    schedule_agent_switch_refresh(app.clone(), provider_key, "reload");
-    if crossing {
-        // The resync flips the active-provider hint; reload the agent pane once
-        // the resumed agent settles so the banner/verb and other per-provider
-        // caches re-derive cleanly instead of staying stale on the old provider.
-        schedule_cross_provider_pane_reload(app.clone());
+    // agent-launch-shared-routine: reload was the one interrupt-then-launch
+    // path #314 left on a fixed 1.2 s sleep; it now gates like the switch.
+    launch_agent_command(AgentLaunch {
+        app: app.clone(),
+        generation,
+        provider: provider_key,
+        command,
+        source: "reload",
+        trace_category: "agent-switch",
+        caller_hint: "agent-reload-launch",
+        gate: true,
+        first_command: false,
+        hook: Box::new(move |app, phase| {
+            if phase == LaunchPhase::Confirmed {
+                if session_exists {
+                    mark_session_entered(app, session_provider, &session);
+                }
+                if let (Some(from), true) = (leaving.as_ref(), session_exists) {
+                    record_pair_for(
+                        app,
+                        from,
+                        &(session_provider, session.clone()),
+                        "explicit-resume",
+                    );
+                }
+                return;
+            }
+            if phase != LaunchPhase::Written {
+                return;
+            }
+            trace_agent_pty_step(app, "reload", provider_key, "launch");
+            // Point the transcript at the resumed session immediately rather
+            // than waiting for the agent's first write to make it
+            // most-recent (see resync_transcript_to_session).
+            let crossing = current_provider(app) != Some(session_provider);
+            if session_exists {
+                schedule_resync_transcript_to_session(
+                    app.clone(),
+                    session_provider,
+                    session.clone(),
+                );
+            } else {
+                set_current_provider(app, session_provider, "reload");
+            }
+            schedule_agent_switch_refresh(app.clone(), provider_key, "reload");
+            if crossing {
+                // The resync flips the active-provider hint; reload the agent
+                // pane once the resumed agent settles so the banner/verb and
+                // other per-provider caches re-derive cleanly instead of
+                // staying stale on the old provider.
+                schedule_cross_provider_pane_reload(app.clone());
+            }
+        }),
+    });
+    Ok(())
+}
+
+// agent-launch-failure-in-pane: the pane notice's "Start <provider> fresh"
+// after a launch exited. A plain launch through the shared routine: no
+// resume (the session may be what failed) and no configured `shell.args`
+// (a bad argument is the other common cause), so it is the launch most
+// likely to come up. Interrupts first, like a switch, in case an agent is in
+// the foreground after all; at a bash prompt they are harmless.
+#[tauri::command]
+fn start_agent_fresh(
+    app: AppHandle,
+    provider: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let provider_key = match provider.trim().to_ascii_lowercase().as_str() {
+        "codex" => "codex",
+        "claude" | "claud" => "claude",
+        other => return Err(format!("unknown agent provider: {}", other)),
+    };
+    refuse_agent_typing_if_policy_none(&app, "start-fresh")?;
+    cancel_agent_boot_hold(&app, "start-fresh");
+    let command = agent_launch_command(provider_key)
+        .ok_or("unknown agent provider")?
+        .to_string();
+    if bram_trace_enabled() {
+        append_bram_trace_line(
+            &app,
+            "agent-switch",
+            &format!(
+                "op=start-fresh provider={} command={}",
+                provider_key, command
+            ),
+        );
     }
+    let generation = begin_agent_launch();
+    clear_stale_terminal_input_for_switch(&app, &state, "agent-start-fresh");
+    pty_write_internal(&app, &state, "\x1b", "agent-fresh-escape")?;
+    std::thread::sleep(std::time::Duration::from_millis(AGENT_INTERRUPT_GAP_MS));
+    pty_write_internal(&app, &state, "\x03", "agent-fresh-interrupt-1")?;
+    std::thread::sleep(std::time::Duration::from_millis(AGENT_INTERRUPT_GAP_MS));
+    pty_write_internal(&app, &state, "\x03", "agent-fresh-interrupt-2")?;
+    let session_provider = if provider_key == "codex" {
+        SessionProvider::Codex
+    } else {
+        SessionProvider::Claude
+    };
+    launch_agent_command(AgentLaunch {
+        app: app.clone(),
+        generation,
+        provider: provider_key,
+        command,
+        source: "start-fresh",
+        trace_category: "agent-switch",
+        caller_hint: "agent-fresh-launch",
+        gate: true,
+        first_command: true,
+        hook: Box::new(move |app, phase| {
+            if phase != LaunchPhase::Written {
+                return;
+            }
+            let crossing = current_provider(app) != Some(session_provider);
+            set_current_provider(app, session_provider, "start-fresh");
+            schedule_agent_switch_refresh(app.clone(), provider_key, "start-fresh");
+            if crossing {
+                schedule_cross_provider_pane_reload(app.clone());
+            }
+        }),
+    });
     Ok(())
 }
 
@@ -19808,7 +21353,7 @@ mod pending_session_title_tests {
         );
         // Switching away must not consume a different provider's request.
         assert_eq!(
-            provider_switch_launch("claude", true, None, Some(&rec), None),
+            provider_switch_launch("claude", true, None, Some(&rec), None, None),
             ("claude --continue".into(), "none")
         );
         assert!(!pending_session_title_abandoned_by_resume(
@@ -19819,7 +21364,7 @@ mod pending_session_title_tests {
         // Both a persisted old pin and the --last fallback used to defeat New.
         for pin in [Some("old-codex"), None] {
             assert_eq!(
-                provider_switch_launch("codex", true, pin, Some(&rec), None),
+                provider_switch_launch("codex", true, pin, Some(&rec), None, None),
                 ("codex".into(), "restart-pending")
             );
         }
@@ -19846,7 +21391,8 @@ mod pending_session_title_tests {
                 true,
                 Some("old-codex"),
                 Some(&rec),
-                Some("fresh-codex")
+                Some("fresh-codex"),
+                None
             ),
             ("codex resume fresh-codex".into(), "resume-pending")
         );
@@ -19930,16 +21476,16 @@ mod pending_session_title_tests {
             ("codex", "codex resume --last"),
         ] {
             assert_eq!(
-                provider_switch_launch(provider, true, None, None, None).0,
+                provider_switch_launch(provider, true, None, None, None, None).0,
                 expected
             );
             assert_eq!(
-                provider_switch_launch(provider, false, None, None, None).0,
+                provider_switch_launch(provider, false, None, None, None, None).0,
                 provider
             );
         }
         assert_eq!(
-            provider_switch_launch("codex", true, Some("pinned"), None, None).0,
+            provider_switch_launch("codex", true, Some("pinned"), None, None, None).0,
             "codex resume pinned"
         );
         let rec = PendingSessionTitle {
@@ -19960,8 +21506,35 @@ mod pending_session_title_tests {
             "reserved"
         ));
         assert_eq!(
-            provider_switch_launch("codex", true, Some("old-codex"), Some(&rec), None).0,
+            provider_switch_launch("codex", true, Some("old-codex"), Some(&rec), None, None).0,
             "codex resume old-codex"
+        );
+    }
+
+    // provider-session-counterparts: the resume order on a header switch is
+    // pending named session, then partner, then the Codex pin, then most
+    // recent.
+    #[test]
+    fn switch_resume_order_puts_the_partner_after_pending_and_before_pin() {
+        assert_eq!(
+            provider_switch_launch("claude", true, None, None, None, Some("c-partner")).0,
+            "claude --resume c-partner"
+        );
+        assert_eq!(
+            provider_switch_launch("codex", true, Some("pinned"), None, None, Some("x-partner")).0,
+            "codex resume x-partner"
+        );
+        let rec = pending_codex();
+        assert_eq!(
+            provider_switch_launch(
+                "codex",
+                true,
+                Some("pinned"),
+                Some(&rec),
+                Some("named"),
+                Some("x-partner")
+            ),
+            ("codex resume named".to_string(), "resume-pending")
         );
     }
 
@@ -20087,6 +21660,8 @@ fn create_new_session(
     app: AppHandle,
     provider: String,
     title: String,
+    pair_with_provider: Option<String>,
+    pair_with_session: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let provider_key = match provider.trim().to_ascii_lowercase().as_str() {
@@ -20123,6 +21698,30 @@ fn create_new_session(
     // typed blind after a fixed settle any more (new-session-handoff-race):
     // hold pane sends until the new CLI shows boot bytes, and gate the launch
     // command itself on shell-prompt evidence in a spawned waiter below.
+    // provider-session-pair-offer: Create from the pane's pair offer pairs
+    // the new session with the session it was offered for (another provider's).
+    let new_provider = if provider_key == "codex" {
+        SessionProvider::Codex
+    } else {
+        SessionProvider::Claude
+    };
+    let pair_with: Option<(SessionProvider, String)> = pair_with_provider
+        .as_deref()
+        .and_then(SessionProvider::from_str)
+        .filter(|p| *p != new_provider)
+        .zip(pair_with_session.filter(|s| !s.is_empty()));
+    let pair_known_sid = session_id.clone();
+    let pair_baseline = if pair_with.is_some() && pair_known_sid.is_none() {
+        live_session_id(&app, new_provider)
+    } else {
+        None
+    };
+    // provider-session-digest-for-codex: the new partner has no history, so
+    // its brief points at the latest turns of the session it was created for.
+    if let Some((p, id)) = pair_with.as_ref() {
+        let _ = write_session_digest(&app, *p, id, false);
+    }
+    let generation = begin_agent_launch();
     arm_agent_boot_hold(&app, provider_key);
     clear_stale_terminal_input_for_switch(&app, &state, "agent-new-session");
     pty_write_internal(&app, &state, "\x1b", "agent-new-escape")?;
@@ -20135,47 +21734,53 @@ fn create_new_session(
     // provisional current row while the launch waits on the prompt.
     emit_replayable_signal(&app, "sessions-list-changed");
     let launch = new_session_launch_command(provider_key, &trimmed, session_id.as_deref());
-    let waiter_app = app.clone();
-    std::thread::spawn(move || {
-        let state = waiter_app.state::<AppState>();
-        // Shared evidence gate (issue-314 extracted it; behavior unchanged
-        // here). On timeout: no prompt — the shell never came back, or its
-        // prompt shape is one the gate can't recognize. Do NOT type blind —
-        // the command would land as tty type-ahead or into a wedged shell.
-        // The boot hold stays armed; a manual launch releases it, and the
-        // pending title expires on its own TTL.
-        match wait_for_shell_prompt_evidence() {
-            Err(waited) => {
-                if bram_trace_enabled() {
-                    append_bram_trace_line(
-                        &waiter_app,
-                        "session-new",
-                        &format!("op=launch-timeout waited_ms={}", waited),
-                    );
-                }
-                // A manual launch is now the only way on; let its boot
-                // bytes release the hold.
-                open_agent_boot_evidence(&waiter_app, "launch-timeout");
-                return;
+    // The shared launch routine gates on the shell's prompt. On timeout: no
+    // prompt — the shell never came back, or no marker and a prompt shape the
+    // guess can't recognize. Nothing is typed blind: the boot hold stays
+    // armed, a manual launch releases it, and the pending title expires on
+    // its own TTL.
+    launch_agent_command(AgentLaunch {
+        app: app.clone(),
+        generation,
+        provider: provider_key,
+        command: launch,
+        source: "new-session",
+        trace_category: "session-new",
+        caller_hint: "agent-new-launch",
+        gate: true,
+        first_command: false,
+        hook: Box::new(move |app, phase| match phase {
+            // A manual launch is now the only way on; let its boot bytes
+            // release the hold.
+            LaunchPhase::Timeout => open_agent_boot_evidence(app, "launch-timeout"),
+            LaunchPhase::BeforeWrite => open_agent_boot_evidence(app, "launch"),
+            LaunchPhase::Written => {
+                schedule_agent_switch_refresh(app.clone(), provider_key, "new-session")
             }
-            Ok(waited) => {
-                if bram_trace_enabled() {
-                    append_bram_trace_line(
-                        &waiter_app,
-                        "session-new",
-                        &format!("op=launch-gated waited_ms={}", waited),
-                    );
+            LaunchPhase::Confirmed => {
+                let Some(from) = pair_with.as_ref() else {
+                    return;
+                };
+                match pair_known_sid.as_ref() {
+                    Some(id) => {
+                        record_pair_for(app, from, &(new_provider, id.clone()), "offer-create")
+                    }
+                    None => {
+                        let mut guard = match PENDING_PAIR.lock() {
+                            Ok(g) => g,
+                            Err(e) => e.into_inner(),
+                        };
+                        *guard = Some(PendingPair {
+                            from: from.clone(),
+                            to: new_provider,
+                            baseline: pair_baseline.clone(),
+                            at_ms: unix_now_ms(),
+                        });
+                    }
                 }
+                emit_pair_offer(app, None, None);
             }
-        }
-        open_agent_boot_evidence(&waiter_app, "launch");
-        let _ = pty_write_internal(
-            &waiter_app,
-            &state,
-            &format!("{}\r", launch),
-            "agent-new-launch",
-        );
-        schedule_agent_switch_refresh(waiter_app.clone(), provider_key, "new-session");
+        }),
     });
     Ok(())
 }
@@ -20712,6 +22317,7 @@ mod agent_startup_policy_tests {
         assert_eq!(view["sessions"]["suggestOnNewItem"], true);
         assert_eq!(view["sessions"]["suggestOnNewIssue"], true);
         assert_eq!(view["sessions"]["suggestOnTopicShift"], false);
+        assert_eq!(view["sessions"]["pairAcrossProviders"], true);
 
         let existing = serde_json::json!({
             "ui": { "showTargetApp": true },
@@ -20730,6 +22336,42 @@ mod agent_startup_policy_tests {
         assert_eq!(view["sessions"]["suggestOnNewIssue"], true);
         assert_eq!(view["sessions"]["suggestOnTopicShift"], true);
         assert_eq!(view["ui"]["showTargetApp"], true);
+    }
+
+    // settings-info-says-storage-and-default: every project default a repo
+    // with no .bram.json gets. The Settings tab's info modals state each one
+    // (window.settingsInfoBodies in app/__shell/helpers.js), so a default
+    // changed here must be changed there too.
+    #[test]
+    fn project_defaults_match_the_settings_info_modals() {
+        let expected = serde_json::json!({
+            "mirrorWorklistLifecycleToIssue": false,
+            "shell": {
+                "agent": "claude",
+                "args": "",
+                "firstCommand": "",
+                "startupPolicy": "agentRecent",
+                "continueLast": true
+            },
+            "worklist": { "batchCommitActions": false },
+            "ui": { "showTargetApp": false, "toolsPaneHotReload": false },
+            "sessions": {
+                "suggestOnNewItem": true,
+                "suggestOnNewIssue": true,
+                "suggestOnTopicShift": false,
+                "pairAcrossProviders": true
+            },
+            "traces": { "enabled": true, "inspectorTap": false, "archiveAfterDays": 14 },
+            "menus": { "parseAndDisplay": false },
+            "ai": { "describeCommands": false },
+            "search": { "commitDepth": 2000, "issueLimit": 500 }
+        });
+        assert_eq!(
+            settings_view_from_config(None),
+            expected,
+            "a project default changed: update its line in window.settingsInfoBodies \
+             (app/__shell/helpers.js) to match, then this expectation"
+        );
     }
 }
 
@@ -20778,34 +22420,43 @@ fn configured_first_command<R: tauri::Runtime>(app: &AppHandle<R>) -> String {
         .unwrap_or_default()
 }
 
-// After a fresh launch (autostart / switch), wait for the agent's TUI to
-// settle, then type the configured first command (e.g. `/resume`). No-op when
-// the command is empty. Runs on its own thread; re-acquires AppState from the
-// handle to reach the PTY writer, mirroring schedule_agent_switch_refresh.
-fn schedule_agent_first_command<R: tauri::Runtime>(app: AppHandle<R>, source: &'static str) {
-    let command = configured_first_command(&app).trim().to_string();
+// Type the configured first command (e.g. `/resume`) into a freshly started
+// agent. No-op when the command is empty. Called by the launch routine only
+// after `launch-confirmed` (agent-launch-shared-routine), never after
+// `launch-exited`, so it can't land in the shell; it used to follow the
+// launch by a fixed 2.5 s whether or not the agent had started.
+fn type_agent_first_command<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    state: &State<'_, AppState>,
+    source: &'static str,
+) {
+    let command = configured_first_command(app).trim().to_string();
     if command.is_empty() {
         return;
     }
-    thread::spawn(move || {
-        thread::sleep(std::time::Duration::from_millis(
-            AGENT_FIRST_COMMAND_SETTLE_MS,
+    // The command and its Enter ride separate writes, as pane sends do
+    // (split-paste-cr-and-submit-nudge): Codex reads "/status\r" arriving in
+    // one burst as a paste and keeps the CR as a newline in its composer, so
+    // the command sat unsubmitted (2026-10-04 demo). Claude submitted either
+    // way.
+    let written = pty_write_internal(app, state, &command, "agent-first-command").and_then(|()| {
+        std::thread::sleep(std::time::Duration::from_millis(
+            AGENT_FIRST_COMMAND_SUBMIT_GAP_MS,
         ));
-        let state = app.state::<AppState>();
-        let payload = format!("{}\r", command);
-        match pty_write_internal(&app, &state, &payload, "agent-first-command") {
-            Ok(()) => {
-                if bram_trace_enabled() {
-                    append_bram_trace_line(
-                        &app,
-                        "agent-switch",
-                        &format!("op=first-command source={} command={}", source, command),
-                    );
-                }
-            }
-            Err(e) => eprintln!("[agent-first-command] write failed: {}", e),
-        }
+        pty_write_internal(app, state, "\r", "agent-first-command-submit")
     });
+    match written {
+        Ok(()) => {
+            if bram_trace_enabled() {
+                append_bram_trace_line(
+                    app,
+                    "agent-switch",
+                    &format!("op=first-command source={} command={}", source, command),
+                );
+            }
+        }
+        Err(e) => eprintln!("[agent-first-command] write failed: {}", e),
+    }
 }
 
 fn schedule_agent_switch_refresh<R: tauri::Runtime>(
@@ -20887,6 +22538,10 @@ fn settings_view_from_config(config: Option<ProjectConfig>) -> serde_json::Value
         .as_ref()
         .and_then(|s| s.suggest_on_topic_shift)
         .unwrap_or(false);
+    let pair_across_providers = sessions_cfg
+        .as_ref()
+        .and_then(|s| s.pair_across_providers)
+        .unwrap_or(true);
     let (
         agent,
         args,
@@ -20979,7 +22634,8 @@ fn settings_view_from_config(config: Option<ProjectConfig>) -> serde_json::Value
         "sessions": {
             "suggestOnNewItem": suggest_on_new_item,
             "suggestOnNewIssue": suggest_on_new_issue,
-            "suggestOnTopicShift": suggest_on_topic_shift
+            "suggestOnTopicShift": suggest_on_topic_shift,
+            "pairAcrossProviders": pair_across_providers
         },
         "traces": {
             "enabled": tracing_enabled,
@@ -21593,6 +23249,434 @@ fn handle_project_config_reload<R: tauri::Runtime>(app_handle: &AppHandle<R>, pr
     emit_settings_changed(app_handle, &settings);
 }
 
+// voice-setup-check-and-log: what a 🎤 click needs before the engine can
+// start (whisper-server, the model file, ffmpeg) and where Bram looked.
+// Before this, all three missing cases ended in one "not running" toast
+// (Raymond Yee, 2026-10-02). An app opened from the Dock or Finder gets
+// launchd's minimal PATH, so Bram's own PATH can miss Homebrew; the
+// well-known prefixes and the user's login shell cover that. ffmpeg is
+// needed only for --convert: the safety pass that transcribes the whole
+// compressed recording when live dictation fails. Live dictation sends WAV.
+const WHISPER_TOOL_DIRS: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin"];
+const WHISPER_LOGIN_SHELL_TIMEOUT_MS: u64 = 2000;
+
+// windows-native-whisper: the well-known prefixes, per platform. Unix gets
+// the Homebrew/local pair above; Windows gets where winget and scoop put
+// executables, since there is no login shell to interrogate here and PATH
+// plus these directories is the whole story. Returned owned because the
+// Windows paths are built from the environment rather than being literals.
+fn whisper_tool_dirs() -> Vec<String> {
+    if cfg!(target_os = "windows") {
+        let mut dirs = Vec::new();
+        if let Some(local) = first_nonempty_env(&["LOCALAPPDATA"]) {
+            dirs.push(format!("{}\\Microsoft\\WindowsApps", local));
+            dirs.push(format!("{}\\Programs", local));
+        }
+        if let Some(home) = first_nonempty_env(&["USERPROFILE"]) {
+            dirs.push(format!("{}\\scoop\\shims", home));
+        }
+        dirs
+    } else {
+        WHISPER_TOOL_DIRS.iter().map(|d| d.to_string()).collect()
+    }
+}
+
+#[derive(serde::Serialize, Clone, Debug, Default, PartialEq)]
+struct WhisperComponent {
+    found: bool,
+    path: Option<String>,
+}
+
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+struct WhisperPreflightReport {
+    // Always true now that every platform runs the engine natively. Kept in
+    // the payload because the pane branches on it and older reports set it
+    // false on Windows, where the engine used to run inside WSL.
+    checked: bool,
+    platform: String,
+    arch: String,
+    binary: WhisperComponent,
+    model: WhisperComponent,
+    ffmpeg: WhisperComponent,
+    searched: Vec<String>,
+    login_shell: String,
+    path_env: String,
+}
+
+// Directories to search, in order: Bram's PATH, then the well-known
+// prefixes not already on it. Pure for unit testing.
+fn whisper_search_dirs(path_env: &str, extra: &[&str]) -> Vec<std::path::PathBuf> {
+    let mut out: Vec<std::path::PathBuf> = Vec::new();
+    for d in std::env::split_paths(std::ffi::OsStr::new(path_env)) {
+        if !d.as_os_str().is_empty() && !out.contains(&d) {
+            out.push(d);
+        }
+    }
+    for e in extra {
+        let d = std::path::PathBuf::from(e);
+        if !out.contains(&d) {
+            out.push(d);
+        }
+    }
+    out
+}
+
+// windows-native-whisper: on Windows the tool on disk is `whisper-server.exe`,
+// so a bare-name `is_file()` check never matches. The old Windows branch never
+// met this because it handed bare names to Command::new, which applies PATHEXT
+// at spawn time; resolving by filesystem probe has to apply it here instead.
+// Found live 2026-10-04: a correctly installed engine reported as missing.
+fn whisper_find_in_dirs(name: &str, dirs: &[std::path::PathBuf]) -> Option<std::path::PathBuf> {
+    dirs.iter().find_map(|d| {
+        let direct = d.join(name);
+        if direct.is_file() {
+            return Some(direct);
+        }
+        if cfg!(target_os = "windows") {
+            let exe = d.join(format!("{}.exe", name));
+            if exe.is_file() {
+                return Some(exe);
+            }
+        }
+        None
+    })
+}
+
+// What the last preflight's login-shell lookups found, so whisper_start
+// can use a tool found only there without blocking on the shell again.
+fn whisper_login_shell_cache(
+) -> &'static Mutex<std::collections::HashMap<String, Option<std::path::PathBuf>>> {
+    static CACHE: std::sync::OnceLock<
+        Mutex<std::collections::HashMap<String, Option<std::path::PathBuf>>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+// `command -v <name>` in the user's login shell, bounded by
+// WHISPER_LOGIN_SHELL_TIMEOUT_MS. Status: used | failed | timeout.
+fn whisper_login_shell_lookup(name: &str) -> (Option<std::path::PathBuf>, &'static str) {
+    let shell = std::env::var("SHELL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/bin/zsh".to_string());
+    let mut child = match std::process::Command::new(&shell)
+        .arg("-lc")
+        .arg(format!("command -v {}", shell_single_quote(name)))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return (None, "failed"),
+    };
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if started.elapsed()
+                    >= std::time::Duration::from_millis(WHISPER_LOGIN_SHELL_TIMEOUT_MS)
+                {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return (None, "timeout");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(_) => return (None, "failed"),
+        }
+    }
+    let mut out = String::new();
+    if let Some(mut s) = child.stdout.take() {
+        let _ = s.read_to_string(&mut out);
+    }
+    (
+        whisper_last_abs_path_line(&out).filter(|p| p.is_file()),
+        "used",
+    )
+}
+
+// The last line of shell output that is an absolute path: profile scripts
+// can print before `command -v` answers. Pure for unit testing.
+fn whisper_last_abs_path_line(out: &str) -> Option<std::path::PathBuf> {
+    out.lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| l.starts_with('/'))
+        .map(std::path::PathBuf::from)
+}
+
+fn whisper_component(p: Option<std::path::PathBuf>) -> WhisperComponent {
+    WhisperComponent {
+        found: p.is_some(),
+        path: p.map(|p| p.display().to_string()),
+    }
+}
+
+// The check itself. Runs the login shell only for a tool not found on
+// PATH or the well-known prefixes, and records what it found for
+// whisper_start.
+fn whisper_preflight_report(model_path: &str) -> WhisperPreflightReport {
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    let tool_dirs = whisper_tool_dirs();
+    let tool_dir_refs: Vec<&str> = tool_dirs.iter().map(|s| s.as_str()).collect();
+    let dirs = whisper_search_dirs(&path_env, &tool_dir_refs);
+    let searched: Vec<String> = dirs.iter().map(|d| d.display().to_string()).collect();
+    let model = std::path::PathBuf::from(expand_tilde(model_path));
+    let model_c = WhisperComponent {
+        found: model.is_file(),
+        path: Some(model.display().to_string()),
+    };
+    let mut login_shell = "skipped";
+    let mut find = |name: &str| -> Option<std::path::PathBuf> {
+        if let Some(p) = whisper_find_in_dirs(name, &dirs) {
+            return Some(p);
+        }
+        // windows-native-whisper: no login shell to interrogate on Windows, so
+        // PATH plus the well-known directories is the whole search there.
+        if cfg!(target_os = "windows") {
+            return None;
+        }
+        let (p, status) = whisper_login_shell_lookup(name);
+        if let Ok(mut cache) = whisper_login_shell_cache().lock() {
+            cache.insert(name.to_string(), p.clone());
+        }
+        if login_shell != "used" {
+            login_shell = status;
+        }
+        p
+    };
+    let binary = find("whisper-server");
+    let ffmpeg = find("ffmpeg");
+    WhisperPreflightReport {
+        checked: true,
+        platform: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        binary: whisper_component(binary),
+        model: model_c,
+        ffmpeg: whisper_component(ffmpeg),
+        searched,
+        login_shell: login_shell.to_string(),
+        path_env,
+    }
+}
+
+// One trace line per check. Pure for unit testing.
+fn whisper_preflight_trace_body(r: &WhisperPreflightReport) -> String {
+    let c = |w: &WhisperComponent| match (w.found, &w.path) {
+        (true, Some(p)) => format!("found:{}", p),
+        (false, Some(p)) => format!("missing:{}", p),
+        _ => "missing".to_string(),
+    };
+    if !r.checked {
+        return format!("preflight checked=false platform={}", r.platform);
+    }
+    format!(
+        "preflight binary={} model={} ffmpeg={} searched={} login_shell={} path={:?}",
+        c(&r.binary),
+        c(&r.model),
+        c(&r.ffmpeg),
+        r.searched.join(","),
+        r.login_shell,
+        r.path_env
+    )
+}
+
+// The engine's PATH: Bram's, with ffmpeg's directory in front when it was
+// found somewhere Bram's PATH doesn't reach (a Dock launch). Pure for unit
+// testing.
+fn whisper_child_path(path_env: &str, ffmpeg: Option<&std::path::Path>) -> String {
+    let Some(dir) = ffmpeg.and_then(|p| p.parent()) else {
+        return path_env.to_string();
+    };
+    let on_path = std::env::split_paths(std::ffi::OsStr::new(path_env)).any(|d| d == dir);
+    if on_path || dir.as_os_str().is_empty() {
+        return path_env.to_string();
+    }
+    if path_env.is_empty() {
+        return dir.display().to_string();
+    }
+    // windows-native-whisper: join with the platform separator, matching the
+    // split_paths membership check above. The hardcoded ":" was unreachable
+    // while this ran on Unix only; it would have built a malformed PATH here.
+    let sep = if cfg!(target_os = "windows") {
+        ";"
+    } else {
+        ":"
+    };
+    format!("{}{}{}", dir.display(), sep, path_env)
+}
+
+// whisper_start's view of a tool: PATH and the well-known prefixes, then
+// whatever the last preflight's login shell found. Never runs the shell.
+fn whisper_resolve_tool(name: &str, dirs: &[std::path::PathBuf]) -> Option<std::path::PathBuf> {
+    whisper_find_in_dirs(name, dirs).or_else(|| {
+        whisper_login_shell_cache()
+            .lock()
+            .ok()
+            .and_then(|c| c.get(name).cloned().flatten())
+            .filter(|p| p.is_file())
+    })
+}
+
+#[cfg(test)]
+mod whisper_preflight_tests {
+    use super::*;
+
+    // windows-native-whisper: these fixtures feed PATH strings to
+    // std::env::split_paths, which splits on ';' on Windows and ':' elsewhere.
+    // Hardcoding ':' made two of these fail on Windows for a reason that had
+    // nothing to do with what they assert, so build the fixture the way the
+    // platform reads it.
+    fn pjoin(parts: &[&str]) -> String {
+        let sep = if cfg!(target_os = "windows") {
+            ";"
+        } else {
+            ":"
+        };
+        parts.join(sep)
+    }
+
+    #[test]
+    fn search_dirs_put_path_first_and_add_prefixes_once() {
+        let dirs = whisper_search_dirs(
+            &pjoin(&["/usr/bin", "/opt/homebrew/bin", "", "/bin"]),
+            WHISPER_TOOL_DIRS,
+        );
+        let s: Vec<String> = dirs.iter().map(|d| d.display().to_string()).collect();
+        assert_eq!(
+            s,
+            vec!["/usr/bin", "/opt/homebrew/bin", "/bin", "/usr/local/bin"]
+        );
+    }
+
+    #[test]
+    fn search_dirs_from_a_dock_launch_still_reach_homebrew() {
+        // launchd's minimal PATH, as an app opened from the Dock sees it.
+        let dirs = whisper_search_dirs(
+            &pjoin(&["/usr/bin", "/bin", "/usr/sbin", "/sbin"]),
+            WHISPER_TOOL_DIRS,
+        );
+        let s: Vec<String> = dirs.iter().map(|d| d.display().to_string()).collect();
+        assert!(s.contains(&"/opt/homebrew/bin".to_string()));
+        assert!(s.contains(&"/usr/local/bin".to_string()));
+    }
+
+    #[test]
+    fn last_abs_path_line_skips_profile_noise() {
+        let out = "Welcome!\n/usr/local/etc/motd\n/opt/homebrew/bin/ffmpeg\n";
+        assert_eq!(
+            whisper_last_abs_path_line(out),
+            Some(PathBuf::from("/opt/homebrew/bin/ffmpeg"))
+        );
+        assert_eq!(whisper_last_abs_path_line("ffmpeg not found\n"), None);
+    }
+
+    #[test]
+    fn child_path_prepends_ffmpeg_dir_only_when_missing() {
+        let ff = Path::new("/opt/homebrew/bin/ffmpeg");
+        assert_eq!(
+            whisper_child_path(&pjoin(&["/usr/bin", "/bin"]), Some(ff)),
+            pjoin(&["/opt/homebrew/bin", "/usr/bin", "/bin"])
+        );
+        assert_eq!(
+            whisper_child_path(&pjoin(&["/opt/homebrew/bin", "/usr/bin"]), Some(ff)),
+            pjoin(&["/opt/homebrew/bin", "/usr/bin"])
+        );
+        assert_eq!(whisper_child_path("/usr/bin", None), "/usr/bin");
+        assert_eq!(whisper_child_path("", Some(ff)), "/opt/homebrew/bin");
+    }
+
+    // codex-session-title-lost-to-codex
+    #[test]
+    fn find_in_dirs_resolves_a_windows_exe() {
+        let dir = std::env::temp_dir().join(format!("bram-whisper-find-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let suffix = if cfg!(target_os = "windows") {
+            ".exe"
+        } else {
+            ""
+        };
+        let planted = dir.join(format!("whisper-server{}", suffix));
+        std::fs::write(&planted, b"x").expect("plant the tool");
+        let found = whisper_find_in_dirs("whisper-server", &[dir.clone()]);
+        assert_eq!(
+            found.as_deref(),
+            Some(planted.as_path()),
+            "a tool named with the platform's executable suffix must resolve"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tool_dirs_are_per_platform() {
+        let dirs = whisper_tool_dirs();
+        if cfg!(target_os = "windows") {
+            // Homebrew prefixes are unreachable here; the Windows list names
+            // where winget and scoop put executables. It can legitimately be
+            // empty when neither environment variable is set.
+            assert!(
+                !dirs.iter().any(|d| d.starts_with('/')),
+                "unix prefixes leaked into the Windows list: {:?}",
+                dirs
+            );
+            if std::env::var_os("LOCALAPPDATA").is_some() {
+                assert!(dirs.iter().any(|d| d.ends_with("\\Microsoft\\WindowsApps")));
+                assert!(dirs.iter().any(|d| d.ends_with("\\Programs")));
+            }
+        } else {
+            assert_eq!(dirs, vec!["/opt/homebrew/bin", "/usr/local/bin"]);
+        }
+    }
+
+    #[test]
+    fn trace_body_names_each_component() {
+        let r = WhisperPreflightReport {
+            checked: true,
+            platform: "macos".into(),
+            arch: "aarch64".into(),
+            binary: WhisperComponent {
+                found: true,
+                path: Some("/opt/homebrew/bin/whisper-server".into()),
+            },
+            model: WhisperComponent {
+                found: false,
+                path: Some("/Users/x/.local/share/whisper-models/ggml-small.en.bin".into()),
+            },
+            ffmpeg: WhisperComponent::default(),
+            searched: vec!["/usr/bin".into(), "/opt/homebrew/bin".into()],
+            login_shell: "used".into(),
+            path_env: "/usr/bin".into(),
+        };
+        let body = whisper_preflight_trace_body(&r);
+        assert!(body.contains("binary=found:/opt/homebrew/bin/whisper-server"));
+        assert!(
+            body.contains("model=missing:/Users/x/.local/share/whisper-models/ggml-small.en.bin")
+        );
+        assert!(body.contains("ffmpeg=missing"));
+        assert!(body.contains("searched=/usr/bin,/opt/homebrew/bin"));
+        assert!(body.contains("login_shell=used"));
+        let mut w = r.clone();
+        w.checked = false;
+        assert_eq!(
+            whisper_preflight_trace_body(&w),
+            "preflight checked=false platform=macos"
+        );
+    }
+}
+
+#[tauri::command]
+async fn whisper_preflight(
+    model_path: String,
+    app: AppHandle,
+) -> Result<WhisperPreflightReport, String> {
+    let report = whisper_preflight_report(&model_path);
+    whisper_trace(&app, &whisper_preflight_trace_body(&report));
+    Ok(report)
+}
+
 #[derive(serde::Serialize)]
 struct WhisperStatusReport {
     running: bool,
@@ -21630,40 +23714,66 @@ fn whisper_start(
     let model = expand_tilde(&model_path);
     whisper_trace(
         &app,
-        &format!(
-            "start requested model_path={} port=18080 wsl_distro={}",
-            model_path,
-            first_nonempty_env(&["BRAM_WSL_DISTRO"]).unwrap_or_else(|| "(default)".to_string())
-        ),
+        &format!("start requested model_path={} port=18080", model_path),
     );
     let mut candidates: Vec<(String, std::process::Command)> = Vec::new();
-    if cfg!(target_os = "windows") {
-        let wsl_tmp_dir = "/tmp/bram-whisper";
-        let script = format!(
-            "mkdir -p {} && exec whisper-server -m {} --convert --tmp-dir {} --port 18080",
-            shell_single_quote(wsl_tmp_dir),
-            wsl_model_path_arg(&model_path),
-            shell_single_quote(wsl_tmp_dir)
+    // voice-setup-check-and-log: spawn the binary where it was found, and
+    // pass --convert only when ffmpeg exists. With --convert and no ffmpeg
+    // the engine refuses to start, which blocked all dictation to protect
+    // the safety pass alone.
+    //
+    // windows-native-whisper: one arm for every platform. Windows used to
+    // take a wsl.exe branch first and then an unfinished native fallback that
+    // forced --convert on and looked for a Homebrew path, so a missing ffmpeg
+    // silently blocked dictation here while Unix degraded gracefully.
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    let (bins, convert, child_path): (Vec<String>, bool, Option<String>) = {
+        let tool_dirs = whisper_tool_dirs();
+        let tool_dir_refs: Vec<&str> = tool_dirs.iter().map(|s| s.as_str()).collect();
+        let dirs = whisper_search_dirs(&path_env, &tool_dir_refs);
+        let binary = whisper_resolve_tool("whisper-server", &dirs);
+        let ffmpeg = whisper_resolve_tool("ffmpeg", &dirs);
+        whisper_trace(
+            &app,
+            &format!(
+                "start convert={}{} binary={}",
+                ffmpeg.is_some(),
+                match &ffmpeg {
+                    Some(p) => format!(" ffmpeg={}", p.display()),
+                    None => " reason=ffmpeg-missing".to_string(),
+                },
+                binary
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "unresolved".to_string())
+            ),
         );
-        let mut cmd = std::process::Command::new("wsl.exe");
-        let distro_args = wsl_distro_args();
-        cmd.args(&distro_args).arg("bash").arg("-lc").arg(script);
-        let label = match first_nonempty_env(&["BRAM_WSL_DISTRO"]) {
-            Some(distro) => format!("wsl.exe -d {} -- bash -lc whisper-server", distro),
-            None => "wsl.exe bash -lc whisper-server".to_string(),
+        // Unresolved falls back to the bare name so PATH still gets a chance
+        // at spawn time; the well-known directories are already in `dirs`.
+        let bins = match &binary {
+            Some(p) => vec![p.display().to_string()],
+            None => vec!["whisper-server".to_string()],
         };
-        candidates.push((label, cmd));
-    }
-    for bin in ["whisper-server", "/opt/homebrew/bin/whisper-server"] {
-        let mut cmd = std::process::Command::new(bin);
-        cmd.arg("-m")
-            .arg(&model)
-            .arg("--convert")
-            .arg("--tmp-dir")
+        (
+            bins,
+            ffmpeg.is_some(),
+            Some(whisper_child_path(&path_env, ffmpeg.as_deref())),
+        )
+    };
+    for bin in bins {
+        let mut cmd = std::process::Command::new(&bin);
+        cmd.arg("-m").arg(&model);
+        if convert {
+            cmd.arg("--convert");
+        }
+        cmd.arg("--tmp-dir")
             .arg(&tmp_dir_str)
             .arg("--port")
             .arg("18080");
-        candidates.push((bin.to_string(), cmd));
+        if let Some(p) = &child_path {
+            cmd.env("PATH", p);
+        }
+        candidates.push((bin, cmd));
     }
     let mut last_err = String::new();
     for (label, mut cmd) in candidates {
@@ -22098,8 +24208,21 @@ async fn issue_close_manual(
 ) -> Result<(), String> {
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let _guard = forge_action_cell().lock();
-        gh_issue_close(&app, number, comment.as_deref().unwrap_or("")).map(|_| ())
+        {
+            let _guard = forge_action_cell().lock();
+            gh_issue_close(&app, number, comment.as_deref().unwrap_or(""))?;
+        }
+        // issues-tab-optimistic-close: re-index the closed issue now, as the
+        // close-on-push path does. refresh_issue_now upserts the cached
+        // issues:list row and emits issues-changed, so /__issues stops
+        // serving the pre-close OPEN row (it otherwise waited for the next
+        // background issues pass). Outside the forge lock: a queued push
+        // shouldn't wait on a read. A refresh failure doesn't fail the
+        // close — the close happened; the next issues pass catches up.
+        if let Err(e) = refresh_issue_now(&app, number) {
+            eprintln!("[issue close manual #{}] refresh failed: {}", number, e);
+        }
+        Ok(())
     })
     .await
     .map_err(|e| format!("issue_close_manual task panicked: {}", e))?
@@ -24172,6 +26295,89 @@ fn canonical_path_string(path: &Path) -> String {
         .into_owned()
 }
 
+// codex-session-title-lost-to-codex: which ids need their Bram-written name
+// put back. `~/.codex/session_index.jsonl` is append-only and read last-wins,
+// so when Codex renames a thread after Bram named it, Bram's name is simply
+// gone from every surface. Observed 2026-10-04: `thread_name:"test"` at
+// 20:57:57Z (whole seconds — Bram, whose rfc3339_now uses as_secs()), then
+// `thread_name:"Send first message"` at 20:57:59.7249145Z (Codex).
+//
+// Reconcile after the fact rather than trying to write last, which is a race
+// nobody wins. Pure for unit testing; takes the index's records in file order.
+//
+// One retry per name, by design: if our last entry for an id already carries
+// `reassert`, Codex has renamed over a reassertion and that is the user's
+// thread name now. A rename made inside Codex must stick.
+fn codex_titles_to_reassert(records: &[serde_json::Value]) -> Vec<(String, String)> {
+    let mut last_by_id: HashMap<&str, &serde_json::Value> = HashMap::new();
+    let mut last_ours: HashMap<&str, &serde_json::Value> = HashMap::new();
+    for rec in records {
+        let Some(id) = rec.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if rec.get("thread_name").and_then(|v| v.as_str()).is_none() {
+            continue;
+        }
+        last_by_id.insert(id, rec);
+        if rec.get("by").and_then(|v| v.as_str()) == Some("bram") {
+            last_ours.insert(id, rec);
+        }
+    }
+    let mut out = Vec::new();
+    for (id, ours) in last_ours {
+        let Some(last) = last_by_id.get(id) else {
+            continue;
+        };
+        // Ours is already the winning entry.
+        if std::ptr::eq(*last, ours) {
+            continue;
+        }
+        // We already spent this name's one retry.
+        if ours.get("reassert").and_then(|v| v.as_bool()) == Some(true) {
+            continue;
+        }
+        let Some(name) = ours.get("thread_name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        out.push((id.to_string(), name.to_string()));
+    }
+    out.sort();
+    out
+}
+
+// Read the index, put back any name Codex overwrote, and say so. Called from
+// the session list, which is where a stale title would otherwise be shown.
+fn reconcile_codex_titles<R: tauri::Runtime>(app: &AppHandle<R>) {
+    let Some(home) = home_dir() else { return };
+    let path = home.join(".codex").join("session_index.jsonl");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let records: Vec<serde_json::Value> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    for (id, name) in codex_titles_to_reassert(&records) {
+        // The reconciler writes to a file another tool owns, so its action has
+        // to be auditable. The first cut used eprintln! alone, which reaches
+        // only a cargo-run console — invisible to the user and to an agent
+        // reading the trace. The live check on 2026-10-04 found the fix working
+        // with nothing in bram-trace.log to show for it.
+        let line = match append_codex_title_record(&id, &name, true) {
+            Ok(()) => format!("op=title-reasserted id={} ours={:?}", id, name),
+            Err(e) => format!(
+                "op=title-reassert-failed id={} ours={:?} err={}",
+                id, name, e
+            ),
+        };
+        if bram_trace_enabled() {
+            append_bram_trace_line(app, "codex-title", &line);
+        }
+        eprintln!("[codex-title] {}", line);
+    }
+}
+
 fn codex_session_index() -> Result<HashMap<String, String>, String> {
     let home = home_dir().ok_or("no HOME or USERPROFILE")?;
     let path = home.join(".codex").join("session_index.jsonl");
@@ -24422,8 +26628,25 @@ fn codex_session_title(path: &Path) -> std::io::Result<Option<String>> {
     codex_cached_read(codex_title_cache(), path, codex_session_title_read)
 }
 
+// The user's first real message in a rollout, for titling.
+//
+// codex-session-title-lost-to-codex: this used to match `event_msg` records
+// carrying `payload.type == "user_message"` with the text in `payload.message`.
+// Codex v0.147.0 writes neither — `grep -c user_message` over a 68 KB rollout
+// returns 0, and user turns now arrive as `response_item` records whose payload
+// is a `message` with `role: "user"` and `content[].input_text`. So the function
+// could only ever return None, and every caller fell through to the index, which
+// is the value Codex overwrites. Both halves failed in the same direction, which
+// is why the symptom read as a titling bug or a pairing bug depending on where
+// you looked.
+//
+// Both shapes are accepted: the old one so an archived rollout still reads, the
+// current one via codex_payload_has_real_user_activity, which already knows this
+// record shape and already skips Bram's injected startup context (without that
+// filter every Bram-launched session would be titled with its own preamble).
 fn codex_session_title_read(path: &Path) -> std::io::Result<Option<String>> {
     let reader = BufReader::new(std::fs::File::open(path)?);
+    let mut scanned = 0usize;
     for line in reader.lines() {
         let line = line?;
         if line.is_empty() {
@@ -24432,24 +26655,135 @@ fn codex_session_title_read(path: &Path) -> std::io::Result<Option<String>> {
         let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
-        if record.get("type").and_then(|v| v.as_str()) != Some("event_msg") {
-            continue;
-        }
+        scanned += 1;
         let Some(payload) = record.get("payload") else {
             continue;
         };
-        if payload.get("type").and_then(|v| v.as_str()) != Some("user_message") {
+        // Retired shape (pre-v0.147.0 rollouts).
+        if record.get("type").and_then(|v| v.as_str()) == Some("event_msg")
+            && payload.get("type").and_then(|v| v.as_str()) == Some("user_message")
+        {
+            if let Some(message) = payload.get("message").and_then(|v| v.as_str()) {
+                if !codex_startup_context_text(message) {
+                    return Ok(Some(message.chars().take(120).collect()));
+                }
+            }
             continue;
         }
-        let Some(message) = payload.get("message").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        if codex_startup_context_text(message) {
+        // Current shape.
+        if !codex_payload_has_real_user_activity(payload) {
             continue;
         }
-        return Ok(Some(message.chars().take(120).collect()));
+        if let Some(text) = codex_payload_first_user_text(payload) {
+            return Ok(Some(text.chars().take(120).collect()));
+        }
+    }
+    // A rollout with records but no recognisable user turn is the fingerprint
+    // of another format drift. Say so rather than returning None silently, as
+    // the retired matcher did for every current rollout.
+    if scanned > 0 {
+        eprintln!(
+            "[codex-title] op=no-user-turn scanned={} path={}",
+            scanned,
+            path.display()
+        );
     }
     Ok(None)
+}
+
+// The display text of a current-shape user payload: a bare string, or the
+// first non-empty input_text/text part.
+fn codex_payload_first_user_text(payload: &serde_json::Value) -> Option<String> {
+    let content = payload.get("content")?;
+    if let Some(text) = content.as_str() {
+        let text = text.trim();
+        if !text.is_empty() && !codex_startup_context_text(text) {
+            return Some(text.to_string());
+        }
+        return None;
+    }
+    content.as_array()?.iter().find_map(|part| {
+        let part_type = part.get("type").and_then(|v| v.as_str());
+        if !matches!(part_type, Some("input_text") | Some("text")) {
+            return None;
+        }
+        let text = part.get("text").and_then(|v| v.as_str())?.trim();
+        if text.is_empty() || codex_startup_context_text(text) {
+            return None;
+        }
+        Some(text.to_string())
+    })
+}
+
+#[cfg(test)]
+mod codex_session_title_tests {
+    use super::*;
+
+    // codex-session-title-lost-to-codex: the retired matcher returned None for
+    // every current rollout, so the first-user-message fallback was dead and
+    // the index — the value Codex overwrites — was all that remained.
+    #[test]
+    fn codex_title_reads_both_rollout_shapes() {
+        let dir = std::env::temp_dir().join(format!("bram-codex-title-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+
+        let current = dir.join("current.jsonl");
+        std::fs::write(
+            &current,
+            concat!(
+                r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\nignore me"}]}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"test"}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            super::codex_session_title_read(&current).unwrap(),
+            Some("test".to_string()),
+            "current shape, with Bram's injected context skipped"
+        );
+
+        let retired = dir.join("retired.jsonl");
+        std::fs::write(
+            &retired,
+            concat!(
+                r#"{"type":"event_msg","payload":{"type":"user_message","message":"older"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            super::codex_session_title_read(&retired).unwrap(),
+            Some("older".to_string()),
+            "an archived rollout must still read"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn codex_titles_reassert_only_what_codex_overwrote() {
+        let j = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+        let ours = r#"{"id":"a","thread_name":"test","by":"bram","reassert":false}"#;
+        let theirs = r#"{"id":"a","thread_name":"Send first message"}"#;
+
+        // The observed case: Bram named it, Codex renamed over it.
+        assert_eq!(
+            super::codex_titles_to_reassert(&[j(ours), j(theirs)]),
+            vec![("a".to_string(), "test".to_string())]
+        );
+        // Ours is already winning — nothing to do.
+        assert!(super::codex_titles_to_reassert(&[j(theirs), j(ours)]).is_empty());
+        // A name Bram never wrote is Codex's business.
+        assert!(super::codex_titles_to_reassert(&[j(theirs)]).is_empty());
+        // One retry only: a rename made inside Codex after our reassertion wins.
+        let reasserted = r#"{"id":"a","thread_name":"test","by":"bram","reassert":true}"#;
+        assert!(
+            super::codex_titles_to_reassert(&[j(ours), j(theirs), j(reasserted), j(theirs)])
+                .is_empty()
+        );
+    }
 }
 
 /// Cheap enumeration of the current project's Claude session files:
@@ -24549,6 +26883,9 @@ fn discover_codex_sessions<R: tauri::Runtime>(
     let project_cwd = canonical_path_string(&project);
     let home = home_dir().ok_or("no HOME or USERPROFILE")?;
     let sessions_root = home.join(".codex").join("sessions");
+    // codex-session-title-lost-to-codex: put back any name Codex overwrote
+    // before reading titles, so the list shows what the user chose.
+    reconcile_codex_titles(app);
     let titles = codex_session_index()?;
     let mut paths = Vec::new();
     collect_codex_session_paths(&sessions_root, &mut paths)?;
@@ -28701,6 +31038,10 @@ fn rfc3339_now() -> String {
 // the id belongs to this project; keeping the append separate from visible
 // session discovery lets Bram name an explicitly created bootstrap rollout.
 fn append_codex_session_title(id: &str, title: &str) -> Result<(), String> {
+    append_codex_title_record(id, title, false)
+}
+
+fn append_codex_title_record(id: &str, title: &str, reassert: bool) -> Result<(), String> {
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         return Err("invalid session id".to_string());
     }
@@ -28713,10 +31054,16 @@ fn append_codex_session_title(id: &str, title: &str) -> Result<(), String> {
     if let Some(parent) = index_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
+    // codex-session-title-lost-to-codex: `by` marks our own entries so the
+    // reconciler can tell a name Bram wrote from one Codex generated, and
+    // `reassert` bounds the reconciliation to a single retry per name. Codex
+    // reads `id` / `thread_name` and ignores the extra keys.
     let record = serde_json::json!({
         "id": id,
         "thread_name": trimmed,
         "updated_at": rfc3339_now(),
+        "by": "bram",
+        "reassert": reassert,
     });
     let mut line = serde_json::to_string(&record).map_err(|e| e.to_string())?;
     line.push('\n');
@@ -35211,48 +37558,21 @@ fn read_session_size<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<Vec<u8>, S
         Some(SessionProvider::Claude) => "claude",
         None => "unknown",
     };
-    // Per-agent reset guidance. Both Claude and Codex re-attach to the
-    // current session JSONL by default when the wrapper script
-    // remembers a session id; the user-facing fix is the same shape
-    // for both — exit the current agent process and re-launch without
-    // the resume flag — but the exact command differs by agent. Keep
-    // the wording calm and the command copy-pasteable.
-    let (reset_command, guidance) = match (provider_label, state) {
-        ("claude", "amber") => (
-            "claude",
-            format!(
-                "Session is {} (warming up). Approaching iframe slowdown — \
-                 consider starting fresh: exit the agent (Ctrl-C twice) and \
-                 run `claude` in the terminal.",
-                human_bytes
-            ),
-        ),
-        ("claude", "red") => (
-            "claude",
-            format!(
-                "Session is {} (over 15 MB). Recommend starting fresh: exit \
-                 the agent (Ctrl-C twice) and run `claude` in the terminal.",
-                human_bytes
-            ),
-        ),
-        ("codex", "amber") => (
-            "codex",
-            format!(
-                "Session is {} (warming up). Approaching iframe slowdown — \
-                 consider starting fresh: exit the agent (Ctrl-C twice) and \
-                 run `codex` in the terminal.",
-                human_bytes
-            ),
-        ),
-        ("codex", "red") => (
-            "codex",
-            format!(
-                "Session is {} (over 15 MB). Recommend starting fresh: exit \
-                 the agent (Ctrl-C twice) and run `codex` in the terminal.",
-                human_bytes
-            ),
-        ),
-        _ => ("", String::new()),
+    // session-size-note-not-warning (Jon, 2026-10-04): size is information,
+    // not a warning. Past the green band the note says why smaller sessions
+    // help, and points at New session (exiting and typing `claude` by hand
+    // bypassed the launch routine and pairing). `state` stays as data.
+    let reset_command = "";
+    let guidance = if bytes > SESSION_SIZE_GREEN_MAX_BYTES {
+        format!(
+            "Session is {}. Larger sessions aren't necessarily a problem, but \
+             keeping each one smaller and on one theme makes it easier to \
+             find, resume and search later. To start one, use New session on \
+             the Sessions tab.",
+            human_bytes
+        )
+    } else {
+        String::new()
     };
     let body = serde_json::json!({
         "bytes": bytes,
@@ -35290,11 +37610,10 @@ fn session_size_status_row<R: tauri::Runtime>(app: &AppHandle<R>) -> serde_json:
     serde_json::json!({
         "signal": "Session size",
         "level": match state {
-            "red" | "amber" => "warn",
-            "green" => "ok",
-            _ => "none",
+            "unknown" => "none",
+            _ => "ok",
         },
-        "state": format!("{} {}", human_bytes, state),
+        "state": human_bytes,
         "detail": if guidance.is_empty() {
             format!("Active {} session is {}", provider, human_bytes)
         } else {
@@ -35448,7 +37767,9 @@ fn outbound_turn_display_source(turn: &serde_json::Value) -> String {
 
 // Equivalent of the whitespace collapse toTurn used to apply client-side
 // (\s+ → " " + trim). Applied host-side to INLINE sends only; envelope
-// text keeps full fidelity.
+// text keeps full fidelity. A typed send containing a line break no longer
+// goes inline (#416), so only one-line text, `voice:` sends and lifecycle
+// payloads reach this collapse.
 fn st_collapse_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -35456,15 +37777,58 @@ fn st_collapse_whitespace(text: &str) -> String {
 // Sends longer than this ride an envelope; short button/selector payloads
 // stay inline so their behavior (and the agent's view of them) is
 // unchanged. Long inline pastes are the Windows ConPTY truncation risk.
+// None ⇒ send inline: small one-line text-only sends, `voice:` sends,
+// worklist lifecycle payloads, or any envelope-write failure.
 const OUTBOUND_TURN_INLINE_MAX_CHARS: usize = 700;
+
+// Why a send rides an envelope, or None when it stays inline. Pure, so the
+// rule is unit-testable without an app handle. `user_text` is the turn as
+// the user sent it, BEFORE host notes are prepended: prepend_host_notes
+// joins a note with a blank line, and a one-line message carrying a note
+// must stay inline. `data` is the text that will actually be sent (notes
+// included), which is what the length limit measures.
+//
+// judell/bram#416: a typed message containing a line break rides an
+// envelope whatever its length, so the PTY payload stays one line on every
+// platform (a bare newline in a bracketed paste held the submit, cec0524;
+// on the Windows raw-injection path it would act as one, #300). `voice:`
+// sends are exempt: their newlines are Whisper pause artifacts (b0c4af4)
+// and stay collapsed inline.
+fn outbound_turn_envelope_reason(
+    user_text: &str,
+    data: &str,
+    has_images: bool,
+) -> Option<&'static str> {
+    let head = user_text.trim_start();
+    for verb in ["approved:", "drop:", "iterate:", "talk:"] {
+        if head.starts_with(verb) {
+            return None;
+        }
+    }
+    if has_images {
+        return Some("images");
+    }
+    if data.chars().count() > OUTBOUND_TURN_INLINE_MAX_CHARS {
+        return Some("long");
+    }
+    if !head.starts_with("voice:") && user_text.trim().contains('\n') {
+        return Some("multiline");
+    }
+    None
+}
 
 // The write half of the envelope contract. Given the raw toTurn text,
 // decide whether this send rides an envelope; if so, write
 // resources/outbound-turns/<id>.json and return the compact PTY frame to
-// inject instead. None ⇒ send inline (small text-only sends, worklist
-// lifecycle payloads, or any envelope-write failure — inline is always the
-// safe fallback; nothing is lost, only fidelity).
-fn frame_outbound_turn<R: tauri::Runtime>(app: &AppHandle<R>, data: &str) -> Option<String> {
+// inject instead. None ⇒ send inline (small one-line text-only sends,
+// `voice:` sends, worklist lifecycle payloads, or any envelope-write
+// failure — inline is always the safe fallback; nothing is lost, only
+// fidelity). `user_text` is the turn before host notes were prepended.
+fn frame_outbound_turn<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    data: &str,
+    user_text: &str,
+) -> Option<String> {
     let trimmed = data.trim_start();
     // Worklist lifecycle stays frozen (doc invariant 5): approved:/drop:/
     // iterate:/talk: payloads ride inline exactly as today. They are small
@@ -35480,9 +37844,7 @@ fn frame_outbound_turn<R: tauri::Runtime>(app: &AppHandle<R>, data: &str) -> Opt
     };
     let images = st_extract_image_paths(body);
     let text = st_strip_image_paths(body);
-    if images.is_empty() && data.chars().count() <= OUTBOUND_TURN_INLINE_MAX_CHARS {
-        return None;
-    }
+    let reason = outbound_turn_envelope_reason(user_text, data, !images.is_empty())?;
     let dir = outbound_turns_dir(app)?;
     if let Err(e) = std::fs::create_dir_all(&dir) {
         eprintln!("[outbound-turn] create dir failed, sending inline: {}", e);
@@ -35510,11 +37872,12 @@ fn frame_outbound_turn<R: tauri::Runtime>(app: &AppHandle<R>, data: &str) -> Opt
             app,
             "outbound-turn",
             &format!(
-                "op=write turn_id={} bytes={} images={} mode={}",
+                "op=write turn_id={} bytes={} images={} mode={} reason={}",
                 id,
                 body_bytes.len(),
                 images.len(),
-                mode
+                mode,
+                reason
             ),
         );
     }
@@ -37577,6 +39940,264 @@ fn pty_tail_shows_shell_prompt_or_continuation() -> bool {
     line_is_shell_prompt_or_continuation(&pty_tail_last_line())
 }
 
+// shell-reports-prompt-and-exit-status: Bram's shellrc reports the shell's
+// foreground edges as private OSC 7779 sequences (see
+// app/shell/claude-code-shellrc): `prompt;<status>` when the shell is back at
+// its prompt, `exec` when a command line starts. Standard OSC 133 was
+// rejected because an agent TUI could emit it itself; nothing else emits
+// 7779 with the `bram` tag. Windows sends the same two edges from
+// app/shell/claude-code-profile.ps1 (a `prompt` function carrying
+// $LASTEXITCODE, and an exec edge from a PSConsoleHostReadLine wrapper), so
+// both platforms run this path; the prompt-shape guess remains only for a
+// shell with no hook at all.
+const SHELL_MARKER_PREFIX: &[u8] = b"\x1b]7779;bram;";
+// Longest well-formed marker is `prompt;-2147483648` plus terminator; a
+// prefix with no terminator within this many bytes is not ours.
+const SHELL_MARKER_MAX_LEN: usize = 48;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShellMarker {
+    Prompt(i32),
+    Exec,
+}
+
+// Complete markers in `buf`, plus the index from which `buf` must be kept as
+// carry because a marker may be split across PTY chunks.
+fn shell_markers_scan(buf: &[u8]) -> (Vec<ShellMarker>, usize) {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < buf.len() {
+        let Some(off) = buf[i..]
+            .windows(SHELL_MARKER_PREFIX.len())
+            .position(|w| w == SHELL_MARKER_PREFIX)
+        else {
+            break;
+        };
+        let start = i + off;
+        let body = start + SHELL_MARKER_PREFIX.len();
+        let term = buf[body..]
+            .iter()
+            .position(|&b| b == 0x07 || b == 0x1b)
+            .map(|p| body + p);
+        match term {
+            Some(t) => {
+                let payload = String::from_utf8_lossy(&buf[body..t]);
+                if payload == "exec" {
+                    out.push(ShellMarker::Exec);
+                } else if let Some(n) = payload.strip_prefix("prompt;") {
+                    if let Ok(status) = n.parse::<i32>() {
+                        out.push(ShellMarker::Prompt(status));
+                    }
+                }
+                i = t + 1;
+            }
+            None if buf.len() - start < SHELL_MARKER_MAX_LEN => return (out, start),
+            None => i = body,
+        }
+    }
+    // A prefix cut off at the chunk boundary: keep its partial head.
+    let tail_from = buf
+        .len()
+        .saturating_sub(SHELL_MARKER_PREFIX.len() - 1)
+        .max(i);
+    for k in tail_from..buf.len() {
+        if SHELL_MARKER_PREFIX.starts_with(&buf[k..]) {
+            return (out, k);
+        }
+    }
+    (out, buf.len())
+}
+
+// What the shell has reported about its foreground. `seen` is false until the
+// first marker, which keeps a shell with no hook (an old rc, a profile that
+// failed to load) on the shape guess. Both bash and PowerShell emit the
+// markers now, so this is a degradation path rather than the Windows path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ShellForeground {
+    seen: bool,
+    at_prompt: bool,
+    status: Option<i32>,
+    at_ms: i64,
+    // When the last `exec` edge arrived; the launch routine's confirm step
+    // reads a prompt after its own launch's exec as "the agent exited".
+    exec_ms: i64,
+}
+
+fn shell_foreground_step(mut s: ShellForeground, m: ShellMarker, now_ms: i64) -> ShellForeground {
+    s.seen = true;
+    s.at_ms = now_ms;
+    match m {
+        ShellMarker::Prompt(status) => {
+            s.at_prompt = true;
+            s.status = Some(status);
+        }
+        ShellMarker::Exec => {
+            s.at_prompt = false;
+            s.exec_ms = now_ms;
+        }
+    }
+    s
+}
+
+static SHELL_FOREGROUND: OnceLock<Mutex<(ShellForeground, Vec<u8>)>> = OnceLock::new();
+
+fn shell_foreground_cell() -> &'static Mutex<(ShellForeground, Vec<u8>)> {
+    SHELL_FOREGROUND.get_or_init(|| Mutex::new((ShellForeground::default(), Vec::new())))
+}
+
+fn shell_foreground() -> ShellForeground {
+    match shell_foreground_cell().lock() {
+        Ok(g) => g.0,
+        Err(e) => e.into_inner().0,
+    }
+}
+
+// agent-launch-shared-routine: a launch command was just written. Until bash
+// reads it and reports `exec`, the shell is still "at its prompt" by the
+// markers, and a second launch in that window would type again. Mark it busy
+// now, unless the exec edge has already arrived since `written_from_ms`.
+fn shell_foreground_note_launch_written(written_from_ms: i64) {
+    let mut g = match shell_foreground_cell().lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    if g.0.seen && g.0.exec_ms < written_from_ms {
+        g.0.at_prompt = false;
+    }
+}
+
+fn shell_marker_scan<R: tauri::Runtime>(app: &AppHandle<R>, chunk: &[u8]) {
+    let markers = {
+        let mut g = match shell_foreground_cell().lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        // Cheap prefilter: no ESC byte in the chunk and no pending carry.
+        if g.1.is_empty() && !chunk.contains(&0x1b) {
+            return;
+        }
+        let mut buf = std::mem::take(&mut g.1);
+        buf.extend_from_slice(chunk);
+        let (markers, keep_from) = shell_markers_scan(&buf);
+        g.1 = buf[keep_from..].to_vec();
+        let now = unix_now_ms();
+        for m in &markers {
+            g.0 = shell_foreground_step(g.0, *m, now);
+        }
+        markers
+    };
+    if !bram_trace_enabled() {
+        return;
+    }
+    for m in markers {
+        let detail = match m {
+            ShellMarker::Prompt(status) => format!("op=marker edge=prompt status={}", status),
+            ShellMarker::Exec => "op=marker edge=exec".to_string(),
+        };
+        append_bram_trace_line(app, "shell-prompt", &detail);
+    }
+}
+
+// pane-send-refuses-bare-shell: true only when the shell has reported its
+// prompt and nothing has started since. No marker ever (Windows) is never a
+// refusal; an `exec` (a launch, or `claude` typed by hand) ends it.
+fn shell_refuses_pane_send(fg: ShellForeground) -> bool {
+    fg.seen && fg.at_prompt
+}
+
+// The gate's evidence: the shell's own report when it has ever sent one,
+// otherwise the prompt-shape guess. None = no evidence the shell is up.
+fn shell_prompt_evidence(fg: ShellForeground, tail_is_prompt: bool) -> Option<&'static str> {
+    if fg.seen {
+        fg.at_prompt.then_some("marker")
+    } else {
+        tail_is_prompt.then_some("shape")
+    }
+}
+
+#[cfg(test)]
+mod shell_marker_tests {
+    use super::{
+        shell_foreground_step as step, shell_markers_scan as scan, shell_prompt_evidence,
+        ShellForeground, ShellMarker,
+    };
+
+    #[test]
+    fn parses_prompt_status_and_exec() {
+        let buf = b"x\x1b]7779;bram;exec\x07hi\r\n\x1b]7779;bram;prompt;1\x07bash-3.2$ ";
+        let (m, keep) = scan(buf);
+        assert_eq!(m, vec![ShellMarker::Exec, ShellMarker::Prompt(1)]);
+        assert_eq!(keep, buf.len());
+    }
+
+    #[test]
+    fn st_terminator_is_accepted() {
+        let (m, _) = scan(b"\x1b]7779;bram;prompt;0\x1b\\");
+        assert_eq!(m, vec![ShellMarker::Prompt(0)]);
+    }
+
+    #[test]
+    fn marker_split_across_chunks_is_kept_as_carry() {
+        let first = b"output\x1b]7779;bram;pro";
+        let (m, keep) = scan(first);
+        assert!(m.is_empty());
+        let mut buf = first[keep..].to_vec();
+        buf.extend_from_slice(b"mpt;130\x07$ ");
+        assert_eq!(scan(&buf).0, vec![ShellMarker::Prompt(130)]);
+    }
+
+    #[test]
+    fn partial_prefix_at_chunk_end_is_kept() {
+        let first = b"output\x1b]77";
+        let (_, keep) = scan(first);
+        assert_eq!(&first[keep..], b"\x1b]77");
+        let (_, keep) = scan(b"plain text");
+        assert_eq!(keep, 10);
+    }
+
+    #[test]
+    fn other_oscs_and_untagged_7779_are_ignored() {
+        let (m, _) = scan(b"\x1b]133;D;0\x07\x1b]7779;evil;prompt;0\x07\x1b]0;title\x07");
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn foreground_follows_the_edges() {
+        let s = ShellForeground::default();
+        let s = step(s, ShellMarker::Prompt(0), 1);
+        assert!(s.seen && s.at_prompt);
+        let s = step(s, ShellMarker::Exec, 2);
+        assert!(!s.at_prompt);
+        let s = step(s, ShellMarker::Prompt(1), 3);
+        assert_eq!((s.at_prompt, s.status), (true, Some(1)));
+    }
+
+    #[test]
+    fn pane_send_is_refused_only_at_a_reported_prompt() {
+        use super::shell_refuses_pane_send as refuses;
+        let none = ShellForeground::default();
+        assert!(!refuses(none), "no marker ever: never refuse (Windows)");
+        let at_prompt = step(none, ShellMarker::Prompt(0), 1);
+        assert!(refuses(at_prompt), "agent exited: bash is reading");
+        let launched = step(at_prompt, ShellMarker::Exec, 2);
+        assert!(!refuses(launched), "an agent started, by Bram or by hand");
+    }
+
+    #[test]
+    fn evidence_prefers_the_marker_once_seen() {
+        let none = ShellForeground::default();
+        assert_eq!(shell_prompt_evidence(none, true), Some("shape"));
+        assert_eq!(shell_prompt_evidence(none, false), None);
+        // An agent running after `exec`: its output can end in `$` or `%`,
+        // but the marker says the shell is not in the foreground.
+        let running = step(step(none, ShellMarker::Prompt(0), 1), ShellMarker::Exec, 2);
+        assert_eq!(shell_prompt_evidence(running, true), None);
+        // A `❯` prompt the shape guess rejects is still a prompt.
+        let back = step(running, ShellMarker::Prompt(0), 3);
+        assert_eq!(shell_prompt_evidence(back, false), Some("marker"));
+    }
+}
+
 #[cfg(test)]
 mod project_managed_tests {
     use super::{has_project_settings, project_is_managed, WORKLIST_AUTH_REL};
@@ -37756,7 +40377,7 @@ mod shell_prompt_shape_tests {
         let res = wait_for_shell_prompt_evidence();
         *pty_tail_cell().lock().unwrap() = prev;
         assert!(
-            matches!(res, Ok(w) if w < 2000),
+            matches!(res, Ok((w, "shape")) if w < 2000),
             "gate should fire immediately on a PowerShell prompt tail: {res:?}"
         );
     }
@@ -37829,12 +40450,39 @@ fn maybe_submit_nudge<R: tauri::Runtime>(app: &AppHandle<R>) {
     let Some((id, injected_at_ms, preview)) = candidate else {
         return;
     };
-    // Same composer-stuck fragment check the strand scene capture uses.
+    // submit-nudge-sees-a-busy-terminal: visibility is ADVISORY, not a
+    // precondition. This used to return early when the payload was not in the
+    // last 400 chars of PTY output.
+    //
+    // What that test actually keys on is the SHAPE of the agent's output, not
+    // whether it is busy — established by live probes 2026-10-04 that failed
+    // to reproduce before one did. When the TUI paints a full frame, the last
+    // 400 chars end at the bottom of the screen, which is where the composer
+    // is, so the payload IS in the tail and a nudge fires normally (observed:
+    // `basis=visible` on a send injected mid-turn that took 18 s to land). It
+    // is while the agent is THINKING — a tool running, output reduced to small
+    // spinner updates — that the composer never re-enters the tail. That is
+    // the case this exists to reach, and it is the one that bit: two dictated
+    // sends with a turn open, tails reading `…Slithering… ✢ Slithering… ●`,
+    // `payload_in_tail=false`, no nudge, both stranded at 60 s, their text
+    // delivered fused onto the user's next send. The old return neither traced
+    // nor latched, so the one path that silently did nothing was the one that
+    // fired.
+    //
+    // Widening the window was rejected: it moves a threshold that a longer
+    // repaint reinstates, and a wider flattened search can match a STALE copy
+    // of the same text from the scrollback — nudging on false evidence. The
+    // two genuinely dangerous cases have their own guards immediately below,
+    // and they still block. What is left after a failed visibility check is an
+    // agent composer that probably holds the text, where a CR either submits
+    // it or, if the composer is empty, does nothing.
     let tail = pty_tail_snippet(400);
     let frag = send_ledger_tail_fragment(&preview);
-    if frag.trim().is_empty() || !tail.contains(frag.trim()) {
-        return;
-    }
+    let basis = if !frag.trim().is_empty() && tail.contains(frag.trim()) {
+        "visible"
+    } else {
+        "not-visible"
+    };
     // new-session-handoff-race: never nudge a shell. A CR into a prompt (or
     // a PS2 quote-continuation) executes whatever stranded payload text sits
     // there — observed live 2026-08-28 as `bash: 00~We: command not found` /
@@ -37851,7 +40499,10 @@ fn maybe_submit_nudge<R: tauri::Runtime>(app: &AppHandle<R>) {
                 e.nudged = true;
             }
         }
-        let line = format!("op=submit-nudge-suppressed id={} reason={}", id, reason);
+        let line = format!(
+            "op=submit-nudge-suppressed id={} reason={} basis={}",
+            id, reason, basis
+        );
         if bram_trace_enabled() {
             append_bram_trace_line(app, "send-ledger", &line);
         }
@@ -37870,17 +40521,16 @@ fn maybe_submit_nudge<R: tauri::Runtime>(app: &AppHandle<R>) {
     let state = app.state::<AppState>();
     let dwell_ms = now - injected_at_ms;
     if pty_write_internal(app, &state, "\r", "send-ledger-submit-nudge").is_ok() {
-        if bram_trace_enabled() {
-            append_bram_trace_line(
-                app,
-                "send-ledger",
-                &format!("op=submit-nudge id={} dwell_ms={}", id, dwell_ms),
-            );
-        }
-        append_strand_forensics_line(
-            app,
-            &format!("op=submit-nudge id={} dwell_ms={}", id, dwell_ms),
+        // basis= says whether the payload was still on screen when we nudged.
+        // not-visible is the busy-terminal case this exists to reach.
+        let line = format!(
+            "op=submit-nudge id={} dwell_ms={} basis={}",
+            id, dwell_ms, basis
         );
+        if bram_trace_enabled() {
+            append_bram_trace_line(app, "send-ledger", &line);
+        }
+        append_strand_forensics_line(app, &line);
     }
 }
 
@@ -46113,6 +48763,36 @@ fn residual_owner_label(
     owners.into_iter().collect::<Vec<_>>().join(",")
 }
 
+// issue-419: declared paths git has never tracked. `git diff HEAD -- <path>`
+// prints nothing for a never-tracked file, so the tracked-file residual pass
+// cannot see a new file the commit left out. `ls-files --others` can.
+// `--exclude-standard` means gitignored files are not reported, and a
+// declared DIRECTORY reports the untracked files under it. Returns
+// repo-relative paths. Fails open (empty) on spawn failure or non-zero exit:
+// this is a disclosure and the commit has already happened. An empty
+// `declared` returns empty without running git, since no pathspec would
+// list every untracked file in the repo.
+fn untracked_declared_paths(root: &std::path::Path, declared: &[String]) -> Vec<String> {
+    if declared.is_empty() {
+        return Vec::new();
+    }
+    let output = match std::process::Command::new("git")
+        .current_dir(root)
+        .args(["ls-files", "--others", "--exclude-standard", "-z", "--"])
+        .args(declared)
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    output
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect()
+}
+
 #[cfg(test)]
 mod residual_disclosure_tests {
     use super::{diff_residual_lines, residual_owner_label, ResidualLines};
@@ -46268,11 +48948,17 @@ mod residual_disclosure_tests {
 // HEAD-relative deletion when the candidate's baseline (its `base_tree`,
 // membership-attributes-deletions below) coincides with HEAD. The caller
 // decides that by the blob-equality rule; this struct only measures.
+// Superseded by the line rule (issue-273); kept, with its tests, until the
+// replay-retirement step decides what the frozen staging path still needs.
+#[allow(dead_code)]
 struct MembershipFootprint {
     added_lines: Vec<usize>,
     removed: usize,
 }
 
+// Superseded by the line rule (issue-273); kept, with its tests, until the
+// replay-retirement step decides what the frozen staging path still needs.
+#[allow(dead_code)]
 fn membership_patch_footprint(patch: &str) -> MembershipFootprint {
     let mut added_lines: Vec<usize> = Vec::new();
     let mut removed = 0usize;
@@ -46328,6 +49014,9 @@ fn membership_patch_footprint(patch: &str) -> MembershipFootprint {
 // declared ambiguous rather than resolved by coin flip (§4, the never-guess
 // principle). Hunks with no changed line are skipped: pure context anchors
 // nothing.
+// Superseded by the line rule (issue-273); kept, with its tests, until the
+// replay-retirement step decides what the frozen staging path still needs.
+#[allow(dead_code)]
 fn membership_hunk_new_blocks(patch: &str) -> Vec<Vec<String>> {
     let mut blocks: Vec<Vec<String>> = Vec::new();
     let mut cur: Option<(Vec<String>, bool)> = None;
@@ -46375,6 +49064,9 @@ fn membership_hunk_new_blocks(patch: &str) -> Vec<Vec<String>> {
 
 // Non-overlapping occurrences of `block` as consecutive lines of `content`.
 // > 1 is the ambiguity signal.
+// Superseded by the line rule (issue-273); kept, with its tests, until the
+// replay-retirement step decides what the frozen staging path still needs.
+#[allow(dead_code)]
 fn membership_block_occurrences(content: &str, block: &[String]) -> usize {
     if block.is_empty() {
         return 0;
@@ -46533,6 +49225,9 @@ fn membership_conservation_breach(
 // here: it resolves to Single and rides `claim_interval_diff`'s scope for
 // that id. Ghosts fall out for free — a ghost is not on the board, so it is
 // never begun.
+// Superseded by the line rule (issue-273); kept, with its tests, until the
+// replay-retirement step decides what the frozen staging path still needs.
+#[allow(dead_code)]
 fn membership_joint_patches(
     root: &Path,
     path: &str,
@@ -46780,6 +49475,9 @@ fn membership_net_patch(
 // the path from nothing). Fail-open: any git failure reads as "not
 // HEAD-relative", the same conservative direction as every other
 // degradation here.
+// Superseded by the line rule (issue-273); kept, with its tests, until the
+// replay-retirement step decides what the frozen staging path still needs.
+#[allow(dead_code)]
 fn membership_blob_matches_head(
     root: &Path,
     tree: &str,
@@ -46875,6 +49573,376 @@ fn membership_trace_unavailable_once<R: tauri::Runtime>(app: &AppHandle<R>, stat
     );
 }
 
+// issue-273 line-level history. The claim store is a sequence of boundary
+// trees; treating it as a linear history rooted at HEAD and ending at the
+// present-state tree lets every line that differs from HEAD be credited to
+// the step that last wrote it. This replaces the old test that an item's
+// whole concatenated interval patch reverse-applies against the present
+// state: a chat-turn (unclaimed) edit to the same lines broke that test and
+// the item lost credit for its own surviving lines (judell/bram#273, ruling
+// of 2026-10-02: wrong in 17 of 19 observed cases).
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LineOrigin {
+    // A line of the HEAD file, by its 1-based HEAD line number.
+    Head(usize),
+    // A line written by the step with this index.
+    Step(usize),
+}
+
+impl LineOrigin {
+    fn advance(self, by: usize) -> LineOrigin {
+        match self {
+            LineOrigin::Head(n) => LineOrigin::Head(n + by),
+            s => s,
+        }
+    }
+}
+
+// Effectively unbounded identity run, so no per-path HEAD line count (and
+// no `git show` per path) is needed.
+const LINE_HISTORY_UNBOUNDED: usize = 1 << 48;
+
+// Segment list for one path: runs of (origin, length) in present-line order.
+#[derive(Clone, Debug)]
+struct LineHistory {
+    segs: Vec<(LineOrigin, usize)>,
+    // HEAD line number -> the step that removed or replaced it (last wins).
+    removed_by: std::collections::BTreeMap<usize, usize>,
+}
+
+impl LineHistory {
+    fn new() -> Self {
+        LineHistory {
+            segs: vec![(LineOrigin::Head(1), LINE_HISTORY_UNBOUNDED)],
+            removed_by: Default::default(),
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = LineHistory::new();
+    }
+
+    // Ensure a segment boundary at 0-based line index `idx`; returns the
+    // index of the segment that starts there.
+    fn split_at(&mut self, idx: usize) -> usize {
+        let mut pos = 0usize;
+        for i in 0..self.segs.len() {
+            if idx == pos {
+                return i;
+            }
+            let (origin, len) = self.segs[i];
+            if idx < pos + len {
+                let first = idx - pos;
+                self.segs[i] = (origin, first);
+                self.segs
+                    .insert(i + 1, (origin.advance(first), len - first));
+                return i + 1;
+            }
+            pos += len;
+        }
+        self.segs.len()
+    }
+
+    // Replace `old_count` lines (starting at 1-based `old_start`; for a pure
+    // insertion `old_start` is the line AFTER which the new lines go) with
+    // `new_count` lines written by `step`. Callers apply one step's hunks in
+    // DESCENDING `old_start` order so earlier indices stay valid.
+    fn apply_hunk(&mut self, old_start: usize, old_count: usize, new_count: usize, step: usize) {
+        let idx = if old_count > 0 {
+            old_start.saturating_sub(1)
+        } else {
+            old_start
+        };
+        let a = self.split_at(idx);
+        let b = if old_count > 0 {
+            self.split_at(idx + old_count)
+        } else {
+            a
+        };
+        let removed: Vec<(LineOrigin, usize)> = self.segs.drain(a..b).collect();
+        for (origin, len) in removed {
+            if let LineOrigin::Head(start) = origin {
+                for h in start..start + len {
+                    self.removed_by.insert(h, step);
+                }
+            }
+        }
+        if new_count > 0 {
+            self.segs.insert(a, (LineOrigin::Step(step), new_count));
+        }
+    }
+
+    // Origin of the 1-based present line `line`.
+    fn origin_at(&self, line: usize) -> Option<LineOrigin> {
+        let mut pos = 0usize;
+        let idx = line.checked_sub(1)?;
+        for &(origin, len) in &self.segs {
+            if idx < pos + len {
+                return Some(origin.advance(idx - pos));
+            }
+            pos += len;
+        }
+        None
+    }
+}
+
+// One file's section of a `git diff -U0 --full-index` output.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct LineDiffFile {
+    path: String,
+    old_blob: String,
+    new_blob: String,
+    // (old_start, old_count, new_start, new_count); a missing count is 1.
+    hunks: Vec<(usize, usize, usize, usize)>,
+}
+
+fn parse_hunk_range(s: &str) -> Option<(usize, usize)> {
+    match s.split_once(',') {
+        Some((a, b)) => Some((a.parse().ok()?, b.parse().ok()?)),
+        None => Some((s.parse().ok()?, 1)),
+    }
+}
+
+fn parse_line_diff(text: &str) -> Vec<LineDiffFile> {
+    let mut out: Vec<LineDiffFile> = Vec::new();
+    let mut in_hunks = false;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            // Renames are off, so both sides name the same path: "a/P b/P".
+            let mut path = String::new();
+            if rest.len() >= 5 && (rest.len() - 5) % 2 == 0 {
+                let n = (rest.len() - 5) / 2;
+                if let (Some(a), Some(b)) = (rest.strip_prefix("a/"), rest.get(n + 3..)) {
+                    if let Some(b) = b.strip_prefix("b/") {
+                        if a.get(..n) == Some(b) {
+                            path = b.to_string();
+                        }
+                    }
+                }
+            }
+            out.push(LineDiffFile {
+                path,
+                ..Default::default()
+            });
+            in_hunks = false;
+            continue;
+        }
+        let Some(cur) = out.last_mut() else {
+            continue;
+        };
+        if let Some(rest) = line.strip_prefix("@@ -") {
+            // Hunk body lines start with ' ', '+', '-' or '\', never "@@",
+            // so this cannot be content.
+            in_hunks = true;
+            if let Some((spec, _)) = rest.split_once(" @@") {
+                let mut it = spec.split_whitespace();
+                let old = it.next().and_then(parse_hunk_range);
+                let new = it
+                    .next()
+                    .and_then(|s| s.strip_prefix('+'))
+                    .and_then(parse_hunk_range);
+                if let (Some((a, b)), Some((c, d))) = (old, new) {
+                    cur.hunks.push((a, b, c, d));
+                }
+            }
+            continue;
+        }
+        if in_hunks {
+            // Body line; a `+++ b/x` here is added content, not a header.
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("index ") {
+            let ids = rest.split_whitespace().next().unwrap_or("");
+            if let Some((old, new)) = ids.split_once("..") {
+                cur.old_blob = old.to_string();
+                cur.new_blob = new.to_string();
+            }
+        } else if let Some(p) = line.strip_prefix("+++ b/") {
+            cur.path = p.trim_end_matches('\t').to_string();
+        } else if let Some(p) = line.strip_prefix("--- a/") {
+            // A deleted file's new side is /dev/null; its path is here.
+            cur.path = p.trim_end_matches('\t').to_string();
+        }
+    }
+    out.retain(|f| !f.path.is_empty());
+    out
+}
+
+// Per-path result of the line rule: step index -> (added, removed) lines
+// credited to that step, plus lines no step explains.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct MembershipLineCredit {
+    by_step: std::collections::BTreeMap<usize, (usize, usize)>,
+    unexplained: (usize, usize),
+}
+
+fn membership_diff_u0(
+    root: &Path,
+    prev: &str,
+    tree: &str,
+    paths: &[String],
+    spawns: &std::cell::Cell<usize>,
+) -> Option<String> {
+    let mut args: Vec<&str> = vec![
+        "-c",
+        "core.quotePath=false",
+        "diff",
+        "-U0",
+        "--no-renames",
+        "--full-index",
+        prev,
+        tree,
+        "--",
+    ];
+    args.extend(paths.iter().map(|s| s.as_str()));
+    spawns.set(spawns.get() + 1);
+    let out = std::process::Command::new("git")
+        .current_dir(root)
+        .args(&args)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+// `steps` is oldest-first `(tree, step_index)` and ends with the present-state
+// tree; the first step diffs against HEAD. One `git diff` per non-identical
+// step plus one final HEAD -> present diff for the universe. `None` on any
+// git failure (the engine fails open).
+fn membership_line_credit(
+    root: &Path,
+    steps: &[(String, usize)],
+    paths: &[String],
+    spawns: &std::cell::Cell<usize>,
+) -> Option<std::collections::BTreeMap<String, MembershipLineCredit>> {
+    let mut result: std::collections::BTreeMap<String, MembershipLineCredit> = paths
+        .iter()
+        .map(|p| (p.clone(), MembershipLineCredit::default()))
+        .collect();
+    let Some((now_tree, _)) = steps.last() else {
+        return Some(result);
+    };
+    if paths.is_empty() {
+        return Some(result);
+    }
+    let mut histories: std::collections::HashMap<String, LineHistory> = Default::default();
+    // The path's HEAD blob: the OLD side of the first step diff listing it
+    // (the path equals HEAD until then; a new file's old side is all zeros).
+    let mut head_blob: std::collections::HashMap<String, String> = Default::default();
+    let mut prev = "HEAD".to_string();
+    for (tree, step) in steps {
+        if *tree == prev {
+            continue;
+        }
+        let text = membership_diff_u0(root, &prev, tree, paths, spawns)?;
+        for file in parse_line_diff(&text) {
+            head_blob
+                .entry(file.path.clone())
+                .or_insert_with(|| file.old_blob.clone());
+            let hist = histories
+                .entry(file.path.clone())
+                .or_insert_with(LineHistory::new);
+            let mut hunks = file.hunks.clone();
+            hunks.sort_by(|a, b| b.0.cmp(&a.0));
+            for (old_start, old_count, _, new_count) in hunks {
+                hist.apply_hunk(old_start, old_count, new_count, *step);
+            }
+            // Restart at HEAD content: a long-parked item keeps old
+            // boundaries alive, so the chain can begin before commits that
+            // have since landed. Without the restart a HEAD line that
+            // postdates the first boundary reads "removed at step 0,
+            // re-added later" and a real later removal of it is tallied to
+            // nobody.
+            if !file.new_blob.is_empty()
+                && head_blob.get(&file.path).map(|h| h.as_str()) == Some(file.new_blob.as_str())
+            {
+                hist.reset();
+            }
+        }
+        prev = tree.clone();
+    }
+    let text = membership_diff_u0(root, "HEAD", now_tree, paths, spawns)?;
+    for file in parse_line_diff(&text) {
+        let Some(credit) = result.get_mut(&file.path) else {
+            continue;
+        };
+        let identity = LineHistory::new();
+        let hist = histories.get(&file.path).unwrap_or(&identity);
+        for (old_start, old_count, new_start, new_count) in file.hunks {
+            for j in new_start..new_start + new_count {
+                match hist.origin_at(j) {
+                    Some(LineOrigin::Step(k)) => credit.by_step.entry(k).or_insert((0, 0)).0 += 1,
+                    _ => credit.unexplained.0 += 1,
+                }
+            }
+            for i in old_start..old_start + old_count {
+                match hist.removed_by.get(&i) {
+                    Some(k) => credit.by_step.entry(*k).or_insert((0, 0)).1 += 1,
+                    None => credit.unexplained.1 += 1,
+                }
+            }
+        }
+    }
+    Some(result)
+}
+
+// Boundary trees and holders from the claim store. `steps` ends with
+// `now_tree`; `holders[i]` are the ids that held the work step `i` wrote:
+// step 0 (HEAD -> first boundary) has none; step i is held by record i-1's
+// ids when that record is a claim (non-`cleared`, non-empty ids); the final
+// step by the last record's. A record with neither `tree` nor `ref` is
+// skipped.
+fn membership_step_chain(
+    intervals_json: &str,
+    now_tree: &str,
+) -> (Vec<(String, usize)>, Vec<Vec<String>>) {
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(intervals_json) else {
+        return (Vec::new(), Vec::new());
+    };
+    let Some(arr) = doc.get("intervals").and_then(|v| v.as_array()) else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut trees: Vec<String> = Vec::new();
+    let mut claim_ids: Vec<Vec<String>> = Vec::new();
+    for rec in arr {
+        let Some(tree) = rec
+            .get("tree")
+            .or_else(|| rec.get("ref"))
+            .and_then(|v| v.as_str())
+        else {
+            continue;
+        };
+        let ids: Vec<String> = if rec.get("kind").and_then(|v| v.as_str()) == Some("cleared") {
+            Vec::new()
+        } else {
+            rec.get("ids")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        trees.push(tree.to_string());
+        claim_ids.push(ids);
+    }
+    if trees.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let n = trees.len();
+    let mut steps: Vec<(String, usize)> =
+        trees.into_iter().enumerate().map(|(i, t)| (t, i)).collect();
+    steps.push((now_tree.to_string(), n));
+    let mut holders: Vec<Vec<String>> = vec![Vec::new()];
+    holders.extend(claim_ids);
+    (steps, holders)
+}
+
 // The engine driver, split along the seam
 // membership-precomputed-off-the-render-path found: everything here is
 // replay-free, so it is safe to run off the request path. Traces
@@ -46882,9 +49950,13 @@ fn membership_trace_unavailable_once<R: tauri::Runtime>(app: &AppHandle<R>, stat
 // a real compute, `fresh=` distinguishes a live result — compute or
 // exact-key hit — from a carried-over previous partition) and, on a serve
 // with neither an exact hit nor a previous slot, `op=membership-unavailable
-// reason=no-partition`. Probes run only over live begun items × their
-// declared paths; the engine never diffs the whole tree and never
-// enumerates untracked content beyond names.
+// reason=no-partition`. Credit comes from the line rule
+// (`membership_line_credit`, issue-273): one `git diff -U0` per claim-store
+// step plus one for the universe, scoped to live begun items' declared
+// paths; the engine never diffs the whole tree and never enumerates
+// untracked content beyond names. The earlier per-item reverse-apply test
+// of the whole interval patch is retired because a chat-turn edit to an
+// item's own lines broke it (17 of 19 observed cases).
 //
 // `allow_compute` is the structural half of the invariant this item exists
 // to establish: when false (the board serve, via `membership_partition`),
@@ -47154,25 +50226,19 @@ fn membership_partition_engine<R: tauri::Runtime>(
         trace_cost(app, 0, spawns.get(), 0, started, false, false);
         return None;
     }
-    // Scratch state for the probes. idx_head is HEAD alone (the
-    // already-committed screen); idx_now is HEAD plus a pathspec-scoped
-    // `add -A` — the present state of exactly the declared paths, untracked
-    // content included (why a plain HEAD index cannot serve: a created
-    // file's evidence must reverse-apply against something that HAS it).
-    // `apply --cached --check` never writes, so each index seeds once.
+    // Scratch state for the present-state tree. idx_now is HEAD plus a
+    // pathspec-scoped `add -A` — the present state of exactly the declared
+    // paths, untracked content included (why a plain HEAD index cannot
+    // serve: a created file has to exist in the tree the history ends at).
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let tag = format!(
         "{}-{}",
         std::process::id(),
         SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
-    let idx_head = std::env::temp_dir().join(format!("bram-membership-head-{}", tag));
     let idx_now = std::env::temp_dir().join(format!("bram-membership-now-{}", tag));
-    let pfile = std::env::temp_dir().join(format!("bram-membership-{}.patch", tag));
     let cleanup = || {
-        let _ = std::fs::remove_file(&idx_head);
         let _ = std::fs::remove_file(&idx_now);
-        let _ = std::fs::remove_file(&pfile);
     };
     let git_idx = |idx: &Path, args: &[&str]| -> bool {
         spawns.set(spawns.get() + 1);
@@ -47184,13 +50250,11 @@ fn membership_partition_engine<R: tauri::Runtime>(
             .map(|o| o.status.success())
             .unwrap_or(false)
     };
-    let seeded = git_idx(&idx_head, &["read-tree", "HEAD"])
-        && git_idx(&idx_now, &["read-tree", "HEAD"])
-        && {
-            let mut args: Vec<&str> = vec!["add", "-A", "--"];
-            args.extend(pathspecs.iter().map(|s| s.as_str()));
-            git_idx(&idx_now, &args)
-        };
+    let seeded = git_idx(&idx_now, &["read-tree", "HEAD"]) && {
+        let mut args: Vec<&str> = vec!["add", "-A", "--"];
+        args.extend(pathspecs.iter().map(|s| s.as_str()));
+        git_idx(&idx_now, &args)
+    };
     if !seeded {
         // Fail open, like capture_claim_tree: an observe-only engine must be
         // incapable of blocking a board serve. The cost line still lands so
@@ -47199,19 +50263,8 @@ fn membership_partition_engine<R: tauri::Runtime>(
         trace_cost(app, 0, spawns.get(), 0, started, false, false);
         return None;
     }
-    let pfile_s = pfile.to_string_lossy().to_string();
-    let probe = |idx: &Path, patch: &str| -> bool {
-        if std::fs::write(&pfile, patch).is_err() {
-            return false;
-        }
-        git_idx(
-            idx,
-            &["apply", "--cached", "--check", "--reverse", &pfile_s],
-        )
-    };
-    // Present-state tree of the declared paths, the fixed side of #367's
-    // net re-diff. Empty on failure, which makes membership_net_patch bail
-    // and every candidate fall back to its raw patch.
+    // Present-state tree of the declared paths: the last step of the line
+    // history. Empty on failure, which fails the engine open below.
     let now_tree = {
         spawns.set(spawns.get() + 1);
         std::process::Command::new("git")
@@ -47225,139 +50278,117 @@ fn membership_partition_engine<R: tauri::Runtime>(
             .unwrap_or_default()
     };
     let declared = worklist_declared_files(app);
-    let mut content_cache: std::collections::HashMap<String, Option<String>> = Default::default();
     let mut per_path: std::collections::BTreeMap<String, MembershipPathBuckets> =
         Default::default();
     for path in universe.keys() {
-        let buckets = per_path.entry(path.clone()).or_default();
-        // Candidate patches: per single begun declarer via claim_interval_diff
-        // (the reused evidence derivation), plus the joint groups. Each
-        // candidate carries its concatenated `patch` (probing, footprint,
-        // ambiguity — unchanged) AND its `sections` in record order — the
-        // fix-patch-composition-for-repeated-paths shape that lets
-        // `membership_candidate_base` undo a multi-interval candidate's own
-        // work section-by-section instead of via one `git apply` over the
-        // concatenation.
-        let mut candidates: Vec<(Vec<String>, String, Vec<String>)> = Vec::new();
-        for (id, files) in &begun_files {
-            if !files.iter().any(|f| declared_covers(f, path)) {
-                continue;
-            }
-            let d = claim_interval_diff(app, id, path);
-            spawns
-                .set(spawns.get() + d.get("spawns").and_then(|v| v.as_u64()).unwrap_or(0) as usize);
-            if let Some(p) = d.get("patch").and_then(|v| v.as_str()) {
-                if !p.trim().is_empty() {
-                    let sections: Vec<String> = d
-                        .get("sections")
-                        .and_then(|v| v.as_array())
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(|v| v.as_str())
-                                .map(String::from)
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    candidates.push((vec![id.clone()], p.to_string(), sections));
-                }
+        per_path.entry(path.clone()).or_default();
+    }
+    // issue-273 line rule: the claim store is a linear history of boundary
+    // trees; every line that differs from HEAD is credited to the step that
+    // last wrote it (or removed it), and that step's holder takes it. No
+    // whole-patch reverse-apply, so a chat-turn edit to an item's own lines
+    // no longer erases the item's credit for the lines that survive.
+    if now_tree.is_empty() {
+        // Fail open, like the seeding failure above.
+        cleanup();
+        trace_cost(app, 0, spawns.get(), 0, started, false, false);
+        return None;
+    }
+    let intervals_raw = std::fs::read_to_string(root.join(CLAIM_INTERVALS_REL)).unwrap_or_default();
+    let (steps, holders) = membership_step_chain(&intervals_raw, &now_tree);
+    let universe_paths: Vec<String> = universe.keys().cloned().collect();
+    let credits = if steps.is_empty() {
+        Default::default()
+    } else {
+        match membership_line_credit(&root, &steps, &universe_paths, &spawns) {
+            Some(c) => c,
+            None => {
+                cleanup();
+                trace_cost(app, 0, spawns.get(), 0, started, false, false);
+                return None;
             }
         }
-        candidates.extend(membership_joint_patches(
-            &root, path, &declared, &begun_ids, &spawns,
-        ));
-        for (members, patch, sections) in candidates {
-            // Already in HEAD → committed content, out of the universe: no
-            // membership (counting it would break conservation against a
-            // universe that by construction excludes it).
-            if probe(&idx_head, &patch) {
+    };
+    // The line rule's own instruments. `steps` is its cost driver (one diff
+    // per step whose tree changed), so it sits beside `op=membership`'s
+    // ms/spawns. `unexplained` is a universe line no step accounts for: it
+    // lands unowned by subtraction, which is honest but silent, and the
+    // offline audit of 142 gate files found 4 such lines it could not
+    // explain. A non-zero count here is what would let the next one be read.
+    {
+        let (ux_added, ux_removed) = credits.values().fold((0usize, 0usize), |acc, c| {
+            (acc.0 + c.unexplained.0, acc.1 + c.unexplained.1)
+        });
+        append_bram_trace_line(
+            app,
+            "claim-interval",
+            &format!(
+                "op=membership-line-rule steps={} paths={} unexplained=+{}-{}",
+                steps.len(),
+                credits.len(),
+                ux_added,
+                ux_removed
+            ),
+        );
+        for (path, credit) in &credits {
+            if credit.unexplained != (0, 0) {
+                append_bram_trace_line(
+                    app,
+                    "claim-interval",
+                    &format!(
+                        "op=membership-unexplained path={} added={} removed={}",
+                        path, credit.unexplained.0, credit.unexplained.1
+                    ),
+                );
+            }
+        }
+    }
+    for (path, credit) in &credits {
+        let Some(buckets) = per_path.get_mut(path) else {
+            continue;
+        };
+        for (step, &(added, removed)) in &credit.by_step {
+            if added == 0 && removed == 0 {
                 continue;
             }
-            // The membership test proper: does this evidence account for the
-            // present state? Drifted evidence (superseded, rewritten) fails
-            // here and contributes nothing — its lines land unowned by
-            // subtraction, the model's honest degradation (§4).
-            if !probe(&idx_now, &patch) {
-                continue;
-            }
-            // The candidate's own reverse-applied baseline — present content
-            // minus this candidate's own work, reversed section-by-section
-            // in record order (fix-patch-composition-for-repeated-paths).
-            // Computed once, shared by #367's net-effect normalization just
-            // below and by the deletion-attribution rule after it (both need
-            // the same reverse-applied tree; see `membership_candidate_base`).
-            let base_tree = membership_candidate_base(&root, &idx_now, &sections, &spawns);
-            // A multi-interval candidate counts a line the item re-edited
-            // across its own intervals once per touching interval; count its
-            // NET effect instead (#367). The ambiguity check below reads the
-            // same normalized patch. Whether a candidate is multi-interval is
-            // read from `sections.len()` — the record, not from counting
-            // `diff --git` occurrences in concatenated text (the same
-            // textual assumption that produced case 5's defect).
-            let patch = if sections.len() > 1 {
-                base_tree
-                    .as_deref()
-                    .filter(|t| !t.is_empty())
-                    .and_then(|t| membership_diff_tree_path(&root, t, &now_tree, path, &spawns))
-                    .unwrap_or(patch)
-            } else {
-                patch
+            // Holders resolve to MEMBERS exactly as the replay resolves a
+            // multi-id (same-click) record per path
+            // (`resolve_interval_path_owner`), then keep only live begun
+            // items that declare the path. No members: the lines are
+            // unowned, which `membership_unowned` computes by subtraction.
+            let ids: &[String] = holders.get(*step).map(|v| v.as_slice()).unwrap_or(&[]);
+            let resolved = match resolve_interval_path_owner(ids, path, &declared) {
+                IntervalPathOwner::Unowned => Vec::new(),
+                IntervalPathOwner::Single(id) => vec![id],
+                IntervalPathOwner::Joint(set) => set,
             };
-            let fp = membership_patch_footprint(&patch);
-            // membership-attributes-deletions (docs/attribution-model.md
-            // §4, the deletion matrix): a candidate's removed lines count as
-            // HEAD-relative deletions ONLY when its `base_tree` blob for
-            // this path equals HEAD's blob for that path — i.e. this
-            // candidate is the sole contributor between HEAD and now.
-            // Additions are unaffected: an added line is present in current
-            // content by definition, so it is HEAD-relative regardless of
-            // layering. When the blobs differ, this candidate sat on top of
-            // other work (still-live or already-superseded) and its removed
-            // count describes a line that never existed relative to HEAD —
-            // counting it would double-book the universe (the dependency
-            // fixture's original fire, expected=1 got=2, 2026-09-08). Those
-            // deletions fall to unowned by subtraction: honest degradation,
-            // the same family as supersession, and the "deletion after a
-            // prior rewrite" case of the matrix — nobody is credited with a
-            // deletion no surviving evidence accounts for.
-            let head_relative = base_tree
-                .as_deref()
-                .map(|t| membership_blob_matches_head(&root, t, path, &spawns))
-                .unwrap_or(false);
-            let counts = (
-                fp.added_lines.len(),
-                if head_relative { fp.removed } else { 0 },
-            );
-            let content = content_cache.entry(path.clone()).or_insert_with(|| {
-                std::fs::read(root.join(path))
-                    .ok()
-                    .map(|b| String::from_utf8_lossy(&b).into_owned())
-            });
-            // Identical-context duplicate placement → the whole candidate's
-            // take on this path is declared ambiguous (coarse: region-level
-            // splitting is a display concern for the later flips, not for
-            // the observation).
-            let ambiguous = content
-                .as_deref()
-                .map(|c| {
-                    membership_hunk_new_blocks(&patch)
-                        .iter()
-                        .any(|b| membership_block_occurrences(c, b) > 1)
+            let mut members: Vec<String> = resolved
+                .into_iter()
+                .filter(|m| {
+                    begun_ids.contains(m)
+                        && begun_files
+                            .iter()
+                            .any(|(id, fs)| id == m && fs.iter().any(|f| declared_covers(f, path)))
                 })
-                .unwrap_or(false);
-            let bucket = if ambiguous {
-                &mut buckets.ambiguous
-            } else if members.len() > 1 {
+                .collect();
+            members.sort();
+            members.dedup();
+            if members.is_empty() {
+                continue;
+            }
+            // `buckets.ambiguous` stays (0, 0): a positional history has no
+            // placement ambiguity — every line's origin is the step that
+            // wrote it, not a content match that could land in two places.
+            let bucket = if members.len() > 1 {
                 &mut buckets.joint
             } else {
                 &mut buckets.single
             };
-            bucket.0 += counts.0;
-            bucket.1 += counts.1;
-            if counts.0 > 0 || counts.1 > 0 {
-                let entry = buckets.per_item.entry(members.clone()).or_insert((0, 0));
-                entry.0 += counts.0;
-                entry.1 += counts.1;
-            }
+            bucket.0 += added;
+            bucket.1 += removed;
+            let entry = buckets.per_item.entry(members.clone()).or_insert((0, 0));
+            entry.0 += added;
+            entry.1 += removed;
             buckets.owners.extend(members);
         }
     }
@@ -47976,12 +51007,508 @@ mod membership_wire_contract_tests {
 }
 
 #[cfg(test)]
+mod membership_line_credit_tests {
+    use super::{
+        membership_line_credit, membership_step_chain, parse_line_diff, LineDiffFile, LineHistory,
+        LineOrigin, MembershipLineCredit,
+    };
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    fn scratch_repo(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "bram-linecredit-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main", "."],
+            vec!["config", "user.email", "t@t"],
+            vec!["config", "user.name", "t"],
+        ] {
+            assert!(Command::new("git")
+                .current_dir(&root)
+                .args(&args)
+                .status()
+                .unwrap()
+                .success());
+        }
+        root
+    }
+
+    fn git(root: &Path, idx: Option<&Path>, args: &[&str]) -> std::process::Output {
+        let mut cmd = Command::new("git");
+        cmd.current_dir(root).args(args);
+        if let Some(i) = idx {
+            cmd.env("GIT_INDEX_FILE", i);
+        }
+        cmd.output().unwrap()
+    }
+
+    fn commit_all(root: &Path, msg: &str) {
+        assert!(git(root, None, &["add", "-A"]).status.success());
+        assert!(git(root, None, &["commit", "-q", "-m", msg])
+            .status
+            .success());
+    }
+
+    // A boundary tree, captured the way the claim store does: HEAD plus
+    // `add -A` in a scratch index, written as a tree.
+    fn snap(root: &Path, tag: &str) -> String {
+        let idx = std::env::temp_dir().join(format!(
+            "bram-linecredit-idx-{}-{}",
+            tag,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&idx);
+        assert!(git(root, Some(&idx), &["read-tree", "HEAD"])
+            .status
+            .success());
+        assert!(git(root, Some(&idx), &["add", "-A"]).status.success());
+        let t = String::from_utf8_lossy(&git(root, Some(&idx), &["write-tree"]).stdout)
+            .trim()
+            .to_string();
+        let _ = std::fs::remove_file(&idx);
+        t
+    }
+
+    fn lines(prefix: &str, n: usize) -> String {
+        (1..=n).map(|i| format!("{prefix}{i}\n")).collect()
+    }
+
+    fn numstat(root: &Path, now: &str, path: &str) -> (usize, usize) {
+        let out = git(root, None, &["diff", "--numstat", "HEAD", now, "--", path]);
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let mut it = text.split_whitespace();
+        (
+            it.next().and_then(|s| s.parse().ok()).unwrap_or(0),
+            it.next().and_then(|s| s.parse().ok()).unwrap_or(0),
+        )
+    }
+
+    fn credit_of(
+        root: &Path,
+        bounds: &[String],
+        now: &str,
+        path: &str,
+    ) -> (MembershipLineCredit, usize) {
+        let mut steps: Vec<(String, usize)> = bounds
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(i, t)| (t, i))
+            .collect();
+        steps.push((now.to_string(), bounds.len()));
+        let spawns = std::cell::Cell::new(0usize);
+        let map = membership_line_credit(root, &steps, &[path.to_string()], &spawns)
+            .expect("git succeeds");
+        (map.get(path).cloned().unwrap(), spawns.get())
+    }
+
+    // Exact (step, added, removed) per step, nothing unexplained, and the
+    // per-path totals equal `git diff --numstat HEAD <now>`.
+    fn assert_credit(
+        root: &Path,
+        bounds: &[String],
+        now: &str,
+        path: &str,
+        expect: &[(usize, usize, usize)],
+    ) {
+        let (credit, _) = credit_of(root, bounds, now, path);
+        let want: BTreeMap<usize, (usize, usize)> =
+            expect.iter().map(|&(s, a, r)| (s, (a, r))).collect();
+        assert_eq!(credit.by_step, want, "per-step credit for {path}");
+        assert_eq!(credit.unexplained, (0, 0), "nothing unexplained for {path}");
+        let (a, r) = credit
+            .by_step
+            .values()
+            .fold((0, 0), |acc, v| (acc.0 + v.0, acc.1 + v.1));
+        assert_eq!((a, r), numstat(root, now, path), "totals match numstat");
+    }
+
+    #[test]
+    fn parser_reads_paths_blobs_and_hunks_across_files() {
+        let z = "0".repeat(40);
+        let b1 = "1".repeat(40);
+        let b2 = "2".repeat(40);
+        let b3 = "3".repeat(40);
+        let text = format!(
+            "diff --git a/m.txt b/m.txt\nindex {b1}..{b2} 100644\n--- a/m.txt\n+++ b/m.txt\n\
+@@ -3 +3 @@\n-old\n+new\n@@ -10,0 +11,2 @@\n+x\n+++ b/fake\n\
+diff --git a/n.txt b/n.txt\nnew file mode 100644\nindex {z}..{b3} \n--- /dev/null\n+++ b/n.txt\n\
+@@ -0,0 +1,2 @@\n+p\n+q\n\
+diff --git a/d.txt b/d.txt\ndeleted file mode 100644\nindex {b1}..{z}\n--- a/d.txt\n+++ /dev/null\n\
+@@ -1,3 +0,0 @@\n-a\n-b\n-c\n\
+diff --git a/bin.dat b/bin.dat\nindex {b2}..{b3} 100644\nBinary files a/bin.dat and b/bin.dat differ\n"
+        );
+        let files = parse_line_diff(&text);
+        assert_eq!(
+            files,
+            vec![
+                LineDiffFile {
+                    path: "m.txt".into(),
+                    old_blob: b1.clone(),
+                    new_blob: b2.clone(),
+                    hunks: vec![(3, 1, 3, 1), (10, 0, 11, 2)],
+                },
+                LineDiffFile {
+                    path: "n.txt".into(),
+                    old_blob: z.clone(),
+                    new_blob: b3.clone(),
+                    hunks: vec![(0, 0, 1, 2)],
+                },
+                LineDiffFile {
+                    path: "d.txt".into(),
+                    old_blob: b1,
+                    new_blob: z,
+                    hunks: vec![(1, 3, 0, 0)],
+                },
+                LineDiffFile {
+                    path: "bin.dat".into(),
+                    old_blob: b2,
+                    new_blob: b3,
+                    hunks: vec![],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn core_insertion_deletion_modification() {
+        let mut h = LineHistory::new();
+        h.apply_hunk(3, 0, 2, 1);
+        assert_eq!(h.origin_at(3), Some(LineOrigin::Head(3)));
+        assert_eq!(h.origin_at(4), Some(LineOrigin::Step(1)));
+        assert_eq!(h.origin_at(5), Some(LineOrigin::Step(1)));
+        assert_eq!(h.origin_at(6), Some(LineOrigin::Head(4)));
+        assert!(h.removed_by.is_empty());
+
+        let mut h = LineHistory::new();
+        h.apply_hunk(2, 2, 0, 1);
+        assert_eq!(h.origin_at(1), Some(LineOrigin::Head(1)));
+        assert_eq!(h.origin_at(2), Some(LineOrigin::Head(4)));
+        assert_eq!(h.removed_by.get(&2), Some(&1));
+        assert_eq!(h.removed_by.get(&3), Some(&1));
+
+        let mut h = LineHistory::new();
+        h.apply_hunk(5, 1, 1, 2);
+        assert_eq!(h.origin_at(5), Some(LineOrigin::Step(2)));
+        assert_eq!(h.origin_at(6), Some(LineOrigin::Head(6)));
+        assert_eq!(h.removed_by.get(&5), Some(&2));
+    }
+
+    #[test]
+    fn core_descending_application_keeps_old_coordinates_valid() {
+        // One step's hunks, in old-file coordinates: replace line 2 with 1
+        // line, replace line 6 with 2 lines. Descending order applies the
+        // later hunk first, so the earlier hunk's index is still valid.
+        let mut h = LineHistory::new();
+        h.apply_hunk(6, 1, 2, 1);
+        h.apply_hunk(2, 1, 1, 1);
+        assert_eq!(h.origin_at(1), Some(LineOrigin::Head(1)));
+        assert_eq!(h.origin_at(2), Some(LineOrigin::Step(1)));
+        assert_eq!(h.origin_at(5), Some(LineOrigin::Head(5)));
+        assert_eq!(h.origin_at(6), Some(LineOrigin::Step(1)));
+        assert_eq!(h.origin_at(7), Some(LineOrigin::Step(1)));
+        assert_eq!(h.origin_at(8), Some(LineOrigin::Head(7)));
+        assert_eq!(h.removed_by.get(&2), Some(&1));
+        assert_eq!(h.removed_by.get(&6), Some(&1));
+        // A later step overwrites a Step line without touching removed_by.
+        h.apply_hunk(2, 1, 1, 2);
+        assert_eq!(h.origin_at(2), Some(LineOrigin::Step(2)));
+        assert_eq!(h.removed_by.get(&2), Some(&1));
+        h.reset();
+        assert_eq!(h.origin_at(2), Some(LineOrigin::Head(2)));
+        assert!(h.removed_by.is_empty());
+    }
+
+    #[test]
+    fn item_window_then_unclaimed_edit_to_same_lines_then_second_window() {
+        let root = scratch_repo("c");
+        std::fs::write(root.join("f.txt"), lines("line-", 20)).unwrap();
+        commit_all(&root, "head");
+        let b0 = snap(&root, "c0");
+        // Item window: rewrite lines 5 and 6.
+        let mut v: Vec<String> = lines("line-", 20).lines().map(String::from).collect();
+        v[4] = "item5".into();
+        v[5] = "item6".into();
+        std::fs::write(root.join("f.txt"), v.join("\n") + "\n").unwrap();
+        let b1 = snap(&root, "c1");
+        // Unclaimed (chat-turn) edit to the SAME line 5.
+        v[4] = "chat5".into();
+        std::fs::write(root.join("f.txt"), v.join("\n") + "\n").unwrap();
+        let b2 = snap(&root, "c2");
+        // The item's second window, elsewhere in the file.
+        v[14] = "item15".into();
+        std::fs::write(root.join("f.txt"), v.join("\n") + "\n").unwrap();
+        let now = snap(&root, "c3");
+
+        let bounds = [b0.clone(), b1.clone(), b2.clone()];
+        assert_credit(
+            &root,
+            &bounds,
+            &now,
+            "f.txt",
+            // step1 (item window): item6 survives, both HEAD lines removed;
+            // step2 (unclaimed): chat5 replaced the item's line 5;
+            // step3 (item window 2): line 15.
+            &[(1, 1, 2), (2, 1, 0), (3, 1, 1)],
+        );
+
+        // The superseded rule: the item's whole concatenated patch (window 1
+        // + window 2) must reverse-apply against the present state. It
+        // cannot: window 1's section expects `item5` at line 5, where the
+        // chat turn left `chat5`, so the item lost credit for `item6` and
+        // `item15`. This documents the defect the line rule replaces.
+        let p1 =
+            String::from_utf8_lossy(&git(&root, None, &["diff", &b0, &b1, "--", "f.txt"]).stdout)
+                .into_owned();
+        let p2 =
+            String::from_utf8_lossy(&git(&root, None, &["diff", &b2, &now, "--", "f.txt"]).stdout)
+                .into_owned();
+        let pfile =
+            std::env::temp_dir().join(format!("bram-linecredit-c-{}.patch", std::process::id()));
+        std::fs::write(&pfile, format!("{p1}{p2}")).unwrap();
+        let idx = std::env::temp_dir().join(format!("bram-linecredit-cidx-{}", std::process::id()));
+        let _ = std::fs::remove_file(&idx);
+        assert!(git(&root, Some(&idx), &["read-tree", &now])
+            .status
+            .success());
+        let check = git(
+            &root,
+            Some(&idx),
+            &[
+                "apply",
+                "--cached",
+                "--check",
+                "--reverse",
+                pfile.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            !check.status.success(),
+            "the old whole-patch reverse-apply check fails on this shape"
+        );
+        let _ = std::fs::remove_file(&pfile);
+        let _ = std::fs::remove_file(&idx);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unclaimed_edit_far_from_the_items_hunks() {
+        let root = scratch_repo("d");
+        std::fs::write(root.join("f.txt"), lines("line-", 30)).unwrap();
+        commit_all(&root, "head");
+        let b0 = snap(&root, "d0");
+        let mut v: Vec<String> = lines("line-", 30).lines().map(String::from).collect();
+        v[4] = "item5".into();
+        v[5] = "item6".into();
+        std::fs::write(root.join("f.txt"), v.join("\n") + "\n").unwrap();
+        let b1 = snap(&root, "d1");
+        v[24] = "chat25".into();
+        std::fs::write(root.join("f.txt"), v.join("\n") + "\n").unwrap();
+        let b2 = snap(&root, "d2");
+        v[14] = "item15".into();
+        std::fs::write(root.join("f.txt"), v.join("\n") + "\n").unwrap();
+        let now = snap(&root, "d3");
+        assert_credit(
+            &root,
+            &[b0, b1, b2],
+            &now,
+            "f.txt",
+            &[(1, 2, 2), (2, 1, 1), (3, 1, 1)],
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn item_reedit_of_its_own_line_is_counted_once() {
+        let root = scratch_repo("e");
+        std::fs::write(root.join("f.txt"), lines("line-", 10)).unwrap();
+        commit_all(&root, "head");
+        let b0 = snap(&root, "e0");
+        let mut v: Vec<String> = lines("line-", 10).lines().map(String::from).collect();
+        v[2] = "v1".into();
+        std::fs::write(root.join("f.txt"), v.join("\n") + "\n").unwrap();
+        let b1 = snap(&root, "e1");
+        v[2] = "v2".into();
+        std::fs::write(root.join("f.txt"), v.join("\n") + "\n").unwrap();
+        let now = snap(&root, "e2");
+        // The removal belongs to the window that first rewrote the HEAD line,
+        // the surviving line to the window that last wrote it: net (1,1)
+        // across the item's two windows, not (2,1).
+        assert_credit(&root, &[b0, b1], &now, "f.txt", &[(1, 0, 1), (2, 1, 0)]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn second_items_window_rewrites_the_first_items_line() {
+        let root = scratch_repo("f");
+        std::fs::write(root.join("f.txt"), lines("line-", 10)).unwrap();
+        commit_all(&root, "head");
+        let b0 = snap(&root, "f0");
+        let mut v: Vec<String> = lines("line-", 10).lines().map(String::from).collect();
+        v[3] = "a4".into();
+        std::fs::write(root.join("f.txt"), v.join("\n") + "\n").unwrap();
+        let b1 = snap(&root, "f1");
+        v[3] = "b4".into();
+        std::fs::write(root.join("f.txt"), v.join("\n") + "\n").unwrap();
+        let now = snap(&root, "f2");
+        // `a4` never survives; the line goes to the later step.
+        assert_credit(&root, &[b0, b1], &now, "f.txt", &[(1, 0, 1), (2, 1, 0)]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn deletion_shapes_under_the_line_rule() {
+        // Pure deletion by an item.
+        let root = scratch_repo("g1");
+        std::fs::write(root.join("f.txt"), lines("line-", 10)).unwrap();
+        commit_all(&root, "head");
+        let b0 = snap(&root, "g1a");
+        let mut v: Vec<String> = lines("line-", 10).lines().map(String::from).collect();
+        v.remove(6);
+        std::fs::write(root.join("f.txt"), v.join("\n") + "\n").unwrap();
+        let now = snap(&root, "g1b");
+        assert_credit(&root, &[b0], &now, "f.txt", &[(1, 0, 1)]);
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Modification.
+        let root = scratch_repo("g2");
+        std::fs::write(root.join("f.txt"), lines("line-", 10)).unwrap();
+        commit_all(&root, "head");
+        let b0 = snap(&root, "g2a");
+        let mut v: Vec<String> = lines("line-", 10).lines().map(String::from).collect();
+        v[6] = "m7".into();
+        std::fs::write(root.join("f.txt"), v.join("\n") + "\n").unwrap();
+        let now = snap(&root, "g2b");
+        assert_credit(&root, &[b0], &now, "f.txt", &[(1, 1, 1)]);
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Deletion after a prior rewrite: HEAD [old], step A old->middle,
+        // step B middle->new. The removal of `old` is tallied to step A and
+        // the added `new` to step B. This deliberately differs from
+        // `matrix_2_deletion_after_prior_rewrite_lands_unowned`, which tests
+        // the superseded helpers where that removal falls to unowned: the
+        // history knows who removed the HEAD line.
+        let root = scratch_repo("g3");
+        std::fs::write(root.join("f.txt"), "keep\nold\ntail\n").unwrap();
+        commit_all(&root, "head");
+        let b0 = snap(&root, "g3a");
+        std::fs::write(root.join("f.txt"), "keep\nmiddle\ntail\n").unwrap();
+        let b1 = snap(&root, "g3b");
+        std::fs::write(root.join("f.txt"), "keep\nnew\ntail\n").unwrap();
+        let now = snap(&root, "g3c");
+        assert_credit(&root, &[b0, b1], &now, "f.txt", &[(1, 0, 1), (2, 1, 0)]);
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Create [p, q], then delete q in a later window of the same item.
+        let root = scratch_repo("g4");
+        std::fs::write(root.join("seed.txt"), "seed\n").unwrap();
+        commit_all(&root, "head");
+        let b0 = snap(&root, "g4a");
+        std::fs::write(root.join("new.txt"), "p\nq\n").unwrap();
+        let b1 = snap(&root, "g4b");
+        std::fs::write(root.join("new.txt"), "p\n").unwrap();
+        let now = snap(&root, "g4c");
+        assert_credit(&root, &[b0, b1], &now, "new.txt", &[(1, 1, 0)]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn work_present_before_the_first_boundary_is_step_zero() {
+        let root = scratch_repo("h");
+        std::fs::write(root.join("f.txt"), lines("line-", 10)).unwrap();
+        commit_all(&root, "head");
+        let mut v: Vec<String> = lines("line-", 10).lines().map(String::from).collect();
+        v[1] = "pre2".into();
+        std::fs::write(root.join("f.txt"), v.join("\n") + "\n").unwrap();
+        let b0 = snap(&root, "h0");
+        v[7] = "item8".into();
+        std::fs::write(root.join("f.txt"), v.join("\n") + "\n").unwrap();
+        let now = snap(&root, "h1");
+        assert_credit(&root, &[b0], &now, "f.txt", &[(0, 1, 1), (1, 1, 1)]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restart_at_head_content_after_a_commit_lands() {
+        let root = scratch_repo("i");
+        std::fs::write(root.join("f.txt"), "a\nb\nc\n").unwrap();
+        commit_all(&root, "head0");
+        // Boundary A, before the commit below lands.
+        let ba = snap(&root, "ia");
+        // A commit lands that adds line L; the worktree is clean for the path.
+        std::fs::write(root.join("f.txt"), "a\nb\nc\nL\n").unwrap();
+        commit_all(&root, "adds L");
+        let bb = snap(&root, "ib");
+        // An item window removes L.
+        std::fs::write(root.join("f.txt"), "a\nb\nc\n").unwrap();
+        let now = snap(&root, "ic");
+        // Without the restart, L reads as removed at step 0 (HEAD -> A) and
+        // re-added at step 1, and the later real removal is tallied to
+        // nobody. With it, the removal belongs to the item's step.
+        assert_credit(&root, &[ba, bb], &now, "f.txt", &[(2, 0, 1)]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn new_file_created_in_an_item_window_then_edited_unclaimed() {
+        let root = scratch_repo("j");
+        std::fs::write(root.join("seed.txt"), "seed\n").unwrap();
+        commit_all(&root, "head");
+        let b0 = snap(&root, "ja");
+        std::fs::write(root.join("new.txt"), "n1\nn2\nn3\n").unwrap();
+        let b1 = snap(&root, "jb");
+        std::fs::write(root.join("new.txt"), "n1\nc2\nn3\n").unwrap();
+        let now = snap(&root, "jc");
+        assert_credit(&root, &[b0, b1], &now, "new.txt", &[(1, 2, 0), (2, 1, 0)]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn step_chain_holders_follow_the_record_before_each_step() {
+        let json = r#"{"intervals":[
+            {"atMs":1,"ids":["a"],"kind":"approved","ref":"r1","tree":"t1"},
+            {"atMs":2,"ids":[],"kind":"cleared","ref":"r2","tree":"t2"},
+            {"atMs":3,"ids":["a","b"],"kind":"approved","ref":"r3","tree":"t3"}]}"#;
+        let (steps, holders) = membership_step_chain(json, "now");
+        assert_eq!(
+            steps,
+            vec![
+                ("t1".to_string(), 0),
+                ("t2".to_string(), 1),
+                ("t3".to_string(), 2),
+                ("now".to_string(), 3)
+            ]
+        );
+        assert_eq!(
+            holders,
+            vec![
+                vec![],
+                vec!["a".to_string()],
+                vec![],
+                vec!["a".to_string(), "b".to_string()]
+            ]
+        );
+        assert!(membership_step_chain("{}", "now").0.is_empty());
+    }
+}
+
+#[cfg(test)]
 mod membership_acceptance_fixture_tests {
     use super::{
         item_joint_with, joint_owners_from_runs, membership_blob_matches_head,
         membership_candidate_base, membership_conservation_breach, membership_net_patch,
         membership_patch_footprint, membership_unowned, resolve_interval_path_owner,
-        IntervalPathOwner,
+        untracked_declared_paths, IntervalPathOwner,
     };
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -48230,6 +51757,41 @@ mod membership_acceptance_fixture_tests {
         assert_eq!(post_commit.added_lines.len(), 0);
         assert_eq!(post_commit.removed, 0);
         assert_eq!(unowned_only, ((1, 0), false));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn issue_419_untracked_declared_paths_are_reported_until_committed() {
+        let root = scratch_repo("i419");
+        std::fs::write(root.join("tracked.txt"), "one\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "ignored.log\n").unwrap();
+        commit_all(&root, "base");
+
+        std::fs::write(root.join("new.js"), "new\n").unwrap();
+        std::fs::create_dir_all(root.join("dir")).unwrap();
+        std::fs::write(root.join("dir/inner.txt"), "inner\n").unwrap();
+        std::fs::write(root.join("other.txt"), "not declared\n").unwrap();
+        std::fs::write(root.join("ignored.log"), "ignored\n").unwrap();
+        std::fs::write(root.join("tracked.txt"), "one\ntwo\n").unwrap();
+
+        // Why the old residual check missed it: git diff HEAD prints nothing
+        // for a file git has never tracked.
+        let patch = git(&root, None, &["diff", "HEAD", "--", "new.js"]);
+        assert!(patch.stdout.is_empty());
+
+        let declared: Vec<String> = ["tracked.txt", "new.js", "dir", "ignored.log"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut got = untracked_declared_paths(&root, &declared);
+        got.sort();
+        assert_eq!(got, vec!["dir/inner.txt".to_string(), "new.js".to_string()]);
+
+        // No pathspec must not mean "every untracked file in the repo".
+        assert!(untracked_declared_paths(&root, &[]).is_empty());
+
+        commit_all(&root, "land everything");
+        assert!(untracked_declared_paths(&root, &declared).is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -52369,6 +55931,7 @@ fn is_bram_owned_path(path: &str) -> bool {
             "bram-traces/",
             "outbound-turns/",
             "message-drafts/",
+            "session-digests/",
             "worklist",
             "feedback-",
         ]
@@ -54919,6 +58482,25 @@ mod session_turn_tests {
         assert_eq!(wrapped.matches("\x1b[201~").count(), 1);
     }
 
+    // windows-send-clear-loses-text: the two platforms must agree on the
+    // clear. They drifted once — Windows sent Ctrl-U alone, the key Claude
+    // Code's Ink input ignores — and the result was a composer that did not
+    // clear and user text truncated on its way to the agent. Pin both the
+    // bytes and the fact that the bracketed path is built from the same
+    // constant the Windows path writes.
+    #[test]
+    fn composer_clear_is_escape_then_ctrl_u_on_every_platform() {
+        assert_eq!(
+            super::COMPOSER_CLEAR,
+            "\x1b\x15",
+            "Escape must precede Ctrl-U: Ink ignores Ctrl-U, readline ignores Escape"
+        );
+        assert!(
+            bracketed_paste_turn_payload("x").starts_with(super::COMPOSER_CLEAR),
+            "the bracketed paste must carry the same clear the raw path writes"
+        );
+    }
+
     #[test]
     fn extract_image_paths_handles_windows_absolute_path() {
         let text = "look\n[Image: source: C:\\Users\\jon\\.cache\\bram\\paste\\foo.png]";
@@ -55141,6 +58723,33 @@ mod session_turn_tests {
             "a b c".to_string()
         );
         assert_eq!(super::st_collapse_whitespace("\n \t"), "".to_string());
+    }
+
+    #[test]
+    fn outbound_turn_envelope_reason_cases() {
+        let r = |u: &str, d: &str, img: bool| super::outbound_turn_envelope_reason(u, d, img);
+        assert_eq!(r("one line", "one line", false), None);
+        let two = "line one\nline two";
+        assert_eq!(r(two, two, false), Some("multiline"));
+        let crlf = "line one\r\nline two";
+        assert_eq!(r(crlf, crlf, false), Some("multiline"));
+        let edge = "\n  one line\n";
+        assert_eq!(r(edge, edge, false), None);
+        let voice = "voice: line one\nline two";
+        assert_eq!(r(voice, voice, false), None);
+        for verb in ["approved:", "drop:", "iterate:", "talk:"] {
+            let t = format!("{} {{\"items\":[]}}\nx", verb);
+            assert_eq!(r(&t, &t, false), None);
+            assert_eq!(r(&t, &t, true), None);
+        }
+        let skip = "skip-worklist: a\nb";
+        assert_eq!(r(skip, skip, false), Some("multiline"));
+        let long = "x".repeat(701);
+        assert_eq!(r(&long, &long, false), Some("long"));
+        let edge_len = "x".repeat(700);
+        assert_eq!(r(&edge_len, &edge_len, false), None);
+        assert_eq!(r("hi", "hi", true), Some("images"));
+        assert_eq!(r("one line", "[bram: note]\n\none line", false), None);
     }
 
     #[test]
@@ -62911,6 +66520,32 @@ fn route_request<R: tauri::Runtime>(
         return (200, "application/json; charset=utf-8", bytes);
     }
 
+    // issues-status-lightweight: "is #N open?" without the full list. Served
+    // from the cached issues:list row (no forge call), which
+    // refresh_issue_now updates at once for closes Bram makes.
+    if path == "__issues/status" {
+        let mut numbers: Vec<u64> = Vec::new();
+        for pair in query.split('&') {
+            if let Some(v) = pair.strip_prefix("numbers=") {
+                numbers = percent_decode(v)
+                    .split(',')
+                    .filter_map(|s| s.trim().trim_start_matches('#').parse().ok())
+                    .collect();
+            }
+        }
+        return match gh_issues_list(app, project_search_issue_limit(app), false) {
+            Ok(bytes) => (
+                200,
+                "application/json; charset=utf-8",
+                issue_status_rows(&bytes, &numbers),
+            ),
+            Err(e) => {
+                eprintln!("[http /__issues/status] {}", e);
+                (500, "text/plain; charset=utf-8", e.into_bytes())
+            }
+        };
+    }
+
     if path == "__issues" {
         let issue_limit = project_search_issue_limit(app);
         let mut limit = issue_limit;
@@ -62925,10 +66560,12 @@ fn route_request<R: tauri::Runtime>(
         }
         return match gh_issues_list(app, limit, fresh) {
             // issues-page-bram-lifecycle-column: the second column's data.
+            // issues-status-lightweight: strip raw comments first, so the
+            // annotation pass parses the slim payload.
             Ok(bytes) => (
                 200,
                 "application/json; charset=utf-8",
-                attach_bram_issue_states(app, bytes),
+                attach_bram_issue_states(app, strip_issue_list_comments(bytes)),
             ),
             Err(e) => {
                 eprintln!("[http /__issues] {}", e);
@@ -63278,8 +66915,21 @@ fn route_request<R: tauri::Runtime>(
         } else if rest == "list" {
             (
                 "application/json; charset=utf-8",
-                list_sessions(app, provider, limit)
-                    .and_then(|entries| serde_json::to_vec(&entries).map_err(|e| e.to_string())),
+                list_sessions(app, provider, limit).and_then(|entries| {
+                    let mut rows = serde_json::to_value(&entries).map_err(|e| e.to_string())?;
+                    attach_session_partners(app, &mut rows);
+                    serde_json::to_vec(&rows).map_err(|e| e.to_string())
+                }),
+            )
+        } else if rest == "pair" {
+            (
+                "application/json; charset=utf-8",
+                pair_sessions_route(app, query),
+            )
+        } else if rest == "unpair" {
+            (
+                "application/json; charset=utf-8",
+                unpair_session(app, &session_id, provider),
             )
         } else if rest == "latest" {
             (
@@ -63307,10 +66957,13 @@ fn route_request<R: tauri::Runtime>(
                 delete_session(app, &session_id, provider),
             )
         } else if rest == "rename" {
-            (
-                "application/json; charset=utf-8",
-                rename_session(app, &session_id, provider, &title),
-            )
+            // provider-session-pair-offer: refresh the list after a rename, so
+            // Match name (and the ✎ rename) show the new title without a reload.
+            let r = rename_session(app, &session_id, provider, &title);
+            if r.is_ok() {
+                emit_replayable_signal(app, "sessions-list-changed");
+            }
+            ("application/json; charset=utf-8", r)
         } else {
             (
                 "text/plain; charset=utf-8",
@@ -64027,10 +67680,28 @@ fn route_request<R: tauri::Runtime>(
             // across all paths and undercounted the button (live case
             // 2026-09-04: "Will commit +185 −1" while an exclusive
             // Inbox.xmlui alone carried +32 −15 its commit would take).
+            // issue-425-gate-routes-by-membership: the prediction must follow
+            // the routing the gate now uses. The gate decides entanglement by
+            // line-level membership, REQUEST-WIDE: if any declared path has
+            // lines a begun outside item owns, every path is interval-staged;
+            // otherwise every path is taken whole-file, unowned lines included.
+            // Routing this per path from the replay (as before) predicted an
+            // interval take the gate no longer makes — the gate-425-r2 demo,
+            // 2026-10-06, whose agent wrote its message from that expectation.
+            // Display tolerates a stale partition; with none, fall back to the
+            // replay's owners, per path, as before.
+            let wc_partition = membership_partition(app).map(|(p, _)| p);
             if let Some(items) = doc.get_mut("items").and_then(|v| v.as_array_mut()) {
+                // Begun the way the gate counts it (handle_worklist_commit's
+                // begun_outside): `applied` OR a host-stamped begunAtMs. Keying
+                // on begunAtMs alone left applied items with no prediction and
+                // let prediction and gate disagree about who entangles.
                 let begun: std::collections::HashSet<String> = items
                     .iter()
-                    .filter(|it| it.get("begunAtMs").is_some())
+                    .filter(|it| {
+                        it.get("status").and_then(|v| v.as_str()) == Some("applied")
+                            || it.get("begunAtMs").and_then(|v| v.as_i64()).unwrap_or(0) > 0
+                    })
                     .filter_map(|it| it.get("id").and_then(|v| v.as_str()).map(String::from))
                     .collect();
                 for item in items.iter_mut() {
@@ -64040,6 +67711,27 @@ fn route_request<R: tauri::Runtime>(
                     if !begun.contains(&id) {
                         continue;
                     }
+                    let declared = worklist_item_files(item);
+                    let item_entangled: Option<bool> = wc_partition.as_ref().map(|p| {
+                        let outside: std::collections::HashSet<String> =
+                            begun.iter().filter(|b| **b != id).cloned().collect();
+                        !membership_entangling_owners(p, &declared, &[id.clone()], &outside)
+                            .is_empty()
+                    });
+                    let unowned_whole: Vec<(String, usize, usize)> =
+                        match (&wc_partition, item_entangled) {
+                            (Some(p), Some(false)) => {
+                                let paths: Vec<String> = p
+                                    .keys()
+                                    .filter(|path| {
+                                        declared.iter().any(|d| declared_covers(d, path))
+                                    })
+                                    .cloned()
+                                    .collect();
+                                membership_unowned_taken(p, &paths)
+                            }
+                            _ => Vec::new(),
+                        };
                     let Some(records) = item.get_mut("changedFiles").and_then(|v| v.as_array_mut())
                     else {
                         continue;
@@ -64056,10 +67748,15 @@ fn route_request<R: tauri::Runtime>(
                         else {
                             continue;
                         };
-                        let entangled = owners_by_path
-                            .get(&path)
-                            .map(|o| o.iter().any(|owner| *owner != id && begun.contains(owner)))
-                            .unwrap_or(false);
+                        let entangled = match item_entangled {
+                            Some(e) => e,
+                            None => owners_by_path
+                                .get(&path)
+                                .map(|o| {
+                                    o.iter().any(|owner| *owner != id && begun.contains(owner))
+                                })
+                                .unwrap_or(false),
+                        };
                         // issue-273 postscript: the residue-driven interval
                         // branch (and its two successor corrections) were
                         // withdrawn the same evening they shipped — three
@@ -64107,6 +67804,23 @@ fn route_request<R: tauri::Runtime>(
                             "willCommit".to_string(),
                             serde_json::json!({ "added": wc.0, "removed": wc.1 }),
                         );
+                        // issue-425-gate-routes-by-membership: what a whole-file
+                        // commit of this item would take that no item wrote —
+                        // the same lines the commit response will disclose as
+                        // `unownedTaken`, available BEFORE committing.
+                        if !unowned_whole.is_empty() {
+                            obj.insert(
+                                "willCommitUnowned".to_string(),
+                                serde_json::Value::Array(
+                                    unowned_whole
+                                        .iter()
+                                        .map(|(p, a, r)| {
+                                            serde_json::json!({ "path": p, "added": a, "removed": r })
+                                        })
+                                        .collect(),
+                                ),
+                            );
+                        }
                     }
                 }
             }
@@ -64225,6 +67939,7 @@ fn route_request<R: tauri::Runtime>(
                 obj.insert("plan".to_string(), plan);
             }
         }
+        worklist_attach_last_sessions(app, &mut doc);
         let body = serde_json::to_vec(&doc).unwrap_or_default();
         return (200, "application/json; charset=utf-8", body);
     }
@@ -65231,23 +68946,268 @@ fn worklist_plan_item<'a>(doc: &'a serde_json::Value, id: &str) -> Option<&'a se
         .find(|i| i.get("id").and_then(|v| v.as_str()) == Some(id))
 }
 
+// issue-420: why a saved plan is not served, or None when it is. Pure, so
+// the reasons are testable; worklist_plan_current traces them. Same checks,
+// same order, as before the reasons were named.
+fn worklist_plan_withheld(
+    plan: &serde_json::Value,
+    doc: &serde_json::Value,
+) -> Option<(&'static str, String)> {
+    let board_version = doc.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
+    if plan.get("version").and_then(|v| v.as_u64()) != Some(board_version) {
+        return Some(("version-mismatch", String::new()));
+    }
+    let Some(steps) = plan.get("steps").and_then(|v| v.as_array()) else {
+        return Some(("unreadable", String::new()));
+    };
+    for step in steps {
+        let Some(ids) = step.get("ids").and_then(|v| v.as_array()) else {
+            return Some(("unreadable", String::new()));
+        };
+        for id in ids {
+            let Some(id) = id.as_str() else {
+                return Some(("unreadable", String::new()));
+            };
+            if worklist_plan_item(doc, id).is_none() {
+                return Some(("id-missing", id.to_string()));
+            }
+        }
+    }
+    None
+}
+
+// issue-420: a plan the agent posted but the board doesn't serve used to
+// vanish without a trace. Once per plan and reason, since the board is
+// served many times.
+fn trace_worklist_plan_withheld<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    plan: &serde_json::Value,
+    doc: &serde_json::Value,
+    reason: &str,
+    missing: &str,
+) {
+    static REPORTED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    let posted = plan.get("postedAtMs").and_then(|v| v.as_u64()).unwrap_or(0);
+    let key = format!("{}|{}", posted, reason);
+    if let Ok(mut g) = REPORTED
+        .get_or_init(|| Mutex::new(Default::default()))
+        .lock()
+    {
+        if !g.insert(key) {
+            return;
+        }
+    }
+    let plan_version = plan
+        .get("version")
+        .and_then(|v| v.as_u64())
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let board_version = doc.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
+    append_bram_trace_line(
+        app,
+        "worklist",
+        &format!(
+            "op=plan-withheld reason={} plan_version={} board_version={} missing={}",
+            reason,
+            plan_version,
+            board_version,
+            if missing.is_empty() { "-" } else { missing }
+        ),
+    );
+}
+
 fn worklist_plan_current<R: tauri::Runtime>(
     app: &AppHandle<R>,
     doc: &serde_json::Value,
 ) -> Option<serde_json::Value> {
     let path = project_resource_path(app, WORKLIST_PLAN_FILE)?;
-    let plan: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
-    let board_version = doc.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
-    if plan.get("version").and_then(|v| v.as_u64()) != Some(board_version) {
+    // No file is the ordinary case: nothing posted, or cleared.
+    let bytes = std::fs::read(&path).ok()?;
+    let plan: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(_) => {
+            trace_worklist_plan_withheld(app, &serde_json::Value::Null, doc, "unreadable", "");
+            return None;
+        }
+    };
+    if let Some((reason, missing)) = worklist_plan_withheld(&plan, doc) {
+        trace_worklist_plan_withheld(app, &plan, doc, reason, &missing);
         return None;
     }
-    let steps = plan.get("steps")?.as_array()?;
+    Some(plan)
+}
+
+#[cfg(test)]
+mod worklist_plan_withheld_tests {
+    use serde_json::json;
+
+    #[test]
+    fn names_each_reason_and_serves_a_current_plan() {
+        let board = json!({"version": 7, "items": [{"id": "a"}, {"id": "b"}]});
+        let plan = |v: u64, ids: serde_json::Value| json!({"version": v, "steps": [{"verb": "drop", "ids": ids}]});
+        assert_eq!(
+            super::worklist_plan_withheld(&plan(7, json!(["a", "b"])), &board),
+            None
+        );
+        assert_eq!(
+            super::worklist_plan_withheld(&plan(6, json!(["a"])), &board),
+            Some(("version-mismatch", String::new()))
+        );
+        assert_eq!(
+            super::worklist_plan_withheld(&plan(7, json!(["a", "gone"])), &board),
+            Some(("id-missing", "gone".to_string()))
+        );
+        assert_eq!(
+            super::worklist_plan_withheld(&json!({"version": 7}), &board),
+            Some(("unreadable", String::new()))
+        );
+        assert_eq!(
+            super::worklist_plan_withheld(&plan(7, json!([1])), &board),
+            Some(("unreadable", String::new()))
+        );
+    }
+}
+
+// The plan's steps, checked against the board. Pure, so the rules are
+// testable. Returns the cleaned steps and their trace summary, or the
+// refusal message.
+//
+// plan-recommends-feedback-in-one-click: besides drop and commit, a step can
+// send feedback to items ({verb: "feedback", ids, text}), so the agent can
+// recommend feedback the user approves in one click instead of copying it
+// into the message box. Feedback and commit can't share a plan: both start
+// agent turns, and the second would queue behind the first.
+fn plan_step_verb(step: &serde_json::Value) -> &str {
+    step.get("verb").and_then(|v| v.as_str()).unwrap_or("")
+}
+
+fn validate_worklist_plan_steps(
+    steps: &[serde_json::Value],
+    doc: &serde_json::Value,
+) -> Result<(Vec<serde_json::Value>, Vec<String>), String> {
+    let mut clean_steps = Vec::new();
+    let mut summary_parts = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if steps.iter().any(|s| plan_step_verb(s) == "feedback")
+        && steps.iter().any(|s| plan_step_verb(s) == "commit")
+    {
+        return Err(
+            "a plan can't both send feedback and commit: both start agent turns, so post them \
+             as separate plans"
+                .to_string(),
+        );
+    }
     for step in steps {
-        for id in step.get("ids")?.as_array()? {
-            worklist_plan_item(doc, id.as_str()?)?;
+        let verb = plan_step_verb(step);
+        if verb != "drop" && verb != "commit" && verb != "feedback" {
+            return Err(format!(
+                "step verb must be \"drop\", \"commit\" or \"feedback\", got {:?}",
+                verb
+            ));
+        }
+        let ids: Vec<String> = step
+            .get("ids")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if ids.is_empty() {
+            return Err(format!("a {} step names no ids", verb));
+        }
+        let text = step
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if verb == "feedback" && text.is_empty() {
+            return Err("a feedback step needs non-empty text".to_string());
+        }
+        for id in &ids {
+            // One step per id: "drop and commit X" can't both be meant.
+            if !seen.insert(id.clone()) {
+                return Err(format!("{} is named in more than one step", id));
+            }
+            let Some(item) = worklist_plan_item(doc, id) else {
+                return Err(format!("{} is not on the board", id));
+            };
+            // Commit needs work to commit: the item has begun or is applied.
+            if verb == "commit" {
+                let applied = item.get("status").and_then(|v| v.as_str()) == Some("applied");
+                if !applied && item.get("begunAtMs").is_none() {
+                    return Err(format!(
+                        "{} hasn't started, so there is nothing to commit",
+                        id
+                    ));
+                }
+            }
+        }
+        summary_parts.push(format!("{}={}", verb, ids.join(",")));
+        if verb == "feedback" {
+            clean_steps.push(serde_json::json!({ "verb": verb, "ids": ids, "text": text }));
+        } else {
+            clean_steps.push(serde_json::json!({ "verb": verb, "ids": ids }));
         }
     }
-    Some(plan)
+    Ok((clean_steps, summary_parts))
+}
+
+#[cfg(test)]
+mod validate_worklist_plan_steps_tests {
+    use serde_json::json;
+
+    fn board() -> serde_json::Value {
+        json!({"version": 3, "items": [
+            {"id": "a", "status": "proposed"},
+            {"id": "b", "status": "applied"},
+            {"id": "c", "status": "proposed"}
+        ]})
+    }
+
+    fn check(steps: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+        super::validate_worklist_plan_steps(steps.as_array().unwrap(), &board()).map(|(s, _)| s)
+    }
+
+    #[test]
+    fn feedback_steps_carry_their_text_and_need_it() {
+        let ok = check(
+            json!([{"verb": "feedback", "ids": ["a"], "text": "  name your prerequisites  "}]),
+        )
+        .unwrap();
+        assert_eq!(ok[0]["text"], "name your prerequisites");
+        assert!(check(json!([{"verb": "feedback", "ids": ["a"], "text": "  "}])).is_err());
+        assert!(check(json!([{"verb": "feedback", "ids": ["a"]}])).is_err());
+        assert!(check(json!([{"verb": "feedback", "ids": ["gone"], "text": "x"}])).is_err());
+    }
+
+    #[test]
+    fn feedback_mixes_with_drop_but_not_commit() {
+        assert!(check(json!([
+            {"verb": "drop", "ids": ["c"]},
+            {"verb": "feedback", "ids": ["a"], "text": "x"}
+        ]))
+        .is_ok());
+        let mixed = check(json!([
+            {"verb": "commit", "ids": ["b"]},
+            {"verb": "feedback", "ids": ["a"], "text": "x"}
+        ]));
+        assert!(mixed.unwrap_err().contains("separate plans"));
+    }
+
+    #[test]
+    fn drop_and_commit_rules_are_unchanged() {
+        let ok = check(json!([{"verb": "drop", "ids": ["a"]}, {"verb": "commit", "ids": ["b"]}]))
+            .unwrap();
+        assert!(ok[0].get("text").is_none());
+        assert!(check(json!([{"verb": "commit", "ids": ["a"]}])).is_err());
+        assert!(
+            check(json!([{"verb": "drop", "ids": ["a"]}, {"verb": "drop", "ids": ["a"]}])).is_err()
+        );
+        assert!(check(json!([{"verb": "rename", "ids": ["a"]}])).is_err());
+    }
 }
 
 fn handle_worklist_plan<R: tauri::Runtime>(
@@ -65288,51 +69248,10 @@ fn handle_worklist_plan<R: tauri::Runtime>(
         );
     }
     let doc = worklist_doc(app);
-    let mut clean_steps = Vec::new();
-    let mut summary_parts = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for step in &steps {
-        let verb = step.get("verb").and_then(|v| v.as_str()).unwrap_or("");
-        if verb != "drop" && verb != "commit" {
-            return refuse(format!(
-                "step verb must be \"drop\" or \"commit\", got {:?}",
-                verb
-            ));
-        }
-        let ids: Vec<String> = step
-            .get("ids")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if ids.is_empty() {
-            return refuse(format!("a {} step names no ids", verb));
-        }
-        for id in &ids {
-            // One step per id: "drop and commit X" can't both be meant.
-            if !seen.insert(id.clone()) {
-                return refuse(format!("{} is named in more than one step", id));
-            }
-            let Some(item) = worklist_plan_item(&doc, id) else {
-                return refuse(format!("{} is not on the board", id));
-            };
-            // Commit needs work to commit: the item has begun or is applied.
-            if verb == "commit" {
-                let applied = item.get("status").and_then(|v| v.as_str()) == Some("applied");
-                if !applied && item.get("begunAtMs").is_none() {
-                    return refuse(format!(
-                        "{} hasn't started, so there is nothing to commit",
-                        id
-                    ));
-                }
-            }
-        }
-        summary_parts.push(format!("{}={}", verb, ids.join(",")));
-        clean_steps.push(serde_json::json!({ "verb": verb, "ids": ids }));
-    }
+    let (clean_steps, summary_parts) = match validate_worklist_plan_steps(&steps, &doc) {
+        Ok(v) => v,
+        Err(msg) => return refuse(msg),
+    };
     let version = doc.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
     let plan = serde_json::json!({
         "summary": req.get("summary").and_then(|v| v.as_str()).unwrap_or(""),
@@ -67527,12 +71446,18 @@ fn gate_membership_comparison(
 // unavailable); until then it is the pre-flip soak's instrument: gate-time
 // cost (criterion 7 has serve-time baselines only) and agreement at the
 // moment a commit actually happens.
+//
+// issue-425-gate-routes-by-membership: no longer observe-only. It returns the
+// fresh partition so the gate can ROUTE by it (see
+// membership_entangling_owners); None means membership had no answer, which
+// the gate refuses on rather than falling back to the replay. The divergence
+// traces stay, so disagreements remain visible until the replay retires.
 fn gate_membership_observe<R: tauri::Runtime>(
     app: &AppHandle<R>,
     ids: &[String],
     requested_files: &[String],
     runs_by_path: &std::collections::HashMap<String, Vec<serde_json::Value>>,
-) {
+) -> Option<std::collections::BTreeMap<String, MembershipPathBuckets>> {
     let started = std::time::Instant::now();
     let Some((partition, fresh)) = membership_partition_engine(app, true) else {
         append_bram_trace_line(
@@ -67544,7 +71469,7 @@ fn gate_membership_observe<R: tauri::Runtime>(
                 started.elapsed().as_millis()
             ),
         );
-        return;
+        return None;
     };
     let replay_owners = replay_owners_from_runs(runs_by_path);
     let replay_joint = joint_owners_from_runs(runs_by_path);
@@ -67582,6 +71507,253 @@ fn gate_membership_observe<R: tauri::Runtime>(
             diverged.is_empty()
         ),
     );
+    Some(partition)
+}
+
+// issue-425-gate-routes-by-membership: the begun items OUTSIDE the request
+// that membership credits with lines on a requested path. Non-empty routes
+// the whole request to interval staging (staging is request-wide: one
+// entangled path sends every requested file through interval patches). A
+// replay "owner" with no lines here routes nothing — the 21-of-21 #419 shape.
+fn membership_entangling_owners(
+    partition: &std::collections::BTreeMap<String, MembershipPathBuckets>,
+    requested_files: &[String],
+    requested_ids: &[String],
+    begun_outside: &std::collections::HashSet<String>,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (path, m) in partition {
+        if !requested_files.iter().any(|d| declared_covers(d, path)) {
+            continue;
+        }
+        for owner in &m.owners {
+            if requested_ids.iter().any(|r| r == owner) {
+                continue;
+            }
+            if begun_outside.contains(owner) {
+                out.push((path.clone(), owner.clone()));
+            }
+        }
+    }
+    out
+}
+
+// issue-425-gate-routes-by-membership: lines a whole-file commit takes that
+// membership credits to NO item (chat-turn edits, edits between windows, a
+// neighbour's lines on a path it does not declare). Disclosed, not refused
+// (decided 2026-10-02). Only committed paths with a nonzero unowned bucket.
+fn membership_unowned_taken(
+    partition: &std::collections::BTreeMap<String, MembershipPathBuckets>,
+    committed_paths: &[String],
+) -> Vec<(String, usize, usize)> {
+    let mut out = Vec::new();
+    for path in committed_paths {
+        let Some(m) = partition.get(path) else {
+            continue;
+        };
+        let attributed = (
+            m.single.0 + m.joint.0 + m.ambiguous.0,
+            m.single.1 + m.joint.1 + m.ambiguous.1,
+        );
+        let ((a, r), _clamped) = membership_unowned(m.universe, attributed);
+        if a + r > 0 {
+            out.push((path.clone(), a, r));
+        }
+    }
+    out
+}
+
+// issue-425-gate-routes-by-membership (Codex review: "one state for
+// classification and staging"): the worktree content of every changed path
+// under the request's files, captured BEFORE membership classifies them.
+// Whole-file staging then checks the index against it, so an edit landing
+// between classification and `git add` is refused, never silently absorbed
+// into a commit membership did not see. Values are blob ids, "-" for a
+// deleted path.
+fn gate_worktree_snapshot<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    files: &[String],
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let mut out = std::collections::BTreeMap::new();
+    if files.is_empty() {
+        return Ok(out);
+    }
+    let root = project_root(Some(app)).ok_or_else(|| "no project root".to_string())?;
+    let mut paths: std::collections::BTreeSet<String> = Default::default();
+    let mut diff = vec![
+        "diff".to_string(),
+        "HEAD".to_string(),
+        "--name-only".to_string(),
+        "--no-renames".to_string(),
+        "--".to_string(),
+    ];
+    diff.extend(files.iter().cloned());
+    for l in git_run_owned(app, &diff)?.lines() {
+        if !l.trim().is_empty() {
+            paths.insert(l.trim().to_string());
+        }
+    }
+    let mut others = vec![
+        "ls-files".to_string(),
+        "--others".to_string(),
+        "--exclude-standard".to_string(),
+        "--".to_string(),
+    ];
+    others.extend(files.iter().cloned());
+    for l in git_run_owned(app, &others)?.lines() {
+        if !l.trim().is_empty() {
+            paths.insert(l.trim().to_string());
+        }
+    }
+    for p in paths {
+        let blob = if root.join(&p).exists() {
+            git_run(app, &["hash-object", "--", &p])?.trim().to_string()
+        } else {
+            "-".to_string()
+        };
+        out.insert(p, blob);
+    }
+    Ok(out)
+}
+
+// The index side of the same comparison: the staged blob id of each path,
+// "-" when the index does not carry it (a staged deletion).
+fn gate_index_blobs<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    paths: &[String],
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let mut out = std::collections::BTreeMap::new();
+    for p in paths {
+        let line = git_run(app, &["ls-files", "-s", "--", p])?;
+        let blob = line
+            .split_whitespace()
+            .nth(1)
+            .map(str::to_string)
+            .unwrap_or_else(|| "-".to_string());
+        out.insert(p.clone(), blob);
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod gate_routes_by_membership_tests {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+    fn bucket(
+        owners: &[&str],
+        universe: (usize, usize),
+        single: (usize, usize),
+    ) -> MembershipPathBuckets {
+        MembershipPathBuckets {
+            owners: owners
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<BTreeSet<_>>(),
+            universe,
+            single,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn outside_begun_owner_with_lines_entangles() {
+        let mut p = BTreeMap::new();
+        p.insert("a.rs".to_string(), bucket(&["A", "B"], (10, 0), (10, 0)));
+        let begun: HashSet<String> = ["B".to_string()].into_iter().collect();
+        let got =
+            membership_entangling_owners(&p, &["a.rs".to_string()], &["A".to_string()], &begun);
+        assert_eq!(got, vec![("a.rs".to_string(), "B".to_string())]);
+    }
+
+    #[test]
+    fn replay_only_neighbour_does_not_entangle() {
+        // #419's 21-of-21 shape: the neighbour is begun and declares the path
+        // but owns no lines, so membership does not list it as an owner.
+        let mut p = BTreeMap::new();
+        p.insert("a.rs".to_string(), bucket(&["A"], (5, 1), (5, 1)));
+        let begun: HashSet<String> = ["B".to_string()].into_iter().collect();
+        assert!(membership_entangling_owners(
+            &p,
+            &["a.rs".to_string()],
+            &["A".to_string()],
+            &begun
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn co_requested_and_unbegun_owners_do_not_entangle() {
+        let mut p = BTreeMap::new();
+        p.insert("a.rs".to_string(), bucket(&["A", "B", "C"], (9, 0), (9, 0)));
+        // B is in the request (committing together is safe); C never began.
+        let begun: HashSet<String> = HashSet::new();
+        let ids = vec!["A".to_string(), "B".to_string()];
+        assert!(membership_entangling_owners(&p, &["a.rs".to_string()], &ids, &begun).is_empty());
+    }
+
+    #[test]
+    fn directory_declaration_covers_paths_and_unrequested_paths_are_ignored() {
+        let mut p = BTreeMap::new();
+        p.insert("src/x.rs".to_string(), bucket(&["B"], (1, 0), (1, 0)));
+        p.insert("other/y.rs".to_string(), bucket(&["C"], (1, 0), (1, 0)));
+        let begun: HashSet<String> = ["B".to_string(), "C".to_string()].into_iter().collect();
+        let got =
+            membership_entangling_owners(&p, &["src/".to_string()], &["A".to_string()], &begun);
+        assert_eq!(got, vec![("src/x.rs".to_string(), "B".to_string())]);
+    }
+
+    #[test]
+    fn unowned_taken_reports_only_committed_paths_with_unowned_lines() {
+        let mut p = BTreeMap::new();
+        p.insert("a.rs".to_string(), bucket(&["A"], (12, 3), (10, 1))); // 2+, 2- unowned
+        p.insert("b.rs".to_string(), bucket(&["A"], (4, 0), (4, 0))); // fully owned
+        p.insert("c.rs".to_string(), bucket(&[], (1, 1), (0, 0))); // unowned, not committed
+        let got = membership_unowned_taken(&p, &["a.rs".to_string(), "b.rs".to_string()]);
+        assert_eq!(got, vec![("a.rs".to_string(), 2, 2)]);
+    }
+
+    #[test]
+    fn drift_catches_changed_new_and_reverted_paths() {
+        let snap: BTreeMap<String, String> = [("a".into(), "h1".into()), ("b".into(), "h2".into())]
+            .into_iter()
+            .collect();
+        let same: BTreeMap<String, String> = snap.clone();
+        assert!(gate_state_drift(&snap, &same).is_empty());
+        let changed: BTreeMap<String, String> =
+            [("a".into(), "h9".into()), ("b".into(), "h2".into())]
+                .into_iter()
+                .collect();
+        assert_eq!(gate_state_drift(&snap, &changed), vec!["a".to_string()]);
+        let extra: BTreeMap<String, String> = [
+            ("a".into(), "h1".into()),
+            ("b".into(), "h2".into()),
+            ("c".into(), "h3".into()),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(gate_state_drift(&snap, &extra), vec!["c".to_string()]);
+        let missing: BTreeMap<String, String> = [("a".into(), "h1".into())].into_iter().collect();
+        assert_eq!(gate_state_drift(&snap, &missing), vec!["b".to_string()]);
+        let deleted: BTreeMap<String, String> = [("a".into(), "-".into())].into_iter().collect();
+        let del_staged = deleted.clone();
+        assert!(gate_state_drift(&deleted, &del_staged).is_empty());
+    }
+}
+
+// Paths whose staged content differs from the pre-classification snapshot,
+// over the union of both sides: a path changed after the snapshot, a path
+// that newly appeared, or one that changed back.
+fn gate_state_drift(
+    snapshot: &std::collections::BTreeMap<String, String>,
+    staged: &std::collections::BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut keys: std::collections::BTreeSet<&String> = snapshot.keys().collect();
+    keys.extend(staged.keys());
+    keys.into_iter()
+        .filter(|k| snapshot.get(*k) != staged.get(*k))
+        .cloned()
+        .collect()
 }
 
 fn handle_worklist_commit<R: tauri::Runtime>(
@@ -67790,21 +71962,52 @@ fn handle_worklist_commit<R: tauri::Runtime>(
     // across the commit because interval staging never touches the worktree
     // the replay is positioned against.
     let (runs_by_path, _, _, _unowned_by_path) = claim_attribution_runs(app);
-    // gate-computes-membership-fresh: observe-only, before any staging
-    // decision. See gate_membership_observe.
-    {
-        let requested_files: Vec<String> = items
-            .iter()
-            .filter(|it| {
-                it.get("id")
-                    .and_then(|v| v.as_str())
-                    .map(|id| ids.iter().any(|r| r == id))
-                    .unwrap_or(false)
-            })
-            .flat_map(worklist_item_files)
-            .collect();
-        gate_membership_observe(app, &ids, &requested_files, &runs_by_path);
-    }
+    // issue-425-gate-routes-by-membership: the worktree snapshot comes
+    // FIRST, so any edit after it — even one membership then sees — shows up
+    // as drift at staging instead of being absorbed. Twins are included
+    // because whole-file staging auto-stages them below.
+    let worktree_snapshot = {
+        let mut snap_files = files.clone();
+        snap_files.extend(installed_twins_for(&files));
+        match gate_worktree_snapshot(app, &snap_files) {
+            Ok(s) => s,
+            Err(e) => {
+                release_claim_on_commit_refusal(app, &ids);
+                return worklist_json_error(500, format!("worktree snapshot failed: {}", e));
+            }
+        }
+    };
+    // gate-computes-membership-fresh, now acting (issue-425-gate-routes-by-
+    // membership): the fresh partition decides entanglement below.
+    let requested_files: Vec<String> = items
+        .iter()
+        .filter(|it| {
+            it.get("id")
+                .and_then(|v| v.as_str())
+                .map(|id| ids.iter().any(|r| r == id))
+                .unwrap_or(false)
+        })
+        .flat_map(worklist_item_files)
+        .collect();
+    let Some(partition) = gate_membership_observe(app, &ids, &requested_files, &runs_by_path)
+    else {
+        // Refuse rather than fall back to the replay: the replay is the
+        // model that named 21 wrong neighbours (#419), and why membership
+        // occasionally has no answer is not yet established.
+        append_bram_trace_line(
+            app,
+            "worklist-commit",
+            &format!("op=refuse-membership-unavailable ids={}", ids.join(",")),
+        );
+        release_claim_on_commit_refusal(app, &ids);
+        return worklist_json_error(
+            409,
+            "commit refused: Bram couldn't work out which lines belong to which item right \
+             now, so it can't tell whether this commit would take another item's work. \
+             Nothing was committed. Try the commit again in a moment."
+                .to_string(),
+        );
+    };
     let begun_outside: std::collections::HashSet<String> = items
         .iter()
         .filter_map(|it| {
@@ -67819,7 +72022,7 @@ fn handle_worklist_commit<R: tauri::Runtime>(
         .collect();
     {
         let requested: std::collections::HashSet<&str> = ids.iter().map(|s| s.as_str()).collect();
-        'scan: for path in &files {
+        for path in &files {
             let Some(runs) = runs_by_path.get(path) else {
                 continue;
             };
@@ -67897,30 +72100,30 @@ fn handle_worklist_commit<R: tauri::Runtime>(
                     }
                     continue;
                 }
-                let Some(owner) = run.get("itemId").and_then(|v| v.as_str()) else {
-                    continue;
-                };
-                if requested.contains(owner) {
-                    continue;
-                }
-                let owner_begun = items.iter().any(|it| {
-                    it.get("id").and_then(|v| v.as_str()) == Some(owner)
-                        && (it.get("status").and_then(|v| v.as_str()) == Some("applied")
-                            || it.get("begunAtMs").and_then(|v| v.as_i64()).unwrap_or(0) > 0)
-                });
-                if owner_begun {
-                    if bram_trace_enabled() {
-                        append_bram_trace_line(
-                            app,
-                            "worklist-commit",
-                            &format!("op=entangled-interval-stage path={} owner={}", path, owner),
-                        );
-                    }
-                    needs_interval_stage = true;
-                    break 'scan;
-                }
+                // issue-425-gate-routes-by-membership: a single-owner replay
+                // run no longer routes anything — membership decides below.
+                // (The replay named an outside item with no lines of its own
+                // 21 of 21 times in #419's adjudication.)
             }
         }
+    }
+    // issue-425-gate-routes-by-membership: entangled iff membership credits
+    // lines on a requested path to a begun item outside the request. Routing
+    // stays request-wide: one entangled path interval-stages every file.
+    for (path, owner) in
+        membership_entangling_owners(&partition, &requested_files, &ids, &begun_outside)
+    {
+        if bram_trace_enabled() {
+            append_bram_trace_line(
+                app,
+                "worklist-commit",
+                &format!(
+                    "op=entangled-interval-stage path={} owner={} source=membership",
+                    path, owner
+                ),
+            );
+        }
+        needs_interval_stage = true;
     }
     // issue-327: per-id declared files, for the interval-staging patch builder.
     let mut item_files_map: std::collections::HashMap<String, Vec<String>> = Default::default();
@@ -68088,6 +72291,40 @@ fn handle_worklist_commit<R: tauri::Runtime>(
                 "commit refused: this item's declared files carry no changes to commit \
                  (its work may be parked or already committed)."
                     .to_string(),
+            );
+        }
+
+        // issue-425-gate-routes-by-membership: one state for classification
+        // and staging. What was just staged must be exactly what the snapshot
+        // (taken before membership classified the paths) saw; otherwise an
+        // edit landed in between and the commit would carry lines no
+        // classification covered. Unstage and refuse — a retry re-snapshots.
+        let staged_blobs = match gate_index_blobs(app, &staged_after) {
+            Ok(b) => b,
+            Err(e) => return worklist_json_error(500, e),
+        };
+        let drift = gate_state_drift(&worktree_snapshot, &staged_blobs);
+        if !drift.is_empty() {
+            let mut unstage = vec!["reset".to_string(), "-q".to_string(), "--".to_string()];
+            unstage.extend(staged_after.iter().cloned());
+            let _ = git_run_owned(app, &unstage);
+            append_bram_trace_line(
+                app,
+                "worklist-commit",
+                &format!(
+                    "op=refuse-state-drift paths={}",
+                    drift.iter().take(5).cloned().collect::<Vec<_>>().join(",")
+                ),
+            );
+            release_claim_on_commit_refusal(app, &ids);
+            return worklist_json_error(
+                409,
+                format!(
+                    "commit refused: {} changed while the commit was being prepared, so \
+                     the commit would have included edits Bram hadn't checked. Nothing was \
+                     committed and nothing was left staged. Commit again.",
+                    drift.iter().take(3).cloned().collect::<Vec<_>>().join(", ")
+                ),
             );
         }
 
@@ -68267,8 +72504,8 @@ fn handle_worklist_commit<R: tauri::Runtime>(
     emit_replayable_signal(app, "git-status-changed");
 
     // issue-364 residual disclosure: only an interval-staged commit can leave
-    // residue in the requested items' declared files (whole-file staging
-    // commits their entire diff). Diff each declared path against the fresh
+    // residue in TRACKED declared files (whole-file staging commits their
+    // entire diff). Diff each declared path against the fresh
     // HEAD, classify leftovers by attribution, and disclose. A path with
     // UNOWNED residue means the requesting item's work is probably
     // incomplete — edited in unclaimed time, so no interval carried it into
@@ -68314,6 +72551,48 @@ fn handle_worklist_commit<R: tauri::Runtime>(
             }
         }
     }
+    // issue-419: the pass above is blind to a declared file git never
+    // tracked (`git diff HEAD` prints nothing for it), so a new file the
+    // interval path skipped was pruned away silently. Check for declared
+    // paths still untracked after EVERY commit. On the whole-file path
+    // `git add -A` stages new files, so this should never fire there: a
+    // `stage=whole-file` trace line is a tripwire for a new bug. Findings
+    // retain the item exactly as unowned tracked residue does.
+    if let Some(root) = project_root(Some(app)) {
+        let mut declared: Vec<String> = Vec::new();
+        for id in &ids {
+            for p in item_files_map.get(id).cloned().unwrap_or_default() {
+                if !declared.contains(&p) {
+                    declared.push(p);
+                }
+            }
+        }
+        let stage = if needs_interval_stage {
+            "interval"
+        } else {
+            "whole-file"
+        };
+        for path in untracked_declared_paths(&root, &declared) {
+            append_bram_trace_line(
+                app,
+                "worklist-commit",
+                &format!(
+                    "op=residual-disclosed path={} owner=unowned untracked=true stage={}",
+                    path, stage
+                ),
+            );
+            for rid in &ids {
+                if item_files_map.get(rid).map_or(false, |fs| {
+                    fs.iter().any(|entry| staged_path_covered_by(entry, &path))
+                }) && !retained.contains(rid)
+                {
+                    retained.push(rid.clone());
+                }
+            }
+            residual_paths
+                .push(serde_json::json!({ "path": path, "owner": "unowned", "untracked": true }));
+        }
+    }
     if !retained.is_empty() {
         append_bram_trace_line(
             app,
@@ -68339,6 +72618,31 @@ fn handle_worklist_commit<R: tauri::Runtime>(
     let mut response = serde_json::json!({ "ok": true, "sha": sha, "queuedCloses": queued_closes });
     if !residual_paths.is_empty() {
         response["residualPaths"] = serde_json::Value::Array(residual_paths);
+    }
+    // issue-425-gate-routes-by-membership: disclose, don't refuse. A
+    // whole-file commit took every line on its paths, including lines
+    // membership credits to no item; name them so the agent can say so.
+    // (Interval staging takes only the requested items' own hunks.)
+    if !needs_interval_stage {
+        let taken = membership_unowned_taken(&partition, &committed_paths);
+        if !taken.is_empty() {
+            for (path, a, r) in &taken {
+                append_bram_trace_line(
+                    app,
+                    "worklist-commit",
+                    &format!(
+                        "op=commit-took-unowned path={} added={} removed={}",
+                        path, a, r
+                    ),
+                );
+            }
+            response["unownedTaken"] = serde_json::Value::Array(
+                taken
+                    .iter()
+                    .map(|(p, a, r)| serde_json::json!({ "path": p, "added": a, "removed": r }))
+                    .collect(),
+            );
+        }
     }
     if !retained.is_empty() {
         response["retained"] = serde_json::json!(retained);
@@ -71839,6 +76143,7 @@ pub fn run() {
             pty_spawn,
             pty_write,
             switch_agent,
+            start_agent_fresh,
             reload_agent_session,
             create_new_session,
             queue_pty_intent,
@@ -71860,6 +76165,7 @@ pub fn run() {
             whisper_start,
             whisper_stop,
             whisper_status,
+            whisper_preflight,
         ])
         .setup(move |app| {
             // issue-405: SIGTERM/SIGINT/SIGHUP run shutdown_children, so a

@@ -59,6 +59,8 @@ STARTERS = (
     "reedit-own-lines",
     "multi-file",
     "committed-outside",
+    "new-file-left-out",
+    "chat-edit-in-item-file",
 )
 
 # The ambiguous-duplicate fixture's stanza pair. Geometry is load-bearing:
@@ -112,6 +114,35 @@ def _multi_file_seeds(prefix: str) -> list[tuple[str, str]]:
     ]
 
 
+# The new-file-left-out fixture's shared file: ten lines, with the author's
+# region at the top and the neighbour's at the bottom so the two hunks stay
+# separable. `edits` is 0 (HEAD), 1 (author's edit), 2 (author's and neighbour's).
+def _new_file_left_out_shared(prefix: str, edits: int) -> str:
+    lines = ["top: base"] + ["middle"] * 8 + ["bottom: base"]
+    if edits >= 1:
+        lines[0] = f"top: changed by {prefix}-author"
+    if edits >= 2:
+        lines[-1] = f"bottom: changed by {prefix}-neighbour"
+    return "".join(f"{line}\n" for line in lines)
+
+
+# The chat-edit-in-item-file fixture's file: ten distinct lines. `stage` is 0
+# (HEAD), 1 (the author's first window), 2 (a chat turn, no claim live) or 3
+# (the author's second window). Each changed line says who wrote it.
+def _chat_edit_file(stage: int) -> str:
+    lines = [f"line {n}: base" for n in range(1, 11)]
+    if stage >= 1:
+        lines[1] = "line 2: changed by the author"
+        lines[4] = "line 5: changed by the author"
+        lines += ["line 11: appended by the author", "line 12: appended by the author"]
+    if stage >= 2:
+        lines[4] = "line 5: rewritten in chat"
+        lines[7] = "line 8: changed in chat"
+    if stage >= 3:
+        lines[2] = "line 3: changed by the author, second window"
+    return "".join(f"{line}\n" for line in lines)
+
+
 def starter_seeds(starter: str, prefix: str) -> list[tuple[str, str]]:
     if starter == "multi-file":
         return _multi_file_seeds(prefix)
@@ -120,6 +151,13 @@ def starter_seeds(starter: str, prefix: str) -> list[tuple[str, str]]:
             (f"demo/{prefix}-landed.txt", "landed: committed with plain git\n"),
             (f"demo/{prefix}-reverted.txt", "reverted: nothing of the item survives\n"),
         ]
+    if starter == "new-file-left-out":
+        return [
+            (f"demo/{prefix}-shared.txt", _new_file_left_out_shared(prefix, 0)),
+            (f"demo/{prefix}-own.txt", "own: never changed by the neighbour\n"),
+        ]
+    if starter == "chat-edit-in-item-file":
+        return [(f"demo/{prefix}-file.txt", _chat_edit_file(0))]
     return [starter_seed(starter, prefix)]
 
 
@@ -558,6 +596,74 @@ class StarterBuilder:
         )
         self.boundary([])
 
+    def starter_new_file_left_out(self, prefix: str) -> None:
+        # judell/bram#419's shape: the author item started a NEW, never-tracked
+        # file and also changed a tracked file. A neighbour item edited that
+        # same file during its own claim window WITHOUT declaring it, as
+        # issue-406-chat-commit-everything-ready did with helpers.js. That
+        # omission is load-bearing: the pane sees no shared declared path, so
+        # it sends no isolate instruction with the Commit click, while the
+        # host's replay still credits the neighbour with lines there and
+        # routes the author's commit to hunk-by-hunk staging - where a new
+        # file was silently left out of commits 30aa4d0 and fe84674. (With
+        # the path declared by both, the agent isolates by hand and the
+        # commit takes the whole-file path, which stages new files.) The
+        # author's second window re-edits the new file so it carries two
+        # windows of evidence, as in the real case.
+        new = f"demo/{prefix}-new.txt"
+        shared = f"demo/{prefix}-shared.txt"
+        own = f"demo/{prefix}-own.txt"
+        author, neighbour = f"{prefix}-author", f"{prefix}-neighbour"
+        self.item(
+            author,
+            [new, shared],
+            "The new file does not exist; the shared file's top line is unchanged.",
+            "Create the new file and change the shared file's top line.",
+        )
+        self.item(
+            neighbour,
+            own,
+            "The neighbour's own file is unchanged.",
+            "Declares only its own file, which it never changes; its one edit "
+            "lands in the author's shared file instead.",
+        )
+        self.boundary([author])
+        self.file(new, "".join(f"line {n}: first pass\n" for n in range(1, 4)))
+        self.file(shared, _new_file_left_out_shared(prefix, 1))
+        self.boundary([])
+        self.boundary([neighbour])
+        self.file(shared, _new_file_left_out_shared(prefix, 2))
+        self.boundary([])
+        self.boundary([author])
+        self.file(new, "".join(f"line {n}: second pass\n" for n in range(1, 4)))
+        self.boundary([])
+
+    def starter_chat_edit_in_item_file(self, prefix: str) -> None:
+        # judell/bram#273's 2026-10-02 ruling. An item edits a file in its own
+        # claim window, a chat turn then edits the same file with no claim
+        # live, and the item edits it again in a second window. The membership
+        # engine used to credit the item with nothing in such a file, because
+        # the item's whole patch no longer reverse-applied; the line-level
+        # rule credits the item with its surviving lines (2, 3 and the two
+        # appended) and leaves the chat-turn lines (5 and 8) unowned. Each
+        # changed line's text names its writer, so the diff checks the board.
+        path = f"demo/{prefix}-file.txt"
+        author = f"{prefix}-author"
+        self.item(
+            author,
+            path,
+            "The file is unchanged.",
+            "Change lines 2, 3 and 5 and append two lines, across two claim "
+            "windows; a chat turn between them rewrites line 5 and line 8.",
+        )
+        self.boundary([author])
+        self.file(path, _chat_edit_file(1))
+        self.boundary([])
+        self.file(path, _chat_edit_file(2))
+        self.boundary([author])
+        self.file(path, _chat_edit_file(3))
+        self.boundary([])
+
     def starter_committed_outside(self, prefix: str) -> None:
         # judell/bram#406: work committed with plain git, outside the gate.
         # Fixture commits are dated from 1_700_000_000 (_fixed_git_env), so:
@@ -879,6 +985,47 @@ def assert_binary_current(binary: Path) -> None:
 
 
 def _process_alive(pid: int) -> bool:
+    """Whether `pid` names a live process.
+
+    True when the process exists, including when it exists but cannot be
+    queried; False when it does not. Both branches keep that contract, because
+    callers treat False as "safe to proceed without stopping anything".
+
+    demo-instance-liveness-on-windows: signal 0 has no meaning on Windows, so
+    the POSIX probe below raised OSError [WinError 87] there — neither of the
+    exceptions it catches — and propagated. Both `stop` and `launch` call this
+    before doing anything useful, so each died before acting; `stop` failed
+    *without stopping anything*, which read as a broken verb rather than a
+    broken check. The rest of the file already branches on os.name (the SIGKILL
+    escalation in _stop_recorded is guarded that way for the same reason); this
+    call site was missed.
+    """
+    if os.name == "nt":
+        import ctypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        ERROR_ACCESS_DENIED = 5
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            # Exists but not queryable → alive, matching the PermissionError
+            # arm below. Any other failure (notably ERROR_INVALID_PARAMETER,
+            # which is what a dead PID gives) means gone.
+            return ctypes.get_last_error() == ERROR_ACCESS_DENIED
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return True
+            # A process that exited with code 259 is indistinguishable from a
+            # running one here — the standard STILL_ACTIVE wart. For a launcher
+            # of one known binary that is not worth a WaitForSingleObject call;
+            # swap to that if a real 259 ever shows up.
+            return code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+
     try:
         os.kill(pid, 0)
     except ProcessLookupError:

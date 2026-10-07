@@ -95,7 +95,9 @@ claim, not that it failed.
 ## Interval staging and entangled commits
 
 When a commit would stage a path carrying lines attributed to a begun
-item *outside the request*, `worklist-commit` doesn't refuse — it
+item *outside the request* — decided by line-level membership (each
+changed line credited to the claim window that last wrote it), not by
+which items merely declare the path — `worklist-commit` doesn't refuse — it
 stages only the requested items' OWN hunks: their claim-interval
 patches applied to a scratch index seeded from `HEAD`, committed via
 `git commit-tree` + `update-ref`, with the worktree and the real index
@@ -403,10 +405,20 @@ the discipline for completing them serially.
 
 - At the commit gate the host parses these verified selections and
   records, for the requested ids only, a pending close bound to the new
-  commit SHA. Nothing closes or pushes at commit time. On the user's
-  next explicit **Push**, once each commit reaches the default branch,
-  the host closes its issue with a `Closed by <commit-url>` comment
-  (prefixed with the user's comment when given).
+  commit SHA. Nothing closes or pushes at commit time. Once each commit
+  reaches the default branch, the host closes its issue with a
+  `Closed by <commit-url>` comment (prefixed with the user's comment
+  when given).
+- **When the queue is checked.** A Push is the usual way a commit gets
+  there, but it is not the only trigger, and a pending close does not
+  wait for one. The queue is re-checked on the **Push** button
+  (`trigger=button`), on any local ref change such as a fetch
+  (`refs-watch`, debounced), on the background issue refresh about
+  every 45 s (`issues-poll`, added for #329 because a merge made on the
+  forge moves no local ref), and at startup. Until a commit qualifies,
+  each check traces why: `op=awaiting-push` (not on origin yet),
+  `op=deferred-not-on-default` (on origin, not yet merged to the
+  default branch), or `op=deferred-unknown-default`.
 - A record whose issue is already closed by other means retires quietly
   (`op=retired-already-closed`). On GitHub, a **merged PR** containing
   the bound commit completes the close (`op=closed-via-pr`,
@@ -438,6 +450,43 @@ the discipline for completing them serially.
   fresh gate click) is the resume channel. Report the partial landing
   instead of announcing completion, and don't re-POST: the approval is
   consumed and the claim released.
+- **Lines taken that no item wrote.** A whole-file commit takes every
+  line on its paths. When some of those lines belong to no item (chat-turn
+  edits, edits between claim windows, a neighbour's lines on a file it
+  doesn't declare), the success body carries `unownedTaken: [{path, added,
+  removed}]`. The commit went through: this is a disclosure, not a refusal.
+  Tell the user which files carried lines no item wrote and that they
+  landed in this commit, so the history doesn't silently credit them to
+  the item.
+- **Write the commit message from the prediction, not from memory.**
+  Before posting `worklist-commit`, read the item's `willCommit` from
+  `GET /__worklist`: it follows the gate's routing (whole-file on every
+  declared path unless another begun item owns lines on one of them,
+  then the item's own hunks on all of them). `willCommitUnowned`
+  (`[{path, added, removed}]`) lists the lines no item wrote that a
+  whole-file commit would take; say so in the message. An agent that
+  wrote "the new file and the top hunk only" before a whole-file commit
+  that also took a neighbour's unowned line (demo, 2026-10-06) is the
+  case this prevents.
+- **Refusals that mean "try again".** `commit refused: Bram couldn't work
+  out which lines belong to which item right now…` (membership had no
+  answer) and `commit refused: <path> changed while the commit was being
+  prepared…` (an edit landed between classification and staging; nothing
+  was committed or left staged) are both safe to retry with a fresh
+  **Commit** click. Say so; don't re-POST the consumed approval.
+- **Untracked residue (#419).** A `residualPaths` entry with
+  `"untracked": true` means a new file the item declared did not land in
+  the commit (it is still untracked). It always comes with
+  `"owner":"unowned"` and the item in `retained`. Tell the user which
+  files were left out and that the row is still on the board. This check
+  runs after every commit, not only interval-staged ones. **Here the
+  Commit offer is not yet a working resume channel:** while another begun
+  item is still credited with lines in one of the item's files, a second
+  Commit is refused ("entirely shared with another begun item and it has
+  no claim interval to stage from"), and that reason is misleading. Say
+  so rather than sending the user to click Commit, and ask how they want
+  the left-out files landed (a direct commit of exactly those files, at
+  the user's direction, is what has worked). Tracked on judell/bram#419.
 - **`[bram: …]` notes** are host-written, e.g. `[bram: the queued close
   of #21 (commit 94f7666) was withdrawn … it will NOT fire on Push, and
   #21 stays open]`. They ride only plain message turns, never
@@ -497,6 +546,27 @@ routes.
 - An empty `steps` list clears the plan. Push, PRs and other non-board steps
   don't belong in it.
 
+**Recommending feedback.** When you'd tell the user to tick an item and send
+it some text as feedback ("tick `x` and send: name your prerequisites"),
+post a `feedback` step instead of asking them to copy your words into the
+message box:
+
+```
+{"summary": "why, in a sentence", "steps": [
+  {"verb": "feedback", "ids": ["x"], "text": "the feedback, as the user would send it"}
+]}
+```
+
+- The pane shows "Recommended: Send feedback to x", with the full text in the
+  tooltip. **Do recommended** sends it exactly as the message box would with
+  those rows ticked: it arrives as an ordinary `iterate:` turn with a
+  feedback draft, which you handle as usual.
+- `text` is required. A plan can include drops and feedback, but not
+  feedback and commit, since both start agent turns; the host refuses that
+  mix, so post them as separate plans.
+- Say in chat what the feedback will send. It goes into the item's history as
+  the user's feedback, so write it as something they'd put their name to.
+
 ## Rows committed outside the Worklist
 
 When work lands through a plain `git commit` (typed in chat, or from a
@@ -543,7 +613,7 @@ right item commits.
 
 ## Edits made in chat turns
 
-A chat turn (nothing selected, or **Chat**) is addressed to no item, so its
+A chat turn (nothing selected, or **Send as chat instead**) is addressed to no item, so its
 edits are credited to no item, even when they're for an item that has
 begun. The gate builds an item's commit from the item's own turns, so work
 done between them is a gap it can't account for. This stays true until the
@@ -667,3 +737,31 @@ same agent across machines. The hostname also makes the signature
 machine-readable provenance: Awaiting You classifies a same-account
 comment by it — unsigned means the human typed it, this host's name
 means this machine's agent, any other means your agent elsewhere moved.
+
+## Reminder items
+
+One item shape carries no diff yet and is still legitimate: a
+**reminder** (placeholder) for an action already decided but gated on
+an external condition — an upstream merge, a release being cut, another
+agent's verdict — that resolves after this session ends. Chat dies with
+the session; the reminder carries it across.
+
+- **Name.** A reminder's id **begins with `reminder-`**
+  (`reminder-revendor-after-xmlui-release`); after the prefix the
+  ordinary id rules apply. When the gate is a **date**, put it at the
+  end of the id (`reminder-rerun-census-after-2026-09-19`). The rule is
+  mechanical on purpose: surfaces such as the Awaiting You inbox key on
+  the prefix. Ids are immutable, so an older reminder keeps its name;
+  the only conversion is the user Dropping it and you re-proposing it
+  verbatim under a `reminder-` id. Don't push that, but say plainly
+  that prefix-keyed surfaces won't see the old row.
+- **Shape.** `Before` states the awaited condition plus enough
+  self-contained context to act with no conversation history. `After`
+  states the action Approve green-lights and what condition would make
+  Drop the right verdict. `files` lists what the eventual action will
+  touch (empty for issue-only actions).
+- **Lifecycle.** Approve = condition met; do the action, then it
+  behaves like any approved item. Drop = mooted or superseded — an
+  expected, honorable ending, not a failure.
+- **Boundary.** Not a door back to investigation items: a reminder
+  records a *decided future action*; an open question is chat's job.

@@ -1,6 +1,6 @@
-// issue-407: live dictation capture, loaded by main.js with
+// issue-407: live dictation capture, loaded by dictation.js with
 // audioContext.audioWorklet.addModule(). Collects the mic's first channel
-// into 4096-sample blocks and posts each block to main.js, which resamples
+// into 4096-sample blocks and posts each block to the loop, which resamples
 // to 16 kHz and feeds the sliding window. Produces no output.
 class BramVoiceCapture extends AudioWorkletProcessor {
   constructor() {

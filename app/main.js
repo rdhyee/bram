@@ -523,8 +523,11 @@ document
   ?.addEventListener("click", () => setTerminalFontSize(term.options.fontSize + 1));
 
 (() => {
-  const TERMINAL_HIDDEN_KEY = "bram.terminal.hidden";
-  const LEGACY_TERMINAL_HIDDEN_KEY = "xmlui-desktop.terminal.hidden";
+  // terminal-open-at-startup-setting: the Settings tab's "Terminal open at
+  // startup" switch (window.__bramSetTerminalOpenAtStartup in helpers.js)
+  // owns "bram.terminal.openAtStartup"; the toolbar toggle is session-only.
+  // The retired bram.terminal.hidden / xmlui-desktop.terminal.hidden keys
+  // are not read.
   const btn = document.getElementById("toggle-terminal");
   if (!btn) return;
   let dismissedSuspiciousEpisode = "";
@@ -607,17 +610,12 @@ document
     }, 4000);
   };
 
-  const apply = (hidden, source, persist) => {
+  const apply = (hidden, source) => {
     const wasHidden = document.body.classList.contains("terminal-hidden");
     document.body.classList.toggle("terminal-hidden", hidden);
     if (!hidden) {
       // Re-measure xterm.js once the layout settles.
       scheduleTerminalFit();
-    }
-    if (persist) {
-      try {
-        localStorage.setItem(TERMINAL_HIDDEN_KEY, hidden ? "1" : "0");
-      } catch {}
     }
     postTerminalVisibility(source);
     if (wasHidden !== hidden) {
@@ -633,20 +631,23 @@ document
     }
   };
 
-  let initial = false;
+  // Closed unless the user opted in: the agent pane is the primary surface.
+  // helpers.js's __bramWriteLS stores dotted keys nested and JSON-encoded:
+  // "bram.terminal.openAtStartup" lives at localStorage["bram"] ->
+  // .terminal.openAtStartup, so read it the same way __bramReadLS does.
+  let initial = true;
   try {
-    initial =
-      (localStorage.getItem(TERMINAL_HIDDEN_KEY) ??
-        localStorage.getItem(LEGACY_TERMINAL_HIDDEN_KEY)) === "1";
+    const root = JSON.parse(localStorage.getItem("bram") || "null");
+    initial = root?.terminal?.openAtStartup !== "1";
   } catch {}
-  apply(initial, "startup", false);
+  apply(initial, "startup");
   if (!initial) {
     scheduleStartupTerminalFit();
   }
 
   btn.addEventListener("click", (event) => {
     const hidden = !document.body.classList.contains("terminal-hidden");
-    apply(hidden, "toolbar-toggle", true);
+    apply(hidden, "toolbar-toggle");
     // A deliberate, inert self-test for the closed-terminal recovery path.
     // It exercises the parent/tools bridge and real footer action without
     // modifying the live turn or weakening the host detector.
@@ -681,7 +682,7 @@ document
       postTerminalVisibility("silence-dismissed");
       return;
     }
-    apply(false, "suspicious-silence-button", true);
+    apply(false, "suspicious-silence-button");
   });
 })();
 
@@ -1788,7 +1789,14 @@ const ptyShell = isWindows
 const _spawnPty = async () => {
   // Fit right before reading cols/rows so the PTY inherits the actual
   // container dimensions, not the xterm.js defaults.
+  // terminal-open-at-startup-setting: a closed terminal is display:none,
+  // so fit() has nothing to measure and the agent would start at 80x24.
+  // Lay the pane out for the measurement and hide it again in the same
+  // synchronous task — no frame paints in between, so nothing flickers.
+  const startsHidden = document.body.classList.contains("terminal-hidden");
+  if (startsHidden) document.body.classList.remove("terminal-hidden");
   fitAddon.fit();
+  if (startsHidden) document.body.classList.add("terminal-hidden");
   try {
     await invoke("pty_spawn", {
       ...ptyShell,
@@ -2240,51 +2248,13 @@ listen("pty-send-sent", (e) => {
   // Speech-to-text engines. The live loop, the boundary repair and the
   // reserve full pass talk only to the selected engine; what is specific to
   // one engine (endpoint, request format, model, quirks) lives in its
-  // adapter. Whisper is the only engine today. localStorage
+  // adapter, in __shell/dictation.js (loaded by index.html before this
+  // file). Whisper is the only engine today. localStorage
   // bram.voice.engine (a decision, no UI yet) selects one; an unknown name
   // falls back to Whisper with a trace line. The local-server lifecycle
   // below (ensureServerRunning, whisper_status / whisper_start) is the
   // Whisper adapter's too; a hosted engine would skip it.
-  const VOICE_ENGINES = {
-    whisper: {
-      id: "whisper",
-      host: "http://127.0.0.1:18080",
-      url: "http://127.0.0.1:18080/inference",
-      // Host-native macOS/Linux launch expands this on the host. Windows launch
-      // sends it to WSL so it resolves under the WSL user's home directory.
-      modelPath: "~/.local/share/whisper-models/ggml-small.en.bin",
-      caps: {
-        // Batch only: live text comes from polling a sliding window.
-        streams: false,
-        // Each request comes back as finished sentences, so a window cut at
-        // a pause ends with a period; the live loop repairs those boundaries.
-        punctuatesPerRequest: true,
-        // Invents "Thank you." from silence; silence is never sent alone.
-        hallucinatesOnSilence: true,
-      },
-      // Whisper's stock output for near-silence. Only traced (silencePhrase
-      // on voice-window), never dropped: a 0.5 s cutoff deleted a deliberate
-      // "thank you" (0.43 s voiced) while the LIVE_MIN_VOICED_S gate alone
-      // kept every phantom out. If phantoms return, their voicedS sets the
-      // cutoff.
-      silencePhrases: /^(thank you|thanks|thanks for watching|thank you for watching|bye|you)$/,
-      // `exact` pins decoding (no temperature fallback) for the live windows.
-      form(file, name, opts) {
-        const fd = new FormData();
-        fd.append("file", file, name);
-        fd.append("response_format", "json");
-        if (opts && opts.exact) {
-          fd.append("temperature", "0.0");
-          fd.append("temperature_inc", "0.0");
-        }
-        if (opts && typeof opts.prompt === "string") fd.append("prompt", opts.prompt);
-        return fd;
-      },
-      text(json) {
-        return (json && json.text) || "";
-      },
-    },
-  };
+  const VOICE_ENGINES = window.BramDictation.engines;
   const VOICE_ENGINE_DEFAULT = "whisper";
   const voiceEngine = (() => {
     let name = VOICE_ENGINE_DEFAULT;
@@ -2500,6 +2470,25 @@ listen("pty-send-sent", (e) => {
       });
       return { ready: true, reason: "status" };
     }
+    // voice-setup-check-and-log: check whisper-server, the model and ffmpeg
+    // before starting (the host traces what it found and where it looked).
+    // Engine or model missing: don't start; the pane opens its setup dialog.
+    // Only ffmpeg missing: the host starts without --convert, so dictation
+    // works, and the pane says the safety pass is off.
+    let setup = null;
+    try {
+      setup = await invoke("whisper_preflight", { modelPath: MODEL_PATH });
+    } catch (e) {
+      voiceLog("setup-check-error", { error: String(e) });
+    }
+    if (setup && setup.checked) {
+      const missing = voiceSetupMissing(setup);
+      voiceLog("setup-check", { missing });
+      if (missing.length) notifyVoiceSetup(setup, missing);
+      if (missing.includes("whisper-server") || missing.includes("model")) {
+        return { ready: false, reason: "setup-missing" };
+      }
+    }
     try {
       voiceLog("ensure-server-start-invoked", { modelPath: MODEL_PATH });
       const pid = await invoke("whisper_start", { modelPath: MODEL_PATH });
@@ -2551,6 +2540,35 @@ listen("pty-send-sent", (e) => {
   // mic origin — the agent pane or any target-app iframe. Startup
   // failures retain the original reason-only payload; post-recording failures
   // add a kind and server detail so the toast can explain what broke.
+  // The components a preflight report found missing, by the names the
+  // setup dialog shows.
+  const voiceSetupMissing = (setup) =>
+    [
+      ["whisper-server", setup.binary],
+      ["model", setup.model],
+      ["ffmpeg", setup.ffmpeg],
+    ]
+      .filter(([, c]) => !(c && c.found))
+      .map(([name]) => name);
+
+  // Send the setup report to the agent pane, which opens its setup dialog.
+  // `blocking` is true when dictation can't start.
+  const notifyVoiceSetup = (setup, missing) => {
+    const blocking = missing.includes("whisper-server") || missing.includes("model");
+    voiceLog("setup-notice", { missing, blocking });
+    try {
+      const tools = document.getElementById("tools-pane");
+      if (tools && tools.contentWindow) {
+        tools.contentWindow.postMessage(
+          { type: "bram-voice-setup", missing, blocking, report: setup },
+          "*",
+        );
+      }
+    } catch (e) {
+      voiceLog("setup-notice-error", { error: String(e) });
+    }
+  };
+
   const notifyWhisperUnavailable = (reason, kind, detail) => {
     voiceLog("whisper-unavailable-notice", {
       reason: String(reason || ""),
@@ -2614,93 +2632,26 @@ listen("pty-send-sent", (e) => {
   };
 
   // issue-407: live dictation. While the MediaRecorder records (unchanged,
-  // and still the source of the reserve full pass), a Web Audio tap on the
-  // same stream feeds a sliding window to whisper-server: every LIVE_STEP_MS
-  // the audio since the last commit is transcribed as provisional text; a
-  // pause (LIVE_PAUSE_MS under LIVE_RMS, with at least LIVE_MIN_FINAL_S of
-  // audio) or LIVE_MAX_WIN_S makes the next result final, which commits its
-  // text and drops its audio. One request at a time; the committed tail goes
-  // along as `prompt`. Measured in the #407 prototype: ~420 ms per request,
-  // matching a one-request pass over the whole recording word for word.
-  // On stop the live text is what gets delivered; localStorage
+  // and still the source of the reserve full pass), the live loop in
+  // __shell/dictation.js (judell/bram#417) taps the same stream and
+  // transcribes a sliding window; this file is its host: the engine
+  // lifecycle, the single in-flight recording and the postMessage transport
+  // to the pane. On stop the live text is what gets delivered; localStorage
   // bram.voice.fullPass === "1" (no UI, kept in reserve) sends the whole
   // recording in one request instead, as before. If live capture can't
   // start, the full pass is used automatically. localStorage
-  // bram.voice.pauseMs (no UI) overrides LIVE_PAUSE_MS for speakers who
-  // pause longer or shorter; voice-final logs every pause (pausesMs) so the
-  // default can be revisited from data.
-  const LIVE_RATE = 16000;
-  const LIVE_STEP_MS = 700;
-  // 700 ms broke sentences at thinking pauses (Jon: "a bit aggressive about
-  // stopping in the middle of the sentence"); a final window ends with a
-  // period and the next starts capitalized.
-  const LIVE_PAUSE_MS = 1200;
-  // Quiet this long after a sub-LIVE_MIN_VOICED_S blip means it was a blip.
-  const LIVE_BLIP_QUIET_MS = 700;
-  // Pauses shorter than this are gaps between words, not worth logging.
-  const LIVE_PAUSE_LOG_MIN_MS = 250;
-  const LIVE_MIN_FINAL_S = 1.5;
-  const LIVE_MAX_WIN_S = 12;
-  // At the cap, cut at the quietest block in this much trailing audio
-  // instead of at the very end, so the cut falls between words (a hard cut
-  // produced "prototyp ing", 2026-09-26). The rest stays for the next window.
-  const LIVE_CAP_LOOKBACK_S = 1.5;
-  // A request that hasn't answered by now is abandoned, so a stuck
-  // whisper-server costs seconds, not WebKit's ~60 s fetch timeout per
-  // request (seen 2026-09-26 when a full stderr pipe wedged the server).
-  const LIVE_REQUEST_TIMEOUT_MS = 15000;
-  const LIVE_RMS = 0.012;
-  const LIVE_SILENCE_KEEP_MS = 2000;
-  // A click or breath is one or two ~85 ms blocks over LIVE_RMS; speech is
-  // far more. Windows below this much voiced audio are never sent.
-  const LIVE_MIN_VOICED_S = 0.3;
-  // Boundary repair (dictation-pauses-become-sentence-breaks). A window
-  // finalized at a pause comes back as a finished sentence ("my dictation
-  // into. Bram. Itself.": 2026-09-29, breaks at exactly the pauses over
-  // pauseMs). So consecutive finals collect into a segment, and after each
-  // new final the whole segment is transcribed again in one request, whose
-  // text replaces the segment's parts: one context, no pause breaks. A
-  // segment holds at most this much audio; past that a new one starts, and
-  // that one boundary stays unrepaired.
-  const LIVE_SEGMENT_MAX_S = 20;
+  // bram.voice.pauseMs (no UI) overrides the loop's default pause for
+  // speakers who pause longer or shorter.
+  // The current dictation's loop (BramDictation.createLoop), with the frame
+  // that started it as `.target`; null when none is live.
   let live = null;
-
-  // Seconds of voiced audio in the first n samples of the window (all of it
-  // by default).
-  const liveVoicedS = (L, n = L.winLen) => {
-    let voiced = 0;
-    let o = 0;
-    for (const c of L.win) {
-      if (o >= n) break;
-      const k = Math.min(c.length, n - o);
-      if (c.voiced) voiced += k;
-      o += k;
-    }
-    return voiced / LIVE_RATE;
-  };
-  // Whether the window holds enough speech to transcribe; a window of
-  // silence and stray blips is dropped instead.
-  const liveHasSpeech = (L) => liveVoicedS(L) >= LIVE_MIN_VOICED_S;
-  const liveIsSilencePhrase = (text) =>
-    !!voiceEngine.silencePhrases &&
-    voiceEngine.silencePhrases.test(
-      String(text || "")
-        .toLowerCase()
-        .replace(/[^a-z ]/g, "")
-        .trim(),
-    );
-  const liveDropWindow = (L) => {
-    L.win = [];
-    L.winLen = 0;
-    L.sentLen = 0;
-  };
 
   const livePauseMs = () => {
     try {
       const v = Number(localStorage.getItem("bram.voice.pauseMs"));
       if (v >= 300 && v <= 5000) return v;
     } catch (_) {}
-    return LIVE_PAUSE_MS;
+    return window.BramDictation.LIVE_PAUSE_MS;
   };
 
   const fullPassReserved = () => {
@@ -2711,464 +2662,58 @@ listen("pty-send-sent", (e) => {
     }
   };
 
-  const liveResample = (input, fromRate) => {
-    if (fromRate === LIVE_RATE) return new Float32Array(input);
-    const ratio = fromRate / LIVE_RATE;
-    const out = new Float32Array(Math.floor(input.length / ratio));
-    for (let i = 0; i < out.length; i++) {
-      const x = i * ratio;
-      const j = Math.floor(x);
-      const f = x - j;
-      out[i] = input[j] * (1 - f) + (input[j + 1] !== undefined ? input[j + 1] : input[j]) * f;
-    }
-    return out;
-  };
-
-  const liveWav = (samples) => {
-    const buf = new ArrayBuffer(44 + samples.length * 2);
-    const v = new DataView(buf);
-    const s = (o, t) => {
-      for (let i = 0; i < t.length; i++) v.setUint8(o + i, t.charCodeAt(i));
-    };
-    s(0, "RIFF");
-    v.setUint32(4, 36 + samples.length * 2, true);
-    s(8, "WAVE");
-    s(12, "fmt ");
-    v.setUint32(16, 16, true);
-    v.setUint16(20, 1, true);
-    v.setUint16(22, 1, true);
-    v.setUint32(24, LIVE_RATE, true);
-    v.setUint32(28, LIVE_RATE * 2, true);
-    v.setUint16(32, 2, true);
-    v.setUint16(34, 16, true);
-    s(36, "data");
-    v.setUint32(40, samples.length * 2, true);
-    for (let i = 0; i < samples.length; i++) {
-      v.setInt16(44 + i * 2, Math.max(-1, Math.min(1, samples[i])) * 0x7fff, true);
-    }
-    return new Blob([buf], { type: "audio/wav" });
-  };
-
-  const liveClean = (t) =>
-    String(t || "")
-      .replace(/\[[^\]]*\]|\([^)]*\)/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-
-  // The running text goes to the pane editor that owns the recording.
-  const livePublish = () => {
-    if (!live) return;
-    const committed = live.committed.join(" ");
-    const provisional = live.provisional;
-    if (live.target && live.target.source) {
-      try {
-        live.target.source.postMessage(
-          {
-            type: "voice-into-partial",
-            requestId: live.target.requestId,
-            target: live.target.voiceTarget || "",
-            committed,
-            provisional,
-            parts: live.parts,
-            openSeq: live.seq,
-            // A boundary repair is due or in flight: a send waits for it
-            // (helpers.js __bramVoiceRepairWait).
-            repairing: !!live.repairDue,
-          },
-          "*",
-        );
-      } catch (_) {}
-    }
-  };
-
-  const liveFlat = (n) => {
-    const out = new Float32Array(n);
-    let o = 0;
-    for (const c of live.win) {
-      const k = Math.min(c.length, n - o);
-      out.set(c.subarray(0, k), o);
-      o += k;
-      if (o >= n) break;
-    }
-    return out;
-  };
-
-  // The sample index to cut a capped window at: the middle of the quietest
-  // block in the last LIVE_CAP_LOOKBACK_S, or the end if none is known.
-  const liveQuietCut = (L) => {
-    const from = L.winLen - LIVE_RATE * LIVE_CAP_LOOKBACK_S;
-    let o = 0;
-    let best = -1;
-    let bestRms = Infinity;
-    for (const c of L.win) {
-      const end = o + c.length;
-      if (end >= from && typeof c.rms === "number" && c.rms < bestRms) {
-        bestRms = c.rms;
-        best = o + Math.floor(c.length / 2);
-      }
-      o = end;
-    }
-    return best > 0 ? best : L.winLen;
-  };
-
-  // Add a finalized window's audio to the current segment, or start a new
-  // one; once a segment spans a boundary, a repair is due.
-  const liveSegmentAdd = (L, samples, partIdx) => {
-    const S = L.segment;
-    if (
-      S &&
-      S.lastPart === partIdx - 1 &&
-      S.len + samples.length <= LIVE_RATE * LIVE_SEGMENT_MAX_S
-    ) {
-      S.audio.push(samples);
-      S.len += samples.length;
-      S.lastPart = partIdx;
-      L.repairDue = true;
-    } else {
-      L.segment = { audio: [samples], len: samples.length, firstPart: partIdx, lastPart: partIdx };
-    }
-  };
-
-  // Transcribe the current segment again as one request. Its text goes in
-  // the segment's first part and the rest go empty; their seq numbers stay,
-  // so the pane's edit tracking still lines up.
-  const liveRepair = async () => {
-    const L = live;
-    const S = L.segment;
-    L.repairDue = false;
-    if (!S || S.lastPart <= S.firstPart) return;
-    L.busy = true;
-    const first = S.firstPart;
-    const through = S.lastPart;
-    const flat = new Float32Array(S.len);
-    let o = 0;
-    for (const a of S.audio) {
-      flat.set(a, o);
-      o += a.length;
-    }
-    const before = L.parts
-      .slice(0, first)
-      .map((p) => p.text)
-      .filter(Boolean)
-      .join(" ");
-    const fd = voiceEngine.form(liveWav(flat), "segment.wav", {
-      exact: true,
-      prompt: before.slice(-200),
-    });
-    const t0 = Date.now();
-    let status = null;
-    let timedOut = false;
-    let applied = false;
-    let silencePhrase = false;
-    const abort = new AbortController();
-    const timer = setTimeout(() => {
-      timedOut = true;
-      abort.abort();
-    }, LIVE_REQUEST_TIMEOUT_MS);
-    try {
-      const res = await fetch(WHISPER_URL, { method: "POST", body: fd, signal: abort.signal });
-      status = res.status;
-      const text = res.ok ? liveClean(voiceEngine.text(await res.json())) : "";
-      if (live !== L) return;
-      silencePhrase = liveIsSilencePhrase(text);
-      if (text && !silencePhrase) {
-        L.parts[first].text = text;
-        for (let i = first + 1; i <= through; i++) L.parts[i].text = "";
-        L.committed = L.parts.map((p) => p.text).filter(Boolean);
-        applied = true;
-      }
-    } catch (e) {
-      L.errors++;
-    } finally {
-      clearTimeout(timer);
-      const ms = Date.now() - t0;
-      L.repairMs.push(ms);
-      voiceLog("voice-repair", {
-        requestId: L.requestId,
-        windows: through - first + 1,
-        segmentS: Math.round((S.len / LIVE_RATE) * 10) / 10,
-        applied,
-        ...(silencePhrase ? { silencePhrase } : {}),
-        ...(timedOut ? { timedOut } : {}),
-        latencyMs: ms,
-        httpStatus: status,
-      });
-      L.busy = false;
-      if (live === L) livePublish();
-    }
-  };
-
-  const liveTranscribe = async (final, cutAt) => {
-    const L = live;
-    L.busy = true;
-    const n = cutAt || L.winLen;
-    const voicedS = liveVoicedS(L, n);
-    let silencePhrase = false;
-    L.sentLen = n;
-    const samples = liveFlat(n);
-    const fd = voiceEngine.form(liveWav(samples), "live.wav", {
-      exact: true,
-      prompt: L.committed.join(" ").slice(-200),
-    });
-    const t0 = Date.now();
-    let status = null;
-    let timedOut = false;
-    const abort = new AbortController();
-    const timer = setTimeout(() => {
-      timedOut = true;
-      abort.abort();
-    }, LIVE_REQUEST_TIMEOUT_MS);
-    try {
-      const res = await fetch(WHISPER_URL, { method: "POST", body: fd, signal: abort.signal });
-      status = res.status;
-      const text = res.ok ? liveClean(voiceEngine.text(await res.json())) : "";
-      if (live !== L) return;
-      L.latencies.push(Date.now() - t0);
-      if (final) {
-        silencePhrase = liveIsSilencePhrase(text);
-        if (text) {
-          L.committed.push(text);
-          L.parts.push({ seq: L.seq, text });
-          liveSegmentAdd(L, samples, L.parts.length - 1);
-        }
-        // Every final closes a window, kept or not; the pane counts windows
-        // to tell which text it already showed before an edit.
-        L.seq++;
-        let drop = n;
-        while (drop > 0 && L.win.length) {
-          if (L.win[0].length <= drop) {
-            drop -= L.win[0].length;
-            L.winLen -= L.win.shift().length;
-          } else {
-            const { voiced, rms } = L.win[0];
-            L.win[0] = L.win[0].subarray(drop);
-            L.win[0].voiced = voiced;
-            L.win[0].rms = rms;
-            L.winLen -= drop;
-            drop = 0;
-          }
-        }
-        L.sentLen = 0;
-        L.provisional = "";
-      } else {
-        L.provisional = text;
-      }
-      livePublish();
-    } catch (e) {
-      L.errors++;
-    } finally {
-      clearTimeout(timer);
-      voiceLog("voice-window", {
-        requestId: L.requestId,
-        final,
-        windowS: Math.round((n / LIVE_RATE) * 10) / 10,
-        voicedS: Math.round(voicedS * 100) / 100,
-        ...(silencePhrase ? { silencePhrase } : {}),
-        ...(cutAt ? { cut: "quiet" } : {}),
-        ...(timedOut ? { timedOut } : {}),
-        latencyMs: Date.now() - t0,
-        httpStatus: status,
-      });
-      L.busy = false;
-    }
-  };
-
-  const liveTick = async () => {
-    const L = live;
-    if (!L || L.stopped) return;
-    if (!L.busy && L.repairDue) {
-      // A repair goes ahead of the next live window: a send may be waiting
-      // on it.
-      L.pending = liveRepair();
-      await L.pending;
-    } else if (!L.busy && L.winLen > 0 && !liveHasSpeech(L)) {
-      // Too little voice to send. Once the quiet has lasted a pause, it was a
-      // blip, not the start of speech: drop it.
-      if (L.quietMs >= LIVE_BLIP_QUIET_MS) liveDropWindow(L);
-    } else if (!L.busy && L.winLen > 0) {
-      const secs = L.winLen / LIVE_RATE;
-      const fresh = L.winLen - L.sentLen;
-      const paused = L.quietMs >= L.pauseMs && secs >= LIVE_MIN_FINAL_S;
-      const capped = secs >= LIVE_MAX_WIN_S && !paused;
-      const final = capped || (paused && fresh > 0);
-      if (final || fresh >= LIVE_RATE * 0.3) {
-        L.pending = liveTranscribe(final, capped ? liveQuietCut(L) : 0);
-        await L.pending;
-      }
-    }
-    if (live === L && !L.stopped) L.timer = setTimeout(liveTick, LIVE_STEP_MS);
-  };
-
-  const liveFrame = (L, data, sampleRate) => {
-    if (L.stopped) return;
-    let sum = 0;
-    for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
-    const rms = Math.sqrt(sum / data.length);
-    const voiced = rms > LIVE_RMS;
-    if (voiced) {
-      // A pause inside speech just ended; keep its length for voice-final.
-      if (L.spoke && L.quietMs >= LIVE_PAUSE_LOG_MIN_MS && L.pauses.length < 500) {
-        L.pauses.push(Math.round(L.quietMs / 10) * 10);
-      }
-      L.spoke = true;
-      L.quietMs = 0;
-    }
-    else L.quietMs += (data.length / sampleRate) * 1000;
-    // Silence doesn't grow the window: not before the first word, and not
-    // after LIVE_SILENCE_KEEP_MS of quiet. Whisper invents "Thank you." from
-    // silence (seen in the first live test), so silence is never sent alone.
-    if (!voiced && (L.winLen === 0 || L.quietMs > LIVE_SILENCE_KEEP_MS)) return;
-    const c = liveResample(data, sampleRate);
-    c.voiced = voiced;
-    c.rms = rms;
-    L.win.push(c);
-    L.winLen += c.length;
-  };
-
+  // Start the live loop on the recording's stream. Its partials go to the
+  // pane editor that owns the recording.
   const startLive = async (mediaStream, target, requestId) => {
-    const L = {
-      target,
+    const loop = window.BramDictation.createLoop({
+      engine: voiceEngine,
+      trace: voiceLog,
       requestId,
-      ctx: null,
-      nodes: [],
-      win: [],
-      winLen: 0,
-      sentLen: 0,
-      quietMs: 0,
       pauseMs: livePauseMs(),
-      pauses: [],
-      spoke: false,
-      committed: [],
-      parts: [],
-      seq: 0,
-      provisional: "",
-      busy: false,
-      pending: null,
-      stopped: false,
-      timer: null,
-      latencies: [],
-      errors: 0,
-      capture: "",
-      segment: null,
-      repairDue: false,
-      repairMs: [],
-    };
-    try {
-      const Ctx = window.AudioContext || window.webkitAudioContext;
-      if (!Ctx) throw new Error("no AudioContext");
-      L.ctx = new Ctx();
-      const src = L.ctx.createMediaStreamSource(mediaStream);
-      const mute = L.ctx.createGain();
-      mute.gain.value = 0;
-      mute.connect(L.ctx.destination);
-      let node = null;
-      if (L.ctx.audioWorklet && typeof AudioWorkletNode === "function") {
-        try {
-          await L.ctx.audioWorklet.addModule("voice-capture-worklet.js");
-          node = new AudioWorkletNode(L.ctx, "bram-voice-capture");
-          node.port.onmessage = (e) => liveFrame(L, e.data, L.ctx.sampleRate);
-          L.capture = "worklet";
-        } catch (e) {
-          voiceLog("voice-live-worklet-error", { requestId, error: String(e) });
-          node = null;
-        }
-      }
-      if (!node) {
-        node = L.ctx.createScriptProcessor(4096, 1, 1);
-        node.onaudioprocess = (e) => liveFrame(L, e.inputBuffer.getChannelData(0), L.ctx.sampleRate);
-        L.capture = "script-processor";
-      }
-      src.connect(node);
-      node.connect(mute);
-      L.nodes = [src, node, mute];
+      workletUrl: "__shell/dictation-capture-worklet.js",
       // A stop that arrived while the worklet loaded has already taken the
       // full-pass path; don't attach a capture nobody will finish.
-      if (activeStopRequested || currentRequestId() !== requestId) {
-        stopLiveCapture(L);
-        voiceLog("voice-live-too-late", { requestId });
-        return;
-      }
-      live = L;
-      voiceLog("voice-live-start", {
-        requestId,
-        capture: L.capture,
-        sampleRate: L.ctx.sampleRate,
-        pauseMs: L.pauseMs,
-      });
-      L.timer = setTimeout(liveTick, LIVE_STEP_MS);
-    } catch (e) {
-      voiceLog("voice-live-unavailable", { requestId, error: String(e) });
-      try {
-        L.ctx && L.ctx.close();
-      } catch (_) {}
-      if (live === L) live = null;
-    }
-  };
-
-  const stopLiveCapture = (L) => {
-    L.stopped = true;
-    if (L.timer) clearTimeout(L.timer);
-    L.timer = null;
-    for (const n of L.nodes) {
-      try {
-        n.disconnect();
-      } catch (_) {}
-    }
-    try {
-      L.ctx && L.ctx.close();
-    } catch (_) {}
+      shouldAttach: () => !(activeStopRequested || currentRequestId() !== requestId),
+      onAttach: () => {
+        live = loop;
+      },
+      onPartial: (p) => {
+        if (!target || !target.source) return;
+        try {
+          target.source.postMessage(
+            {
+              type: "voice-into-partial",
+              requestId: target.requestId,
+              target: target.voiceTarget || "",
+              committed: p.committed,
+              provisional: p.provisional,
+              parts: p.parts,
+              openSeq: p.openSeq,
+              // A boundary repair is due or in flight: a send waits for it
+              // (helpers.js __bramVoiceRepairWait).
+              repairing: p.repairing,
+            },
+            "*",
+          );
+        } catch (_) {}
+      },
+    });
+    loop.target = target;
+    if (!(await loop.start(mediaStream)) && live === loop) live = null;
   };
 
   // Stop capturing, commit what's left, and return the live text.
   const finishLive = async () => {
-    const L = live;
-    if (!L) return null;
-    stopLiveCapture(L);
-    if (L.pending) {
-      try {
-        await L.pending;
-      } catch (_) {}
-    }
-    if (L.winLen >= LIVE_RATE * 0.3 && liveHasSpeech(L)) await liveTranscribe(true);
-    // The stop's own final can make a repair due; the delivered text should
-    // be the repaired one.
-    if (L.repairDue) await liveRepair();
-    // A successful final clears the provisional text. If it's still set, the
-    // last window never came back (whisper-server stuck or down): keep what
-    // was on screen rather than lose it. The 2026-09-26 hang delivered an
-    // empty result because nothing had been committed yet.
-    if (L.provisional) {
-      voiceLog("voice-live-kept-provisional", { requestId: L.requestId, chars: L.provisional.length });
-      L.committed.push(L.provisional);
-      L.parts.push({ seq: L.seq, text: L.provisional });
-      L.seq++;
-      L.provisional = "";
-      livePublish();
-    }
-    const text = L.committed.join(" ").trim();
-    const lat = L.latencies;
-    voiceLog("voice-final", {
-      requestId: L.requestId,
-      mode: "live",
-      capture: L.capture,
-      words: text ? text.split(/\s+/).length : 0,
-      windows: lat.length,
-      avgLatencyMs: lat.length ? Math.round(lat.reduce((a, b) => a + b, 0) / lat.length) : null,
-      errors: L.errors,
-      pauseMs: L.pauseMs,
-      pausesMs: L.pauses,
-      repairs: L.repairMs.length,
-      repairAvgMs: L.repairMs.length
-        ? Math.round(L.repairMs.reduce((a, b) => a + b, 0) / L.repairMs.length)
-        : null,
-    });
-    if (live === L) live = null;
-    return { text, errors: L.errors };
+    const loop = live;
+    if (!loop) return null;
+    const result = await loop.finish();
+    if (live === loop) live = null;
+    return result;
   };
 
   const abortLive = () => {
     if (!live) return;
-    stopLiveCapture(live);
+    live.abort();
     live = null;
   };
 
@@ -3267,7 +2812,9 @@ listen("pty-send-sent", (e) => {
         requestId: incomingId,
         reason: serverResult.reason,
       });
-      notifyWhisperUnavailable(serverResult.reason);
+      // A missing component already opened the setup dialog; the generic
+      // "not running" toast would only repeat it less usefully.
+      if (serverResult.reason !== "setup-missing") notifyWhisperUnavailable(serverResult.reason);
       postIframeVoiceState("idle", { reason: serverResult.reason || "whisper-unavailable" });
       const t = active;
       resetActiveState();
@@ -3521,6 +3068,24 @@ listen("pty-send-sent", (e) => {
     if (d.kind === "voice-start") {
       voiceLog("iframe-voice-start", { requestId: d.requestId });
       startRecording({ source: ev.source, requestId: d.requestId, voiceTarget: d.target || "" });
+    } else if (d.kind === "voice-edit-boundary") {
+      // The pane's field adopted an edit (dictation.js createField): windows
+      // below fromSeq are the user's text now. Only the frame that started
+      // the current dictation may set it, and it only moves forward.
+      const loop = live;
+      const fromOwner =
+        !!loop &&
+        !!loop.target &&
+        !!ev.source &&
+        loop.target.source === ev.source &&
+        loop.requestId === d.requestId;
+      const r = fromOwner ? loop.setEditBoundary(d.fromSeq) : { accepted: false, segmentClosed: false };
+      voiceLog("voice-edit-boundary", {
+        requestId: d.requestId,
+        fromSeq: d.fromSeq,
+        accepted: r.accepted,
+        segmentClosed: r.segmentClosed,
+      });
     } else if (d.kind === "voice-stop") {
       const stopAtMs = typeof d.stopAtMs === "number" ? d.stopAtMs : Date.now();
       voiceLog("iframe-voice-stop", {

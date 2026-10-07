@@ -3,15 +3,16 @@
   var.searchNeedle="{searchQuery.trim().toLowerCase()}"
   var.showNewIssueHint="{false}"
   var.newIssueSubmitting="{false}"
-  var.closingIssue="{false}"
   var.newIssueStartSig="{''}"
   var.newIssueTurnEnded="{false}"
   var.lastIssuesSig="{''}"
   var.issueRefreshTick="{0}"
   var.sortField="activityAt"
   var.sortDir="desc"
-  var.stateFilter="open"
-  var.issuesSource="{(issuesFull.value &amp;&amp; issuesFull.value.length > 0) ? issuesFull.value : (issuesFirstPage.value || [])}"
+  var.stateFilter="both"
+  var.pendingCloses="{window.__bramPendingIssueCloseList()}"
+  var.rawIssuesSource="{issuesFull.value || []}"
+  var.issuesSource="{window.__bramApplyPendingIssueCloses(rawIssuesSource, pendingCloses)}"
   var.sortedIssues="{(issuesSource || []).filter(i => stateFilter === 'both' || (stateFilter === 'open') === (i.state === 'OPEN')).sort(function(a, b) {
     // AGE is an elapsed-time ordering: compare the activity timestamp that
     // compactAge renders, never the compact duration string itself.
@@ -53,23 +54,14 @@
        path. No polling — the agent-turn-end event covers locally-filed
        issues, comment/close bump issueRefreshTick, and Refresh is manual for
        remote (GitHub/GitLab) changes with no push channel. -->
-  <DataSource
-    id="issuesFirstPage"
-    url="/__issues"
-    onLoaded="(data) => {
-      const currentSig = ((data || []).map(i => i && i.number).filter(Boolean).sort()).join(',');
-      if (newIssueSubmitting &amp;&amp; newIssueStartSig &amp;&amp; currentSig !== newIssueStartSig) {
-        newIssueSubmitting = false; newIssueStartSig = ''; newIssueTurnEnded = false;
-      } else if (newIssueSubmitting &amp;&amp; newIssueTurnEnded) {
-        newIssueSubmitting = false; newIssueStartSig = ''; newIssueTurnEnded = false;
-      }
-      lastIssuesSig = currentSig;
-    }" />
-
+  <!-- issues-single-fetch-no-load-jump: ONE fetch. The 50-row first page
+       (a fast paint from when /__issues was 3 MB) retired once the list
+       slimmed to ~240 KB: its swap to the full list changed the top row, so
+       List's useShift read it as a prepend and the tab opened ~50 rows from
+       the bottom (06:10:57Z, rows 372-381 of 424; xmlui-org/xmlui#3936). -->
   <DataSource
     id="issuesFull"
     url="/__issues"
-    when="{issuesFirstPage.loaded || issuesFirstPage.value}"
     onLoaded="(data) => {
       const currentSig = ((data || []).map(i => i && i.number).filter(Boolean).sort()).join(',');
       if (newIssueSubmitting &amp;&amp; newIssueStartSig &amp;&amp; currentSig !== newIssueStartSig) {
@@ -88,7 +80,7 @@
     method="post"
     queryParams="{{ number: $param.number, body: $param.body }}"
     completedNotificationMessage="Comment posted."
-    onSuccess="issueRefreshTick = issueRefreshTick + 1; issuesFirstPage.refetch(); issuesFull.refetch()" />
+    onSuccess="issueRefreshTick = issueRefreshTick + 1; issuesFull.refetch()" />
 
   <ModalDialog
     when="{showNewIssueHint}"
@@ -131,7 +123,7 @@
     subscribe="{window.bramSubscribeTauriEvent('agent-turn-end')}" />
   <ChangeListener
     listenTo="{issuesAgentTurnEndEvt.value &amp;&amp; issuesAgentTurnEndEvt.value.tick}"
-    onDidChange="() => { if (newIssueSubmitting) { newIssueTurnEnded = true; } issuesFirstPage.refetch(); issuesFull.refetch(); }" />
+    onDidChange="() => { if (newIssueSubmitting) { newIssueTurnEnded = true; } issuesFull.refetch(); }" />
 
   <!-- Host synthesizes issues-changed when its background poll of the forge
        detects a change; the client only refetches on the event — no polling,
@@ -142,24 +134,42 @@
     subscribe="{window.bramSubscribeTauriEvent('issues-changed')}" />
   <ChangeListener
     listenTo="{issuesChangedEvt.value &amp;&amp; issuesChangedEvt.value.tick}"
-    onDidChange="() => { issuesFirstPage.refetch(); issuesFull.refetch(); }" />
-  <VStack padding="$space-4" gap="$space-4" overflowY="auto" height="100%">
+    onDidChange="() => { issuesFull.refetch(); }" />
+  <!-- issues-tab-optimistic-close: a close in flight renders CLOSED via
+       pendingCloses; each fresh fetch of the raw list retires the entries
+       the forge data now confirms (the host re-indexes on success and emits
+       issues-changed, which lands here). -->
+  <ChangeListener
+    listenTo="{rawIssuesSource}"
+    onDidChange="pendingCloses = window.__bramReconcilePendingIssueCloses(rawIssuesSource)" />
+  <!-- issues-status-lightweight: no overflowY / height here. This wrapper
+       was a second scroll container between the ResultList's virtua List and
+       the App's scroll container; the List defers its scroll outward
+       (hasOutsideScroll) and, measured, then rendered EVERY row — domRows 423
+       of 423 hits in an 876px viewport (2026-10-06), and every Issues trace
+       since September tracks the issue count the same way, while Search,
+       whose wrapper has no overflow, stays at ~25-60 DOM rows. Each filter
+       switch rebuilt all ~400 row cards: 4.3 s / 5.4 s per click in the
+       Inspector export. Same differencing fix as
+       https://www.xmlui.org/docs/howto/pin-a-toolbar-above-a-bounded-scroll-region
+       ("delete the wrapper"). -->
+  <VStack padding="$space-4" gap="$space-4">
     <HStack gap="$space-3" verticalAlignment="center">
       <Heading level="h2">Issues</Heading>
       <RadioGroup
-        initialValue="open"
+        initialValue="both"
         orientation="horizontal"
         gap="$space-3"
         onDidChange="(v) => stateFilter = v">
+        <Option value="both" label="both" />
         <Option value="open" label="open" />
         <Option value="closed" label="closed" />
-        <Option value="both" label="both" />
       </RadioGroup>
       <SearchBox
         boxWidth="22rem"
         placeholder="Filter issues…"
         initialValue="{searchQuery}"
-        inProgress="{issuesFirstPage.inProgress || issuesFull.inProgress}"
+        inProgress="{issuesFull.inProgress}"
         onQueryChange="(q) => { searchQuery = q; setLastSearchQuery(q) }"
         onClear="searchQuery = ''; setLastSearchQuery('')" />
       <Button
@@ -169,7 +179,7 @@
         enabled="{!newIssueSubmitting}"
         onClick="showNewIssueHint = true" />
       <Theme size-Spinner="16px">
-        <Spinner when="{newIssueSubmitting || (issuesFirstPage.inProgress &amp;&amp; !issuesFirstPage.loaded)}" />
+        <Spinner when="{newIssueSubmitting || (issuesFull.inProgress &amp;&amp; !issuesFull.loaded)}" />
       </Theme>
     </HStack>
 
@@ -179,7 +189,7 @@
       No forge remote detected for this project. Add an origin remote (GitHub or GitLab) to populate this tab.
     </Text>
     <Text
-      when="{repoOrigin.value &amp;&amp; repoOrigin.value.htmlBase &amp;&amp; issuesFirstPage.loaded &amp;&amp; !issuesFirstPage.inProgress &amp;&amp; (!issuesSource || issuesSource.length === 0)}"
+      when="{repoOrigin.value &amp;&amp; repoOrigin.value.htmlBase &amp;&amp; issuesFull.loaded &amp;&amp; !issuesFull.inProgress &amp;&amp; (!issuesSource || issuesSource.length === 0)}"
       color="$textColor-secondary">
       No issues found. (The repo may have none, `{(repoOrigin.value &amp;&amp; repoOrigin.value.cli) || 'gh'}` may not be installed / authenticated, or the last fetch failed — it will retry shortly.)
     </Text>
@@ -221,10 +231,26 @@
            virtualized). Row anatomy (state / title+meta / age) and the
            comment/close controls stay Issues-owned via the two slots; the
            inline expansion and its expandedNumber state retire. -->
+      <!-- result-list-tabs-virtualize: pinKey pins the page to top whenever
+           the rows are replaced wholesale (state filter, sort, search).
+           Without it, once the list virtualizes against the App scroller,
+           virtua re-anchors on a previously visible row and drags the page
+           down the new list — open→closed landed at row 362 of 388
+           (2026-10-06 03:46Z). That drag was List's useShift reading any
+           first-row change as a prepend (xmlui-org/xmlui#3936), fixed in the
+           vendored List: switches from the top now land on row 0 on their
+           own (retest, #3936). The pin stays as intent — a filter, sort or
+           search change starts at the top — and fires immediately.
+           issues-single-fetch-no-load-jump: the load phase is in the key too,
+           so the pin also fires once when the data first arrives. -->
+
       <ResultList
+        id="issueResults"
         data="{issueRows}"
         query="{searchQuery.trim()}"
-        detailRefreshTick="{issueRefreshTick}">
+        detailRefreshTick="{issueRefreshTick}"
+        pinKey="{(issuesFull.loaded ? 'loaded' : 'loading') + '|' + stateFilter + '|' + sortField + '|' + sortDir + '|' + searchNeedle}"
+        pinVia="issues">
         <property name="rowTemplate">
           <HStack gap="$space-3" verticalAlignment="center">
             <HStack width="64px" verticalAlignment="center">
@@ -314,23 +340,23 @@
               maxRows="12"
               voiceTarget="{'issue-comment:' + $item.number}"
               voiceTooltip="Dictate comment"
-              enabled="{!commentIssueCall.inProgress &amp;&amp; !closingIssue}" />
+              enabled="{!commentIssueCall.inProgress}" />
             <HStack gap="$space-2">
               <Button
                 label="Comment"
                 variant="outlined"
                 size="sm"
-                enabled="{!commentIssueCall.inProgress &amp;&amp; !closingIssue}"
+                enabled="{!commentIssueCall.inProgress}"
                 onClick="const text = (closeCommentBox.getValue() || '').trim(); if (text) { commentIssueCall.execute({ number: $item.number, body: text }); closeCommentBox.clear(); }" />
               <Button
                 when="{$item.state === 'OPEN'}"
                 label="Close issue"
                 variant="outlined"
                 size="sm"
-                enabled="{!commentIssueCall.inProgress &amp;&amp; !closingIssue}"
-                onClick="closingIssue = true; window.__bramCloseIssue($item.number, closeCommentBox.getValue() || '', () => { closingIssue = false; closeCommentBox.clear(); issueRefreshTick = issueRefreshTick + 1; issuesFirstPage.refetch(); issuesFull.refetch(); }, () => { closingIssue = false; })" />
+                enabled="{!commentIssueCall.inProgress}"
+                onClick="pendingCloses = window.__bramCloseIssue($item.number, closeCommentBox.getValue() || '', toast, (list) => pendingCloses = list); issueResults.closeDetail()" />
               <Theme size-Spinner="16px">
-                <Spinner when="{commentIssueCall.inProgress || closingIssue}" />
+                <Spinner when="{commentIssueCall.inProgress}" />
               </Theme>
             </HStack>
           </VStack>

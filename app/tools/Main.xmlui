@@ -39,6 +39,15 @@
   <ChangeListener
     listenTo="{whisperNotice.value &amp;&amp; whisperNotice.value.at}"
     onDidChange="() => window.__bramToastWhisperNotice(whisperNotice.value, toast)" />
+  <!-- voice-setup-dialog: a 🎤 click found whisper-server, the model or
+       ffmpeg missing; open voiceSetupDialog (helpers.js decides whether). -->
+  <PushSource
+    id="voiceSetupNotice"
+    initial="{null}"
+    subscribe="{window.bramSubscribeVoiceSetup()}" />
+  <ChangeListener
+    listenTo="{voiceSetupNotice.value &amp;&amp; voiceSetupNotice.value.at}"
+    onDidChange="() => window.__bramOpenVoiceSetup(voiceSetupNotice.value, voiceSetupDialog)" />
   <ChangeListener
     listenTo="{voiceBusyNotice.value &amp;&amp; voiceBusyNotice.value.at}"
     onDidChange="(c) => { if (c.newValue) { toast('A voice recording is already in progress. Return to that recording to stop it. If you can\'t find it, reload Bram to clear it.'); } }" />
@@ -287,6 +296,13 @@
         <Text>Later launches of any supported agent in this repo will not prompt again unless the setup artifacts are removed. Additional agent adapters can plug into the same flow in the future.</Text>
       </VStack>
     </VStack>
+  </ModalDialog>
+
+  <ModalDialog
+    id="voiceSetupDialog"
+    title="Set up voice input"
+    onClose="window.__bramVoiceSetupClosed()">
+    <VoiceSetupDialog notice="{$param}" />
   </ModalDialog>
 
   <!-- issue-221-skill-launcher: pick a project skill, add an optional argument,
@@ -616,19 +632,27 @@
     </property>
     <!-- worklist2 cutover complete: the legacy Workspace tab and its
          Show legacy Worklist setting were retired in the 0.5.3 run. -->
-    <NavLink label="Awaiting You" to="/needs-you" />
-    <NavLink label="Worklist" to="/worklist2" />
-    <NavLink label="Transcript" to="/transcript" />
-    <NavLink label="Search" to="/search" />
-    <NavLink label="Issues" to="/issues" />
-    <NavLink label="Commits" to="/commits" />
-    <NavLink label="Queue" to="/queue" />
-    <NavLink label="History" to="/history" />
-    <NavLink label="Sessions" to="/sessions" />
-    <NavLink label="Tips" to="/tips" />
-    <NavLink label="Context" to="/context" />
-    <NavLink label="Status" to="/status" />
-    <NavLink label="Settings" to="/settings" />
+    <NavLink label="Worklist" to="/worklist2" tooltip="Proposed and in-progress changes: start, commit or drop them" />
+    <NavLink label="Transcript" to="/transcript" tooltip="The current agent session, turn by turn" />
+    <NavLink label="Sessions" to="/sessions" tooltip="Every Claude and Codex session in this project: switch, rename, pair" />
+    <NavLink label="Issues" to="/issues" tooltip="This repo&apos;s open issues" />
+    <NavLink label="Commits" to="/commits" tooltip="Recent commits, and pushing them" />
+    <NavLink label="Queue" to="/queue" tooltip="Notes you&apos;re holding to send the agent when it&apos;s free" />
+    <NavLink label="Search" to="/search" tooltip="Search the project&apos;s history: sessions, commits, issues, worklist" />
+    <NavLink label="Awaiting You" to="/needs-you" tooltip="Everything waiting on your decision, in one list" />
+    <NavLink label="Settings" to="/settings" tooltip="Project and personal settings for Bram" />
+    <!-- nav-primary-list-and-more-group: less-used pages, collapsed by
+         default (initiallyExpanded unset;
+         https://www.xmlui.org/docs/reference/components/NavGroup). The group
+         opens itself when one of its pages becomes the active route (the
+         Worklist tab's History button relies on this; NavGroupReact.tsx,
+         the pathname effect looking for .xmlui-navlink-active). -->
+    <NavGroup label="More">
+      <NavLink label="History" to="/history" tooltip="Every worklist item that was committed or dropped, and why" />
+      <NavLink label="Tips" to="/tips" tooltip="All the footer tips, including ones you dismissed" />
+      <NavLink label="Context" to="/context" tooltip="What the agent reads: CLAUDE.md, memory, hooks and settings" />
+      <NavLink label="Status" to="/status" tooltip="Bram&apos;s health: guards, session size, state checks" />
+    </NavGroup>
   </NavPanel>
 
   <!-- Mis-launch notices. Bram manages whatever directory it is launched from,
@@ -925,6 +949,123 @@
            Worklist-dock mount (AgentMenuView is self-gating on menu and
            owns its preview modal, so the footer mount is drop-in). -->
       <AgentMenuView menu="{footerAgentMenuEvt.value}" surface="footer" />
+      <!-- agent-launch-failure-in-pane: a launch that failed (the agent
+           exited right after launch, or the terminal never came back to a
+           prompt) is said here, above the message box, where the user is
+           about to type into a terminal no agent is reading. Driven by the
+           host's replayable `launch-outcome`; the next confirmed launch
+           clears it. The terminal's last lines use Text variant="sample"
+           (program output), per
+           https://www.xmlui.org/docs/reference/components/Text#variant .
+           Warn styling matches FooterAgentStatus's suspicious-silence notice. -->
+      <PushSource
+        id="launchFailure"
+        initial="{null}"
+        subscribe="{window.bramSubscribeLaunchFailure()}" />
+      <VStack
+        when="{!!launchFailure.value}"
+        gap="$space-1"
+        paddingHorizontal="$space-2"
+        paddingVertical="$space-1"
+        backgroundColor="$color-warn-50"
+        border="1px solid $color-warn-200"
+        borderRadius="$borderRadius">
+        <HStack width="100%" gap="$space-2" verticalAlignment="center">
+          <Text
+            width="*"
+            fontSize="$fontSize-sm"
+            color="$color-warn-700"
+            value="{launchFailure.value &amp;&amp; launchFailure.value.message}" />
+          <Button
+            label="{launchFailure.value &amp;&amp; launchFailure.value.actionLabel}"
+            tooltip="{launchFailure.value &amp;&amp; launchFailure.value.actionTooltip}"
+            variant="outlined"
+            size="xs"
+            onClick="window.__bramLaunchFailureAction(launchFailure.value, toast)" />
+          <Button
+            label="Dismiss"
+            variant="ghost"
+            size="xs"
+            onClick="window.__bramLaunchFailureDismiss(launchFailure.value)" />
+        </HStack>
+        <Text
+          when="{!!(launchFailure.value &amp;&amp; launchFailure.value.tail)}"
+          variant="sample"
+          fontSize="$fontSize-sm"
+          value="{launchFailure.value &amp;&amp; launchFailure.value.tail}" />
+      </VStack>
+      <!-- provider-session-pair-offer: a header switch found no session that
+           goes with the one being left, so the host resumed the target's
+           most recent (or pinned) session. Pairs are explicit only: Keep
+           these together pairs the two, or start a new session instead. Driven by the host's replayable `pair-offer`; the
+           next switch replaces it. Info palette: nothing went wrong. -->
+      <!-- provider-session-digest-for-codex: after a switch that resumed a
+           partner (or Keep these together), offer one turn telling the
+           running agent to read what it missed in the other session. -->
+      <PushSource
+        id="catchUpOffer"
+        initial="{null}"
+        subscribe="{window.bramSubscribeCatchUpOffer()}" />
+      <HStack
+        when="{!!catchUpOffer.value}"
+        gap="$space-2"
+        verticalAlignment="center"
+        paddingHorizontal="$space-2"
+        paddingVertical="$space-1"
+        backgroundColor="$color-info-50"
+        border="1px solid $color-info-200"
+        borderRadius="$borderRadius">
+        <Text
+          width="*"
+          fontSize="$fontSize-sm"
+          value="{catchUpOffer.value &amp;&amp; catchUpOffer.value.message}" />
+        <Button
+          label="{catchUpOffer.value &amp;&amp; catchUpOffer.value.actionLabel}"
+          tooltip="{catchUpOffer.value &amp;&amp; catchUpOffer.value.actionTooltip}"
+          variant="outlined"
+          size="xs"
+          onClick="window.__bramCatchUpSend(catchUpOffer.value)" />
+        <Button
+          label="Dismiss"
+          variant="ghost"
+          size="xs"
+          onClick="window.__bramCatchUpDismiss(catchUpOffer.value)" />
+      </HStack>
+      <PushSource
+        id="pairOffer"
+        initial="{null}"
+        subscribe="{window.bramSubscribePairOffer()}" />
+      <HStack
+        when="{!!pairOffer.value}"
+        gap="$space-2"
+        verticalAlignment="center"
+        paddingHorizontal="$space-2"
+        paddingVertical="$space-1"
+        backgroundColor="$color-info-50"
+        border="1px solid $color-info-200"
+        borderRadius="$borderRadius">
+        <Text
+          width="*"
+          fontSize="$fontSize-sm"
+          value="{pairOffer.value &amp;&amp; pairOffer.value.message}" />
+        <Button
+          label="Keep these together"
+          tooltip="{pairOffer.value &amp;&amp; pairOffer.value.keepTooltip}"
+          variant="outlined"
+          size="xs"
+          onClick="window.__bramPairOfferKeep(pairOffer.value, toast)" />
+        <Button
+          label="{pairOffer.value &amp;&amp; pairOffer.value.actionLabel}"
+          tooltip="{pairOffer.value &amp;&amp; pairOffer.value.actionTooltip}"
+          variant="outlined"
+          size="xs"
+          onClick="window.__bramPairOfferStart(pairOffer.value)" />
+        <Button
+          label="Dismiss"
+          variant="ghost"
+          size="xs"
+          onClick="window.__bramPairOfferDismiss(pairOffer.value)" />
+      </HStack>
       <!-- The hot TextArea is isolated from this App-scope footer. Props flow
            down only when provider state changes; the low-frequency Skills
            request flows up as a component event. -->
@@ -1170,7 +1311,7 @@
             fontSize="$fontSize-sm"
             width="*"
             color="$color-warn-700"
-            value="The terminal is waiting at a prompt Bram can't answer." />
+            value="{window.__bramTerminalAttentionText(terminalAttentionEvt.value)}" />
           <Button
             label="Open terminal"
             variant="outlined"

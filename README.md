@@ -12,52 +12,17 @@ Bram runs agents mindfully.
 
 Anyone who uses Claude Code and/or Codex.
 
-<img width="1078" height="1034" alt="v0 6 6" src="https://github.com/user-attachments/assets/cac26927-a65a-4e11-b72c-78be758fd19c" />
-
-
-## Demo
-
-This storyboard shows Bram and XMLUI co-evolving on August 26, 2026. In the ~/xmlui repo we burn down a set of issues and stress-test Bram's ability to manage file entanglement across items being handled by parallel subagents. In the ~/bram repo we burn down issues raised in response to findings from ~/xmlui. Real work happened on both sides while each helped improve the other.
-
-https://gist.github.com/judell/663ac00adf36a01096f2bdcdd08642ae
-
-
-## Blog
-
-<a href="https://blog.jonudell.net/2026/06/02/how-to-make-best-use-of-git-and-github-for-ai-assisted-software-development/">How to make best use of git and GitHub for AI-assisted software development</a>
-
-<a href="https://blog.jonudell.net/2026/06/17/vibe-coding-as-a-team-sport/">Vibe coding as a team sport</a>
-
-<a href="https://blog.jonudell.net/2026/06/28/doctor-it-hurts-when-agents-create-unreviewable-prs-dont-do-that/">“Doctor, it hurts when agents create unreviewable PRs.” “Don’t do that.”</a>
-
-<a href="https://blog.jonudell.net/2026/07/01/what-is-the-terminal/">"What is the terminal?"</a>
-
-<a href="https://blog.jonudell.net/2026/07/08/dont-infer-behavior-from-code-observe-it-in-logs/">Don’t infer behavior from code, observe it in logs</a>
-
-<a href="https://blog.jonudell.net/2026/07/16/talking-to-claude-code-and-codex/">Talking to Claude Code and Codex</a>
-
-<a href="https://blog.jonudell.net/2026/07/12/small-models-can-solve-big-problems/">Small models can solve big problems</a>
-
-<a href="https://blog.jonudell.net/2026/07/23/agents-that-narrate-their-work-are-the-best-team-players/">Agents that narrate their work are the best team players</a>
-
-<a href="https://blog.jonudell.net/2026/08/01/make-agent-memory-searchable/">Make agent memory searchable</a>
-
-### Elsewhere
-
-<a href="https://www.infoworld.com/article/4224587/the-agent-coordination-protocol-hiding-in-plain-sight-github-issues.html">The agent coordination protocol hiding in plain sight: GitHub issues</a>
-
-<a href="https://www.infoworld.com/article/4211198/when-an-ai-agent-goes-off-the-rails-file-a-bug-to-fix-the-documentation-then-test-the-fix.html">When an AI agent goes off the rails, file a bug to fix the documentation – then test the fix</a>
-
-<a href="https://waltzweb.wordpress.com/2026/07/02/github-for-todays-hybrid-teams/">Technical or not, human or AI – could Bram be the missing link?</a>
-
-<a href="https://arxiv.org/abs/2607.25975">Who is scientific code for? Maintaining human-readable landmarks in agent-written code</a>
+<a href="https://judell.github.io/bram/"><img alt="Bram demo video: a six-minute tour of Bram tackling and completing a GitHub issue. Click to watch on the Bram homepage." src="site/poster.jpg" /></a>
 
 ## How does it work?
 
 ### Terminal (optional)
 
-A terminal where you run `claude` or `codex`. It can be hidden in favor of the
-agent pane's Worklist, Transcript, and Queue views.
+A terminal where you run `claude` or `codex`. It starts closed, in favor of the
+agent pane's Worklist, Transcript, and Queue views. The **terminal** button in
+the toolbar opens and closes it for the current session; to have it open every
+time Bram launches, turn on **Terminal open at startup** in the Settings tab's
+UI section.
 
 ### Agent pane
 
@@ -140,7 +105,7 @@ agent's goodwill.
 4. **XMLUI CLI - optional.** If you are developing an XMLUI app, or if you are developing `Bram` itself (the agent pane UI is an embedded XMLUI app) you will want the XMLUI MCP server. Follow the steps [here](https://xmlui.org/get-started) to get it.
 
 5. **`whisper-server` — optional.** Powers the 🎤 dictation buttons in
-   the agent pane. Tested on macOS and Windows/WSL, see [Voice input](#voice-input) below for install and per-platform
+   the agent pane. Tested on macOS and Windows, see [Voice input](#voice-input) below for install and per-platform
    status.
 
 ## [Download the latest release →](https://github.com/judell/bram/releases/latest)
@@ -329,39 +294,48 @@ curl -L -o ~/.local/share/whisper-models/ggml-small.en.bin \
 
 `small.en` is ~466 MB, English-only, real-time on Apple Silicon. Swap in a different model from the same Hugging Face repo for other size/accuracy/language tradeoffs. The bundled `Info.plist` declares `NSMicrophoneUsageDescription`, so first use triggers the standard macOS mic-permission prompt. The model path the app loads is `~/.local/share/whisper-models/ggml-small.en.bin`.
 
-### Windows / WSL
+### Windows
 
-On Windows, Bram launches `whisper-server` inside WSL via `wsl.exe bash -lc` and talks to it through `http://127.0.0.1:18080` from the WebView. WSL2 forwards that loopback port to Windows automatically, so the request path is the same as on macOS once the server is running.
+On Windows, Bram launches `whisper-server` natively and talks to it through `http://127.0.0.1:18080` from the WebView, exactly as it does on macOS. **WSL is not used and not required.** Earlier versions ran the engine inside WSL via `wsl.exe bash -lc`; if you set that up for a previous release, nothing inside the distro is reachable any more and the components below have to exist on the Windows side.
 
-**Prerequisite: WSL2 with Ubuntu.** If you don't already have it, open PowerShell and run `wsl --install`, which installs WSL and the default Ubuntu distro. Restart when prompted, then complete Ubuntu's first-run setup (pick a Linux username and password). Microsoft's full install doc: <https://learn.microsoft.com/en-us/windows/wsl/install>.
+**One-time setup.** In PowerShell:
 
-**One-time setup inside Ubuntu.** Open Ubuntu (Start menu → Ubuntu, or run `wsl` from PowerShell), then paste this whole block. The `cmake` build takes a few minutes on modern hardware; the model download is ~466 MB.
+```powershell
+winget install Gyan.FFmpeg
 
-```bash
-sudo apt update
-sudo apt install -y build-essential cmake ffmpeg git curl
-git clone https://github.com/ggml-org/whisper.cpp.git
-cd whisper.cpp
-cmake -B build
-cmake --build build -j --config Release
-sudo cp build/bin/whisper-server /usr/local/bin/
-mkdir -p ~/.local/share/whisper-models
-curl -L -o ~/.local/share/whisper-models/ggml-small.en.bin \
+# whisper-server: take whisper-blas-bin-x64.zip from a whisper.cpp release
+# that publishes Windows binaries (the tagged vN.N.N releases often carry
+# none; the dated build tags do). Extract it somewhere permanent and put
+# that directory on your PATH — the exe needs its DLLs beside it.
+mkdir "$env:LOCALAPPDATA\Programs\whisper"
+# ...extract the zip's contents there, then:
+[Environment]::SetEnvironmentVariable(
+  'Path',
+  [Environment]::GetEnvironmentVariable('Path','User') + ";$env:LOCALAPPDATA\Programs\whisper",
+  'User')
+
+# the model (~466 MB)
+mkdir "$env:USERPROFILE\.local\share\whisper-models"
+curl.exe -L -o "$env:USERPROFILE\.local\share\whisper-models\ggml-small.en.bin" `
   https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin
 ```
 
-That's the whole install. Bram handles starting/stopping `whisper-server` on its own — first 🎤 click after launching Bram spawns it inside WSL (the button shows ⏳ for ~2-3 s while the model loads), and every click after that is fast until Bram exits.
+**Relaunch Bram after changing PATH** — a running process keeps the environment it started with, so the 🎤 will keep reporting `whisper-server` missing until you do.
+
+That's the whole install. Bram handles starting and stopping `whisper-server` on its own — the first 🎤 click after launching Bram spawns it (the button shows ⏳ for a few seconds while the model loads), and every click after that is fast until Bram exits.
+
+**On speed.** The `blas` build runs on the CPU. On a machine without a fast CPU this is noticeably slower than macOS, where whisper.cpp uses the GPU through Metal. If transcription drags, a smaller model (`ggml-base.en`, `ggml-tiny.en`) buys back most of the time for some accuracy. The `cublas`/`cuda` release assets are considerably faster but need an NVIDIA GPU; they do nothing on Intel or AMD integrated graphics.
 
 **Notes:**
 
 - **Mic permission.** WebView2 inherits the standard Windows microphone prompt. On first 🎤 click Windows asks to allow mic access; click **Yes**.
-- **Multiple WSL distros.** If Ubuntu isn't your default distro, set `BRAM_WSL_DISTRO=Ubuntu` (or whatever distro name) in your Windows environment before launching Bram. Single-distro setups need no env var.
 - **Already running?** If you happen to have `whisper-server` listening on port `18080` (e.g., started manually in another terminal), Bram detects it via a preflight probe and uses it instead of spawning a new one — no conflict.
-- **Sanity check after install.** From inside Ubuntu, `which whisper-server` should print `/usr/local/bin/whisper-server`, and `ls ~/.local/share/whisper-models/` should show `ggml-small.en.bin`. If both look right, you're done.
+- **Sanity check after install.** In a *new* PowerShell window, `where.exe whisper-server` and `where.exe ffmpeg` should each print a path, and `ls "$env:USERPROFILE\.local\share\whisper-models\"` should show `ggml-small.en.bin`. If all three look right, relaunch Bram and you're done.
+- **Upgrading from a WSL setup.** The `BRAM_WSL_DISTRO` environment variable is gone and is ignored if set. A model inside your distro can be copied out rather than downloaded again: `wsl cp ~/.local/share/whisper-models/ggml-small.en.bin /mnt/c/Users/<you>/.local/share/whisper-models/ggml-small.en.bin`.
 
 ### Linux
 
-The same setup is expected to work on non-WSL Linux, using the host process path and port `18080`.
+The same setup is expected to work on Linux, using the host process path and port `18080`.
 
 ## Target app
 

@@ -942,6 +942,396 @@ window.__bramSwitchAgent = function (provider) {
     throw e;
   });
 };
+// agent-launch-failure-in-pane: the host's `launch-outcome` (from the shared
+// launch routine, replayable so a provider switch's pane reload doesn't lose
+// it) becomes a notice above the message box when a launch failed: the agent
+// exited right after launch, or the terminal never came back to a prompt.
+// The notice is the LATEST outcome only, so the next confirmed launch clears
+// it. Dismiss is focus, not decision (docs/developing-bram.md §Client
+// storage): sessionStorage, keyed by the outcome's time, so a reload doesn't
+// bring back a notice already dismissed.
+(function () {
+  var DISMISS_KEY = "bram.launchFailureDismissedAt";
+  var subscribers = new Set();
+  var latest = null;
+  var dismissedAt = 0;
+  var lastValue = null;
+  var hooked = false;
+  try { dismissedAt = Number(window.sessionStorage.getItem(DISMISS_KEY)) || 0; } catch (e) {}
+
+  var providerName = function (p) { return p === "codex" ? "Codex" : "Claude"; };
+  var derive = function () {
+    var p = latest;
+    if (!p || (p.outcome !== "exited" && p.outcome !== "timeout")) return null;
+    if (Number(p.atMs) && Number(p.atMs) <= dismissedAt) return null;
+    var name = providerName(p.provider);
+    if (p.outcome === "exited") {
+      var hasStatus = p.status !== null && p.status !== undefined;
+      return {
+        kind: "exited",
+        provider: p.provider,
+        atMs: p.atMs,
+        message: name + " exited right after launch" + (hasStatus ? " (status " + p.status + ")" : "") +
+          (p.tail ? ". The terminal said:" : "."),
+        tail: p.tail || "",
+        actionLabel: "Start " + name + " fresh",
+        actionTooltip: "Starts " + p.provider + " as a new session, without resuming and without extra arguments.",
+      };
+    }
+    return {
+      kind: "timeout",
+      provider: p.provider,
+      atMs: p.atMs,
+      message: "Bram didn't start " + name + ": the terminal never came back to a prompt.",
+      tail: "",
+      actionLabel: "Try again",
+      actionTooltip: "Switches to " + name + " again.",
+    };
+  };
+  var notify = function (reason) {
+    var next = derive();
+    var was = !!lastValue;
+    lastValue = next;
+    if (was !== !!next) {
+      try {
+        window.__bramIframeTrace("launch-failure", {
+          op: next ? "shown" : "cleared",
+          reason: reason,
+          provider: (next || latest || {}).provider || "",
+          // Not `kind`: __bramIframeTrace copies fields over its payload,
+          // and `kind` is the envelope the host routes on.
+          failure: next ? next.kind : "",
+        });
+      } catch (e) {}
+    }
+    subscribers.forEach(function (fn) {
+      try { fn(); } catch (e) { console.error("[bram] launch-failure subscriber threw:", e); }
+    });
+  };
+  var ensureHooked = function () {
+    if (hooked) return;
+    hooked = true;
+    var source = window.bramSubscribeTauriEvent("launch-outcome");
+    source(function (snapshot) {
+      latest = (snapshot && snapshot.payload) || null;
+      notify((latest && latest.outcome) || "outcome");
+    });
+  };
+
+  window.bramSubscribeLaunchFailure = (function () {
+    var factory;
+    return function () {
+      if (factory) return factory;
+      ensureHooked();
+      factory = function (emit) {
+        var fire = function () { emit(lastValue); };
+        subscribers.add(fire);
+        fire();
+        return function () { subscribers.delete(fire); };
+      };
+      return factory;
+    };
+  })();
+
+  var dismiss = function (value, reason) {
+    if (!value) return;
+    dismissedAt = Number(value.atMs) || Date.now();
+    try { window.sessionStorage.setItem(DISMISS_KEY, String(dismissedAt)); } catch (e) {}
+    notify(reason);
+  };
+  window.__bramLaunchFailureDismiss = function (value) { dismiss(value, "dismiss-click"); };
+  window.__bramLaunchFailureAction = function (value, toastApi) {
+    if (!value) return;
+    dismiss(value, "action-click");
+    var done = value.kind === "exited"
+      ? (function () {
+          var invoke = getTauriInvoke();
+          if (!invoke) return Promise.reject(new Error("Tauri IPC unavailable"));
+          return window.__bramWithAgentCommandTimeout(
+            invoke("start_agent_fresh", { provider: value.provider }), "start fresh");
+        })()
+      : window.__bramSwitchAgent(value.provider);
+    done.catch(function (e) {
+      if (toastApi && typeof toastApi.error === "function") {
+        toastApi.error("Could not start " + providerName(value.provider) + ": " + String((e && e.message) || e));
+      }
+    });
+  };
+})();
+// provider-session-pair-offer: after a header switch that found no partner
+// (the host resumed the target's pin or most recent session, and pairs only
+// on an explicit act), offer to keep the two sessions together or to start a
+// new session for the one being left. Driven by the
+// host's replayable `pair-offer`; a later switch replaces it. Dismiss is
+// focus (sessionStorage, keyed by offer time). "Start a new one" opens the
+// New session dialog pre-filled (the suggest path) and holds the offer until
+// Create, which pairs the new session with it (__bramTakePairOfferForCreate);
+// Cancel drops it (__bramClearPairOfferForCreate).
+(function () {
+  var DISMISS_KEY = "bram.pairOfferDismissedAt";
+  var CREATE_TTL_MS = 10 * 60 * 1000;
+  var subscribers = new Set();
+  var latest = null;
+  var lastValue = null;
+  var dismissedAt = 0;
+  var hooked = false;
+  var forCreate = null;
+  try { dismissedAt = Number(window.sessionStorage.getItem(DISMISS_KEY)) || 0; } catch (e) {}
+
+  var name = function (p) { return p === "codex" ? "Codex" : "Claude"; };
+  // A session with no title is named by its short id, which the Sessions
+  // tab can find, never "(untitled)".
+  var quoted = function (t, id) { return t ? "'" + t + "'" : String(id || "").slice(0, 8); };
+  var derive = function () {
+    var p = latest;
+    if (!p || !p.active) return null;
+    if (Number(p.atMs) && Number(p.atMs) <= dismissedAt) return null;
+    return {
+      atMs: p.atMs,
+      fromProvider: p.fromProvider,
+      fromSessionId: p.fromSessionId,
+      fromTitle: p.fromTitle || "",
+      toProvider: p.toProvider,
+      toSessionId: p.toSessionId,
+      message: "No " + name(p.toProvider) + " session goes with " + name(p.fromProvider) + " session " +
+        quoted(p.fromTitle, p.fromSessionId) + ". " + name(p.toProvider) + " resumed its most recent, " +
+        quoted(p.toTitle, p.toSessionId) + ".",
+      keepTooltip: "Pair these two, so switching between Claude and Codex moves between them.",
+      actionLabel: "Start a new " + name(p.toProvider) + " session",
+      actionTooltip: "Opens New session to start a " + name(p.toProvider) + " session that goes with " +
+        quoted(p.fromTitle, p.fromSessionId) + "; switching back and forth will then move between those two.",
+    };
+  };
+  var notify = function (reason) {
+    var next = derive();
+    var was = !!lastValue;
+    lastValue = next;
+    if (was !== !!next) {
+      try {
+        window.__bramIframeTrace("pair-offer", {
+          op: next ? "shown" : "cleared",
+          reason: reason,
+          to: next ? next.toProvider : "",
+        });
+      } catch (e) {}
+    }
+    subscribers.forEach(function (fn) {
+      try { fn(); } catch (e) { console.error("[bram] pair-offer subscriber threw:", e); }
+    });
+  };
+  var ensureHooked = function () {
+    if (hooked) return;
+    hooked = true;
+    window.bramSubscribeTauriEvent("pair-offer")(function (snapshot) {
+      latest = (snapshot && snapshot.payload) || null;
+      notify(latest && latest.active ? "offer" : "host-clear");
+    });
+  };
+  window.bramSubscribePairOffer = (function () {
+    var factory;
+    return function () {
+      if (factory) return factory;
+      ensureHooked();
+      factory = function (emit) {
+        var fire = function () { emit(lastValue); };
+        subscribers.add(fire);
+        fire();
+        return function () { subscribers.delete(fire); };
+      };
+      return factory;
+    };
+  })();
+  var dismiss = function (value, reason) {
+    if (!value) return;
+    dismissedAt = Number(value.atMs) || Date.now();
+    try { window.sessionStorage.setItem(DISMISS_KEY, String(dismissedAt)); } catch (e) {}
+    notify(reason);
+  };
+  window.__bramPairOfferDismiss = function (value) { dismiss(value, "dismiss-click"); };
+  window.__bramPairOfferKeep = function (value, toastApi) {
+    if (!value) return;
+    var claude = value.fromProvider === "claude" ? value.fromSessionId : value.toSessionId;
+    var codex = value.fromProvider === "codex" ? value.fromSessionId : value.toSessionId;
+    dismiss(value, "keep-click");
+    window.fetch("/__sessions/pair?claude=" + encodeURIComponent(claude || "") +
+      "&codex=" + encodeURIComponent(codex || "") +
+      "&from=" + encodeURIComponent(value.fromProvider || ""), { cache: "no-store" }).then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+    }).catch(function (e) {
+      if (toastApi && typeof toastApi.error === "function") {
+        toastApi.error("Could not pair: " + String((e && e.message) || e));
+      }
+    });
+  };
+  window.__bramPairOfferStart = function (value) {
+    if (!value) return;
+    forCreate = {
+      provider: value.fromProvider,
+      id: value.fromSessionId,
+      title: value.fromTitle,
+      toProvider: value.toProvider,
+      at: Date.now(),
+    };
+    dismiss(value, "start-click");
+    window.__bramSessionSuggestIngest({
+      name: (value.fromTitle || (name(value.fromProvider) + " session " + String(value.fromSessionId || "").slice(0, 8))) +
+        " (" + name(value.toProvider) + ")",
+      whatsNext: "Pick up the work of the " + name(value.fromProvider) + " session " +
+        quoted(value.fromTitle, value.fromSessionId) + " here in " + name(value.toProvider) + ".",
+      atMs: Date.now(),
+    });
+  };
+  window.__bramTakePairOfferForCreate = function (provider) {
+    var o = forCreate;
+    forCreate = null;
+    if (!o || Date.now() - o.at > CREATE_TTL_MS) return null;
+    if (String(provider || "").toLowerCase() !== o.toProvider) return null;
+    try { window.__bramIframeTrace("pair-offer", { op: "create", to: o.toProvider }); } catch (e) {}
+    return o;
+  };
+  window.__bramClearPairOfferForCreate = function () { forCreate = null; };
+})();
+
+// provider-session-pair-offer: the Sessions row's "paired with" label.
+window.__bramPairedWithLabel = function (partner) {
+  if (!partner) return "";
+  var who = partner.provider === "codex" ? "Codex" : "Claude";
+  return "Paired with " + who + " session " +
+    (partner.title ? "'" + partner.title + "'" : String(partner.id || "").slice(0, 8));
+};
+
+// provider-session-pair-offer: Match name. The name this row's session would
+// take to match its partner: "<partner title> (<this provider>)". Empty when
+// there's nothing to match (no partner title) or the names already match,
+// ignoring a trailing "(Claude)" / "(Codex)".
+window.__bramPairMatchTitle = function (item) {
+  var p = item && item.partner;
+  if (!p || !p.title) return "";
+  var mine = item.provider === "codex" ? "Codex" : "Claude";
+  var strip = function (t) { return String(t || "").replace(/ \((Claude|Codex)\)$/, ""); };
+  var base = strip(p.title);
+  // Already matching, suffix aside: nothing to offer on either row.
+  if (strip(item.title) === base) return "";
+  return base + " (" + mine + ")";
+};
+window.__bramPairMatchTooltip = function (item) {
+  var t = window.__bramPairMatchTitle(item);
+  return t ? "Rename this session to '" + t + "'" : "";
+};
+window.__bramPairMatchName = function (item, toastApi) {
+  var t = window.__bramPairMatchTitle(item);
+  if (!t) return;
+  var url = "/__sessions/rename?provider=" + encodeURIComponent(item.provider || "") +
+    "&id=" + encodeURIComponent(item.id || "") + "&title=" + encodeURIComponent(t);
+  try { window.__bramIframeTrace("pair-offer", { op: "match-name", provider: item.provider || "" }); } catch (e) {}
+  window.fetch(url, { cache: "no-store" }).then(function (r) {
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    if (typeof toastApi === "function") toastApi("Renamed to '" + t + "'");
+  }).catch(function (e) {
+    if (toastApi && typeof toastApi.error === "function") {
+      toastApi.error("Could not rename: " + String((e && e.message) || e));
+    }
+  });
+};
+
+// provider-session-pair-offer: the Sessions tab's Unpair. The host records
+// the unpair and signals sessions-list-changed, which refetches the list.
+window.__bramUnpairSession = function (provider, id, toastApi) {
+  var url = "/__sessions/unpair?provider=" + encodeURIComponent(provider || "") +
+    "&id=" + encodeURIComponent(id || "");
+  window.fetch(url, { cache: "no-store" }).then(function (r) {
+    if (!r.ok) throw new Error("HTTP " + r.status);
+  }).catch(function (e) {
+    if (toastApi && typeof toastApi.error === "function") {
+      toastApi.error("Could not unpair: " + String((e && e.message) || e));
+    }
+  });
+};
+
+// provider-session-digest-for-codex ("catch the partner up"): after a switch
+// that resumed a partner (or Keep these together), the host wrote what the
+// partner missed to a digest file and emits `catch-up-offer`. The pane offers
+// one turn telling the now-running agent to read it. A button, not an
+// automatic turn: a turn on every switch costs tokens and arrives unasked.
+// Same shape as the pair-offer bridge above; dismiss is focus (sessionStorage).
+(function () {
+  var DISMISS_KEY = "bram.catchUpDismissedAt";
+  var subscribers = new Set();
+  var latest = null;
+  var lastValue = null;
+  var dismissedAt = 0;
+  var hooked = false;
+  try { dismissedAt = Number(window.sessionStorage.getItem(DISMISS_KEY)) || 0; } catch (e) {}
+  var name = function (p) { return p === "codex" ? "Codex" : "Claude"; };
+  var label = function (title, id) { return title ? "'" + title + "'" : String(id || "").slice(0, 8); };
+  var derive = function () {
+    var p = latest;
+    if (!p || !p.active || !p.path) return null;
+    if (Number(p.atMs) && Number(p.atMs) <= dismissedAt) return null;
+    var n = Number(p.turns) || 0;
+    var from = name(p.fromProvider) + " session " + label(p.fromTitle, p.fromSessionId);
+    return {
+      atMs: p.atMs,
+      toProvider: p.toProvider,
+      message: name(p.toProvider) + " doesn't know what happened in " + from + " since it last ran (" +
+        n + " turn" + (n === 1 ? "" : "s") + ").",
+      actionLabel: "Catch " + name(p.toProvider) + " up",
+      actionTooltip: "Sends " + name(p.toProvider) + " one message asking it to read " + p.path +
+        " and say what changed.",
+      // Written by the host (catch_up_turn_text), so a later digest can
+      // recognise this exchange and leave it out.
+      turn: p.turnText || "",
+    };
+  };
+  var notify = function (reason) {
+    var next = derive();
+    var was = !!lastValue;
+    lastValue = next;
+    if (was !== !!next) {
+      try {
+        window.__bramIframeTrace("catch-up-offer", { op: next ? "shown" : "cleared", reason: reason, to: next ? next.toProvider : "" });
+      } catch (e) {}
+    }
+    subscribers.forEach(function (fn) {
+      try { fn(); } catch (e) { console.error("[bram] catch-up subscriber threw:", e); }
+    });
+  };
+  var ensureHooked = function () {
+    if (hooked) return;
+    hooked = true;
+    window.bramSubscribeTauriEvent("catch-up-offer")(function (snapshot) {
+      latest = (snapshot && snapshot.payload) || null;
+      notify(latest && latest.active ? "offer" : "host-clear");
+    });
+  };
+  window.bramSubscribeCatchUpOffer = (function () {
+    var factory;
+    return function () {
+      if (factory) return factory;
+      ensureHooked();
+      factory = function (emit) {
+        var fire = function () { emit(lastValue); };
+        subscribers.add(fire);
+        fire();
+        return function () { subscribers.delete(fire); };
+      };
+      return factory;
+    };
+  })();
+  var dismiss = function (value, reason) {
+    if (!value) return;
+    dismissedAt = Number(value.atMs) || Date.now();
+    try { window.sessionStorage.setItem(DISMISS_KEY, String(dismissedAt)); } catch (e) {}
+    notify(reason);
+  };
+  window.__bramCatchUpDismiss = function (value) { dismiss(value, "dismiss-click"); };
+  window.__bramCatchUpSend = function (value) {
+    if (!value || !value.turn) return;
+    dismiss(value, "send-click");
+    window.toTurn(value.turn);
+  };
+})();
+
 window.__bramHandleAgentSwitcherChange = function (next, previous, select, toastApi) {
   var key = String(next || "").toLowerCase() === "codex" ? "codex" : (String(next || "").toLowerCase() === "claude" ? "claude" : "");
   var prev = String(previous || "").toLowerCase() === "codex" ? "codex" : "claude";
@@ -1005,7 +1395,7 @@ window.__bramReloadAgentSession = function (provider, sessionId) {
 // sessions-new-named-session: start a fresh session for the current provider,
 // optionally naming it. The host kills+relaunches the agent without --continue
 // and applies the name when the new session's JSONL surfaces.
-window.__bramCreateNewSession = function (provider, title) {
+window.__bramCreateNewSession = function (provider, title, pairWith) {
   var key = String(provider || "").toLowerCase() === "codex" ? "codex" : "claude";
   var invoke = getTauriInvoke();
   // dismiss-click-evidence-before-guard audit: __bramCreateNewSessionClick
@@ -1015,8 +1405,15 @@ window.__bramCreateNewSession = function (provider, title) {
   // bram-trace.log. Same anti-pattern as #343 (gitPush, __bramCloseIssue).
   window.__bramIframeTrace("new-session-client", { op: invoke ? "act" : "no-invoke", provider: key });
   if (!invoke) return Promise.reject(new Error("Tauri IPC unavailable"));
+  // provider-session-pair-offer: Create from the pair offer pairs the new
+  // session with the session it was offered for.
+  var args = { provider: key, title: String(title || "") };
+  if (pairWith && pairWith.provider && pairWith.id) {
+    args.pairWithProvider = String(pairWith.provider);
+    args.pairWithSession = String(pairWith.id);
+  }
   return window.__bramWithAgentCommandTimeout(
-    invoke("create_new_session", { provider: key, title: String(title || "") }),
+    invoke("create_new_session", args),
     "new session"
   );
 };
@@ -1033,6 +1430,13 @@ window.__bramNewSessionBrief = function (words, predecessor) {
     ? "the session I just left (" + String(predecessor.provider || "") + " " + predecessor.id +
       (predecessor.title ? ', "' + predecessor.title + '"' : "") + ")"
     : "the session I just left (see the Sessions list)";
+  // provider-session-digest-for-codex: a partner on the other provider may
+  // not be able to read that session directly (Codex can't reach /__turns),
+  // so name the digest Bram wrote; its header names the full transcript.
+  if (predecessor && predecessor.digest) {
+    prev += ", whose latest turns Bram wrote to `" + predecessor.digest +
+      "` (its header names the full transcript if you need more)";
+  }
   return [
     "You're starting a new session for this line of work, in my words:",
     "",
@@ -1045,8 +1449,20 @@ window.__bramNewSessionBrief = function (words, predecessor) {
 };
 window.__bramCreateNewSessionClick = function (provider, name, toastApi, words, predecessor) {
   var said = String(words || "").trim();
+  // provider-session-pair-offer: a dialog opened from the pair offer creates
+  // a session that goes with the offered one, and its brief points there.
+  var offer = window.__bramTakePairOfferForCreate(provider);
+  if (offer) {
+    predecessor = {
+      provider: offer.provider,
+      id: offer.id,
+      title: offer.title,
+      // provider-session-digest-for-codex: the host writes this before launch.
+      digest: "resources/session-digests/" + offer.provider + "-" + offer.id + ".md",
+    };
+  }
   if (typeof toastApi === "function") toastApi("Starting a new session…");
-  window.__bramCreateNewSession(provider, name).then(function () {
+  window.__bramCreateNewSession(provider, name, offer).then(function () {
     if (!said) return;
     var brief = window.__bramNewSessionBrief(said, predecessor);
     window.__bramIframeTrace("new-session-client", {
@@ -1062,6 +1478,69 @@ window.__bramCreateNewSessionClick = function (provider, name, toastApi, words, 
       toastApi.error("Could not create session: " + String((e && e.message) || e));
     }
   });
+  // sessions-switch-icon-and-land-on-transcript: creating a session is a switch too; land on the Transcript.
+  try { if (typeof window.__bramSetVisibleRange === "function") window.__bramSetVisibleRange(null); } catch (e) {}
+  try { if (typeof window.__bramGateGoTranscript === "function") window.__bramGateGoTranscript(); } catch (e) {}
+};
+// item-last-session-switch-there: the session the ticked items were last
+// worked on in (the host's computed `lastSession`, from the state-mirror
+// ledger), when it is one session they all share and it is not the current
+// one. With several items ticked, any item with no record, or a different
+// session, means no line: offering one item's session would move the others
+// away from where they were worked on. null means the gate line renders
+// nothing. "Current" comes from the live /__sessions/list (refetched on
+// sessions-list-changed), so a switch updates the line without refetching
+// the board; the host's isCurrent is the fallback until that list loads.
+window.__bramGateLastSession = function (items, sel, sessions) {
+  var ids = Array.isArray(sel) ? sel : [];
+  if (!ids.length) return null;
+  var byId = {};
+  (Array.isArray(items) ? items : []).forEach(function (it) { if (it && it.id) byId[it.id] = it; });
+  var shared = null;
+  for (var i = 0; i < ids.length; i++) {
+    var it = byId[ids[i]];
+    var ls = it && it.lastSession;
+    if (!ls || !ls.sessionId) return null;
+    if (shared && (ls.sessionId !== shared.sessionId || ls.provider !== shared.provider)) return null;
+    if (!shared || (ls.atMs || 0) > (shared.atMs || 0)) shared = ls;
+  }
+  var cur = Array.isArray(sessions) && sessions.length ? window.__bramCurrentSessionOf(sessions) : null;
+  if (cur ? shared.sessionId === cur.id : shared.isCurrent) return null;
+  return { id: ids.join(","), provider: shared.provider, sessionId: shared.sessionId, atMs: shared.atMs, title: shared.title };
+};
+var __bramGateLastSessionShown = {};
+window.__bramGateLastSessionLine = function (items, sel, sessions) {
+  var b = window.__bramGateLastSession(items, sel, sessions);
+  if (!b) return "";
+  var key = b.id + ":" + b.sessionId;
+  if (!__bramGateLastSessionShown[key]) {
+    __bramGateLastSessionShown[key] = true;
+    window.__bramIframeTrace("worklist-last-session", { op: "shown", id: b.id, session: b.sessionId, provider: b.provider });
+  }
+  // item-last-session-names-provider-and-session: name the agent when it's
+  // the other one ("by Codex"), and show the session's own name. Paired
+  // sessions carry a provider suffix ("General (Oct 5, 0.7.3) (Codex)");
+  // drop it here, where the line already names the provider, so the shared
+  // name reads the same from both sides.
+  var cur = Array.isArray(sessions) && sessions.length ? window.__bramCurrentSessionOf(sessions) : null;
+  var prov = String(b.provider || "").toLowerCase();
+  var provName = prov === "codex" ? "Codex" : prov === "claude" ? "Claude" : String(b.provider || "");
+  var otherAgent = !!(cur && cur.provider && String(cur.provider).toLowerCase() !== prov);
+  var title = String(b.title || "").replace(/\s*\((?:Codex|Claude)\)\s*$/i, "").trim();
+  if (otherAgent) {
+    return title
+      ? "Last worked on by " + provName + " in '" + title + "'."
+      : "Last worked on by " + provName + " in another session.";
+  }
+  return title
+    ? "Last worked on in another session: '" + title + "'."
+    : "Last worked on in another " + provName + " session.";
+};
+window.__bramGateSwitchToLastSession = function (items, sel, sessions, toastApi) {
+  var b = window.__bramGateLastSession(items, sel, sessions);
+  if (!b) return;
+  window.__bramIframeTrace("worklist-last-session", { op: "switch-click", id: b.id, session: b.sessionId, provider: b.provider });
+  window.__bramReloadAgentSessionClick(b.provider, b.sessionId, toastApi);
 };
 window.__bramReloadAgentSessionClick = function (provider, sessionId, toastApi) {
   var key = String(provider || "").toLowerCase() === "codex" ? "codex" : "claude";
@@ -1084,6 +1563,9 @@ window.__bramReloadAgentSessionClick = function (provider, sessionId, toastApi) 
   try {
     if (typeof toastApi === "function") toastApi("Reloading session - killing the running agent and resuming.");
   } catch (e) {}
+  // sessions-switch-icon-and-land-on-transcript: land on the Transcript after a switch starts.
+  try { if (typeof window.__bramSetVisibleRange === "function") window.__bramSetVisibleRange(null); } catch (e) {}
+  try { if (typeof window.__bramGateGoTranscript === "function") window.__bramGateGoTranscript(); } catch (e) {}
 };
 // Pick the live session from a /__sessions/list payload: the entry flagged
 // current, else the first returned. Shared by the Transcript header and the
@@ -1287,7 +1769,12 @@ window.__bramIframeTrace = function (subkind, fields) {
     var payload = { kind: "iframe-trace", subkind: subkind, at: new Date().toISOString() };
     if (fields && typeof fields === "object") {
       Object.keys(fields).forEach(function (key) {
-        payload[key] = window.__bramTraceSafeValue(fields[key], 0);
+        // `kind` and `subkind` are the envelope the host routes on; a field
+        // with either name used to overwrite it and send the line to stderr
+        // instead of the trace (agent-launch-failure-in-pane, 2026-10-04).
+        // Keep the caller's value under a prefixed name.
+        var safeKey = key === "kind" || key === "subkind" ? "field_" + key : key;
+        payload[safeKey] = window.__bramTraceSafeValue(fields[key], 0);
       });
     }
     window.logToHost(payload);
@@ -1886,8 +2373,9 @@ window.__bramComposerTargetsSelection = function () {
 // that turns into a status message conflates teaching with reporting — the
 // combined footer context line (__bramFooterContextLine) carries in-flight
 // status now, and the placeholder always tells you what Enter will do.
-window.__bramComposerPlaceholder = function (pathname, sel) {
-  var selection = sel || window.__bramW2Selection || [];
+window.__bramComposerPlaceholder = function (pathname, sel, toChat) {
+  // composer-addressee-line: switched to chat, the box is a chat box.
+  var selection = toChat ? [] : (sel || window.__bramW2Selection || []);
   var route = String(
     pathname != null ? pathname : (function () { try { return location.hash; } catch (e) { return ""; } })()
   );
@@ -1905,9 +2393,9 @@ window.__bramComposerPlaceholder = function (pathname, sel) {
     // verb now, and the gate buttons are pure lifecycle — each sends this
     // message along WITH its action. The wording teaches that split.
     if (onWorklist) {
-      return "Feedback about selection: Enter sends it; the buttons above send it with their action. Shift+Enter newline, Ctrl-V/Cmd-V paste screenshot. Chat to talk with the agent about anything.";
+      return "Feedback about selection: Enter sends it; the buttons above send it with their action. Shift+Enter newline, Ctrl-V/Cmd-V paste screenshot.";
     }
-    return "Feedback about selection: Enter sends, Shift+Enter newline, Ctrl-V/Cmd-V paste screenshot. Chat to talk with the agent about anything.";
+    return "Feedback about selection: Enter sends, Shift+Enter newline, Ctrl-V/Cmd-V paste screenshot.";
   }
   return "Chat with agent: Enter sends, Shift+Enter newline, Ctrl-V/Cmd-V paste screenshot.";
 };
@@ -1944,11 +2432,40 @@ window.__bramSubmitFeedbackForSelection = function (box) {
 // Enter routes by selection (spec cases 1 / 2A / 2B): a live selection makes
 // Enter send feedback about it; idle, Enter chats. The Chat button bypasses
 // this router and always chats — the per-message escape the placeholder names.
-window.__bramComposerEnterSubmit = function (box) {
-  if ((window.__bramW2Selection || []).length > 0) {
+// composer-addressee-line: Enter follows the addressee line above the box.
+// With items ticked it sends feedback to them unless the line has been
+// switched to chat for this message (`toChat`, component state that resets
+// when the selection changes). Two misroutes on 2026-10-06 — a chat message
+// sent with an item ticked, the sender unsure where it went — are why the
+// destination is shown before sending instead of inferred silently.
+window.__bramComposerEnterSubmit = function (box, toChat) {
+  var sel = window.__bramW2Selection || [];
+  var feedback = sel.length > 0 && !toChat;
+  try {
+    var text = box && typeof box.value === "string" ? box.value : "";
+    if (String(text).trim()) {
+      window.__bramIframeTrace("composer-send", { to: feedback ? "feedback" : "chat", override: !!(toChat && sel.length > 0), selected: sel.length });
+    }
+  } catch (e) {}
+  if (feedback) {
     return window.__bramSubmitFeedbackForSelection(box);
   }
   return window.__bramSubmitMessageAgentComposer(box, "");
+};
+// The addressee line's text. `provider` is the active agent ("claude" |
+// "codex"); `toChat` the per-message override.
+window.__bramComposerAddressee = function (sel, toChat, provider) {
+  var ids = Array.isArray(sel) ? sel : [];
+  var p = String(provider || "").toLowerCase();
+  var agent = p === "codex" ? "Codex" : "Claude";
+  if (!ids.length || toChat) return "To: " + agent + " (chat)";
+  return "To: " + (ids.length === 1 ? ids[0] : ids.length + " items") + " (feedback)";
+};
+window.__bramComposerAddresseeTooltip = function (sel, toChat) {
+  var ids = Array.isArray(sel) ? sel : [];
+  if (!ids.length) return "Enter sends this to the agent as chat. Tick Worklist items to send feedback on them instead.";
+  if (toChat) return "Enter sends this one message as chat. The ticked items stay ticked; changing the selection switches back to feedback.";
+  return "Enter files this as feedback on: " + ids.join(", ");
 };
 
 // The Footer composer is now the Worklist's message box too, so the gate
@@ -2174,18 +2691,52 @@ function __bramPlanSteps(board) {
   var plan = board && board.plan;
   return (plan && Array.isArray(plan.steps)) ? plan.steps : [];
 }
+// issue-420: once per plan, so a plan the host served but nobody saw can be
+// told apart from one the host withheld (op=plan-withheld, host side).
+var __bramPlanShown = {};
 window.__bramPlanLine = function (board) {
-  var parts = __bramPlanSteps(board).map(function (s) {
+  var steps = __bramPlanSteps(board);
+  var parts = steps.map(function (s) {
+    var ids = (s.ids || []).join(", ");
+    if (s.verb === "feedback") return "Send feedback to " + ids;
     var verb = s.verb === "drop" ? "Drop" : s.verb === "commit" ? "Commit" : String(s.verb || "");
-    return verb + " " + (s.ids || []).join(", ");
+    return verb + " " + ids;
   });
+  if (parts.length) {
+    var key = String((board.plan && board.plan.postedAtMs) || "");
+    if (!__bramPlanShown[key]) {
+      __bramPlanShown[key] = true;
+      var ids = steps.reduce(function (n, s) { return n + (s.ids || []).length; }, 0);
+      window.__bramIframeTrace("plan-line", { op: "shown", steps: steps.length, ids: ids, version: board.plan.version });
+    }
+  }
   return parts.length ? "Recommended: " + parts.join(" · ") : "";
 };
+// plan-recommends-feedback-in-one-click: a feedback step's full text goes in
+// the tooltip, so the user reads exactly what one click will send.
+// plan-feedback-shown-in-row-not-tooltip: the closing lines help the user
+// decide, and are not part of the message, so they sit under a rule in
+// italics, one short line per sentence. XMLUI's Tooltip has no width limit, so a long
+// paragraph would run off the edge instead of wrapping (8045e8f).
 window.__bramPlanTooltip = function (board) {
   var plan = board && board.plan;
   var summary = String((plan && plan.summary) || "").trim();
-  var how = "Drops happen at once, like the Drop button. Commits go to the agent, like the Commit button.";
-  return summary ? summary + "\n\n" + how : how;
+  var steps = __bramPlanSteps(board);
+  var feedback = steps
+    .filter(function (s) { return s.verb === "feedback"; })
+    .map(function (s) {
+      return "**Feedback to " + (s.ids || []).join(", ") + ":**\n\n> " + String(s.text || "").split("\n").join("\n> ");
+    });
+  // What helps decide (Jon, 2026-10-04): it's all or nothing, and the
+  // feedback goes as written. Not the mechanics of each step.
+  var decide = ["*One click does all of it.*", "*Skip it if you disagree with any step" +
+    (feedback.length ? " or would word the feedback differently" : "") + "; × dismisses it.*"];
+  var parts = [];
+  if (summary) parts.push(summary);
+  parts = parts.concat(feedback);
+  parts.push("---");
+  parts.push(decide.join("  \n"));
+  return parts.join("\n\n");
 };
 // Runs the plan through the gate buttons' own paths, for exactly the named
 // ids: feedback-less drops host-direct (POST /__worklist/drop, as Drop does),
@@ -2200,19 +2751,27 @@ window.__bramDoRecommended = function (board, claim) {
   var steps = __bramPlanSteps(board);
   var dropIds = [];
   var commitIds = [];
+  var feedbackSteps = [];
   steps.forEach(function (s) {
     var ids = s.ids || [];
     if (s.verb === "drop") dropIds = dropIds.concat(ids);
     else if (s.verb === "commit") commitIds = commitIds.concat(ids);
+    else if (s.verb === "feedback" && ids.length && s.text) feedbackSteps.push(s);
   });
   window.__bramIframeTrace("click", {
     target: "gatebar-do-recommended",
     drop: dropIds.length,
     commit: commitIds.length,
+    feedback: feedbackSteps.length,
   });
   var items = (board && board.items) || [];
+  // After any drops, like commits. The host refuses a plan that mixes
+  // feedback with commit, so at most one of the two runs.
   var commit = function () {
     if (commitIds.length) window.__bramGateAct("commit", items, commitIds, "together", claim);
+    feedbackSteps.forEach(function (s) {
+      window.__bramWorklist2BatchIterate(s.ids, String(s.text));
+    });
   };
   window.__bramDismissPlan();
   if (!dropIds.length) {
@@ -2570,32 +3129,19 @@ window.__bramSaveSplitterSize = function (key, sizes) {
 // Body strings for the Settings tab info dialogs. Lifted out of
 // Settings.xmlui to keep the markup readable; the dialog itself
 // stays inline in Settings since it's a single consumer.
+// settings-info-says-storage-and-default: each setting's subsection ends with
+// its kind (project .bram.json, or per-user on this machine) and its default.
+// The project defaults are pinned by settings_default_view_tests in lib.rs;
+// change a default there and here together.
 window.settingsInfoBodies = {
   shell:
-    "## Agent\n\n" +
-    "The default agent used by agent-scoped launch choices and as the fallback when no valid last-active Bram session exists.\n\n" +
-    "## On Bram launch\n\n" +
-    "**Resume selected agent's most recent session** uses the Agent selection above.\n\n" +
-    "**Resume most-recently-active agent's session** reopens the exact Claude or Codex session Bram was actually using before shutdown.\n\n" +
-    "**Start a new session** starts the selected Agent fresh.\n\n" +
-    "## Advanced\n\n" +
-    "Launch arguments are extra CLI flags. First command is sent to the agent's TUI after startup. Both apply whichever startup choice is used.",
+    "## Agent\n\nThe default agent used by agent-scoped launch choices and as the fallback when no valid last-active Bram session exists.\n\n*Project setting, saved in `.bram.json` as `shell.agent` and shared with everyone who works in this repo. Default: Claude.*\n\n## On Bram launch\n\n**Resume selected agent's most recent session** uses the Agent selection above.\n\n**Resume most-recently-active agent's session** reopens the exact Claude or Codex session Bram was actually using before shutdown.\n\n**Start a new session** starts the selected Agent fresh.\n\n*Project setting, saved in `.bram.json` as `shell.startupPolicy` and shared with everyone who works in this repo. Default: Resume selected agent's most recent session.*\n\n## Launch arguments\n\nExtra CLI flags for the agent. They apply whichever startup choice is used.\n\n*Project setting, saved in `.bram.json` as `shell.args` and shared with everyone who works in this repo. Default: empty.*\n\n## First command\n\nSent to the agent's TUI after startup, whichever startup choice is used.\n\n*Project setting, saved in `.bram.json` as `shell.firstCommand` and shared with everyone who works in this repo. Default: empty.*",
+  sessions:
+    "The agent can offer to continue a new line of work in a fresh session. It always asks first, in one line, and at most once per topic; saying no keeps the work here.\n\n## When the agent is about to propose a new worklist item\n\n*Project setting, saved in `.bram.json` as `sessions.suggestOnNewItem` and shared with everyone who works in this repo. Default: on.*\n\n## When the agent is about to file a new issue\n\n*Project setting, saved in `.bram.json` as `sessions.suggestOnNewIssue` and shared with everyone who works in this repo. Default: on.*\n\n## When the conversation shifts to a significantly different topic\n\nThe agent judges when a topic has shifted, so this one asks more often than the other two.\n\n*Project setting, saved in `.bram.json` as `sessions.suggestOnTopicShift` and shared with everyone who works in this repo. Default: off.*\n\n## Pair new sessions across providers\n\nWhen you switch between Claude and Codex and the session you're leaving has no partner on the other side, the other agent resumes its most recent session and Bram asks what you want: **Keep these together** pairs the two, so switching back and forth moves between them; **Start a new … session** starts one for the session you left. Bram never pairs sessions on its own. Turning this off stops the question; pairs you already made keep working, and **Unpair** on the Sessions tab ends one.\n\n*Project setting, saved in `.bram.json` as `sessions.pairAcrossProviders` and shared with everyone who works in this repo. Default: on.*",
   batchCommitActions:
-    "## Mirror Worklist lifecycle to GitHub issues\n\n" +
-    "Post Worklist lifecycle comments to linked GitHub issues.",
+    "## Mirror Worklist lifecycle to GitHub issues\n\nPost Worklist lifecycle comments to linked GitHub issues.\n\n*Project setting, saved in `.bram.json` as `mirrorWorklistLifecycleToIssue` and shared with everyone who works in this repo. Default: off.*",
   ui:
-    "## Show target app\n\n" +
-    "Show the embedded target-app preview pane. Usually off.\n\n" +
-    "## Agent-pane hot-reload\n\n" +
-    "Auto-reload the agent pane as you edit Bram's own source. For developing Bram.\n\n" +
-    "## Show tips in the footer\n\n" +
-    "Show rotating tips in the footer.\n\n" +
-    "## Soft beep on menus and turn completion\n\n" +
-    "Play a soft beep when a permission menu appears or a turn finishes.\n\n" +
-    "## Dismissed tips return after\n\n" +
-    "How long a dismissed tip stays hidden before showing again.\n\n" +
-    "## Search badges start all on\n\n" +
-    "Whether the Search tab opens with all facet badges selected, or none.",
+    "## Show target app\n\nShow the embedded target-app preview pane. Usually off.\n\n*Project setting, saved in `.bram.json` as `ui.showTargetApp` and shared with everyone who works in this repo. Default: off.*\n\n## Terminal open at startup\n\nOpen the terminal pane when Bram launches. The agent pane's Worklist and Transcript are the main surface; the toolbar's terminal button still opens and closes it for the current session.\n\n*Your setting, saved on this machine for every Bram window, not in the repo. Default: off.*\n\n## Agent-pane hot-reload\n\nAuto-reload the agent pane as you edit Bram's own source. For developing Bram.\n\n*Project setting, saved in `.bram.json` as `ui.toolsPaneHotReload` and shared with everyone who works in this repo. Default: off.*\n\n## Show tips in the footer\n\nShow rotating tips in the footer.\n\n*Your setting, saved on this machine for every Bram window, not in the repo. Default: on.*\n\n## Soft beep on menus and turn completion\n\nPlay a soft beep when a permission menu appears or a turn finishes.\n\n*Your setting, saved on this machine for every Bram window, not in the repo. Default: on.*\n\n## Dismissed tips return after\n\nHow long a dismissed tip stays hidden before showing again.\n\n*Your setting, saved on this machine for every Bram window, not in the repo. Default: 1 week.*\n\n## Search badges start all on\n\nWhether the Search tab opens with all facet badges selected, or none.\n\n*Your setting, saved on this machine for every Bram window, not in the repo. Default: on.*",
   ai:
     "## Tool Descriptions\n\n" +
     "The one-line intent header on Transcript tool rows.\n\n" +
@@ -2611,26 +3157,11 @@ window.settingsInfoBodies = {
     "Credentials are redacted heuristically, not guaranteed. If Claude Code " +
     "also accepts the key, run `/config` → turn off \"Use custom API key\" " +
     "to keep it Bram-only.\n\n" +
-    "Stored in `.bram.json` as `ai.describeCommands`.",
+    "*Project setting, saved in `.bram.json` as `ai.describeCommands` and shared with everyone who works in this repo. Default: off.*",
   search:
-    "## Commit depth\n\n" +
-    "How many of the newest commits the search index covers, messages and " +
-    "diffs (100–20,000, default 2,000); deeper indexing lengthens the next " +
-    "cold rebuild proportionally.\n\n" +
-    "## Issue limit\n\n" +
-    "How many forge issues the Issues tab and search index fetch " +
-    "(50–2,000, default 500).",
+    "## Commit depth\n\nHow many of the newest commits the search index covers, messages and diffs (100\u201320,000); deeper indexing lengthens the next cold rebuild proportionally.\n\n*Project setting, saved in `.bram.json` as `search.commitDepth` and shared with everyone who works in this repo. Default: 2,000.*\n\n## Issue limit\n\nHow many forge issues the Issues tab and search index fetch (50\u20132,000).\n\n*Project setting, saved in `.bram.json` as `search.issueLimit` and shared with everyone who works in this repo. Default: 500.*",
   traces:
-    "## Tracing enabled\n\n" +
-    "Master switch for writes to `bram-trace.log`. **On by default** — " +
-    "switch it off here to silence traces for this project. `BRAM_TRACE` " +
-    "in the environment overrides either way.\n\n" +
-    "## Inspector trace tap\n\n" +
-    "Forward XMLUI Inspector events into the trace log. Requires Tracing " +
-    "enabled.\n\n" +
-    "## Keep raw traces for (days)\n\n" +
-    "Raw archives older than this are sanitized and gzipped at startup " +
-    "(1–3650, default 14). Compressed history is kept indefinitely.",
+    "## Tracing enabled\n\nMaster switch for writes to `bram-trace.log`. Switch it off here to silence traces for this project. `BRAM_TRACE` in the environment overrides either way.\n\n*Project setting, saved in `.bram.json` as `traces.enabled` and shared with everyone who works in this repo. Default: on.*\n\n## Inspector trace tap\n\nForward XMLUI Inspector events into the trace log. Requires Tracing enabled.\n\n*Project setting, saved in `.bram.json` as `traces.inspectorTap` and shared with everyone who works in this repo. Default: off.*\n\n## Keep raw traces for (days)\n\nRaw archives older than this are sanitized and gzipped at startup (1\u20133650). Compressed history is kept indefinitely.\n\n*Project setting, saved in `.bram.json` as `traces.archiveAfterDays` and shared with everyone who works in this repo. Default: 14.*",
 };
 
 // Settings.xmlui owns its explicit-save drafts with scoped Forms. This is the
@@ -3067,8 +3598,109 @@ window.__bramInflightBlocker = function (claim) {
 // Un-begun sharers are ignored on the same reasoning __bramWorklistOverlapGroups
 // uses: an item that has never been approved has not run, so it cannot have
 // contributed.
+//
+// issue-273-pane-reads-membership: when the board carries the host's
+// line-level membership partition (`membership`, served beside the items
+// since membership-crosses-the-wire; each changed line credited to the claim
+// window that wrote it, 93830b1), ownership comes from THAT instead of from
+// declared-path exclusivity. A path counts for the item only where the item
+// owns lines, and only those lines are counted; a declared path the item
+// wrote nothing on contributes nothing — #273's opening report, where a
+// chat/skip-worklist/hand edit read as the item's work and offered Commit.
+// Display only: the gate, staging and refusals still decide by the replay
+// (#273 step 4a), and the tooltip's "Commits +X" still quotes the host's
+// willCommit, i.e. what the gate will actually take.
+window.__bramBoardMembership = function () {
+  var p = __bramWlAccepted;
+  if (!p || !p.membership || !p.membership.byPath) return null;
+  return { byPath: p.membership.byPath, stale: !!p.membershipStale };
+};
+var __bramPaneAttributionLast = "";
 window.__bramItemChangedSplit = function (item, items, claim, coSelected) {
-  var out = { exclusive: [], shared: [], sharedDeclared: [], added: 0, removed: 0, sharedAdded: 0, sharedRemoved: 0 };
+  var m = window.__bramBoardMembership();
+  var traceKey = (m ? "membership" : "fallback") + "|" + (m && m.stale ? "1" : "0") + "|" + (__bramWlSeen === null ? "" : __bramWlSeen);
+  if (traceKey !== __bramPaneAttributionLast) {
+    __bramPaneAttributionLast = traceKey;
+    window.__bramIframeTrace("pane-attribution", { source: m ? "membership" : "fallback", stale: !!(m && m.stale), version: __bramWlSeen });
+  }
+  if (m) return window.__bramItemChangedSplitMembership(item, items, claim, coSelected, m);
+  return window.__bramItemChangedSplitDeclared(item, items, claim, coSelected);
+};
+// Ownership from membership. Same output shape as the declared split, so
+// every caller (strip, tooltip, committable predicate, gate notes) follows.
+window.__bramItemChangedSplitMembership = function (item, items, claim, coSelected, m) {
+  var out = { exclusive: [], shared: [], sharedDeclared: [], added: 0, removed: 0, sharedAdded: 0, sharedRemoved: 0, unowned: [] };
+  var id = item && item.id;
+  var files = (item && item.changedFiles) || [];
+  var byId = {};
+  var list = items || [];
+  for (var i = 0; i < list.length; i++) byId[list[i].id] = list[i];
+  var co = coSelected || [];
+  var outsideBegun = function (other) {
+    if (other === id || co.indexOf(other) !== -1) return false;
+    var o = byId[other];
+    return !!(o && window.__bramWorklist2Begun(o, claim));
+  };
+  for (var j = 0; j < files.length; j++) {
+    var f = files[j];
+    if (!f) continue;
+    // Declared-shared stays a fact about DECLARATIONS (the stage tooltip's
+    // "what this item shares"), independent of who wrote what.
+    var sharers = f.sharedWith || [];
+    for (var k = 0; k < sharers.length; k++) {
+      if (outsideBegun(sharers[k])) { out.sharedDeclared.push(f.path); break; }
+    }
+    if ((f.added || 0) <= 0 && (f.removed || 0) <= 0) continue;
+    var bp = m.byPath[f.path];
+    if (!bp) {
+      // Fresh partition and no entry: nothing on this path is anyone's
+      // change by the partition's diff, so nothing to credit. A STALE
+      // partition may simply predate this change — display may lag, so fall
+      // back to the declared reading for this one path rather than hide work.
+      if (m.stale) {
+        var one = window.__bramItemChangedSplitDeclared(Object.assign({}, item, { changedFiles: [f] }), items, claim, coSelected);
+        out.exclusive = out.exclusive.concat(one.exclusive);
+        out.shared = out.shared.concat(one.shared);
+        out.added += one.added; out.removed += one.removed;
+        out.sharedAdded += one.sharedAdded; out.sharedRemoved += one.sharedRemoved;
+      }
+      continue;
+    }
+    var mineA = 0, mineR = 0;
+    var entries = bp.perItem || [];
+    for (var e = 0; e < entries.length; e++) {
+      var members = entries[e].members || [];
+      if (members.indexOf(id) === -1) continue;
+      var c = entries[e].counts || {};
+      mineA += Number(c.added) || 0;
+      mineR += Number(c.removed) || 0;
+    }
+    if (mineA + mineR === 0) continue; // declared, but none of these lines are its
+    var owners = bp.owners || [];
+    var entangled = false;
+    for (var o = 0; o < owners.length; o++) {
+      if (outsideBegun(owners[o])) { entangled = true; break; }
+    }
+    if (entangled) {
+      out.shared.push(f.path);
+      out.sharedAdded += mineA;
+      out.sharedRemoved += mineR;
+    } else {
+      out.exclusive.push(f.path);
+      out.added += mineA;
+      out.removed += mineR;
+    }
+    var un = bp.unowned || {};
+    if ((Number(un.added) || 0) + (Number(un.removed) || 0) > 0) {
+      out.unowned.push({ path: f.path, added: Number(un.added) || 0, removed: Number(un.removed) || 0 });
+    }
+  }
+  return out;
+};
+// The declared-path exclusivity reading: the fallback when the board has no
+// membership partition, and the per-path fallback on a stale one.
+window.__bramItemChangedSplitDeclared = function (item, items, claim, coSelected) {
+  var out = { exclusive: [], shared: [], sharedDeclared: [], added: 0, removed: 0, sharedAdded: 0, sharedRemoved: 0, unowned: [] };
   var files = (item && item.changedFiles) || [];
   var byId = {};
   var list = items || [];
@@ -3154,6 +3786,19 @@ window.__bramWorklist2StripTooltip = function (item, claim, items, attributionTo
       );
     }
     lines.push("Files: " + changed + " of " + (cs.total || 0) + " planned");
+    // issue-273-pane-reads-membership: the strip counts only this item's
+    // lines, but a whole-file commit (every unentangled path, until #273's
+    // step 4a) still takes the lines no item wrote. Say so, by path, rather
+    // than let them pass as the item's work.
+    var takenUnowned = (split.unowned || []).filter(function (u) {
+      return split.exclusive.indexOf(u.path) !== -1;
+    });
+    if (takenUnowned.length) {
+      lines.push(
+        "Also takes lines no item wrote (chat-turn or hand edits): " +
+          takenUnowned.map(function (u) { return u.path + " +" + u.added + " −" + u.removed; }).join(", "),
+      );
+    }
     if (split.shared.length) {
       lines.push(
         "Shares " + split.shared.length + " file" +
@@ -4893,8 +5538,14 @@ window.__bramStartConsequence = function (items, sel, claim) {
     var itb = byId[begun[b]];
     if ((itb.status || "proposed") === "applied") continue;
     var split = window.__bramItemChangedSplit(itb, list, claim);
+    // issue-273-pane-reads-membership: with the membership partition on the
+    // board, "has changes" means changes of ITS OWN — the same test the
+    // Commit button uses. changeSummary counts any change on a declared
+    // path, so an item that wrote nothing read as committable here while the
+    // button stayed dark ("Commit makes one commit…" beside a lone Drop).
+    var ownOnly = !!window.__bramBoardMembership();
     var hasAnyChange =
-      (itb.changeSummary && itb.changeSummary.changed > 0) ||
+      (!ownOnly && itb.changeSummary && itb.changeSummary.changed > 0) ||
       split.exclusive.length > 0 ||
       split.shared.length > 0;
     if (!hasAnyChange) empty.push(itb.id);
@@ -4903,7 +5554,9 @@ window.__bramStartConsequence = function (items, sel, claim) {
     return (
       window.__bramNameList(empty) +
       (empty.length === 1 ? " has" : " have") +
-      " no changes yet — nothing to commit."
+      (window.__bramBoardMembership()
+        ? " no changes of " + (empty.length === 1 ? "its" : "their") + " own — nothing to commit."
+        : " no changes yet — nothing to commit.")
     );
   }
 
@@ -4931,13 +5584,10 @@ window.__bramStartConsequence = function (items, sel, claim) {
     return false;
   });
   if (!changedShared.length) return oneCommit;
-  var whatChanged = changedShared.length === 1
-    ? changedShared[0]
-    : changedShared.length + " files";
-  return (
-    "These share " + whatChanged + ", which has uncommitted changes. " +
-    "Commit them together."
-  );
+  // issue-273-pane-reads-membership: no file names here (Jon, 2026-10-06):
+  // naming one file misled when the set shared several, and which files are
+  // shared is the overlaps view's job.
+  return "These share files with uncommitted changes. Commit them together.";
 };
 
 // issue-275-a1: the Transcript's unmount cleanup as ONE synchronous call.
@@ -8395,6 +9045,15 @@ window.__bramMakeTerminalVisibilityBridge = function (spec) {
   window.__bramOpenTerminalForAttention = function () {
     window.parent.postMessage({ type: "bram-open-terminal" }, "*");
   };
+
+  // terminal-attention-slash-panel (#423): the banner's words follow the
+  // host's classified shape. The hooks prompt keeps the original line.
+  window.__bramTerminalAttentionText = function (value) {
+    if (value && value.shape === "slash-panel") {
+      return "Claude has a panel open in the terminal. Press Esc there to close it.";
+    }
+    return "The terminal is waiting at a prompt Bram can't answer.";
+  };
 })();
 
 // Host compaction + parent terminal-visibility join
@@ -8694,51 +9353,34 @@ window.bramSubscribeVoicePartial = (function () {
   };
 })();
 // The live text goes INTO the editor (Jon: "why not put the text into the
-// message box instead of below it"). The box's text from before the
-// dictation is kept per target; each partial rewrites the box as that text
-// plus the live transcript. When the transcript is delivered, the editor
-// calls __bramVoiceFinalizeInto, which sets pre-dictation text + final
-// transcript in one step, so the final text lands exactly once. A textarea can't gray out part of its text, so
-// provisional words look like the rest until they're replaced.
+// message box instead of below it"). The field logic — the box's text from
+// before the dictation, partials written over it, edit adoption ("your
+// edits win") and the one final write — is BramDictation.createField in
+// __shell/dictation.js (judell/bram#417; tools/index.html loads it before
+// this file). This file keeps one record per voice target: that field,
+// plus what is the pane's own (the box, its scroll-following, and the
+// voice-edit-boundary message to main.js). Only a send stops the mic
+// (__bramVoiceStopOnSend).
 window.__bramVoiceLiveBase = {};
-// Your edits win. Each window main.js transcribes has a number (seq); the
-// partial carries the committed parts with their numbers and the number of
-// the window still open. If the box no longer holds what dictation last
-// wrote, you edited it: your text becomes the new base, and only windows
-// you hadn't seen yet are added after it — erased text stays erased
-// (Jon: "I had to erase it … and it came back"). Clearing the box is an
-// edit like any other; dictation carries on into the empty box. Only a
-// send stops the mic (__bramVoiceStopOnSend).
-function __bramVoiceLiveText(rec, parts, provisional, openSeq) {
-  var words = [];
-  (parts || []).forEach(function (p) {
-    if (p && p.seq >= rec.fromSeq && p.text) words.push(p.text);
+function __bramVoiceNewRec(requestId, target) {
+  var rec = { requestId: requestId, box: null };
+  rec.field = window.BramDictation.createField({
+    get: function () { return rec.box ? rec.box.value : ""; },
+    set: function (text) { rec.box.setValue(text); },
+    trace: function (stage, info) {
+      try { window.__bramIframeTrace && window.__bramIframeTrace("voice-trace", Object.assign({ stage: stage, target: target }, info)); } catch (e) {}
+    },
+    // Tell main.js where the edit is, so a pause repair never folds later
+    // windows into a part the field no longer reads.
+    onEditBoundary: function (fromSeq) {
+      window.parent.postMessage(
+        { type: "right-pane", kind: "voice-edit-boundary", requestId: requestId, fromSeq: fromSeq },
+        "*",
+      );
+    },
   });
-  if (provisional && openSeq >= rec.fromSeq) words.push(provisional);
-  return words.join(" ");
-}
-function __bramVoiceJoin(base, text) {
-  var spacer = base && text && !/\s$/.test(base) ? " " : "";
-  return base + spacer + text;
-}
-// Adopt the box's current text as the base when it differs from what
-// dictation last wrote. Returns true when an edit was adopted.
-function __bramVoiceAdoptEdit(rec, box, target) {
-  if (rec.written === undefined) return false;
-  var cur = String(box.value || "");
-  // box.value can lag a setValue (the 311→597 duplication), so the value
-  // written just before the last one isn't an edit either.
-  // An empty box is never a lag, though: it's a send or a clear.
-  if (cur === rec.written || (cur.trim() && cur === rec.prevWritten)) return false;
-  rec.edited = true;
-  // The window that showed as provisional text is part of what you edited;
-  // skip it too, or its final text would bring the erased words back.
-  rec.fromSeq = rec.wHadProv ? rec.wOpenSeq + 1 : rec.wOpenSeq;
-  rec.base = cur;
-  rec.written = cur;
-  rec.prevWritten = undefined;
-  try { window.__bramIframeTrace && window.__bramIframeTrace("voice-trace", { stage: "live-edit-adopted", target: target, baseLen: cur.length, fromSeq: rec.fromSeq }); } catch (e) {}
-  return true;
+  window.__bramVoiceLiveBase[target] = rec;
+  return rec;
 }
 // Sending while this box records stops the mic (the message box's send,
 // IsolatedDraftEditor.clear() — which every other 🎤 box's submit and
@@ -8795,10 +9437,9 @@ window.__bramVoiceStopOnSend = function (target) {
   if (!window._voiceSession || window._voiceSessionTarget !== target) return;
   var rec = window.__bramVoiceLiveBase[target];
   if (!rec || rec.requestId !== window._voiceSession) {
-    rec = { requestId: window._voiceSession, base: "", fromSeq: 0, edited: false };
-    window.__bramVoiceLiveBase[target] = rec;
+    rec = __bramVoiceNewRec(window._voiceSession, target);
   }
-  rec.stopped = true;
+  rec.field.markStopped();
   try { window.__bramIframeTrace && window.__bramIframeTrace("voice-trace", { stage: "live-send-stop", target: target }); } catch (e) {}
   window.voiceStop(function (t, meta) {
     window.__bramSetLatestVoiceState(t, Object.assign({}, meta || {}, { target: target }));
@@ -8844,18 +9485,9 @@ window.__bramVoiceShowLive = function (box, partial, target) {
   var cur = window.__bramVoicePartial;
   if (!cur || cur.requestId !== partial.requestId || cur.at !== partial.at) return;
   var rec = window.__bramVoiceLiveBase[target];
-  var first = !rec || rec.requestId !== partial.requestId;
-  if (first) {
-    rec = { requestId: partial.requestId, base: String(box.value || ""), fromSeq: 0, edited: false, stopped: false };
-    window.__bramVoiceLiveBase[target] = rec;
-  }
-  if (rec.stopped) return;
-  __bramVoiceAdoptEdit(rec, box, target);
-  var next = __bramVoiceJoin(rec.base, __bramVoiceLiveText(rec, partial.parts, partial.provisional, partial.openSeq));
-  rec.prevWritten = rec.written;
-  rec.written = next;
-  rec.wOpenSeq = partial.openSeq;
-  rec.wHadProv = !!partial.provisional;
+  if (!rec || rec.requestId !== partial.requestId) rec = __bramVoiceNewRec(partial.requestId, target);
+  if (rec.field.stopped) return;
+  rec.box = box;
   // Keep the newest words in view when the text outgrows the box (Jon:
   // "we don't scroll to the bottom … my words are not visible"), unless you
   // scrolled up to read. Following is tracked from the element's own scroll
@@ -8867,13 +9499,14 @@ window.__bramVoiceShowLive = function (box, partial, target) {
   if (!rec.el && document.activeElement && document.activeElement.tagName === "TEXTAREA") {
     __bramVoiceTrackScroll(rec, document.activeElement);
   }
-  try { box.setValue(next); } catch (e) {}
+  var shown = rec.field.showLive(partial);
+  if (!shown) return;
   __bramVoiceFollow(rec);
   // Dictating into a box means you're in it: on the first words, focus it
   // with the caret at the end so Enter sends without a click first (Jon:
   // "I can't press enter until I click into the message box"). Only the
   // first time, so a caret you place to edit mid-dictation isn't moved.
-  if (first) {
+  if (shown.first) {
     try {
       if (typeof box.focus === "function") box.focus();
     } catch (e) {}
@@ -8902,26 +9535,15 @@ window.__bramVoiceFinalizeInto = function (box, target, transcript) {
   delete window.__bramVoiceLastParts[target];
   if (!rec) return window.__bramAppendVoiceToBox(box, transcript);
   if (!box) return false;
-  if (rec.stopped) {
-    try { window.__bramIframeTrace && window.__bramIframeTrace("voice-trace", { stage: "finalize-into-stopped", target: target }); } catch (e) {}
-    return false;
-  }
-  __bramVoiceAdoptEdit(rec, box, target);
-  var base = rec.base;
-  var text = transcript;
-  if (rec.edited) {
-    var parts = last && last.requestId === rec.requestId ? last.parts : [];
-    text = __bramVoiceLiveText(rec, parts, "", 0);
-  }
-  var cleaned = String(text || "").replace(/\r?\n/g, " ").replace(/[ \t]+/g, " ").trim();
-  var next = __bramVoiceJoin(base, cleaned);
-  try { box.setValue(next); } catch (e) { return false; }
+  rec.box = box;
+  var parts = last && last.requestId === rec.requestId ? last.parts : [];
+  var done = rec.field.finalize(transcript, parts);
+  if (!done) return false;
   try {
     if (typeof box.focus === "function") box.focus();
-    if (typeof box.setSelectionRange === "function") box.setSelectionRange(next.length, next.length);
+    if (typeof box.setSelectionRange === "function") box.setSelectionRange(done.next.length, done.next.length);
   } catch (e) {}
-  try { window.__bramIframeTrace && window.__bramIframeTrace("voice-trace", { stage: "finalize-into", baseLen: base.length, transcriptLen: cleaned.length, nextLen: next.length, edited: rec.edited }); } catch (e) {}
-  return cleaned ? next : false;
+  return done.added ? done.next : false;
 };
 
 // Parent → agent-pane bridge for whisper-server failure notices.
@@ -9004,6 +9626,225 @@ window.__bramToastWhisperNotice = function (notice, toastApi) {
     "Start it manually — see the README Voice input section: " +
     "https://github.com/judell/bram#voice-input"
   );
+};
+
+// voice-setup-dialog: when a 🎤 click finds whisper-server, the model or
+// ffmpeg missing, main.js posts { type: "bram-voice-setup", missing,
+// blocking, report } (report is whisper_preflight's). This replaces the
+// README pointer with a dialog: what each component is for, whether it was
+// found and where, one button to have the agent install what's missing,
+// and the commands to do it yourself (Jon: "don't make people jump through
+// hoops"). Same bridge shape as bram-whisper-unavailable above.
+window.addEventListener("message", function (event) {
+  var data = event && event.data;
+  if (!data || data.type !== "bram-voice-setup") return;
+  try {
+    window.dispatchEvent(new CustomEvent("bram:voice-setup", {
+      detail: {
+        missing: Array.isArray(data.missing) ? data.missing.slice() : [],
+        blocking: !!data.blocking,
+        report: data.report || {},
+        at: Date.now(),
+      },
+    }));
+  } catch (e) {
+    console.error("[bram] voice-setup dispatch failed:", e);
+  }
+});
+
+window.bramSubscribeVoiceSetup = (function () {
+  var factory;
+  return function () {
+    if (factory) return factory;
+    var subscribers = new Set();
+    var lastEvent = null;
+    window.addEventListener("bram:voice-setup", function (evt) {
+      lastEvent = (evt && evt.detail) || null;
+      subscribers.forEach(function (fn) {
+        try { fn(); } catch (e) { console.error("[bram] voice-setup subscriber threw:", e); }
+      });
+    });
+    factory = function (emit) {
+      var fire = function () { emit(lastEvent); };
+      subscribers.add(fire);
+      fire();
+      return function () { subscribers.delete(fire); };
+    };
+    return factory;
+  };
+})();
+
+function __bramVoiceSetupTrace(stage, info) {
+  try {
+    window.__bramIframeTrace && window.__bramIframeTrace("voice-setup", Object.assign({ stage: stage }, info || {}));
+  } catch (e) {}
+}
+
+// "Not now" on the ffmpeg-only notice is focus, not a decision: it lasts
+// the session (docs/developing-bram.md, Client storage). Dictation works
+// without ffmpeg, so that notice shows once per session; a missing engine
+// or model blocks dictation and shows on every click.
+var __BRAM_VOICE_SETUP_FFMPEG_SHOWN = "bram.voiceSetupFfmpegShown";
+window.__bramVoiceSetupLast = null;
+window.__bramVoiceSetupDialogRef = null;
+
+window.__bramOpenVoiceSetup = function (notice, dialog) {
+  if (!notice || !dialog || typeof dialog.open !== "function") return;
+  if (!notice.blocking) {
+    var shown = false;
+    try { shown = sessionStorage.getItem(__BRAM_VOICE_SETUP_FFMPEG_SHOWN) === "1"; } catch (e) {}
+    if (shown) {
+      __bramVoiceSetupTrace("dialog-skipped", { missing: notice.missing, reason: "shown-this-session" });
+      return;
+    }
+    try { sessionStorage.setItem(__BRAM_VOICE_SETUP_FFMPEG_SHOWN, "1"); } catch (e) {}
+  }
+  window.__bramVoiceSetupLast = notice;
+  window.__bramVoiceSetupDialogRef = dialog;
+  __bramVoiceSetupTrace("dialog-open", {
+    missing: notice.missing,
+    blocking: notice.blocking,
+    platform: (notice.report && notice.report.platform) || "",
+  });
+  try { dialog.open(notice); } catch (e) {
+    __bramVoiceSetupTrace("dialog-open-error", { error: String(e) });
+  }
+};
+
+var __BRAM_WHISPER_MODEL_URL =
+  "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin";
+
+// Everything the dialog shows, from one notice: the intro, a row per
+// component, and the do-it-yourself commands for what's missing on this
+// platform. Pure, so the markup stays a set of bindings.
+window.__bramVoiceSetupView = function (notice) {
+  var n = notice || {};
+  var r = n.report || {};
+  var missing = Array.isArray(n.missing) ? n.missing : [];
+  var has = function (name) { return missing.indexOf(name) >= 0; };
+  var row = function (name, c, purpose) {
+    var found = !!(c && c.found);
+    return {
+      name: name,
+      status: found ? "Found: " + (c.path || "") : "Missing",
+      found: found,
+      purpose: purpose,
+    };
+  };
+  var components = [
+    row("whisper-server", r.binary,
+      "The speech engine. It turns your voice into text, on your own machine."),
+    row("The model (ggml-small.en.bin, 466 MB)", r.model,
+      "What the engine has learned about English speech. It loads this file when it starts" +
+      (r.model && r.model.path ? ", from " + r.model.path + "." : ".")),
+    row("ffmpeg", r.ffmpeg,
+      "Converts audio. Bram uses it only for the safety pass: when live dictation fails, " +
+      "Bram transcribes the whole recording in one go, and that recording needs converting first. " +
+      "Without ffmpeg, dictation works, but a failed dictation can't be rescued."),
+  ];
+  // Name only what blocks dictation in the first sentence; ffmpeg doesn't.
+  var label = { "whisper-server": "whisper-server", model: "the model", ffmpeg: "ffmpeg" };
+  var blockers = missing.filter(function (m) { return m !== "ffmpeg"; }).map(function (m) { return label[m] || m; });
+  var list = blockers.length > 1
+    ? blockers.slice(0, -1).join(", ") + " and " + blockers[blockers.length - 1]
+    : blockers.join("");
+  var intro = n.blocking
+    ? "Voice input can't start: " + list + (blockers.length > 1 ? " are" : " is") +
+      " missing. Install " + (blockers.length > 1 ? "them" : "it") + ", then click 🎤 again." +
+      (has("ffmpeg") ? " ffmpeg is missing too; dictation works without it, but the safety pass is off." : "")
+    : "Voice input works, but ffmpeg is missing, so the safety pass is off. " +
+      "Install it whenever you like; this notice won't show again this session.";
+  var commands = [];
+  var linux = r.platform === "linux";
+  if (!linux) {
+    var pkgs = [];
+    if (has("whisper-server")) pkgs.push("whisper-cpp");
+    if (has("ffmpeg")) pkgs.push("ffmpeg");
+    if (pkgs.length) {
+      commands.push({
+        id: "brew",
+        label: "Install with Homebrew",
+        text: "brew install " + pkgs.join(" "),
+      });
+    }
+  } else {
+    if (has("ffmpeg")) {
+      commands.push({
+        id: "apt-ffmpeg",
+        label: "Install ffmpeg (Debian or Ubuntu; use your distribution's package manager otherwise)",
+        text: "sudo apt install -y ffmpeg",
+      });
+    }
+    if (has("whisper-server")) {
+      commands.push({
+        id: "build-whisper",
+        label: "Build whisper-server from source (a few minutes)",
+        text: [
+          "sudo apt install -y build-essential cmake git curl",
+          "git clone https://github.com/ggml-org/whisper.cpp.git",
+          "cd whisper.cpp",
+          "cmake -B build",
+          "cmake --build build -j --config Release",
+          "sudo cp build/bin/whisper-server /usr/local/bin/",
+        ].join("\n"),
+      });
+    }
+  }
+  if (has("model")) {
+    commands.push({
+      id: "model",
+      label: "Download the model (466 MB)",
+      text: "mkdir -p ~/.local/share/whisper-models\n" +
+        "curl -L -o ~/.local/share/whisper-models/ggml-small.en.bin \\\n  " +
+        __BRAM_WHISPER_MODEL_URL,
+    });
+  }
+  commands.forEach(function (c) { c.md = "```\n" + c.text + "\n```"; });
+  return {
+    intro: intro,
+    components: components,
+    commands: commands,
+    hasCommands: commands.length > 0,
+  };
+};
+
+window.__bramVoiceSetupCopy = function (id, text, toastApi) {
+  __bramVoiceSetupTrace("copy", { command: String(id || "") });
+  window.__bramCopyText(text, toastApi);
+};
+
+// The install button: hand the agent a turn naming what's missing and
+// where Bram looked (convention-voice-setup-repair says what it does with
+// it), and close the dialog.
+window.__bramVoiceSetupInstall = function () {
+  var n = window.__bramVoiceSetupLast || {};
+  var r = n.report || {};
+  var found = {};
+  [["whisper-server", r.binary], ["model", r.model], ["ffmpeg", r.ffmpeg]].forEach(function (p) {
+    if (p[1] && p[1].found) found[p[0]] = p[1].path || "";
+  });
+  var payload = {
+    missing: n.missing || [],
+    found: found,
+    platform: r.platform || "",
+    arch: r.arch || "",
+    modelPath: (r.model && r.model.path) || "",
+    searched: r.searched || [],
+    loginShell: r.loginShell || "",
+  };
+  __bramVoiceSetupTrace("install-with-agent", { missing: payload.missing });
+  try {
+    window.toTurn("voice-setup: " + JSON.stringify(payload));
+  } catch (e) {
+    __bramVoiceSetupTrace("install-with-agent-error", { error: String(e) });
+  }
+  var d = window.__bramVoiceSetupDialogRef;
+  try { if (d && typeof d.close === "function") d.close(); } catch (e) {}
+};
+
+window.__bramVoiceSetupClosed = function () {
+  var n = window.__bramVoiceSetupLast || {};
+  __bramVoiceSetupTrace("dialog-closed", { missing: n.missing || [] });
 };
 
 window.bramSubscribeVoiceBusy = (function () {
@@ -13070,33 +13911,6 @@ window.__bramWorklistOverlapGroups = function (items, claim) {
   return out;
 };
 
-// Appends the shared-file commit choice to the feedback the gate buttons send.
-// Folded into the existing actions rather than given its own submit button --
-// the same reasoning as the close-on-commit dialog's `close-issue:` lines, and
-// the pane convention against a third decision point beside Approve/Drop.
-//
-// Selection remains literal. If an unselected begun claimant shares a path,
-// the agent must isolate that neighbour before committing exactly the chosen
-// ids. With several selected ids, `split` additionally asks for one commit per
-// selected item; `together` keeps the selected set in one commit.
-window.__bramSelectionHasUnselectedShared = function (items, sel, claim) {
-  var list = items || [];
-  var chosen = {};
-  (sel || []).forEach(function (id) { chosen[id] = true; });
-  if (!Object.keys(chosen).length) return false;
-  var byId = {};
-  list.forEach(function (item) { if (item) byId[item.id] = item; });
-  return list.some(function (item) {
-    if (!item || !chosen[item.id]) return false;
-    return (item.changedFiles || []).some(function (file) {
-      return (file.sharedWith || []).some(function (otherId) {
-        var other = byId[otherId];
-        return !chosen[otherId] && other && window.__bramWorklist2Begun(other, claim);
-      });
-    });
-  });
-};
-
 window.__bramSelectionHasBegunShared = function (items, sel, claim) {
   var list = items || [];
   var chosen = sel || [];
@@ -13107,18 +13921,22 @@ window.__bramSelectionHasBegunShared = function (items, sel, claim) {
 };
 
 window.__bramWithShareMode = function (text, mode, items, sel, claim) {
-  var body = text || "";
-  var chosen = sel || [];
   // gate-remove-commit-share-radio: no "split" mode any more. The radio that
   // chose it is gone; its only effect was the split-shared-files hunk
-  // separation #273 froze. `mode` is kept for the call shape.
-  if (!window.__bramSelectionHasUnselectedShared(items, chosen, claim)) return body;
-  return (
-    (body ? body + "\n\n" : "") +
-    "selected-only-shared-files: isolate the selected items' shared-file changes from " +
-    "unselected claimants before committing; commit exactly the selected item ids" +
-    (chosen.length > 1 ? " together." : ".")
-  );
+  // separation #273 froze. `mode`, `items`, `sel`, `claim` are kept for the
+  // call shape.
+  //
+  // retire-selected-only-shared-files-instruction: this used to append
+  // "selected-only-shared-files: isolate the selected items' shared-file
+  // changes from unselected claimants before committing" whenever the
+  // selection shared a file with an unselected begun item. Agents obeyed by
+  // hand: revert the neighbour's lines, commit, restore them (demo gate-425,
+  // 2026-10-06 07:11:18-35Z). That hid the shared lines from the gate — which
+  // since #327 interval-stages them itself, and since issue-425 decides
+  // entanglement by line-level membership — and rewrote another item's lines
+  // inside the committing item's claim window. The host owns isolation now;
+  // the body passes through unchanged.
+  return text || "";
 };
 
 // One ROW per entangled path, for the banner's table: { path, disk,
@@ -13481,7 +14299,10 @@ window.__bramToastIssuesClosed = function (evtValue, toastApi) {
   toastApi("Closed " + list + " on push");
 };
 
-window.__bramApplySendRestore = function (snapshot, box) {
+// pane-send-refuses-bare-shell: `toastApi` is XMLUI's toast()
+// (https://www.xmlui.org/docs/howto/show-toast-notifications-from-code), used
+// to say why a refused send came back (p.reason === "shell-foreground").
+window.__bramApplySendRestore = function (snapshot, box, toastApi) {
   try {
     window.__bramIframeTrace("send-restore", {
       stage: "enter",
@@ -13519,8 +14340,15 @@ window.__bramApplySendRestore = function (snapshot, box) {
     try { box.setValue(merged); } catch (e) {}
   }
   try {
-    window.__bramIframeTrace("send-restore", { chars: text.length, merged: existing.trim().length > 0 });
+    window.__bramIframeTrace("send-restore", {
+      chars: text.length,
+      merged: existing.trim().length > 0,
+      reason: (p && p.reason) || "",
+    });
   } catch (e) {}
+  if (p && p.reason === "shell-foreground" && typeof toastApi === "function") {
+    toastApi("No agent is running in the terminal, so your message wasn't sent. It's back in the message box.");
+  }
 };
 
 // Stable identity key for the Transcript's pending-menu row: present /
@@ -13605,7 +14433,7 @@ window.__bramDescribeMaterial = function (item) {
   var summary = item.summary || "";
   return summary && summary !== item.name ? summary : "";
 };
-window.__bramExpandTool = function (arr, item) {
+window.__bramExpandTool = function (arr, item, agentId, surface) {
   // Arm the xmlui freeze-probe window (xmlui-eval-probe-vendor): for 1.5s
   // after an expansion click, the instrumented vendored engine emits
   // xmlui-probe trace lines (op=eval|stmt|action) synchronously via
@@ -13618,6 +14446,25 @@ window.__bramExpandTool = function (arr, item) {
   // = true from the console to restore the expand-trigger while hunting.
   try { if (window.__bramEvalProbeArm) window.__xmluiEvalTraceUntil = performance.now() + 1500; } catch (e) {}
   var next = window.__bramToggleInArray(arr, item && item.id);
+  // trace-tool-expand: one line per tool-row toggle, so screencast and
+  // attention tooling (Bram Studio's auto-screencast) can see when the user
+  // opened or closed a tool call. The generic dom-click line can't tell an
+  // expand from any other click. Fields per docs/trace-vocabulary.md.
+  try {
+    if (item && item.id) {
+      var fields = {
+        op: (next || []).indexOf(item.id) >= 0 ? "open" : "close",
+        // Where the click happened: the live Transcript or a past session's
+        // detail view (Sessions / Search). Both share this function.
+        surface: String(surface || "unknown"),
+        id: String(item.id),
+        name: String(item.name || ""),
+      };
+      if (item.nameDetail) fields.detail = String(item.nameDetail).slice(0, 80);
+      if (agentId) fields.agentId = String(agentId);
+      window.__bramIframeTrace("tool-expand", fields);
+    }
+  } catch (e) { /* tracing must never break the expand */ }
   try {
     var opening = item && item.id && (next || []).indexOf(item.id) >= 0;
     if (opening && window.__bramDescribeMaterial(item)) {
@@ -14509,8 +15356,32 @@ window.__bramQueueEditedLabel = function (updatedAtMs) {
 // are reachable only from Bram's same-origin agent pane (loopback curl and
 // the C1-isolated target pane cannot call them), so the H5 close-authority
 // contract holds: a clicked button, never an agent channel.
-window.__bramCloseIssue = function (number, comment, onDone, onError) {
+//
+// issues-tab-optimistic-close: the click no longer waits on the forge. It
+// records the number as a pending close and returns the pending list at once
+// (the caller closes the detail modal and renders the row CLOSED from that
+// list); the invoke runs in the background. On success the host re-indexes
+// the issue (refresh_issue_now) and emits issues-changed, so the cached
+// /__issues list catches up on its own. On failure the pending entry is
+// dropped, onPendingChange hands the caller the shrunken list, and a toast
+// names the issue, so a failed close never passes silently.
+//
+// The pending map is module state, not a component var, so it outlives the
+// Issues tab unmounting: reopen the tab seconds later and the row still reads
+// closed. Pending is focus, not decision (docs/developing-bram.md, Client
+// storage), so it is deliberately not persisted.
+var __bramPendingIssueCloses = {}; // number -> startedAtMs
+var __BRAM_PENDING_CLOSE_MAX_MS = 120000;
+window.__bramPendingIssueCloseList = function () {
+  return Object.keys(__bramPendingIssueCloses).map(Number);
+};
+window.__bramCloseIssue = function (number, comment, toastApi, onPendingChange) {
   var invoke = getTauriInvoke();
+  var say = function (msg) {
+    if (!toastApi) return;
+    if (typeof toastApi.error === "function") toastApi.error(msg);
+    else if (typeof toastApi === "function") toastApi(msg);
+  };
   // issue-343: same treatment as gitPush — trace first, and a dead bridge
   // reports through the caller's error surface instead of vanishing.
   window.__bramIframeTrace("click", {
@@ -14519,19 +15390,61 @@ window.__bramCloseIssue = function (number, comment, onDone, onError) {
     number: number,
   });
   if (!invoke) {
-    if (typeof onError === "function") {
-      onError("Close could not reach the host (IPC unavailable) — reload the pane or restart Bram");
-    }
-    return;
+    say("Couldn't close #" + number + ": the host is unreachable (IPC unavailable). Reload the pane or restart Bram.");
+    return window.__bramPendingIssueCloseList();
   }
+  var startedAt = Date.now();
+  __bramPendingIssueCloses[number] = startedAt;
   invoke("issue_close_manual", { number: number, comment: comment || "" })
     .then(function () {
-      if (typeof onDone === "function") onDone();
+      // issue-close-pending-retires-on-host-ok: the close is complete here,
+      // whether or not an Issues tab is mounted. The host has already run
+      // refresh_issue_now, so the cached /__issues row reads CLOSED and any
+      // remount sees the truth. Deliberately NO onPendingChange: a mounted
+      // tab's pendingCloses var keeps its override until its own
+      // issues-changed refetch reconciles, so the row never flickers open.
+      delete __bramPendingIssueCloses[number];
+      window.__bramIframeTrace("issue-close", { op: "ok", number: number, elapsedMs: Date.now() - startedAt });
     })
     .catch(function (e) {
+      delete __bramPendingIssueCloses[number];
+      window.__bramIframeTrace("issue-close", { op: "err", number: number, elapsedMs: Date.now() - startedAt, error: String(e) });
       window.logToHost({ kind: "issue-close-manual", phase: "err", error: String(e) });
-      if (typeof onError === "function") onError(String(e));
+      say("Couldn't close #" + number + ": " + String(e));
+      if (typeof onPendingChange === "function") onPendingChange(window.__bramPendingIssueCloseList());
     });
+  return window.__bramPendingIssueCloseList();
+};
+// Rows as the Issues tab should show them: any row with a close in flight
+// reads CLOSED, so the state filter and the row badge agree with the click.
+window.__bramApplyPendingIssueCloses = function (rows, pending) {
+  if (!Array.isArray(rows) || !Array.isArray(pending) || pending.length === 0) return rows || [];
+  return rows.map(function (r) {
+    if (r && r.state === "OPEN" && pending.indexOf(Number(r.number)) !== -1) {
+      return Object.assign({}, r, { state: "CLOSED" });
+    }
+    return r;
+  });
+};
+// Called with the RAW fetched rows: drop pending entries the data now
+// confirms, and any older than the cap (a close whose re-index never landed
+// shouldn't mask the forge's truth for the rest of the session).
+window.__bramReconcilePendingIssueCloses = function (rows) {
+  var now = Date.now();
+  (rows || []).forEach(function (r) {
+    var n = r && Number(r.number);
+    if (n && __bramPendingIssueCloses[n] && r.state !== "OPEN") {
+      window.__bramIframeTrace("issue-close", { op: "confirmed", number: n, elapsedMs: now - __bramPendingIssueCloses[n] });
+      delete __bramPendingIssueCloses[n];
+    }
+  });
+  Object.keys(__bramPendingIssueCloses).forEach(function (k) {
+    if (now - __bramPendingIssueCloses[k] > __BRAM_PENDING_CLOSE_MAX_MS) {
+      window.__bramIframeTrace("issue-close", { op: "expired", number: Number(k), elapsedMs: now - __bramPendingIssueCloses[k] });
+      delete __bramPendingIssueCloses[k];
+    }
+  });
+  return window.__bramPendingIssueCloseList();
 };
 
 // Sessions tab: pending-delete and pending-rename ids persist across
@@ -15167,6 +16080,19 @@ window.__bramSetSearchBadgesInitialAllOn = function (on) {
   return !!on;
 };
 
+// terminal-open-at-startup-setting: whether the terminal pane is open when Bram
+// launches. Default OFF (the agent pane is the primary surface). DECISION,
+// per-user and unscoped: a layout preference, not about any one project. The
+// parent shell (app/main.js) reads the same key at startup; it shares this
+// pane's tauri://localhost origin. The toolbar button no longer persists.
+window.__bramTerminalOpenAtStartup = function () {
+  return __bramReadLS('bram.terminal.openAtStartup', '0') === '1';
+};
+window.__bramSetTerminalOpenAtStartup = function (on) {
+  __bramWriteLS('bram.terminal.openAtStartup', on ? '1' : '0');
+  return !!on;
+};
+
 // turn-complete-beep: a per-user (localStorage) audio cue when a permission
 // menu appears or the agent finishes a turn. Default ON (it's genuinely useful);
 // an explicit off stores '0' and stays off. Per-user, not a project setting — an
@@ -15258,7 +16184,8 @@ window.__bramSkipTip = function (id, tick) {
 };
 
 // suggest-fresh-session: sessions.* settings read for the Settings checkboxes.
-// Defaults mirror the host: new-item and new-issue on, topic-shift off.
+// Defaults mirror the host: new-item, new-issue and pairAcrossProviders on,
+// topic-shift off.
 window.__bramSuggestSetting = function (settings, key) {
   var s = settings && settings.sessions;
   if (s && typeof s[key] === "boolean") return s[key];

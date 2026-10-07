@@ -162,7 +162,25 @@
            through window.__bramSuggestSetting so the defaults (true/true/false)
            live in one place. https://www.xmlui.org/docs/reference/components/Checkbox -->
       <VStack gap="$space-2">
-        <Heading level="h3">Suggest a fresh session</Heading>
+        <!-- settings-info-says-storage-and-default: the same heading-with-info
+             chip as the other cards, so this card's settings say their kind
+             and default too. -->
+        <HStack
+          width="fit-content"
+          gap="$space-1"
+          verticalAlignment="center"
+          paddingHorizontal="$space-2"
+          paddingVertical="$space-1"
+          borderRadius="$borderRadius"
+          backgroundColor="$color-surface-100">
+          <Button
+            icon="info"
+            size="xs"
+            variant="ghost"
+            tooltip="About Suggest a fresh session"
+            onClick="infoTitle = 'Suggest a fresh session'; infoBody = window.settingsInfoBodies.sessions; settingInfoDialog.open()" />
+          <Heading level="h3">Suggest a fresh session</Heading>
+        </HStack>
         <Text
           color="$textColor-secondary"
           fontSize="$fontSize-sm"
@@ -182,6 +200,18 @@
           labelPosition="end"
           initialValue="{window.__bramSuggestSetting(settingsValue, 'suggestOnTopicShift')}"
           onDidChange="(v) => saveSettings.execute({ sessions: { suggestOnTopicShift: v } })" />
+        <!-- provider-session-pair-offer: a Switch, not a fourth checkbox,
+             because it isn't a "when to suggest" trigger: it turns the pair
+             offer after a provider switch on or off. Default on, read through
+             __bramSuggestSetting like its neighbours. label/labelPosition as
+             on the Mirror switch below: input-level label props, per
+             https://www.xmlui.org/docs/howto/arrange-form-fields-side-by-side
+             https://www.xmlui.org/docs/reference/components/Switch -->
+        <Switch
+          label="Pair new sessions across providers"
+          labelPosition="end"
+          initialValue="{window.__bramSuggestSetting(settingsValue, 'pairAcrossProviders')}"
+          onDidChange="(v) => saveSettings.execute({ sessions: { pairAcrossProviders: v } })" />
       </VStack>
 
       <ContentSeparator />
@@ -242,6 +272,15 @@
           labelPosition="end"
           initialValue="{settingsShowTargetApp(settingsValue)}"
           onDidChange="(v) => saveSettings.execute({ ui: { showTargetApp: v } })" />
+        <!-- terminal-open-at-startup-setting: per-user preference,
+             localStorage-backed like the tips and beep switches below. The
+             parent shell reads it at launch; the toolbar toggle is
+             session-only. -->
+        <Switch
+          label="Terminal open at startup"
+          labelPosition="end"
+          initialValue="{window.__bramTerminalOpenAtStartup ? window.__bramTerminalOpenAtStartup() : false}"
+          onDidChange="(v) => window.__bramSetTerminalOpenAtStartup(v)" />
         <Switch
           id="hotReloadSwitch"
           label="Agent-pane hot-reload"

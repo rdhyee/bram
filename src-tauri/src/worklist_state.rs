@@ -163,6 +163,163 @@ fn append_transition(
     Ok(())
 }
 
+// --- item sessions (item-last-session-switch-there) -------------------------
+//
+// The ledger's first real reader. Bram records which session received an
+// item's Start / Commit / Drop / feedback turn, as a `kind='session'`
+// transitions row, so the Worklist can offer "Last worked on in '…' ·
+// Switch there". Written only when the session differs from the item's
+// latest one, so ordinary turns add no rows. Sessions and this db are both
+// per machine, so the fact lives where it's true. A failed write is a missed
+// stamp, healed by the item's next delivery (the latest row still differs).
+
+fn session_id_is_plain(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// The item's most recent recorded session: (provider, session id, at_ms).
+pub fn latest_item_session(
+    conn: &Connection,
+    item_id: &str,
+) -> Result<Option<(String, String, i64)>> {
+    let row: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT detail, at_ms FROM transitions WHERE item_id = ?1 AND kind = 'session' \
+             ORDER BY id DESC LIMIT 1",
+            params![item_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    Ok(row.and_then(|(detail, at)| {
+        let v: serde_json::Value = serde_json::from_str(&detail).ok()?;
+        let provider = v.get("provider")?.as_str()?.to_string();
+        let sid = v.get("sessionId")?.as_str()?.to_string();
+        Some((provider, sid, at))
+    }))
+}
+
+/// Record that `item_id`'s turn was delivered to (provider, session). Returns
+/// Ok(true) when a row was written, Ok(false) when it matched the latest
+/// row (or the ids weren't plain, which stores nothing rather than guess).
+pub fn record_item_session(
+    conn: &Connection,
+    item_id: &str,
+    provider: &str,
+    session_id: &str,
+    at_ms: i64,
+) -> Result<bool> {
+    if !session_id_is_plain(provider) || !session_id_is_plain(session_id) {
+        return Ok(false);
+    }
+    if let Some((p, sid, _)) = latest_item_session(conn, item_id)? {
+        if p == provider && sid == session_id {
+            return Ok(false);
+        }
+    }
+    let detail = format!(
+        "{{\"provider\":\"{}\",\"sessionId\":\"{}\"}}",
+        provider, session_id
+    );
+    append_transition(conn, at_ms, Some(item_id), "session", &detail, "delivery")?;
+    Ok(true)
+}
+
+// --- session pairs (provider-session-counterparts) --------------------------
+//
+// A Claude session and a Codex session that go together: switching providers
+// from one resumes the other. Stored as `kind='pair'` transitions rows with
+// detail {"claude": <id>, "codex": <id>}; append-only, so the history stays
+// queryable. One partner per side: a session's partner is the other side of
+// the latest row naming it, and only while that partner's own latest row
+// names it back. An unpair is a row with the other side empty.
+
+fn latest_pair_row_for(
+    conn: &Connection,
+    side: &str,
+    sid: &str,
+) -> Result<Option<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT detail FROM transitions WHERE kind = 'pair' AND item_id IS NULL ORDER BY id DESC",
+    )?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    for detail in rows {
+        let detail = detail?;
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&detail) else {
+            continue;
+        };
+        let claude = v
+            .get("claude")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let codex = v
+            .get("codex")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let mine = if side == "claude" { &claude } else { &codex };
+        if mine == sid {
+            return Ok(Some((claude, codex)));
+        }
+    }
+    Ok(None)
+}
+
+/// The session paired with (`provider`, `sid`), if the pairing still holds
+/// from both sides. `provider` is "claude" or "codex".
+pub fn session_partner(conn: &Connection, provider: &str, sid: &str) -> Result<Option<String>> {
+    if !session_id_is_plain(sid) || !matches!(provider, "claude" | "codex") {
+        return Ok(None);
+    }
+    let other_side = if provider == "claude" {
+        "codex"
+    } else {
+        "claude"
+    };
+    let Some((claude, codex)) = latest_pair_row_for(conn, provider, sid)? else {
+        return Ok(None);
+    };
+    let partner = if provider == "claude" { codex } else { claude };
+    if partner.is_empty() {
+        return Ok(None);
+    }
+    // The partner's own latest row must name this session back.
+    match latest_pair_row_for(conn, other_side, &partner)? {
+        Some((c, x)) if (if provider == "claude" { &c } else { &x }) == sid => Ok(Some(partner)),
+        _ => Ok(None),
+    }
+}
+
+/// Pair a Claude session with a Codex session. Ok(false) when they are
+/// already paired (no row written) or an id isn't plain. Either id may be
+/// empty, which records an unpair of the other side.
+pub fn record_session_pair(
+    conn: &Connection,
+    claude: &str,
+    codex: &str,
+    at_ms: i64,
+    source: &str,
+) -> Result<bool> {
+    let plain_or_empty = |s: &str| s.is_empty() || session_id_is_plain(s);
+    if !plain_or_empty(claude) || !plain_or_empty(codex) || (claude.is_empty() && codex.is_empty())
+    {
+        return Ok(false);
+    }
+    if !claude.is_empty() && !codex.is_empty() {
+        if session_partner(conn, "claude", claude)?.as_deref() == Some(codex) {
+            return Ok(false);
+        }
+    }
+    let detail = format!("{{\"claude\":\"{}\",\"codex\":\"{}\"}}", claude, codex);
+    // The row's `source` says how the pair came about (offer-keep,
+    // offer-create, explicit-resume, unpair, …), so the ledger alone can
+    // explain a pairing; it was hard-coded to "switch" before.
+    append_transition(conn, at_ms, None, "pair", &detail, source)?;
+    Ok(true)
+}
+
 // --- auth_records ----------------------------------------------------------
 
 /// Mirror a fresh `.worklist-authorization.json` write (the gate-click
@@ -1448,5 +1605,67 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].0, 200);
         assert_eq!(rows[1].0, 100);
+    }
+
+    // item-last-session-switch-there
+    #[test]
+    fn item_session_is_recorded_only_when_it_changes() {
+        let conn = open_in_memory().unwrap();
+        assert_eq!(latest_item_session(&conn, "item-a").unwrap(), None);
+        assert!(record_item_session(&conn, "item-a", "claude", "s-1", 100).unwrap());
+        assert!(!record_item_session(&conn, "item-a", "claude", "s-1", 200).unwrap());
+        assert_eq!(
+            latest_item_session(&conn, "item-a").unwrap(),
+            Some(("claude".to_string(), "s-1".to_string(), 100))
+        );
+        assert!(record_item_session(&conn, "item-a", "codex", "01a0-x", 300).unwrap());
+        assert_eq!(
+            latest_item_session(&conn, "item-a").unwrap(),
+            Some(("codex".to_string(), "01a0-x".to_string(), 300))
+        );
+        assert_eq!(latest_item_session(&conn, "item-b").unwrap(), None);
+    }
+
+    #[test]
+    fn session_pairs_follow_the_latest_row_on_both_sides() {
+        let conn = open_in_memory().unwrap();
+        assert_eq!(session_partner(&conn, "claude", "c1").unwrap(), None);
+        assert!(record_session_pair(&conn, "c1", "x1", 1, "test").unwrap());
+        assert_eq!(
+            session_partner(&conn, "claude", "c1").unwrap().as_deref(),
+            Some("x1")
+        );
+        assert_eq!(
+            session_partner(&conn, "codex", "x1").unwrap().as_deref(),
+            Some("c1")
+        );
+        // Re-recording the same pair writes nothing.
+        assert!(!record_session_pair(&conn, "c1", "x1", 2, "test").unwrap());
+        // x1 re-pairs with c2: c1 no longer has a partner (one per side).
+        assert!(record_session_pair(&conn, "c2", "x1", 3, "test").unwrap());
+        assert_eq!(session_partner(&conn, "claude", "c1").unwrap(), None);
+        assert_eq!(
+            session_partner(&conn, "codex", "x1").unwrap().as_deref(),
+            Some("c2")
+        );
+        // Unpair c2.
+        assert!(record_session_pair(&conn, "c2", "", 4, "test").unwrap());
+        assert_eq!(session_partner(&conn, "claude", "c2").unwrap(), None);
+        assert_eq!(session_partner(&conn, "codex", "x1").unwrap(), None);
+    }
+
+    #[test]
+    fn session_pairs_refuse_ids_they_would_have_to_escape() {
+        let conn = open_in_memory().unwrap();
+        assert!(!record_session_pair(&conn, "a\"b", "x1", 1, "test").unwrap());
+        assert!(!record_session_pair(&conn, "", "", 1, "test").unwrap());
+        assert_eq!(session_partner(&conn, "claude", "a\"b").unwrap(), None);
+    }
+
+    #[test]
+    fn item_session_refuses_ids_it_would_have_to_escape() {
+        let conn = open_in_memory().unwrap();
+        assert!(!record_item_session(&conn, "item-a", "claude", "a\"b", 1).unwrap());
+        assert_eq!(latest_item_session(&conn, "item-a").unwrap(), None);
     }
 }
