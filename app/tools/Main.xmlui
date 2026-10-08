@@ -133,6 +133,9 @@
     initial="{null}"
     subscribe="{window.bramSubscribeTauriEvent('settings-changed')}" />
   <variable name="footerTipTick" value="{0}" />
+  <!-- workflow-toggle-button-unwired: first cut, display only. Starts "on" at
+       every pane load, saved nowhere; nothing reads it yet. -->
+  <variable name="workflowOn" value="{true}" />
   <LocalLinkPreview />
   <!-- Live session meta for the footer echo (mirrors Transcript's source):
        /__sessions/list flags the current session; refetch on changes so the
@@ -587,6 +590,13 @@
           <Option value="claude" label="Claude" />
           <Option value="codex" label="Codex" />
         </RadioGroup>
+        <!-- workflow-toggle-button-unwired: label only, no behaviour wired. -->
+        <Button
+          label="{workflowOn ? 'Workflow: on' : 'Workflow: off'}"
+          variant="ghost"
+          size="sm"
+          tooltip="Not wired yet: this only changes the label."
+          onClick="workflowOn = !workflowOn" />
         <!-- switch-to-transcript-on-action: the "Starting <item>…" claim
              message moved to the footer status line (Jon: it belongs there,
              not in the app header) — see the footer HStack below. -->
