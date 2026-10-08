@@ -320,6 +320,55 @@ pub fn record_session_pair(
     Ok(true)
 }
 
+// new-session-switch-starts-fresh-partner: a session started with New session
+// is a new line of work, so the first switch away from it starts a fresh
+// partner instead of resuming the other side's old pin. Stored as a
+// `kind='session-born'` transitions row with detail {"provider", "id"}.
+
+/// Record that (`provider`, `sid`) was started with New session. Ok(false)
+/// when the id isn't plain or the row already exists.
+pub fn record_session_born(
+    conn: &Connection,
+    provider: &str,
+    sid: &str,
+    at_ms: i64,
+    source: &str,
+) -> Result<bool> {
+    if !session_id_is_plain(sid) || !matches!(provider, "claude" | "codex") {
+        return Ok(false);
+    }
+    if session_born_from_new_session(conn, provider, sid)? {
+        return Ok(false);
+    }
+    let detail = format!("{{\"provider\":\"{}\",\"id\":\"{}\"}}", provider, sid);
+    append_transition(conn, at_ms, None, "session-born", &detail, source)?;
+    Ok(true)
+}
+
+/// Whether (`provider`, `sid`) qualifies for a fresh partner on a switch:
+/// started with New session and never in a pair row, so neither paired
+/// before nor unpaired (an Unpair must survive the next switch, `e311c09`).
+pub fn session_wants_fresh_partner(conn: &Connection, provider: &str, sid: &str) -> Result<bool> {
+    if !session_born_from_new_session(conn, provider, sid)? {
+        return Ok(false);
+    }
+    Ok(latest_pair_row_for(conn, provider, sid)?.is_none())
+}
+
+/// Whether (`provider`, `sid`) was started with New session.
+pub fn session_born_from_new_session(conn: &Connection, provider: &str, sid: &str) -> Result<bool> {
+    if !session_id_is_plain(sid) || !matches!(provider, "claude" | "codex") {
+        return Ok(false);
+    }
+    let detail = format!("{{\"provider\":\"{}\",\"id\":\"{}\"}}", provider, sid);
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM transitions WHERE kind = 'session-born' AND item_id IS NULL AND detail = ?1",
+        params![detail],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
 // --- auth_records ----------------------------------------------------------
 
 /// Mirror a fresh `.worklist-authorization.json` write (the gate-click
@@ -981,6 +1030,20 @@ pub fn compare_divergence(
 /// `.inflight-claim.json` — at most one row should ever match, but the
 /// `ORDER BY ... LIMIT 1` is a defensive tie-break, not a claim that more
 /// than one can exist under normal operation.
+/// When the mirror first saw `item_id` on the board (`items.first_seen_ms`),
+/// or None if it never did. clear-landed-never-begun-rows: the anchor for a
+/// row that was never started, so has no `begunAtMs`. For an item older than
+/// this database it is when the mirror first saw it, later than the true
+/// proposal, which errs safe (an earlier commit is refused, never accepted).
+pub fn item_first_seen_ms(conn: &Connection, item_id: &str) -> Result<Option<i64>> {
+    conn.query_row(
+        "SELECT first_seen_ms FROM items WHERE id = ?1",
+        params![item_id],
+        |r| r.get(0),
+    )
+    .optional()
+}
+
 pub fn live_claim(conn: &Connection) -> Result<Option<(String, String, i64)>> {
     conn.query_row(
         "SELECT kind, ids, written_at_ms FROM claims WHERE cleared_at_ms IS NULL \
@@ -1193,6 +1256,19 @@ mod tests {
             files_json,
             closes_issues_json,
         }
+    }
+
+    #[test]
+    fn item_first_seen_ms_is_the_first_sync_and_none_when_unseen() {
+        // clear-landed-never-begun-rows anchors a never-started row on this.
+        let conn = open_in_memory().unwrap();
+        assert_eq!(item_first_seen_ms(&conn, "item-a").unwrap(), None);
+        let items = vec![snap("item-a", "proposed", None, "[\"a.rs\"]", "[]")];
+        mirror_items_sync(&conn, 1000, &items, "watcher").unwrap();
+        // A later sync of the same item must not move the anchor forward.
+        mirror_items_sync(&conn, 5000, &items, "watcher").unwrap();
+        assert_eq!(item_first_seen_ms(&conn, "item-a").unwrap(), Some(1000));
+        assert_eq!(item_first_seen_ms(&conn, "item-b").unwrap(), None);
     }
 
     #[test]
@@ -1660,6 +1736,38 @@ mod tests {
         assert!(!record_session_pair(&conn, "a\"b", "x1", 1, "test").unwrap());
         assert!(!record_session_pair(&conn, "", "", 1, "test").unwrap());
         assert_eq!(session_partner(&conn, "claude", "a\"b").unwrap(), None);
+    }
+
+    #[test]
+    fn session_born_is_per_provider_and_written_once() {
+        let conn = open_in_memory().unwrap();
+        assert!(!session_born_from_new_session(&conn, "claude", "c1").unwrap());
+        assert!(record_session_born(&conn, "claude", "c1", 1, "test").unwrap());
+        assert!(!record_session_born(&conn, "claude", "c1", 2, "test").unwrap());
+        assert!(session_born_from_new_session(&conn, "claude", "c1").unwrap());
+        assert!(!session_born_from_new_session(&conn, "codex", "c1").unwrap());
+        assert!(!record_session_born(&conn, "claude", "a\"b", 3, "test").unwrap());
+        assert!(!record_session_born(&conn, "other", "c2", 3, "test").unwrap());
+    }
+
+    #[test]
+    fn fresh_partner_only_for_a_new_session_never_paired_or_unpaired() {
+        let conn = open_in_memory().unwrap();
+        // Not started with New session.
+        assert!(!session_wants_fresh_partner(&conn, "claude", "c0").unwrap());
+        // Started with New session, never paired.
+        record_session_born(&conn, "claude", "c1", 1, "test").unwrap();
+        assert!(session_wants_fresh_partner(&conn, "claude", "c1").unwrap());
+        // Paired, then unpaired: an Unpair must survive the next switch.
+        record_session_pair(&conn, "c1", "x1", 2, "test").unwrap();
+        assert!(!session_wants_fresh_partner(&conn, "claude", "c1").unwrap());
+        record_session_pair(&conn, "c1", "", 3, "test").unwrap();
+        assert!(!session_wants_fresh_partner(&conn, "claude", "c1").unwrap());
+        // Unpaired from the other side leaves the earlier row naming it.
+        record_session_born(&conn, "claude", "c2", 4, "test").unwrap();
+        record_session_pair(&conn, "c2", "x2", 5, "test").unwrap();
+        record_session_pair(&conn, "", "x2", 6, "test").unwrap();
+        assert!(!session_wants_fresh_partner(&conn, "claude", "c2").unwrap());
     }
 
     #[test]

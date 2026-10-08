@@ -2914,7 +2914,18 @@ window.__bramGateAct = function (kind, items, sel, shareMode, claim) {
     }
   }
   var r = window.__bramPrepareBatchWorklistActionSubmission(opts);
-  window.__bramW2SetSelection([]);
+  // start-keeps-started-items-selected: after Start (and Resume, the same
+  // kind) the started items stay selected, so the user's follow-up messages
+  // address them as feedback by default instead of going out as chat, whose
+  // edits belong to no item. Only the started ids stay; anything else that
+  // was ticked is released, so the addressee line names exactly what is being
+  // worked on. Every other kind clears: Start & commit, Commit and Drop rows
+  // leave the board.
+  var keep = (kind === "start") ? ids : [];
+  window.__bramW2SetSelection(keep);
+  window.__bramIframeTrace("click", {
+    target: "gatebar-" + kind, op: "selection-after", keptSelection: keep,
+  });
   window.__bramClearComposer();
   window.__bramWorklistActApply(r);
   window.__bramGateGoTranscript();
@@ -3759,6 +3770,20 @@ window.__bramWorklist2StripTooltip = function (item, claim, items, attributionTo
       "removes it from the board; the history entry keeps the commit."
     );
   }
+  // strip-proposed-says-files-changed: the not-yet-started row whose files
+  // have changed explains itself, since nothing on the board credits them.
+  if (item && !window.__bramWorklist2Begun(item, claim)) {
+    var moved = window.__bramUnbegunMovedFiles(item);
+    if (moved) {
+      return (
+        moved + " of its files " + (moved === 1 ? "has" : "have") +
+        " changed on disk, but nothing on the board started this row, so " +
+        "those changes aren't credited to it yet.\n\n" +
+        "**Start & commit** lands them under this item. **Drop** removes " +
+        "the row and leaves the changes on disk, belonging to no item."
+      );
+    }
+  }
   var split = window.__bramItemChangedSplit(item, items, claim);
   // For a committable row, the terse label dropped the on-disk total, the
   // shared paths, the plan denominator and the last-change time; the tooltip
@@ -4592,10 +4617,19 @@ window.__bramClaimantCell = function (item, rowId) {
 // the cell reads as it always did. Extracted from an inline markup
 // expression per the single-call handler rule.
 window.__bramFileChangesCell = function (rec, rowBegun) {
-  if (!rowBegun || !rec || rec.status === "unchanged") return "";
+  if (!rec || rec.status === "unchanged") return "";
   var suffix =
     rec.status === "new" ? " (new)" : rec.status === "deleted" ? " (deleted)" : "";
   var total = "+" + rec.added + " −" + rec.removed;
+  // strip-proposed-says-files-changed: a not-yet-started row's strip now says
+  // "its files have changed", so its table must not show a blank Changes cell
+  // beside that claim (Jon, 2026-10-07). Show the disk change, marked as not
+  // yet credited to the item, since nothing on the board started it.
+  if (!rowBegun) {
+    return (rec.added || 0) > 0 || (rec.removed || 0) > 0
+      ? total + suffix + " · not credited"
+      : "";
+  }
   var hasTake = typeof rec.takeAdded === "number";
   if (hasTake && (rec.takeAdded !== rec.added || rec.takeRemoved !== rec.removed)) {
     return "+" + rec.takeAdded + " −" + rec.takeRemoved + " of " + total + suffix;
@@ -4874,11 +4908,18 @@ window.__bramWorklist2Strip = function (item, claim, items, attribution, attribu
   // "No changes yet", so the visible line distinguished nothing while the
   // tooltip carried the whole distinction one hover away.
   if (!begun) {
-    window.__bramWorklistStripAnomaly(item, claim, cs);
     // Just the state. The "· Start to green-light" tail instructed the user to
     // press a button that is already sitting in the footer, labelled -- the
     // strip's job is to name where the item IS, not to narrate the next click.
-    return withCloses("Proposed");
+    // strip-proposed-says-files-changed: but a bare "Proposed" hid real work
+    // after a "just do it" edit (2026-10-07: demo-notes-file read "Proposed"
+    // with its one file written). Say both: the lifecycle, and that its files
+    // moved. This retired the __bramWorklistStripAnomaly tripwire (removed),
+    // whose `no-changes-yet-with-changed-files` line flagged exactly this
+    // label hiding real changes.
+    return withCloses(
+      window.__bramUnbegunMovedFiles(item) ? "Proposed · its files have changed" : "Proposed",
+    );
   }
   // issue-406: its work was committed outside the Worklist (a plain git
   // commit in chat or a terminal). The host sets `landed` only for a begun
@@ -4943,69 +4984,17 @@ window.__bramWorklist2Strip = function (item, claim, items, attribution, attribu
   return withCloses("With the agent · nothing to do");
 };
 
-// strip-vs-diff-disagreement-instrument. A row was observed printing
-// "No changes yet" directly above a rendered diff of its own edits
-// (2026-08-21 ~07:12Z, on 0.5.0), correcting itself at the next refetch about
-// a minute later. The two halves have different sources of truth, which is why
-// they CAN disagree: `diff` / `changedFiles` derive from disk state (997017a),
-// while this strip is gated on `__bramWorklist2Begun` — a status/authorization
-// fact. Three inputs could each have produced it (a payload predating the
-// approval, an authorization consumed earlier than assumed, or
-// `changeSummary.changed === 0` beside a non-empty `changedFiles`), and the
-// existing trace records none of them: `/__worklist` route lines carry only
-// method, status, body size and duration.
-//
-// So this records the CONTRADICTION with the fields that discriminate, rather
-// than guessing which of the three to fix. Same conclusion #259 reached after
-// 420 observations that could not self-classify: a better instrument, not more
-// soak.
-//
-// This is a TRIPWIRE, not a soak observer. It fires only when the row is
-// actively lying, so its steady state is zero lines — and a tripwire's zero is
-// indistinguishable from a dead instrument's zero in a grep. Its provenance
-// check is a deliberate fire, never a wait. Deduped per item per contradicting
-// signature so a re-render storm cannot bury the first occurrence.
-var __bramStripAnomalySeen = {};
-window.__bramWorklistStripAnomaly = function (item, claim, cs) {
-  try {
-    if (!item) return;
-    var files = item.changedFiles || [];
-    var moved = 0;
-    for (var i = 0; i < files.length; i++) {
-      var f = files[i];
-      if (!f) continue;
-      if ((f.added || 0) > 0 || (f.removed || 0) > 0) moved++;
-    }
-    // No moved files means "No changes yet" is simply true.
-    if (!moved) return;
-    var sig =
-      String(item.id) +
-      "|" +
-      String(item.status || "") +
-      "|" +
-      String(item.activeAuthorization || "") +
-      "|" +
-      String((cs && cs.changed) || 0) +
-      "|" +
-      moved;
-    if (__bramStripAnomalySeen[sig]) return;
-    __bramStripAnomalySeen[sig] = true;
-    window.__bramIframeTrace("worklist-strip", {
-      op: "anomaly",
-      reason: "no-changes-yet-with-changed-files",
-      item: item.id,
-      status: item.status || "",
-      claimed: !!window.__bramItemInflightKind(claim, item.id, "", "", 0),
-      auth: item.activeAuthorization || "",
-      auth_age_ms: item.authorizationAgeMs == null ? -1 : item.authorizationAgeMs,
-      cs_changed: (cs && cs.changed) || 0,
-      cs_total: (cs && cs.total) || 0,
-      files_moved: moved,
-      files_total: files.length,
-    });
-  } catch (e) {
-    /* an instrument must never break the surface it watches */
+// strip-proposed-says-files-changed: how many of an item's changed files have
+// lines added or removed -- the test the strip uses to say a not-yet-started
+// row's files have changed.
+window.__bramUnbegunMovedFiles = function (item) {
+  var files = (item && item.changedFiles) || [];
+  var moved = 0;
+  for (var i = 0; i < files.length; i++) {
+    var f = files[i];
+    if (f && ((f.added || 0) > 0 || (f.removed || 0) > 0)) moved++;
   }
+  return moved;
 };
 // worklist2-checkbox-during-action: the row checkbox stays ticked and
 // disabled while a live claim covers the item — the tick is part of the
@@ -6504,9 +6493,16 @@ window.__bramFlipExpansionKey = function (keys, key) {
 };
 window.__bramPruneWorklist2Expansion = function (validIds) {
   var ids = validIds || [];
-  var kept = window.__bramRestoreWorklist2Expansion().filter(function (k) {
+  var onBoard = function (k) {
     return ids.indexOf(String(k).split("::")[0]) !== -1;
-  });
+  };
+  // Saved file-diff keys share the itemId:: prefix, so the same rule prunes
+  // them; the live diffKeys var keeps any stale key harmlessly until the
+  // next remount reads the pruned copy.
+  if (window.__bramRestoreWorklist2DiffKeys) {
+    window.__bramPersistWorklist2DiffKeys(window.__bramRestoreWorklist2DiffKeys().filter(onBoard));
+  }
+  var kept = window.__bramRestoreWorklist2Expansion().filter(onBoard);
   return window.__bramPersistWorklist2Expansion(kept);
 };
 
@@ -10565,9 +10561,231 @@ var __BRAM_DESCRIBE_CONCURRENCY = 3;
 // Primary signal: the List's visibleRangeDidChange event (first-class API,
 // added upstream in xmlui feat/list-visible-range). The [data-index] DOM
 // scrape remains as fallback for the window before the first event lands.
-window.__bramSetVisibleRange = function (range) {
+window.__bramSetVisibleRange = function (range, listRef, agentId) {
+  // A pending Worklist-pane close re-lands BEFORE the new range is stored,
+  // so the reading row recorded at the toggle isn't overwritten by the
+  // remounted List's top-of-list report.
+  if (window.__bramSplitToggleLand && listRef) {
+    try { __bramSplitToggleLanding(listRef, agentId); } catch (e0) {}
+  }
   window.__bramVisibleRange = range || null;
   try { __bramPumpDescribeQueue(); } catch (e) {}
+  // #427: the List's first render is the moment its splitter exists to
+  // measure; later range changes re-measure for free (emits only on change).
+  try { if (window.__bramTranscriptSplitMeasure) window.__bramTranscriptSplitMeasure(); } catch (e2) {}
+};
+
+// #427: the height the Transcript's Worklist VSplitter may fill -- from its
+// own top edge to the top of the sticky App footer. This tab's page scrolls,
+// so nothing above bounds a "*" height, and a guessed calc(100vh - 300px)
+// overflowed the page by 134px (demo trace, 2026-10-07): the List was at its
+// end but its last lines sat under the message box until the page scrolled.
+// Measured, never guessed; re-measured on window resize, on a ResizeObserver
+// over the footer and everything stacked above the splitter, and on the
+// List's visible-range changes. Elements are found by XMLUI testId
+// (Transcript.xmlui's VSplitter, Main.xmlui's Footer). Emits px, or 0 before the first measurement
+// (the markup's fallback). Splitter top is taken in page coordinates (adds
+// the page scroller's scrollTop) so an already-scrolled page measures right.
+window.bramSubscribeTranscriptSplitHeight = (function () {
+  var factory;
+  var subscribers = new Set();
+  var value = 0;
+  var prevValue = -1;
+  var lastEmitAt = 0;
+  var ro = null;
+  var observed = [];
+  var hooked = false;
+  function observe(els) {
+    if (typeof ResizeObserver === "undefined") return;
+    if (!ro) ro = new ResizeObserver(function () { measure(); });
+    var same = els.length === observed.length && els.every(function (e, i) { return e === observed[i]; });
+    if (same) return;
+    observed.forEach(function (e) { try { ro.unobserve(e); } catch (x) {} });
+    observed = els;
+    els.forEach(function (e) { try { ro.observe(e); } catch (x) {} });
+  }
+  function measure() {
+    var sp = null, ft = null;
+    try {
+      sp = document.querySelector('[data-testid="transcript-split"]');
+      ft = document.querySelector('[data-testid="app-footer"]');
+    } catch (e) { return; }
+    if (!sp) return;
+    var page = sp.parentElement;
+    while (page && !__bramIsScrollable(page)) page = page.parentElement;
+    var scrolled = page ? page.scrollTop : 0;
+    // Scroll-invariant by construction: the page scroller's visible height,
+    // minus the splitter's offset within the page CONTENT, minus the footer's
+    // own height. The first cut subtracted the sticky footer's on-screen top,
+    // which moves with page scroll; a 160px page scroll then fed back through
+    // the height it set (629 <-> 505px every 30-80ms, 2026-10-07 20:17:38,
+    // until a reload). None of these three terms changes when the page
+    // scrolls, so the same layout always yields the same height.
+    var pageTop = page ? page.getBoundingClientRect().top : 0;
+    var viewH = page ? page.clientHeight : (window.innerHeight || 0);
+    var spOffset = sp.getBoundingClientRect().top - pageTop + scrolled;
+    var footH = ft ? ft.getBoundingClientRect().height : 0;
+    var next = Math.max(0, Math.floor(viewH - spOffset - footH));
+    var watch = [];
+    if (ft) watch.push(ft);
+    var sib = sp.previousElementSibling;
+    while (sib) { watch.push(sib); sib = sib.previousElementSibling; }
+    observe(watch);
+    if (next !== value) {
+      // A return to the value before last within a second is a flip: the
+      // signature of a measure/resize feedback loop. Flag it rather than
+      // leave it to be spotted in a run of lines.
+      var now = Date.now();
+      var flip = next === prevValue && (now - lastEmitAt) < 1000;
+      window.__bramIframeTrace("transcript-split-height", {
+        px: next, prev: value, scrolled: Math.round(scrolled),
+        viewH: Math.round(viewH), spOffset: Math.round(spOffset), footH: Math.round(footH),
+        flip: flip,
+      });
+      prevValue = value;
+      lastEmitAt = now;
+      value = next;
+      subscribers.forEach(function (fn) {
+        try { fn(); } catch (e) { console.error("[bramSubscribeTranscriptSplitHeight] subscriber threw:", e); }
+      });
+    }
+  }
+  window.__bramTranscriptSplitMeasure = measure;
+  return function () {
+    if (factory) return factory;
+    if (!hooked) {
+      hooked = true;
+      try { window.addEventListener("resize", measure); } catch (e) {}
+    }
+    factory = function (emit) {
+      var fire = function () { emit(value); };
+      subscribers.add(fire);
+      fire();
+      measure();
+      return function () { subscribers.delete(fire); };
+    };
+    return factory;
+  };
+})();
+
+// #427: the Transcript's Worklist pane, open or closed. FOCUS (what the user
+// is looking at now), so sessionStorage: it survives a tab switch or pane
+// reload, which remount the Transcript, but not a relaunch.
+window.__bramRestoreTranscriptWorklistOpen = function () {
+  return __bramReadSS("bram.transcriptWorklistOpen", "") === "1";
+};
+window.__bramToggleTranscriptWorklistOpen = function (open) {
+  var next = !open;
+  __bramWriteSS("bram.transcriptWorklistOpen", next ? "1" : "");
+  // XMLUI's Splitter renders one child and two children in different trees,
+  // so toggling the pane REMOUNTS the transcript List, which starts at the
+  // top. Record what the reader was looking at; the remounted List's first
+  // visible-range report re-lands it (__bramSplitToggleLanding). Opening
+  // keeps its deliberate jump to the newest turn, so only a close is
+  // recorded. (transcript-split-toggle-keeps-reading-position)
+  var following = window.__bramFollowAtBottom !== false;
+  var vr = window.__bramVisibleRange;
+  var row = (vr && typeof vr.startIndex === "number") ? vr.startIndex : -1;
+  window.__bramSplitToggleLand = next ? null : { following: following, row: row };
+  window.__bramIframeTrace("transcript-worklist", {
+    op: next ? "open" : "close", follow: following, row: row,
+  });
+  return next;
+};
+// The Worklist pane's own scroll position (transcript-split-toggle-keeps-
+// reading-position). FOCUS, so sessionStorage. Saved continuously while the
+// pane is mounted (a tab switch unmounts it as surely as Hide does), and
+// restored on mount as the Worklist's rows load: a ResizeObserver waits for
+// the content to be tall enough -- no timed wait -- and the restore stands
+// down the moment the user scrolls the pane themselves.
+var __bramWorklistPaneState = null;
+window.__bramWorklistPaneMounted = function () {
+  var KEY = "bram.transcriptWorklistPaneScroll";
+  var el = null;
+  try { el = document.querySelector('[data-testid="transcript-worklist-pane"]'); } catch (e) { el = null; }
+  if (!el) return;
+  if (__bramWorklistPaneState) window.__bramWorklistPaneUnmounted();
+  var saved = Number(__bramReadSS(KEY, "0")) || 0;
+  var st = { el: el, restoring: saved > 0, ro: null, listeners: [] };
+  __bramWorklistPaneState = st;
+  var finish = function (how) {
+    if (!st.restoring) return;
+    st.restoring = false;
+    if (st.ro) { try { st.ro.disconnect(); } catch (e) {} st.ro = null; }
+    window.__bramIframeTrace("transcript-worklist", {
+      op: "pane-restore", saved: saved, landed: Math.round(el.scrollTop), how: how,
+    });
+  };
+  var tryRestore = function () {
+    if (!st.restoring) return;
+    var max = el.scrollHeight - el.clientHeight;
+    el.scrollTop = Math.min(saved, Math.max(0, max));
+    if (max >= saved) finish("content");
+  };
+  var onScroll = function () {
+    if (st.restoring) return;
+    __bramWriteSS(KEY, String(Math.round(el.scrollTop)));
+  };
+  var onUser = function () { finish("user"); };
+  var add = function (type, fn) {
+    el.addEventListener(type, fn, { passive: true });
+    st.listeners.push([type, fn]);
+  };
+  add("scroll", onScroll);
+  add("wheel", onUser);
+  add("pointerdown", onUser);
+  add("keydown", onUser);
+  if (st.restoring && typeof ResizeObserver !== "undefined") {
+    st.ro = new ResizeObserver(tryRestore);
+    st.ro.observe(el);
+    if (el.firstElementChild) st.ro.observe(el.firstElementChild);
+  }
+  tryRestore();
+};
+window.__bramWorklistPaneUnmounted = function () {
+  var st = __bramWorklistPaneState;
+  __bramWorklistPaneState = null;
+  if (!st) return;
+  if (st.ro) { try { st.ro.disconnect(); } catch (e) {} }
+  st.listeners.forEach(function (l) {
+    try { st.el.removeEventListener(l[0], l[1]); } catch (e) {}
+  });
+};
+
+// Re-land the transcript after a close remounted it: the bottom if the
+// reader was following (the jump yields if they scroll first), else the row
+// they were reading. Called with the List's first visible-range report after
+// the toggle; one-shot.
+function __bramSplitToggleLanding(listRef, agentId) {
+  var p = window.__bramSplitToggleLand;
+  window.__bramSplitToggleLand = null;
+  if (!p || !listRef) return;
+  if (p.following) {
+    window.__bramBottomJumpRetry(listRef, "worklist-close", agentId, null);
+    return;
+  }
+  if (p.row > 0) {
+    try { listRef.scrollToIndex(p.row); } catch (e) { /* ignore */ }
+  }
+  window.__bramIframeTrace("follow-state", {
+    op: "restore", cause: "worklist-close", row: p.row, agentId: agentId || "main",
+  });
+}
+// #427: the split's resize event. Saves the divider as a percentage (a
+// DECISION, via __bramSaveSplitterSize -> localStorage) only while the
+// Worklist pane is open -- closed, the transcript fills the splitter and
+// that is not a divider position. Then re-lands the transcript on its
+// newest turn (the jump yields if the user has scrolled up).
+window.__bramTranscriptSplitResized = function (primaryPx, totalPx, open, listRef, agentId) {
+  var p = Number(primaryPx), t = Number(totalPx);
+  if (open && p > 0 && t > p) window.__bramSaveSplitterSize("transcript-worklist", [p, t - p]);
+  window.__bramBottomJumpRetry(listRef, "worklist-resize", agentId, null);
+};
+
+// Markup helper: the measured px, or a viewport-relative stand-in until the
+// first measurement lands (one render at most).
+window.__bramTranscriptSplitHeightCss = function (px) {
+  return (typeof px === "number" && px > 0) ? (px + "px") : "70vh";
 };
 function __bramVisibleToolIds() {
   var ids = {};
@@ -11725,6 +11943,15 @@ function __bramLastRowProbe(total) {
     out.lastRowRendered = true;
     var r = node.getBoundingClientRect();
     var vh = window.innerHeight || document.documentElement.clientHeight || 0;
+    // #427: the fold is the scroller's bottom edge, not the window's, when the
+    // List scrolls itself (the Transcript's Worklist split bounds it above the
+    // window bottom). Measuring against the window read a row 125px below the
+    // scroller's fold as gap 0, so jumps stopped short.
+    var info = __bramTranscriptScrollerInfo();
+    if (info.el && info.how === "scoped-self") {
+      var sb = info.el.getBoundingClientRect().bottom;
+      if (sb > 0 && sb < vh) vh = sb;
+    }
     out.lastRowGap = Math.max(0, Math.round(r.bottom - vh));
   } catch (e) { /* ignore */ }
   return out;
@@ -11750,6 +11977,12 @@ function __bramLastRowProbe(total) {
 // constant error, so a fudge factor would fix one and miss the other.
 window.__bramBottomJumpRetry = function (listRef, cause, agentId, total) {
   window.__bramJumpListRef = listRef;
+  // #427: one live retry loop at a time. The Transcript's Worklist split
+  // calls this on every splitter resize, which fires per frame during a
+  // divider drag; each call used to start its own 40-attempt loop (hundreds
+  // in flight for one drag). A newer jump supersedes an older one.
+  var gen = (window.__bramJumpGen || 0) + 1;
+  window.__bramJumpGen = gen;
   var MAX_ATTEMPTS = 40; // ~2s at 50ms; a jump from the top of a long
                          // virtualized list needs virtua to render and measure
                          // its way down, which the old 600ms budget cut short.
@@ -11757,8 +11990,20 @@ window.__bramBottomJumpRetry = function (listRef, cause, agentId, total) {
   var settled = 0;
   function jump() {
     try { if (listRef && listRef.scrollToBottom) listRef.scrollToBottom(); } catch (e) { /* ignore */ }
+    // #427: after the List's scroller shrinks (the Transcript's Worklist
+    // split), scrollToBottom() undershot by a constant 125px across all 40
+    // attempts, consistent with a stale viewport size in the List. Finish the
+    // jump on the measured scroller itself; virtua renders from the resulting
+    // scroll event like any other scroll.
+    try {
+      var el = __bramTranscriptScrollerInfo().el;
+      if (el && el.scrollHeight - (el.scrollTop + el.clientHeight) > 4) {
+        el.scrollTop = el.scrollHeight;
+      }
+    } catch (e2) { /* ignore */ }
   }
   function step() {
+    if (window.__bramJumpGen !== gen) return;
     // The user scrolling up mid-retry takes precedence: __bramFollowTransition
     // sets this false on a corroborated user scroll, and a retry that fought
     // that would be worse than the miss it fixes.
@@ -11904,6 +12149,28 @@ window.__bramFollowVerify = function (cause, agentId, total) {
           // so a run of `scoped-miss` / `unmounted` is legible as "this reading
           // is index-only" instead of passing for a pixel verdict.
           var landed = (pixelAtEnd === null) ? indexAtEnd : pixelAtEnd;
+          // #427: when the List scrolls itself (the Transcript's Worklist
+          // split), "at end" can still hide the last lines if the PAGE around
+          // it overflows: the List's bottom edge then sits under the footer
+          // or below the window. `page` is the nearest scrolling ancestor
+          // (scrollTop/scrollHeight hClient); `listBottom` / `footerTop` /
+          // `winH` place the List's visible bottom edge.
+          var page = "", listBottom = -1, footerTop = -1, winH = -1;
+          if (info.how === "scoped-self" && sc) {
+            try {
+              var up = sc.parentElement;
+              while (up && !__bramIsScrollable(up)) up = up.parentElement;
+              if (up) {
+                page = String(up.className || "").split(/\s+/)[0].slice(0, 24)
+                  + " " + Math.round(up.scrollTop) + "/" + Math.round(up.scrollHeight)
+                  + " h" + Math.round(up.clientHeight);
+              }
+              listBottom = Math.round(sc.getBoundingClientRect().bottom);
+              var ft = document.querySelector('[data-testid="app-footer"]');
+              if (ft) footerTop = Math.round(ft.getBoundingClientRect().top);
+              winH = window.innerHeight || -1;
+            } catch (e6) { /* ignore */ }
+          }
           var route = "";
           try { route = String(location.hash || ""); } catch (e4) { /* ignore */ }
 
@@ -11917,6 +12184,10 @@ window.__bramFollowVerify = function (cause, agentId, total) {
             divergent: (pixelAtEnd !== null && pixelAtEnd !== indexAtEnd),
             scroller: info.how,
             el: elDesc,
+            page: page,
+            listBottom: listBottom,
+            footerTop: footerTop,
+            winH: winH,
             lastRowRendered: probe.lastRowRendered,
             lastRowGap: probe.lastRowGap,
             maxRenderedIndex: probe.maxRenderedIndex,
@@ -12865,7 +13136,7 @@ window.__bramCommitMarkedText = function (row) {
 // (block 0) bakes the header fields so the row template never reads issue.value
 // from a frozen List-row scope (first-click-stuck-Loading trap); one comment
 // row per comment (blocks 1+N).
-window.__bramIssueBlockRows = function (issue) {
+window.__bramIssueBlockRows = function (issue, _pendingTick) {
   var rows = [{
     id: "body", kind: "body",
     body: (issue && issue.body) || "",
@@ -12881,7 +13152,10 @@ window.__bramIssueBlockRows = function (issue) {
     var c = comments[i] || {};
     rows.push({ id: "comment:" + i, kind: "comment", body: c.body || "", author: c.author });
   }
-  return rows;
+  // issue-comment-optimistic-and-reindexed: pending comments after the real
+  // ones. `_pendingTick` is unused here; IssueDetail passes it so the binding
+  // re-evaluates when a pending comment is added, posted or dropped.
+  return rows.concat(__bramPendingCommentRows(issue));
 };
 // Marked surface (counted == highlighted): the body text for both kinds.
 window.__bramIssueMarkedText = function (row) {
@@ -13709,6 +13983,22 @@ window.__bramFooterSessionLineParts = function (session, agentId, roster) {
     bold: viewBold,
     post: viewPost + " ·" + meta.slice(sp),
   };
+};
+// composer-addressee-hugs-box (Jon): the footer status as ONE Markdown
+// paragraph, so a narrow pane wraps it at word boundaries like a sentence.
+// As separate Text items under HStack wrapContent it broke per item
+// ("CLAUDE ·Main" alone, then the rest, then "· Indexed" on its own line).
+// Only the viewport name is bold; every join is the same " · ". Session and
+// agent names are data, so Markdown punctuation is escaped.
+window.__bramFooterStatusMarkdown = function (parts, indexStatus) {
+  var indexLabel = indexStatus ? window.__bramFooterIndexLabel(indexStatus) : "";
+  var esc = function (t) {
+    return String(t || "").replace(/([\\`*_{}\[\]()#+\-.!|<>~])/g, "\\$1");
+  };
+  var p = parts || {};
+  var line = esc(p.pre) + (p.bold ? "**" + esc(p.bold) + "**" : "") + esc(p.post);
+  if (indexLabel) line += (line ? " · " : "") + esc(indexLabel);
+  return line;
 };
 window.__bramFooterSessionLine = function (session, agentId, roster) {
   var p = window.__bramFooterSessionLineParts(session, agentId, roster);
@@ -15106,7 +15396,24 @@ window.__bramDiffToggleFile = function (keys, itemId, path) {
     return String(k).indexOf(prefix) !== 0;
   });
   if (!wasOpen) next.push(key);
-  return next;
+  return window.__bramPersistWorklist2DiffKeys(next);
+};
+// Which file diffs are open survives a Worklist remount (Hide/Show of the
+// Transcript's Worklist pane, a tab switch), as row expansion does: FOCUS,
+// so sessionStorage, keyed `itemId::path` and pruned with expandedKeys.
+// (transcript-split-toggle-keeps-reading-position)
+window.__bramPersistWorklist2DiffKeys = function (keys) {
+  try {
+    sessionStorage.setItem("bram.worklist2.diffKeys", JSON.stringify(keys || []));
+  } catch (e) {}
+  return keys || [];
+};
+window.__bramRestoreWorklist2DiffKeys = function () {
+  try {
+    return JSON.parse(sessionStorage.getItem("bram.worklist2.diffKeys") || "[]") || [];
+  } catch (e) {
+    return [];
+  }
 };
 window.__bramDiffToggleTooltip = function (keys, itemId, path) {
   return window.__bramDiffExpanded(keys, itemId, path) ? "Hide this file's diff" : "Show this file's diff";
@@ -15375,6 +15682,119 @@ var __BRAM_PENDING_CLOSE_MAX_MS = 120000;
 window.__bramPendingIssueCloseList = function () {
   return Object.keys(__bramPendingIssueCloses).map(Number);
 };
+// issue-comment-optimistic-and-reindexed: a comment posts the way a close
+// does (4173873). The click records a pending comment, clears the box, and
+// POSTs /__issue/comment in the background; the host re-indexes the issue on
+// success (refresh_issue_now, issues-changed). IssueDetail shows pending
+// comments after the real ones -- "posting…" until the POST returns, then
+// unmarked -- and drops each one once its own fetch contains a comment with
+// the same text, so nothing flickers out before the re-index lands. On
+// failure the entry is dropped, a toast says why, and the text goes back into
+// the box. Module state, so it survives the tab remounting; 120 s expiry, as
+// close has.
+var __bramPendingIssueComments = {};
+var __bramPendingCommentSubs = new Set();
+var __bramPendingCommentTick = 0;
+function __bramPendingCommentsChanged() {
+  __bramPendingCommentTick += 1;
+  __bramPendingCommentSubs.forEach(function (fn) {
+    try { fn(); } catch (e) { console.error("[bramSubscribeIssueComments] subscriber threw:", e); }
+  });
+}
+window.bramSubscribeIssueComments = (function () {
+  var factory;
+  return function () {
+    if (factory) return factory;
+    factory = function (emit) {
+      var fire = function () { emit(__bramPendingCommentTick); };
+      __bramPendingCommentSubs.add(fire);
+      fire();
+      return function () { __bramPendingCommentSubs.delete(fire); };
+    };
+    return factory;
+  };
+})();
+window.__bramCommentIssue = function (number, box, toastApi) {
+  if (!number || !box || typeof box.getValue !== "function") return;
+  // A user-defined component's <method>s (IsolatedDraftEditor's getValue /
+  // setValue / clear) return Promises when called from real JS. Using the
+  // return value directly posted "[object Promise]" as the comment
+  // (2026-10-07, #428). Resolve it first.
+  Promise.resolve(box.getValue()).then(function (raw) {
+    __bramCommentIssuePost(number, String(raw || "").trim(), box, toastApi);
+  });
+};
+function __bramCommentIssuePost(number, body, box, toastApi) {
+  if (!body) return;
+  var say = function (msg) {
+    if (!toastApi) return;
+    if (typeof toastApi.error === "function") toastApi.error(msg);
+    else if (typeof toastApi === "function") toastApi(msg);
+  };
+  var startedAt = Date.now();
+  var entry = { body: body, at: startedAt, state: "posting" };
+  var list = __bramPendingIssueComments[number] || (__bramPendingIssueComments[number] = []);
+  list.push(entry);
+  try { Promise.resolve(box.clear()).catch(function () {}); } catch (e) { /* ignore */ }
+  window.__bramIframeTrace("click", { target: "comment-issue", op: "act", number: number, bodyBytes: body.length });
+  __bramPendingCommentsChanged();
+  var drop = function () {
+    var l = __bramPendingIssueComments[number] || [];
+    var i = l.indexOf(entry);
+    if (i !== -1) l.splice(i, 1);
+  };
+  window
+    .fetch("/__issue/comment?number=" + encodeURIComponent(number) + "&body=" + encodeURIComponent(body), {
+      method: "POST",
+    })
+    .then(function (r) {
+      if (!r.ok) {
+        return r.text().then(function (t) { throw new Error(t || ("HTTP " + r.status)); });
+      }
+      entry.state = "posted";
+      window.__bramIframeTrace("issue-comment", { op: "ok", number: number, elapsedMs: Date.now() - startedAt });
+      __bramPendingCommentsChanged();
+    })
+    .catch(function (e) {
+      drop();
+      window.__bramIframeTrace("issue-comment", { op: "err", number: number, elapsedMs: Date.now() - startedAt, error: String(e) });
+      say("Couldn't comment on #" + number + ": " + String(e && e.message || e));
+      // Put the text back, unless the user has typed something new since.
+      Promise.resolve(box.getValue())
+        .then(function (now) {
+          if (!String(now || "").trim()) return box.setValue(body);
+        })
+        .catch(function () {});
+      __bramPendingCommentsChanged();
+    });
+}
+// The issue's display rows plus its pending comments. A pending comment whose
+// text the fetched issue already contains has landed: it is retired here.
+function __bramPendingCommentRows(issue) {
+  var number = issue && issue.number;
+  var list = __bramPendingIssueComments[number];
+  if (!list || !list.length) return [];
+  var have = {};
+  ((issue && issue.comments) || []).forEach(function (c) {
+    have[String((c && c.body) || "").trim()] = true;
+  });
+  var now = Date.now();
+  var keep = list.filter(function (p) {
+    if (have[p.body]) {
+      window.__bramIframeTrace("issue-comment", { op: "confirmed", number: number, elapsedMs: now - p.at });
+      return false;
+    }
+    return now - p.at < 120000;
+  });
+  __bramPendingIssueComments[number] = keep;
+  return keep.map(function (p, i) {
+    return {
+      id: "pending:" + p.at + ":" + i, kind: "comment", body: p.body,
+      author: { login: "you" }, pending: p.state,
+    };
+  });
+}
+
 window.__bramCloseIssue = function (number, comment, toastApi, onPendingChange) {
   var invoke = getTauriInvoke();
   var say = function (msg) {
@@ -16271,3 +16691,111 @@ window.__bramSuggestTrace = function (op, suggested, name, text, sugName, sugTex
 window.bramSubscribeTauriEvent("session-suggest", false)(function (snap) {
   window.__bramSessionSuggestIngest(snap && snap.payload);
 });
+
+// code-block-copy-and-dblclick-select: XMLUI's Markdown has no copy
+// affordance for code blocks and exposes no hook to add one
+// (https://www.xmlui.org/docs/reference/components/Markdown), and
+// double-clicking inside a block selected far more than the block. Both are
+// handled by delegated listeners on the document, so nothing is injected into
+// React-managed DOM (virtualized rows recycle; an injected button would be
+// wiped or duplicated).
+//   - One floating Copy button, positioned over whichever <pre> the pointer
+//     is on, copies that block's text through __bramCopyText (#414).
+//   - A double-click inside a <pre> selects exactly that block. The browser's
+//     own selection is traced first (op=dblclick-native), so the cause of the
+//     whole-pane selection is on record even though this overrides it.
+// Candidate for upstream XMLUI once it proves itself.
+window.__bramInstallCodeBlockTools = function () {
+  if (window.__bramCodeBlockToolsInstalled) return;
+  window.__bramCodeBlockToolsInstalled = true;
+  var btn = null;
+  var current = null;
+  var preOf = function (node) {
+    var el = node && (node.nodeType === 1 ? node : node.parentElement);
+    return el && el.closest ? el.closest("pre") : null;
+  };
+  // The "Copied" label resets when the button next hides or moves to another
+  // block: event-driven, no timer.
+  var hide = function () {
+    if (btn) { btn.style.display = "none"; btn.textContent = "Copy"; }
+    current = null;
+  };
+  var ensureBtn = function () {
+    if (btn) return btn;
+    btn = document.createElement("button");
+    btn.type = "button";
+    btn.textContent = "Copy";
+    btn.setAttribute("data-testid", "code-block-copy");
+    btn.style.cssText = [
+      "position:fixed", "z-index:1000", "display:none",
+      "font-size:12px", "line-height:1", "padding:4px 8px", "cursor:pointer",
+      "border-radius:4px",
+      "border:1px solid var(--xmlui-borderColor, #c8ccd2)",
+      "background:var(--xmlui-backgroundColor-primary, #fff)",
+      "color:var(--xmlui-textColor-primary, #222)",
+      "opacity:0.9",
+    ].join(";");
+    btn.addEventListener("mousedown", function (e) { e.preventDefault(); });
+    btn.addEventListener("click", function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!current) return;
+      var text = String(current.innerText || "").replace(/\n$/, "");
+      window.__bramCopyText(text, function (msg) {
+        var ok = String(msg).indexOf("Copied") === 0;
+        window.__bramIframeTrace("code-block", { op: "copy", bytes: text.length, ok: ok });
+        btn.textContent = ok ? "Copied" : "Copy failed";
+      });
+    });
+    btn.addEventListener("mouseleave", function (e) {
+      if (!preOf(e.relatedTarget)) hide();
+    });
+    document.body.appendChild(btn);
+    return btn;
+  };
+  var place = function (pre) {
+    var b = ensureBtn();
+    var r = pre.getBoundingClientRect();
+    if (r.width < 40 || r.height < 16) return hide();
+    if (pre !== current) b.textContent = "Copy";
+    current = pre;
+    b.style.display = "block";
+    var w = b.offsetWidth || 48;
+    b.style.top = Math.max(0, Math.round(r.top + 4)) + "px";
+    b.style.left = Math.max(0, Math.round(r.right - w - 4)) + "px";
+  };
+  document.addEventListener("mouseover", function (e) {
+    if (btn && e.target === btn) return;
+    var pre = preOf(e.target);
+    if (pre) { if (pre !== current) place(pre); }
+    else if (current) hide();
+  }, true);
+  // A scroll moves the block out from under a fixed button: hide until the
+  // pointer moves over a block again.
+  document.addEventListener("scroll", function () { if (current) hide(); }, true);
+  document.addEventListener("dblclick", function (e) {
+    var pre = preOf(e.target);
+    if (!pre) return;
+    var sel = window.getSelection && window.getSelection();
+    if (!sel) return;
+    var describe = function (node) {
+      var el = node && (node.nodeType === 1 ? node : node.parentElement);
+      if (!el) return "";
+      var cls = String(el.className && el.className.baseVal !== undefined ? el.className.baseVal : el.className || "");
+      return (el.tagName || "?").toLowerCase() + (cls ? "." + cls.split(/\s+/)[0].slice(0, 24) : "");
+    };
+    var nativeText = String(sel.toString() || "");
+    window.__bramIframeTrace("code-block", {
+      op: "dblclick-native", bytes: nativeText.length,
+      inBlock: !!(preOf(sel.anchorNode) === pre && preOf(sel.focusNode) === pre),
+      anchor: describe(sel.anchorNode), focus: describe(sel.focusNode),
+      blockBytes: String(pre.innerText || "").length,
+    });
+    var range = document.createRange();
+    range.selectNodeContents(pre.querySelector("code") || pre);
+    sel.removeAllRanges();
+    sel.addRange(range);
+    window.__bramIframeTrace("code-block", { op: "dblclick-select", bytes: String(sel.toString() || "").length });
+  }, true);
+};
+window.__bramInstallCodeBlockTools();

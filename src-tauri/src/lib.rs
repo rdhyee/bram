@@ -8955,6 +8955,7 @@ fn handle_permission_menu<R: tauri::Runtime>(
         .clone()
         .unwrap_or_else(|| resolution.to_string());
     let claim_at_ms = unix_now_ms();
+    let mut merged_into: Option<String> = None;
     let depth = {
         let Ok(mut q) = menu_hook_claims_cell().lock() else {
             return (
@@ -8963,19 +8964,56 @@ fn handle_permission_menu<R: tauri::Runtime>(
                 b"claim queue poisoned".to_vec(),
             );
         };
-        q.retain(|c| c.id_key != id_key);
-        q.push(HookMenuClaim {
-            id_key: id_key.clone(),
-            tool_use_id,
-            signature: claim_signature,
-            menu,
-            at_ms: claim_at_ms,
-            answered: false,
-            answered_label: None,
-            answered_at_ms: None,
-        });
-        q.len()
+        // hook-claim-merge-same-signature: one call can arrive twice —
+        // PreToolUse with its tool_use_id, then PermissionRequest without
+        // one that claim-id-resolution couldn't resolve (AskUserQuestion,
+        // 2026-10-08). Keyed differently, the pair sat at depth 2, which
+        // defeats claim_remained_sole and the grid join's identical-claim
+        // refusal, so the card showed only if the coalesce timer won the
+        // race. Fold the id-less claim into the id-bearing one instead.
+        let existing = match (&tool_use_id, &claim_signature) {
+            (None, Some(sig)) => q.iter().position(|c| {
+                !c.answered && c.tool_use_id.is_some() && c.signature.as_deref() == Some(sig)
+            }),
+            _ => None,
+        };
+        if let Some(pos) = existing {
+            q[pos].menu = menu;
+            merged_into = Some(q[pos].id_key.clone());
+            q.len()
+        } else {
+            q.retain(|c| c.id_key != id_key);
+            q.push(HookMenuClaim {
+                id_key: id_key.clone(),
+                tool_use_id,
+                signature: claim_signature,
+                menu,
+                at_ms: claim_at_ms,
+                answered: false,
+                answered_label: None,
+                answered_at_ms: None,
+            });
+            q.len()
+        }
     };
+    if let Some(existing_key) = merged_into {
+        if bram_trace_enabled() {
+            append_bram_trace_line(
+                app,
+                "hook-menu",
+                &format!(
+                    "op=claim-queue-merge id_key={} via=signature depth={}",
+                    existing_key, depth
+                ),
+            );
+        }
+        // The id-bearing claim already scheduled its coalesce timer.
+        return (
+            200,
+            "application/json; charset=utf-8",
+            b"{\"ok\":true,\"applied\":true}".to_vec(),
+        );
+    }
     if bram_trace_enabled() {
         append_bram_trace_line(
             app,
@@ -19769,6 +19807,43 @@ fn switch_agent(
     } else {
         None
     };
+    // new-session-switch-starts-fresh-partner: leaving a session started with
+    // New session that has no partner yet, start the target fresh, named for
+    // that session, and pair the two once it is up. New session was the
+    // explicit act ("this is a new line of work"), so pairs stay explicit; any
+    // other unpaired switch still falls back and offers the choice. A pending
+    // named Codex session still wins: the user just asked for it.
+    // Only a session never paired or unpaired qualifies (an Unpair must
+    // survive the next switch), and only with "Pair new sessions across
+    // providers" on: this branch pairs, so it obeys the same setting.
+    let wants_fresh = leaving.as_ref().is_some_and(|(p, sid)| {
+        worklist_state_open(&app)
+            .and_then(|conn| {
+                worklist_state::session_wants_fresh_partner(&conn, session_provider_label(*p), sid)
+                    .ok()
+            })
+            .unwrap_or(false)
+    });
+    let fresh: Option<(String, Option<String>)> = if switch_starts_fresh_partner(
+        partner.is_some(),
+        provider_key == "codex" && pending.is_some(),
+        pair_offers_enabled(&app),
+        wants_fresh,
+    ) {
+        leaving
+            .as_ref()
+            .and_then(|(p, sid)| session_title_by_id(&app, *p, sid))
+            .map(|title| {
+                // Claude takes a pre-allocated id (#274); Codex's surfaces later.
+                let sid = (provider_key == "claude").then(|| uuid::Uuid::new_v4().to_string());
+                (fresh_partner_title(&title, target_provider), sid)
+            })
+    } else {
+        None
+    };
+    let fresh_command = fresh
+        .as_ref()
+        .map(|(title, sid)| new_session_launch_command(provider_key, title, sid.as_deref()));
     let (base_command, pending_disposition) = provider_switch_launch(
         provider_key,
         has_session,
@@ -19776,6 +19851,7 @@ fn switch_agent(
         pending.as_ref(),
         pending_target.as_deref(),
         partner.as_deref(),
+        fresh_command.as_deref(),
     );
     if !has_session && bram_trace_enabled() {
         append_bram_trace_line(
@@ -19820,6 +19896,8 @@ fn switch_agent(
                     .unwrap_or("unbound"),
                 if pending_disposition == "restart-pending" {
                     "none"
+                } else if pending_disposition == "fresh-for-new-session" {
+                    "fresh"
                 } else {
                     pending_target
                         .as_deref()
@@ -19839,9 +19917,34 @@ fn switch_agent(
         "partner" => partner.clone(),
         "pin" => pin.as_ref().map(|t| t.id.clone()),
         "latest" => live_session_id(&app, target_provider),
+        "fresh-for-new-session" => fresh.as_ref().and_then(|(_, sid)| sid.clone()),
         _ => None,
     };
     let pair_from = leaving.clone();
+    // new-session-switch-starts-fresh-partner: queue the fresh partner's name
+    // (applied when its session surfaces), and note the target's live session
+    // now so a Codex partner, whose id isn't known yet, pairs once it changes.
+    let fresh_baseline = if resume_reason == "fresh-for-new-session" {
+        let baseline = live_session_id(&app, target_provider);
+        if let Some((title, sid)) = fresh.as_ref() {
+            write_pending_session_title(&app, provider_key, title, sid.clone());
+            if bram_trace_enabled() {
+                append_bram_trace_line(
+                    &app,
+                    "agent-switch",
+                    &format!(
+                        "op=fresh-partner provider={} from={} sid={}",
+                        provider_key,
+                        leaving.as_ref().map(|(_, id)| id.as_str()).unwrap_or(""),
+                        sid.as_deref().unwrap_or("unbound")
+                    ),
+                );
+            }
+        }
+        baseline
+    } else {
+        None
+    };
     // The boot hold is NOT armed here, deliberately (#305, reverting the arm
     // added by 597935b): its release condition is boot bytes, and Codex emits
     // none it accepts, so holding made every Codex switch swallow pane sends
@@ -19903,16 +20006,94 @@ fn switch_agent(
                         .filter(|_| offer)
                         .map(|id| (target_provider, id)),
                 );
+                // new-session-switch-starts-fresh-partner: pair the fresh
+                // partner with the session it was started for; a Codex one
+                // pairs once its id surfaces (PENDING_PAIR).
+                if resume_reason == "fresh-for-new-session" {
+                    if let Some(from) = pair_from.as_ref() {
+                        match target_sid.as_ref() {
+                            Some(id) => record_pair_for(
+                                app,
+                                from,
+                                &(target_provider, id.clone()),
+                                "switch-new-session-born",
+                            ),
+                            None => {
+                                let mut guard = match PENDING_PAIR.lock() {
+                                    Ok(g) => g,
+                                    Err(e) => e.into_inner(),
+                                };
+                                *guard = Some(PendingPair {
+                                    from: from.clone(),
+                                    to: target_provider,
+                                    baseline: fresh_baseline.clone(),
+                                    at_ms: unix_now_ms(),
+                                    source: "switch-new-session-born",
+                                });
+                            }
+                        }
+                    }
+                }
                 // provider-session-digest-for-codex: resuming a partner, write
                 // what it missed in the session being left, and offer the
-                // catch-up turn. Then mark the entered session.
-                let digest = if resume_reason == "partner" {
-                    pair_from
-                        .as_ref()
-                        .and_then(|(p, id)| write_session_digest(app, *p, id, true))
-                } else {
-                    None
+                // catch-up turn. Then mark the entered session. A fresh
+                // partner has missed everything, so it gets the latest turns.
+                let digest = match resume_reason {
+                    "partner" | "fresh-for-new-session" => {
+                        pair_from.as_ref().and_then(|(p, id)| {
+                            write_session_digest(app, *p, id, resume_reason == "partner")
+                        })
+                    }
+                    _ => None,
                 };
+                // A fresh Codex session has no file, name or pair until its
+                // first message, so the catch-up is sent rather than offered:
+                // the partner gets its context and surfaces at once, before
+                // the queued name (10 min) or pending pair (15 min) expire.
+                if resume_reason == "fresh-for-new-session" {
+                    if let (Some((fp, fid)), Some((path, turns))) =
+                        (pair_from.as_ref(), digest.as_ref())
+                    {
+                        let title = session_title_by_id(app, *fp, fid);
+                        let text = catch_up_turn_text(
+                            &catch_up_from_label(*fp, fid, title.as_deref()),
+                            *turns,
+                            path,
+                        );
+                        let state = app.state::<AppState>();
+                        let queued = queue_pty_intent_inner(
+                            app,
+                            serde_json::json!({
+                                "kind": "toTurn",
+                                "data": text,
+                                "source": "fresh-partner-catch-up",
+                            }),
+                            &state,
+                        );
+                        if bram_trace_enabled() {
+                            append_bram_trace_line(
+                                app,
+                                "agent-switch",
+                                &format!(
+                                    "op=fresh-partner-catch-up provider={} turns={} result={}",
+                                    session_provider_label(target_provider),
+                                    turns,
+                                    match &queued {
+                                        Ok(()) => "queued".to_string(),
+                                        Err(e) => format!("error detail={}", e),
+                                    }
+                                ),
+                            );
+                        }
+                        if queued.is_ok() {
+                            emit_catch_up_offer(app, None, None, None);
+                            if let Some(id) = target_sid.as_deref() {
+                                mark_session_entered(app, target_provider, id);
+                            }
+                            return;
+                        }
+                    }
+                }
                 emit_catch_up_offer(app, pair_from.as_ref(), Some(target_provider), digest);
                 if let Some(id) = target_sid.as_deref() {
                     mark_session_entered(app, target_provider, id);
@@ -20419,6 +20600,19 @@ fn write_session_digest<R: tauri::Runtime>(
 
 // The pane's "Catch <partner> up" notice. Replayable (a cross-provider switch
 // reloads the pane); any switch without a digest clears it.
+// "Claude session '<title>'", or the id's first 8 characters when untitled.
+fn catch_up_from_label(provider: SessionProvider, id: &str, title: Option<&str>) -> String {
+    let who = if provider == SessionProvider::Codex {
+        "Codex"
+    } else {
+        "Claude"
+    };
+    match title {
+        Some(t) => format!("{} session '{}'", who, t),
+        None => format!("{} session {}", who, id.chars().take(8).collect::<String>()),
+    }
+}
+
 fn emit_catch_up_offer<R: tauri::Runtime>(
     app: &AppHandle<R>,
     from: Option<&(SessionProvider, String)>,
@@ -20428,19 +20622,7 @@ fn emit_catch_up_offer<R: tauri::Runtime>(
     let payload = match (from, to, digest) {
         (Some((fp, fid)), Some(tp), Some((path, turns))) => {
             let title = session_title_by_id(app, *fp, fid);
-            let who = if *fp == SessionProvider::Codex {
-                "Codex"
-            } else {
-                "Claude"
-            };
-            let from = match title.as_deref() {
-                Some(t) => format!("{} session '{}'", who, t),
-                None => format!(
-                    "{} session {}",
-                    who,
-                    fid.chars().take(8).collect::<String>()
-                ),
-            };
+            let from = catch_up_from_label(*fp, fid, title.as_deref());
             serde_json::json!({
                 "active": true,
                 "fromProvider": session_provider_label(*fp),
@@ -20466,6 +20648,8 @@ struct PendingPair {
     to: SessionProvider,
     baseline: Option<String>,
     at_ms: i64,
+    // The pair-stamp source once it resolves.
+    source: &'static str,
 }
 
 static PENDING_PAIR: Mutex<Option<PendingPair>> = Mutex::new(None);
@@ -20493,9 +20677,41 @@ fn resolve_pending_pair<R: tauri::Runtime>(app: &AppHandle<R>, provider: Session
         return;
     }
     let from = pending.from.clone();
+    let source = pending.source;
     *guard = None;
     drop(guard);
-    record_pair_for(app, &from, &(provider, live), "switch-new-session");
+    record_pair_for(app, &from, &(provider, live), source);
+}
+
+// new-session-switch-starts-fresh-partner: whether a switch starts a fresh
+// partner. Not when the leaving session has a partner or a named Codex launch
+// is pending; not with "Pair new sessions across providers" off (this pairs);
+// and only for a session started with New session and never paired or
+// unpaired (worklist_state::session_wants_fresh_partner).
+fn switch_starts_fresh_partner(
+    has_partner: bool,
+    codex_pending: bool,
+    pairing_enabled: bool,
+    wants_fresh: bool,
+) -> bool {
+    !has_partner && !codex_pending && pairing_enabled && wants_fresh
+}
+
+// new-session-switch-starts-fresh-partner: the name of a fresh partner is the
+// session it goes with, tagged with the provider it runs on. A title already
+// tagged with the other provider swaps the tag rather than stacking a second.
+fn fresh_partner_title(from_title: &str, to: SessionProvider) -> String {
+    let base = from_title.trim();
+    let base = base
+        .strip_suffix(" (Claude)")
+        .or_else(|| base.strip_suffix(" (Codex)"))
+        .unwrap_or(base);
+    let tag = if to == SessionProvider::Codex {
+        "Codex"
+    } else {
+        "Claude"
+    };
+    format!("{} ({})", base, tag)
 }
 
 fn provider_switch_launch(
@@ -20505,6 +20721,7 @@ fn provider_switch_launch(
     pending: Option<&PendingSessionTitle>,
     pending_target: Option<&str>,
     partner_id: Option<&str>,
+    fresh_partner: Option<&str>,
 ) -> (String, &'static str) {
     if provider == "codex" {
         if let Some(rec) = pending.filter(|rec| rec.provider == "codex") {
@@ -20525,6 +20742,12 @@ fn provider_switch_launch(
     // (above) still wins: the user just asked for it.
     if let Some(id) = partner_id {
         return (agent_resume_command(provider, id).unwrap(), "none");
+    }
+    // new-session-switch-starts-fresh-partner: leaving a session started with
+    // New session and not yet paired, start its partner fresh (the caller
+    // built the named launch) instead of resuming the pin or most recent.
+    if let Some(command) = fresh_partner {
+        return (command.to_string(), "fresh-for-new-session");
     }
     if provider == "codex" {
         if let Some(id) = pinned_id {
@@ -21266,6 +21489,18 @@ fn apply_pending_session_title<R: tauri::Runtime>(
         match rename_result {
             Ok(_) => {
                 let _ = std::fs::remove_file(&path);
+                // new-session-switch-starts-fresh-partner: remember that this
+                // session began as a new line of work, so the first switch
+                // away from it starts a fresh partner (switch_agent).
+                if let Some(conn) = worklist_state_open(app) {
+                    let _ = worklist_state::record_session_born(
+                        &conn,
+                        want,
+                        new_sid,
+                        unix_now_ms(),
+                        "new-session",
+                    );
+                }
                 emit_replayable_signal(app, "sessions-list-changed");
                 if bram_trace_enabled() {
                     append_bram_trace_line(
@@ -21301,9 +21536,10 @@ fn apply_pending_session_title<R: tauri::Runtime>(
 #[cfg(test)]
 mod pending_session_title_tests {
     use super::{
-        claim_pending_session_title, codex_session_is_visible, merge_pending_session_entry,
-        new_session_launch_command, pending_session_title_abandoned_by_resume,
-        pending_session_title_can_claim, provider_switch_launch, session_change_snapshot,
+        claim_pending_session_title, codex_session_is_visible, fresh_partner_title,
+        merge_pending_session_entry, new_session_launch_command,
+        pending_session_title_abandoned_by_resume, pending_session_title_can_claim,
+        provider_switch_launch, session_change_snapshot, switch_starts_fresh_partner,
         PendingSessionTitle, SessionEntry, SessionProvider,
     };
 
@@ -21353,7 +21589,7 @@ mod pending_session_title_tests {
         );
         // Switching away must not consume a different provider's request.
         assert_eq!(
-            provider_switch_launch("claude", true, None, Some(&rec), None, None),
+            provider_switch_launch("claude", true, None, Some(&rec), None, None, None),
             ("claude --continue".into(), "none")
         );
         assert!(!pending_session_title_abandoned_by_resume(
@@ -21364,7 +21600,7 @@ mod pending_session_title_tests {
         // Both a persisted old pin and the --last fallback used to defeat New.
         for pin in [Some("old-codex"), None] {
             assert_eq!(
-                provider_switch_launch("codex", true, pin, Some(&rec), None, None),
+                provider_switch_launch("codex", true, pin, Some(&rec), None, None, None),
                 ("codex".into(), "restart-pending")
             );
         }
@@ -21392,6 +21628,7 @@ mod pending_session_title_tests {
                 Some("old-codex"),
                 Some(&rec),
                 Some("fresh-codex"),
+                None,
                 None
             ),
             ("codex resume fresh-codex".into(), "resume-pending")
@@ -21476,16 +21713,16 @@ mod pending_session_title_tests {
             ("codex", "codex resume --last"),
         ] {
             assert_eq!(
-                provider_switch_launch(provider, true, None, None, None, None).0,
+                provider_switch_launch(provider, true, None, None, None, None, None).0,
                 expected
             );
             assert_eq!(
-                provider_switch_launch(provider, false, None, None, None, None).0,
+                provider_switch_launch(provider, false, None, None, None, None, None).0,
                 provider
             );
         }
         assert_eq!(
-            provider_switch_launch("codex", true, Some("pinned"), None, None, None).0,
+            provider_switch_launch("codex", true, Some("pinned"), None, None, None, None).0,
             "codex resume pinned"
         );
         let rec = PendingSessionTitle {
@@ -21506,7 +21743,16 @@ mod pending_session_title_tests {
             "reserved"
         ));
         assert_eq!(
-            provider_switch_launch("codex", true, Some("old-codex"), Some(&rec), None, None).0,
+            provider_switch_launch(
+                "codex",
+                true,
+                Some("old-codex"),
+                Some(&rec),
+                None,
+                None,
+                None
+            )
+            .0,
             "codex resume old-codex"
         );
     }
@@ -21517,11 +21763,20 @@ mod pending_session_title_tests {
     #[test]
     fn switch_resume_order_puts_the_partner_after_pending_and_before_pin() {
         assert_eq!(
-            provider_switch_launch("claude", true, None, None, None, Some("c-partner")).0,
+            provider_switch_launch("claude", true, None, None, None, Some("c-partner"), None).0,
             "claude --resume c-partner"
         );
         assert_eq!(
-            provider_switch_launch("codex", true, Some("pinned"), None, None, Some("x-partner")).0,
+            provider_switch_launch(
+                "codex",
+                true,
+                Some("pinned"),
+                None,
+                None,
+                Some("x-partner"),
+                None
+            )
+            .0,
             "codex resume x-partner"
         );
         let rec = pending_codex();
@@ -21532,9 +21787,63 @@ mod pending_session_title_tests {
                 Some("pinned"),
                 Some(&rec),
                 Some("named"),
-                Some("x-partner")
+                Some("x-partner"),
+                Some("codex")
             ),
             ("codex resume named".to_string(), "resume-pending")
+        );
+    }
+
+    // new-session-switch-starts-fresh-partner: a fresh partner for a session
+    // started with New session comes after a partner and before the pin.
+    #[test]
+    fn switch_starts_a_fresh_partner_after_partner_and_before_pin() {
+        assert_eq!(
+            provider_switch_launch(
+                "codex",
+                true,
+                Some("pinned"),
+                None,
+                None,
+                None,
+                Some("codex")
+            ),
+            ("codex".to_string(), "fresh-for-new-session")
+        );
+        assert_eq!(
+            provider_switch_launch(
+                "claude",
+                true,
+                None,
+                None,
+                None,
+                Some("c-partner"),
+                Some("claude --name 'x'")
+            ),
+            ("claude --resume c-partner".to_string(), "none")
+        );
+    }
+
+    #[test]
+    fn fresh_partner_needs_no_partner_no_pending_the_setting_and_a_new_session() {
+        assert!(switch_starts_fresh_partner(false, false, true, true));
+        assert!(!switch_starts_fresh_partner(true, false, true, true));
+        assert!(!switch_starts_fresh_partner(false, true, true, true));
+        // "Pair new sessions across providers" off.
+        assert!(!switch_starts_fresh_partner(false, false, false, true));
+        // Not started with New session, or paired / unpaired before.
+        assert!(!switch_starts_fresh_partner(false, false, true, false));
+    }
+
+    #[test]
+    fn fresh_partner_title_names_the_target_provider_once() {
+        assert_eq!(
+            fresh_partner_title("General (Oct 8, 0.7.4)", SessionProvider::Codex),
+            "General (Oct 8, 0.7.4) (Codex)"
+        );
+        assert_eq!(
+            fresh_partner_title("General (Oct 8, 0.7.4) (Codex)", SessionProvider::Claude),
+            "General (Oct 8, 0.7.4) (Claude)"
         );
     }
 
@@ -21775,6 +22084,7 @@ fn create_new_session(
                             to: new_provider,
                             baseline: pair_baseline.clone(),
                             at_ms: unix_now_ms(),
+                            source: "switch-new-session",
                         });
                     }
                 }
@@ -62421,6 +62731,16 @@ fn classify_worklist_removals(
     (dropped_via_auth, violations)
 }
 
+// issue-426: is this raw read a complete worklist document? A JSON object with
+// an `items` array. Empty, truncated or otherwise partial reads are not, and
+// must never be judged (or cached) as a board.
+fn worklist_raw_parseable(s: &str) -> bool {
+    match serde_json::from_str::<serde_json::Value>(s) {
+        Ok(v) => v.get("items").map(|i| i.is_array()).unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
 fn maybe_enforce_worklist_policy<R: tauri::Runtime>(
     app: &AppHandle<R>,
     prior_str: &str,
@@ -62477,10 +62797,36 @@ fn maybe_enforce_worklist_policy<R: tauri::Runtime>(
         .map(|(id, status)| format!("\"{}\" (status={})", id, status))
         .collect::<Vec<_>>()
         .join(", ");
+    // issue-426: compare before reverting. If the file has changed since the
+    // read that triggered this check, a newer write has landed; reverting now
+    // would overwrite it with the stale prior copy. Let that write's own
+    // watcher event be judged instead.
+    match std::fs::read_to_string(&path) {
+        Ok(now) if now == current_str => {}
+        _ => {
+            append_bram_trace_line(
+                app,
+                "worklist-enforce",
+                &format!("op=revert-skipped-file-changed ids={}", bad),
+            );
+            return false;
+        }
+    }
     eprintln!(
         "[worklist-enforce] reverting unauthorized removal of {} via watcher fallback; last auth kind={}",
         bad,
         auth.as_ref().map(|a| a.kind.as_str()).unwrap_or("none")
+    );
+    // issue-426: the revert used to reach stderr only, so a reverted write
+    // left no line in bram-trace.log.
+    append_bram_trace_line(
+        app,
+        "worklist-enforce",
+        &format!(
+            "op=revert ids={} auth={}",
+            bad,
+            auth.as_ref().map(|a| a.kind.as_str()).unwrap_or("none")
+        ),
     );
     if let Err(e) = std::fs::write(&path, prior_str) {
         eprintln!(
@@ -62784,6 +63130,20 @@ fn maybe_snapshot_worklist<R: tauri::Runtime>(app: &AppHandle<R>) {
         Ok(s) => s,
         Err(_) => return,
     };
+    // issue-426: a writer that truncates then writes (cp, a shell redirect)
+    // exposes an empty or partial file. Parsing that with unwrap_or_default
+    // read as an EMPTY board, every proposed item looked removed, and the
+    // policy below wrote the cached prior board back over the writer's
+    // complete write. Never act on an unparseable read: the watcher event
+    // that follows the finished write carries the real content.
+    if !worklist_raw_parseable(&current_raw_str) {
+        append_bram_trace_line(
+            app,
+            "worklist",
+            &format!("op=skip-unparsed bytes={}", current_raw_str.len()),
+        );
+        return;
+    }
     let current_raw_doc: serde_json::Value =
         serde_json::from_str(&current_raw_str).unwrap_or_default();
     let drafts_dir = worklist_drafts_dir(app);
@@ -66621,6 +66981,21 @@ fn route_request<R: tauri::Runtime>(
                 "ok": result.is_ok(),
             }),
         );
+        // issue-comment-optimistic-and-reindexed: re-index the issue now, as
+        // the manual close does. refresh_issue_now upserts the cached
+        // issues:list row and emits issues-changed, so /__issues and search
+        // show the comment without waiting for the next issues pass. On its
+        // own thread: the pane no longer waits on this route, but the route
+        // shouldn't hold the server for a second forge round trip either. A
+        // refresh failure doesn't fail the comment, which already posted.
+        if result.is_ok() {
+            let app = app.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = refresh_issue_now(&app, number) {
+                    eprintln!("[issue comment #{}] refresh failed: {}", number, e);
+                }
+            });
+        }
         return match result {
             Ok(bytes) => (200, "application/json; charset=utf-8", bytes),
             Err(e) => {
@@ -70538,10 +70913,45 @@ fn worklist_item_landed<R: tauri::Runtime>(
     paths: &[String],
     known_clean: Option<bool>,
 ) -> Option<LandedInfo> {
+    let begun_ms = item.get("begunAtMs").and_then(|v| v.as_i64())?;
+    worklist_item_landed_since(app, item, paths, known_clean, begun_ms, None)
+}
+
+// clear-landed-never-begun-rows (#406): a row whose work was done in a "just
+// do it" turn was never started, so it has no begunAtMs and the rule above
+// refuses it however clearly the work landed. Anchor instead on when the
+// state mirror first saw the row, and require that the landing commit's
+// message NAME the item: never-begun rows (proposals, reminders) sit for days
+// and often list busy files, so "a commit touched the file" alone would accept
+// unrelated work. Used by clear-landed only -- the board builder still labels
+// begun rows alone, since it runs per row per serve.
+fn worklist_item_landed_never_begun<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    item: &serde_json::Value,
+    paths: &[String],
+) -> Option<LandedInfo> {
+    let id = item.get("id").and_then(|v| v.as_str())?;
+    let conn = worklist_state_open(app)?;
+    let first_seen_ms = worklist_state::item_first_seen_ms(&conn, id).ok()??;
+    worklist_item_landed_since(app, item, paths, None, first_seen_ms, Some(id))
+}
+
+// The landed check proper: `paths` clean against HEAD, and a commit since
+// `since_ms` that the gate didn't make touched them. `must_name`, when set,
+// also requires that commit's message to contain that string (git log
+// --fixed-strings --grep, which searches the whole message, not just the
+// subject).
+fn worklist_item_landed_since<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    item: &serde_json::Value,
+    paths: &[String],
+    known_clean: Option<bool>,
+    since_ms: i64,
+    must_name: Option<&str>,
+) -> Option<LandedInfo> {
     if paths.is_empty() {
         return None;
     }
-    let begun_ms = item.get("begunAtMs").and_then(|v| v.as_i64())?;
     let clean = match known_clean {
         Some(c) => c,
         None => {
@@ -70557,14 +70967,19 @@ fn worklist_item_landed<R: tauri::Runtime>(
     // newest first, with the files each touched. Commits the Worklist made
     // (its own gate commits, for this item or a sibling sharing a file)
     // don't count: they are not work landing outside the Worklist.
-    let since = format!("--since=@{}", begun_ms / 1000);
+    let since = format!("--since=@{}", since_ms / 1000);
+    let grep = must_name.map(|n| format!("--grep={}", n));
     let mut args = vec![
         "log",
         "--format=%x00%H%x09%s",
         "--name-only",
         since.as_str(),
-        "--",
     ];
+    if let Some(g) = grep.as_deref() {
+        args.push("--fixed-strings");
+        args.push(g);
+    }
+    args.push("--");
     args.extend(paths.iter().map(|p| p.as_str()));
     let out = git_run(app, &args).ok()?;
     let mut newest: Option<(String, String)> = None;
@@ -70779,6 +71194,7 @@ fn handle_worklist_clear_landed<R: tauri::Runtime>(
         .unwrap_or_default();
     let mut cleared: Vec<(String, String)> = Vec::new();
     let mut refused: Vec<serde_json::Value> = Vec::new();
+    let mut never_begun_cleared = 0usize;
     for id in &ids {
         let item = items
             .iter()
@@ -70788,11 +71204,26 @@ fn handle_worklist_clear_landed<R: tauri::Runtime>(
             continue;
         };
         let paths = worklist_item_declared_paths(item);
-        match worklist_item_landed(app, item, &paths, None) {
-            Some(info) => cleared.push((id.clone(), info.sha)),
-            None => {
+        let begun = item.get("begunAtMs").is_some();
+        let landed = if begun {
+            worklist_item_landed(app, item, &paths, None)
+        } else {
+            worklist_item_landed_never_begun(app, item, &paths)
+        };
+        match landed {
+            Some(info) => {
+                if !begun {
+                    never_begun_cleared += 1;
+                }
+                cleared.push((id.clone(), info.sha))
+            }
+            None if begun => {
                 refused.push(serde_json::json!({ "id": id, "reason": "not verified as committed" }))
             }
+            None => refused.push(serde_json::json!({
+                "id": id,
+                "reason": "not verified as committed (never started: needs a commit since the row appeared, outside the Worklist, whose message names the item)"
+            })),
         }
     }
     if cleared.is_empty() {
@@ -70855,11 +71286,12 @@ fn handle_worklist_clear_landed<R: tauri::Runtime>(
         app,
         "worklist",
         &format!(
-            "op=clear-landed via={} cleared={} refused={} ids={}",
+            "op=clear-landed via={} cleared={} refused={} ids={} never_begun={}",
             via,
             cleared.len(),
             refused.len(),
-            cleared_ids.join(",")
+            cleared_ids.join(","),
+            never_begun_cleared
         ),
     );
     emit_replayable_signal(app, "worklist-changed");
@@ -72698,10 +73130,10 @@ mod worklist_authorization_tests {
         validate_worklist_mutate_authorization, worklist_auth_feedback_for_ids,
         worklist_commit_add_args, worklist_commit_consumed_retry_message,
         worklist_commit_files_for_ids, worklist_draft_path, worklist_feedback_ref_item_id,
-        worklist_iteration_comment_body, worklist_lifecycle_comment_body,
+        worklist_items, worklist_iteration_comment_body, worklist_lifecycle_comment_body,
         worklist_lifecycle_item_issue_numbers, worklist_pushed_lifecycle_comment_body,
-        ParsedWorklistAuthorization, PendingWorklistPushMirror, WorklistAuthRetirement,
-        WORKLIST_AUTH_TTL_MS,
+        worklist_raw_parseable, ParsedWorklistAuthorization, PendingWorklistPushMirror,
+        WorklistAuthRetirement, WORKLIST_AUTH_TTL_MS,
     };
     use serde_json::json;
     use std::path::Path;
@@ -73500,6 +73932,42 @@ mod worklist_authorization_tests {
         let (dropped, violations) = classify_worklist_removals(&prior, &current, None, &empty);
         assert!(dropped.is_empty());
         assert_eq!(violations, vec![("a".to_string(), "proposed".to_string())]);
+    }
+
+    #[test]
+    fn worklist_raw_parseable_rejects_partial_reads() {
+        // issue-426: the reads a truncate-then-write exposes.
+        assert!(!worklist_raw_parseable(""));
+        assert!(!worklist_raw_parseable("{\"description\": \"\", \"ite"));
+        assert!(!worklist_raw_parseable("[]"));
+        assert!(!worklist_raw_parseable("null"));
+        assert!(!worklist_raw_parseable("{\"version\": 3}"));
+        assert!(!worklist_raw_parseable("{\"items\": {}}"));
+        // Complete documents, including a genuinely empty board.
+        assert!(worklist_raw_parseable("{\"items\": []}"));
+        assert!(worklist_raw_parseable(
+            "{\"description\": \"\", \"items\": [{\"id\": \"a\", \"status\": \"proposed\"}], \"version\": 4}"
+        ));
+    }
+
+    #[test]
+    fn empty_read_never_reaches_revert_classification() {
+        use std::collections::HashSet;
+        // issue-426: before the guard, an empty read parsed (via
+        // unwrap_or_default) to a board with no items, so every proposed item
+        // classified as an unauthorized removal and was reverted.
+        let prior = vec![json!({"id": "a", "status": "proposed"})];
+        let empty: HashSet<String> = HashSet::new();
+        let empty_doc: serde_json::Value = serde_json::from_str("").unwrap_or_default();
+        let (_, violations) =
+            classify_worklist_removals(&prior, &worklist_items(&empty_doc), None, &empty);
+        assert_eq!(
+            violations,
+            vec![("a".to_string(), "proposed".to_string())],
+            "the unguarded path does classify an empty read as a removal"
+        );
+        // The guard maybe_snapshot_worklist applies first stops that read.
+        assert!(!worklist_raw_parseable(""));
     }
 
     #[test]
