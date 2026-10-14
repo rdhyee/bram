@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import contextlib
+import fnmatch
 import hashlib
 import json
 import os
@@ -61,7 +62,123 @@ STARTERS = (
     "committed-outside",
     "new-file-left-out",
     "chat-edit-in-item-file",
+    "joint-owner-committed",
+    "entangled-with-unowned",
+    "membership-unanswerable",
 )
+
+# What membership should answer for each starter, checked by
+# scripts/membership-starter-check.py against a live demo's /__worklist.
+# Paths are relative to the repo with "{p}" for the starter's prefix. Per path:
+# `owners` (the sorted owner ids), and the (added, removed) line counts in
+# `single`, `joint` and `unowned`. A path listed under `absent` must have no
+# membership entry. `will_commit` pins an item's (added, removed) take where the
+# starter exists to pin that count. Each entry restates its starter's own
+# comment; when the engine and this table disagree, read the starter first.
+EXPECTATIONS: dict[str, dict[str, Any]] = {
+    # Two begun items each own one hunk of one file.
+    "disjoint-entanglement": {
+        "paths": {
+            "demo/{p}.txt": {"owners": ["{p}-bottom", "{p}-top"], "single": (2, 2)},
+        },
+    },
+    # prepare rewrote the line (its removal is prepare's); consume rewrote it
+    # again (the surviving addition is consume's).
+    "dependency": {
+        "paths": {
+            "demo/{p}.txt": {"owners": ["{p}-consume", "{p}-prepare"], "single": (1, 1)},
+        },
+    },
+    # replace rewrote draft's added line, so the surviving line is replace's and
+    # draft owns nothing (attribution-model.md, "Supersession and drift").
+    "supersession": {
+        "paths": {"demo/{p}.txt": {"owners": ["{p}-replace"], "single": (1, 0)}},
+    },
+    # Written with no claim open: nobody's.
+    "unattributed": {
+        "paths": {"demo/{p}.txt": {"owners": [], "unowned": (1, 1)}},
+    },
+    # Six items approved in one click share one claim: one jointly owned line.
+    "many-claimants": {
+        "paths": {
+            "demo/{p}.txt": {
+                "owners": [f"{{p}}-{n}" for n in range(1, 7)],
+                "joint": (1, 1),
+            },
+        },
+    },
+    # A proposed, never-begun item: nothing to attribute.
+    "expired-authorization": {"absent": ["demo/{p}.txt"]},
+    # Identical-context duplicates: the line rule is positional, so both edits
+    # are the aligning item's, and nothing is ambiguous.
+    "ambiguous-duplicate": {
+        "paths": {"demo/{p}.txt": {"owners": ["{p}-align"], "single": (2, 2)}},
+    },
+    # #367: a file created in one window and re-edited in a second counts its
+    # five lines once, not once per window.
+    "reedit-own-lines": {
+        "paths": {"demo/{p}-created.txt": {"owners": ["{p}-author"], "single": (5, 0)}},
+        "will_commit": {"{p}-author": (5, 0)},
+    },
+    # One begun item over five files; the listed-but-untouched one has no entry.
+    "multi-file": {
+        "paths": {
+            "demo/{p}/README.md": {"owners": ["{p}-feature"], "single": (80, 1)},
+            "demo/{p}/app.js": {"owners": ["{p}-feature"], "single": (3, 2)},
+            "demo/{p}/format.js": {"owners": ["{p}-feature"], "single": (3, 0)},
+            "demo/{p}/styles.css": {"owners": ["{p}-feature"], "single": (1, 1)},
+        },
+        "absent": ["demo/{p}/untouched.txt"],
+    },
+    # #406: the landed row's work is in HEAD, the reverted row left nothing.
+    "committed-outside": {"absent": ["demo/{p}-landed.txt", "demo/{p}-reverted.txt"]},
+    # #419: the author owns its new file and its top-line edit. The neighbour's
+    # edit to the shared file is unowned, because the neighbour doesn't declare
+    # that file (membership credits only begun items that declare the path).
+    "new-file-left-out": {
+        "paths": {
+            "demo/{p}-new.txt": {"owners": ["{p}-author"], "single": (3, 0)},
+            "demo/{p}-shared.txt": {
+                "owners": ["{p}-author"],
+                "single": (1, 1),
+                "unowned": (1, 1),
+            },
+        },
+    },
+    # #273: the item keeps its surviving lines (2, 3 and two appended, plus its
+    # removals of 2, 3 and 5); the chat turn's lines 5 and 8 are unowned.
+    "chat-edit-in-item-file": {
+        "paths": {
+            "demo/{p}-file.txt": {
+                "owners": ["{p}-author"],
+                "single": (4, 3),
+                "unowned": (2, 1),
+            },
+        },
+    },
+    # #432: the owner committed and left; the later item owns the shared file.
+    "joint-owner-committed": {
+        "paths": {"demo/{p}-shared.txt": {"owners": ["{p}-later"], "single": (1, 1)}},
+        "absent": ["demo/{p}-vendor.txt"],
+    },
+    # Two owners of one file plus one hunk nobody owns.
+    "entangled-with-unowned": {
+        "paths": {
+            "demo/{p}.txt": {
+                "owners": ["{p}-bottom", "{p}-top"],
+                "single": (2, 2),
+                "unowned": (1, 1),
+            },
+        },
+        "will_commit": {"{p}-top": (1, 1), "{p}-bottom": (1, 1)},
+    },
+    # #437: a declared file not yet created and an ignored declared file must
+    # not stop the compute; the planner owns its edit.
+    "membership-unanswerable": {
+        "paths": {"demo/{p}/code.txt": {"owners": ["{p}-planner"], "single": (1, 1)}},
+        "will_commit": {"{p}-planner": (1, 1)},
+    },
+}
 
 # The ambiguous-duplicate fixture's stanza pair. Geometry is load-bearing:
 # with git's default 3-line hunk context, the claim-era edit below produces
@@ -143,6 +260,25 @@ def _chat_edit_file(stage: int) -> str:
     return "".join(f"{line}\n" for line in lines)
 
 
+def _joint_owner_shared(prefix: str, owner_edit: bool, later_edit: bool = False) -> str:
+    lines = ["shared: base\n", "middle\n" * 6]
+    lines.append(f"{prefix}-owner: committed step URL\n" if owner_edit else "owner: base\n")
+    lines.append("middle\n" * 6)
+    lines.append(f"{prefix}-later: token terms\n" if later_edit else "later: base\n")
+    return "".join(lines)
+
+
+def _entangled_unowned(top: bool, middle: bool, bottom: bool) -> str:
+    # 17 lines: the three changed lines (1, 9, 17) are 7 lines apart, more
+    # than git's 2 x 3 lines of context, so each lands in its own hunk.
+    lines = ["top: changed by A" if top else "top: base"]
+    lines += ["middle"] * 7
+    lines += ["middle: changed with no claim" if middle else "middle: base"]
+    lines += ["middle"] * 7
+    lines += ["bottom: changed by B" if bottom else "bottom: base"]
+    return "\n".join(lines) + "\n"
+
+
 def starter_seeds(starter: str, prefix: str) -> list[tuple[str, str]]:
     if starter == "multi-file":
         return _multi_file_seeds(prefix)
@@ -158,6 +294,19 @@ def starter_seeds(starter: str, prefix: str) -> list[tuple[str, str]]:
         ]
     if starter == "chat-edit-in-item-file":
         return [(f"demo/{prefix}-file.txt", _chat_edit_file(0))]
+    if starter == "membership-unanswerable":
+        # Its own folder, so the ignore rule below reaches no other starter.
+        return [
+            (f"demo/{prefix}/.gitignore", "/*.md\n"),
+            (f"demo/{prefix}/code.txt", "code: base\n"),
+        ]
+    if starter == "joint-owner-committed":
+        # HEAD already holds the owner's edit: it "committed" before the board
+        # was captured, so the joint window below replays base -> edited.
+        return [
+            (f"demo/{prefix}-shared.txt", _joint_owner_shared(prefix, owner_edit=True)),
+            (f"demo/{prefix}-vendor.txt", "vendor: runtime 1.0\n"),
+        ]
     return [starter_seed(starter, prefix)]
 
 
@@ -187,6 +336,7 @@ def starter_seed(starter: str, prefix: str) -> tuple[str, str]:
             f"demo/{prefix}.txt",
             "reedit: the created sibling arrives under two claim windows\n",
         ),
+        "entangled-with-unowned": (f"demo/{prefix}.txt", _entangled_unowned(False, False, False)),
     }
     try:
         return seeds[starter]
@@ -664,6 +814,97 @@ class StarterBuilder:
         self.file(path, _chat_edit_file(3))
         self.boundary([])
 
+    def starter_membership_unanswerable(self, prefix: str) -> None:
+        # judell/bram#437: two ordinary board shapes that made the membership
+        # engine's scratch-index `add -A -- <declared entries>` fail, so every
+        # gate commit on the board was refused as "no membership answer"
+        # (`op=membership paths=0 spawns=7`). One begun item declares a file it
+        # has not created yet; another declares a new file that the folder's
+        # `/*.md` rule ignores, as CodeExam's THIRD-PARTY-NOTICES.md was.
+        # Expected since the fix: Commit on the planner goes through, and
+        # `op=membership` at the gate reads `fresh=true` with paths > 0. The
+        # notices item's own commit still meets the ignore rule at `git add`
+        # (#373's refuse-ignored-path) unless the file is force-staged; that is
+        # a separate, deliberate refusal. A scenario is stored as git trees,
+        # so the ignored NOTICES.md does not survive `use`/`reset`: until it
+        # is recreated by hand, the notices item is a second declared file
+        # not yet created, which breaks the old seed just as well.
+        code = f"demo/{prefix}/code.txt"
+        planned = f"demo/{prefix}/planned.txt"
+        notices = f"demo/{prefix}/NOTICES.md"
+        planner, noticer = f"{prefix}-planner", f"{prefix}-notices"
+        self.item(
+            planner,
+            [code, planned],
+            "code.txt reads base; planned.txt does not exist yet.",
+            "Change code.txt now; create planned.txt later.",
+        )
+        self.item(
+            noticer,
+            notices,
+            "There is no NOTICES.md.",
+            "Create NOTICES.md, which the folder's /*.md rule ignores.",
+        )
+        self.boundary([planner])
+        self.file(code, "code: changed by the planner\n")
+        self.boundary([])
+        self.boundary([noticer])
+        self.file(notices, "notices: a new file an ignore rule hides\n")
+        self.boundary([])
+
+    def starter_entangled_with_unowned(self, prefix: str) -> None:
+        # issue-425-retire-replay (Codex review): two begun owners of one file
+        # plus a third hunk nobody owns. Each row alone is interval-staged and
+        # predicts only its own hunk; committing both together leaves no
+        # outside owner, so the gate takes the whole file, unowned hunk
+        # included. The per-row numbers then don't add up to the commit.
+        path = f"demo/{prefix}.txt"
+        a, b = f"{prefix}-top", f"{prefix}-bottom"
+        self.item(a, path, "The top line is unchanged.", "The top line identifies item A.")
+        self.item(b, path, "The bottom line is unchanged.", "The bottom line identifies item B.")
+        self.boundary([a])
+        self.file(path, _entangled_unowned(True, False, False))
+        self.boundary([])
+        self.file(path, _entangled_unowned(True, True, False))
+        self.boundary([b])
+        self.file(path, _entangled_unowned(True, True, True))
+        self.boundary([])
+
+    def starter_joint_owner_committed(self, prefix: str) -> None:
+        # judell/bram#432. `owner` and `partner` were approved in one click
+        # (one joint claim interval). Their files don't overlap: owner edited
+        # the shared file, partner the vendor file. Owner has since committed
+        # and been pruned (its edit is in HEAD; it is not on the board), and
+        # partner's edit was reverted (no changes, still begun). A later,
+        # separately approved item edits the shared file. Committing `later`
+        # must succeed: the replay re-resolved the joint interval to partner
+        # once owner left the board and refused it (op=refuse-joint-interval
+        # ids=[partner]).
+        shared = f"demo/{prefix}-shared.txt"
+        vendor = f"demo/{prefix}-vendor.txt"
+        owner, partner, later = f"{prefix}-owner", f"{prefix}-partner", f"{prefix}-later"
+        self.item(
+            partner,
+            vendor,
+            "Approved in one click with the (since committed) owner; its own edit was reverted.",
+            "Has no changes; should not block anything. Drop it.",
+        )
+        self.item(
+            later,
+            shared,
+            "Approved separately, after the owner committed the shared file.",
+            "Should commit: it was never approved together with the partner.",
+        )
+        self.file(shared, _joint_owner_shared(prefix, owner_edit=False))
+        self.boundary([owner, partner])
+        self.file(shared, _joint_owner_shared(prefix, owner_edit=True))
+        self.file(vendor, "vendor: runtime 2.0\n")
+        self.file(vendor, "vendor: runtime 1.0\n")
+        self.boundary([])
+        self.boundary([later])
+        self.file(shared, _joint_owner_shared(prefix, owner_edit=True, later_edit=True))
+        self.boundary([])
+
     def starter_committed_outside(self, prefix: str) -> None:
         # judell/bram#406: work committed with plain git, outside the gate.
         # Fixture commits are dated from 1_700_000_000 (_fixed_git_env), so:
@@ -970,17 +1211,40 @@ def scrub_agent_environment(env: Mapping[str, str]) -> dict[str, str]:
     return clean
 
 
+def newest_rust_source(root: Path) -> tuple[float, str] | None:
+    """The newest modification time among git-tracked files under src-tauri/,
+    and that file. Under the ./bram symlink launch the binary depends only on
+    src-tauri/ (app/** is served from disk), so this is the yardstick for a
+    stale binary. None when git can't list the files."""
+    listing = run_git(root, "ls-files", "-z", "src-tauri", check=False)
+    newest: tuple[float, str] | None = None
+    for rel in filter(None, listing.split("\0")):
+        try:
+            mtime = (root / rel).stat().st_mtime
+        except OSError:
+            continue  # deleted in the worktree
+        if newest is None or mtime > newest[0]:
+            newest = (mtime, rel)
+    return newest
+
+
 def assert_binary_current(binary: Path) -> None:
-    """Refuse evidence from a debug binary older than the checked-out HEAD."""
-    head_raw = run_git(SOURCE_ROOT, "log", "-1", "--format=%ct", check=False)
-    if not head_raw.isdigit():
+    """Refuse evidence from a debug binary older than its Rust sources.
+
+    The test used to be "older than HEAD's commit time", which was wrong both
+    ways: any commit tripped it, scripts- and docs-only ones included, and an
+    uncommitted Rust edit, which never moves HEAD, slipped through. Comparing
+    against the newest tracked file under src-tauri/ catches committed and
+    uncommitted Rust changes and ignores everything else."""
+    newest = newest_rust_source(SOURCE_ROOT)
+    if newest is None:
         return
-    binary_mtime = binary.stat().st_mtime
-    head_time = int(head_raw)
-    if binary_mtime < head_time:
+    newest_mtime, newest_path = newest
+    if binary.stat().st_mtime < newest_mtime:
+        changed = time.strftime("%Y-%m-%d %H:%M", time.localtime(newest_mtime))
         raise DemoError(
-            "stale Bram binary: "
-            f"{binary} predates HEAD; rebuild before measuring this checkout"
+            f"stale Bram binary: {binary} is older than {newest_path} "
+            f"(changed {changed}); rebuild with cargo build"
         )
 
 
@@ -1148,6 +1412,40 @@ def status(repo: Path) -> dict[str, Any]:
     }
 
 
+def prune_scenarios(
+    repo: Path, matches: Sequence[str], keep: int, dry_run: bool, gc: bool
+) -> tuple[list[str], list[str]]:
+    """Remove scenario branches matching any glob in `matches`, keeping the
+    newest `keep` of them and never the active scenario. Returns (removed,
+    skipped). "Newest" is by name, not commit date: scenario commits carry
+    fixed dates (`_fixed_git_env`) so their trees are reproducible, and the
+    starter check's `check-YYYYMMDD-HHMMSS` names sort in time order."""
+    repo = validate_demo(repo)
+    active_path = _runtime_root(repo) / "active.json"
+    active = (read_json(active_path) if active_path.exists() else {}).get("name")
+    names = run_git(
+        repo, "for-each-ref", "--format=%(refname:strip=3)", "refs/heads/scenario"
+    ).splitlines()
+    matched = sorted(
+        (n for n in names if any(fnmatch.fnmatchcase(n, m) for m in matches)), reverse=True
+    )
+    removed: list[str] = []
+    skipped: list[str] = []
+    for i, name in enumerate(matched):
+        if name == active:
+            skipped.append(f"{name} (active)")
+            continue
+        if i < keep:
+            skipped.append(f"{name} (kept)")
+            continue
+        if not dry_run:
+            run_git(repo, "branch", "-D", f"scenario/{name}")
+        removed.append(name)
+    if gc and not dry_run:
+        run_git(repo, "gc", "--prune=now", "--quiet")
+    return removed, skipped
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -1187,6 +1485,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     status_parser = sub.add_parser("status", help="show scenarios and live fixture state")
     status_parser.add_argument("--json", action="store_true")
+
+    prune = sub.add_parser(
+        "prune",
+        help="remove scenario branches (default: the starter check's check-* boards)",
+    )
+    prune.add_argument(
+        "--match",
+        action="append",
+        help="glob over scenario names; repeatable (default: check-*)",
+    )
+    prune.add_argument(
+        "--keep", type=int, default=0, help="keep the newest N matches, newest by name"
+    )
+    prune.add_argument("--dry-run", action="store_true", help="list, change nothing")
+    prune.add_argument(
+        "--gc", action="store_true", help="then git gc --prune=now to reclaim the space"
+    )
     return parser
 
 
@@ -1224,6 +1539,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"items: {value['items']}  claims: {len(value['claimRefs'])}")
                 print(f"dirty paths: {len(value['dirty'])}  pid: {value['pid'] or '-'}")
                 print(f"log: {value['log']}")
+        elif args.command == "prune":
+            removed, skipped = prune_scenarios(
+                args.repo, args.match or ["check-*"], args.keep, args.dry_run, args.gc
+            )
+            verb = "would remove" if args.dry_run else "removed"
+            for name in removed:
+                print(f"{verb} scenario/{name}")
+            for note in skipped:
+                print(f"kept scenario/{note}")
+            print(f"{verb} {len(removed)} scenario(s)" + (" and ran gc" if args.gc and not args.dry_run else ""))
         return 0
     except DemoError as exc:
         print(f"demo-instance: {exc}", file=sys.stderr)

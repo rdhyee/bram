@@ -810,6 +810,87 @@ fn node_dash_e_writes(command: &str) -> bool {
     false
 }
 
+/// unowned-lines-postmortem-fixes: a script fed to `python`/`node` on stdin
+/// through a heredoc (`python3 - <<'EOF'`, `python3 -I -`, `node - <<EOF`) is
+/// a script, so it gets the same body inspection as `python -c` / `node -e`.
+/// The general `open(write-mode)` scan runs on quote-MASKED text, so in a
+/// heredoc `open(p,'w')` became `open(p,   )` and a file-writing script
+/// classified `bash-read-only` (2026-10-09 06:09:03Z, an unauthorized edit of
+/// app/__shell/helpers.js). Only an interpreter line whose remaining words
+/// are all flags (or `-`) counts: `python3 tool.py <<EOF` feeds DATA, not a
+/// script. An unquoted heredoc expands `$`/backticks, so a body carrying
+/// either is read conservatively, as for `-c`.
+fn interpreter_heredoc_writes(command: &str) -> bool {
+    let lines: Vec<&str> = command.split('\n').collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        i += 1;
+        let Some(at) = line.find("<<") else { continue };
+        let Some(lang) = heredoc_interpreter(&line[..at]) else {
+            continue;
+        };
+        let rest = line[at + 2..].trim_start_matches('-').trim_start();
+        let quoted = rest.starts_with('\'') || rest.starts_with('"');
+        let tag: String = rest
+            .trim_start_matches(|c| c == '\'' || c == '"')
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if tag.is_empty() {
+            return true;
+        }
+        let mut body = String::new();
+        while i < lines.len() && lines[i].trim() != tag {
+            body.push_str(lines[i]);
+            body.push('\n');
+            i += 1;
+        }
+        if !quoted && (body.contains('$') || body.contains('`')) {
+            return true;
+        }
+        let hints = if lang == "node" {
+            NODE_WRITE_HINTS
+        } else {
+            PY_WRITE_HINTS
+        };
+        if hints.iter().any(|h| body.contains(h)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The interpreter a heredoc line runs as a stdin script: "python" (any
+/// `python`, `python3`, `python3.12`) or "node", when every word after it
+/// before the `<<` is a flag or `-`. The interpreter may follow `;`, `&&`,
+/// `|` or `(` on the same line.
+fn heredoc_interpreter(prefix: &str) -> Option<&'static str> {
+    let segment = prefix
+        .rsplit(|c| c == ';' || c == '|' || c == '&' || c == '(')
+        .next()
+        .unwrap_or(prefix);
+    let mut words = segment.split_whitespace();
+    let first = words.next()?;
+    let base = first.rsplit('/').next().unwrap_or(first);
+    let lang = if base == "node" {
+        "node"
+    } else if base.starts_with("python")
+        && base["python".len()..]
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '.')
+    {
+        "python"
+    } else {
+        return None;
+    };
+    if words.all(|w| w.starts_with('-')) {
+        Some(lang)
+    } else {
+        None
+    }
+}
+
 /// #299 (case 2): the Python guard treats the mere presence of `python -c` as
 /// a write. Here the inline script is read: if it can be extracted and carries
 /// no write indicator, the command is not a write via this pattern. When the
@@ -1045,6 +1126,9 @@ fn write_patterns_token(command: &str, skip: SkipPattern) -> Option<String> {
     // classification below that denied pure-expression one-liners.
     if node_dash_e_writes(command) {
         return Some("node -e".to_string());
+    }
+    if interpreter_heredoc_writes(command) {
+        return Some("interpreter heredoc".to_string());
     }
     let masked_owned = mask_quoted_spans(command);
     let scan: &str = masked_owned.as_deref().unwrap_or(command);
@@ -2807,10 +2891,58 @@ fn trace_would_deny_unaddressed(project_root: &Path, provider: &str, tool: &str,
         // `auth=` is the decision input; `ctx=` stays for diagnosis so the two
         // suppression reasons remain distinguishable when reading a soak.
         &format!(
-            "target={} auth=none ctx={} reason=general-turn-item-edit",
-            rel, ctx
+            "target={} auth=none ctx={} reason={}",
+            rel,
+            ctx,
+            would_deny_reason(project_root, rel)
         ),
     );
+}
+
+// guard-coverage-requires-begun-item: split the soak by WHAT covered the
+// path. `general-turn-item-edit` is #368's class: a begun item (applied, or
+// `begunAtMs` stamped by the host at its first approval) covers it.
+// `proposed-only-coverage` is the narrower, harmful class: only items nobody
+// has started cover it (2026-10-09 06:09:03Z: app/__shell/helpers.js, named
+// only by the unstarted issue-425-retire-replay, edited in a chat turn).
+// Observe-only; the eventual rule keys on this reason.
+fn would_deny_reason(project_root: &Path, rel: &str) -> &'static str {
+    let begun = begun_item_ids(project_root);
+    let begun_cov = worklist_covered_files_filtered(project_root, Some(&begun));
+    if coverage_verdict(&begun_cov, rel).0 {
+        "general-turn-item-edit"
+    } else {
+        "proposed-only-coverage"
+    }
+}
+
+/// Items that have begun: `applied`, or `proposed` with the host-written
+/// `begunAtMs` (conventions: "the durable answer to 'has work on this item
+/// begun?'").
+fn begun_item_ids(project_root: &Path) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    let Ok(text) = std::fs::read_to_string(project_root.join(WORKLIST_REL)) else {
+        return ids;
+    };
+    let Ok(doc) = serde_json::from_str::<Value>(&text) else {
+        return ids;
+    };
+    for it in doc
+        .get("items")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let Some(o) = it.as_object() else { continue };
+        let applied = o.get("status").and_then(|v| v.as_str()) == Some("applied");
+        let begun = o.get("begunAtMs").and_then(|v| v.as_f64()).is_some();
+        if applied || begun {
+            if let Some(id) = o.get("id").and_then(|v| v.as_str()) {
+                ids.insert(id.to_string());
+            }
+        }
+    }
+    ids
 }
 
 /// issue-387: refines a Bash branch's coarse "some begun item covers
@@ -3107,6 +3239,42 @@ fn iterate_feedback_text(project_root: &Path, last_msg: &str) -> String {
     out.join("\n")
 }
 
+/// issue-431-opt-out-in-outbound-turn: a turn Bram delivers through an
+/// outbound-turn file reaches the transcript only as its frame,
+/// `Read and follow this Bram turn: @resources/outbound-turns/<id>-turn.json
+/// …`, so the user's words, "just do it" included, live in the file's `text`.
+/// Since 9b40e82 (2026-10-02, #416) every message with a line break takes
+/// that route; before it, short ones went inline and the phrase was visible.
+/// Same indirection as `iterate_feedback_text`, same name hygiene.
+fn outbound_turn_text(project_root: &Path, last_msg: &str) -> String {
+    const MARK: &str = "@resources/outbound-turns/";
+    let Some(at) = last_msg.find(MARK) else {
+        return String::new();
+    };
+    let name: String = last_msg[at + MARK.len()..]
+        .chars()
+        .take_while(|c| !c.is_whitespace())
+        .collect();
+    if !name.ends_with("-turn.json")
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains("..")
+    {
+        return String::new();
+    }
+    let path = project_root
+        .join("resources")
+        .join("outbound-turns")
+        .join(&name);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return String::new();
+    };
+    serde_json::from_slice::<Value>(&bytes)
+        .ok()
+        .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(String::from))
+        .unwrap_or_default()
+}
+
 /// Last-chance authorization shared by every write surface (judell/bram#263).
 /// Returns the last user message on a match so authority mode can compute
 /// the audit-breadcrumb turn key; the shadow makes no network call, so for
@@ -3119,6 +3287,13 @@ fn opt_out_clears(project_root: &Path, payload: &Value) -> Option<String> {
     }
     let draft = iterate_feedback_text(project_root, &last_msg);
     if !draft.is_empty() && has_opt_out(&draft) {
+        return Some(last_msg);
+    }
+    // issue-431: the turn's words may live in its outbound-turn file. The
+    // audit turn key stays the frame (`last_msg`), so the one-turn scope
+    // and the host's dedupe are unchanged.
+    let wrapped = outbound_turn_text(project_root, &last_msg);
+    if !wrapped.is_empty() && has_opt_out(&wrapped) {
         return Some(last_msg);
     }
     None
@@ -5245,6 +5420,80 @@ mod guard_policy_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // issue-431-opt-out-in-outbound-turn
+    #[test]
+    fn opt_out_in_an_outbound_turn_file_counts() {
+        let root = scratch("opt-out-outbound");
+        let turns = root.join("resources").join("outbound-turns");
+        std::fs::create_dir_all(&turns).unwrap();
+        let write_turn = |id: &str, text: &str| {
+            std::fs::write(
+                turns.join(format!("{}.json", id)),
+                serde_json::json!({ "schema": 1, "id": id, "kind": "message", "mode": "", "text": text })
+                    .to_string(),
+            )
+            .unwrap();
+        };
+        let transcript = root.join("t.jsonl");
+        let payload_for = |frame: &str| {
+            std::fs::write(
+                &transcript,
+                serde_json::json!({ "type": "user", "message": { "content": frame } }).to_string(),
+            )
+            .unwrap();
+            serde_json::json!({ "transcript_path": transcript.to_string_lossy() })
+        };
+        // #431's message, verbatim.
+        write_turn(
+            "1791677856169-turn",
+            "number the arrows so we see a record of the sequence\n\n7 and 8 should collapse into one step.\n\njust do it.",
+        );
+        let frame = "Read and follow this Bram turn: @resources/outbound-turns/1791677856169-turn.json (end of Bram turn)";
+        assert_eq!(
+            opt_out_clears(&root, &payload_for(frame)).as_deref(),
+            Some(frame)
+        );
+        // A wrapped message without the phrase does not opt out.
+        write_turn("2-turn", "number the arrows\n\nthanks");
+        assert!(opt_out_clears(
+            &root,
+            &payload_for("Read and follow this Bram turn: @resources/outbound-turns/2-turn.json (end of Bram turn)")
+        )
+        .is_none());
+        // A frame that tries to leave the directory is ignored.
+        assert_eq!(
+            outbound_turn_text(
+                &root,
+                "Read and follow this Bram turn: @resources/outbound-turns/../x-turn.json"
+            ),
+            ""
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // guard-coverage-requires-begun-item
+    #[test]
+    fn would_deny_reason_separates_unstarted_proposals_from_begun_items() {
+        let root = scratch("would-deny-reason");
+        std::fs::create_dir_all(root.join("resources")).unwrap();
+        std::fs::write(
+            root.join(WORKLIST_REL),
+            serde_json::json!({ "items": [
+                { "id": "unstarted", "status": "proposed", "files": ["a.js"] },
+                { "id": "begun", "status": "proposed", "begunAtMs": 1, "files": ["b.js"] },
+                { "id": "done", "status": "applied", "files": ["c.js"] },
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(would_deny_reason(&root, "a.js"), "proposed-only-coverage");
+        assert_eq!(would_deny_reason(&root, "b.js"), "general-turn-item-edit");
+        assert_eq!(would_deny_reason(&root, "c.js"), "general-turn-item-edit");
+        let ids = begun_item_ids(&root);
+        assert!(ids.contains("begun") && ids.contains("done") && !ids.contains("unstarted"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn scratch(name: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("bram-guard-policy-{}-{}", name, std::process::id()));
@@ -6459,6 +6708,47 @@ mod guard_policy_tests {
         assert!(shadow_worklist_decision("gemini-rs", &payload).is_none());
         assert!(shadow_worklist_decision("claude-rs", &payload).is_some());
         assert!(shadow_worklist_decision("codex-rs", &payload).is_some());
+    }
+
+    // unowned-lines-postmortem-fixes: a stdin script through a heredoc is
+    // inspected like `python -c` / `node -e`.
+    #[test]
+    fn interpreter_heredoc_writes_classify_as_writes() {
+        // The 2026-10-09 06:09:03Z command's shape: quote-masking hid 'w'.
+        let incident = "python3 - <<'EOF'\np='/x/helpers.js'\ns=open(p).read()\nopen(p,'w').write(s)\nEOF\nnode --check helpers.js";
+        assert!(interpreter_heredoc_writes(incident));
+        assert_eq!(
+            write_patterns_token(incident, SkipPattern::None).as_deref(),
+            Some("interpreter heredoc")
+        );
+        assert!(interpreter_heredoc_writes(
+            "python3 -I - <<'EOF'\nimport os\nos.replace('a','b')\nEOF"
+        ));
+        assert!(interpreter_heredoc_writes(
+            "cd x && python3.12 - <<EOF\nshutil.copy('a','b')\nEOF"
+        ));
+        assert!(interpreter_heredoc_writes(
+            "node - <<'JS'\nrequire('fs').writeFileSync('a','b')\nJS"
+        ));
+        // Unquoted tag: the shell expands the body, so `$` is conservative.
+        assert!(interpreter_heredoc_writes(
+            "python3 - <<EOF\nprint(\"$HOME\")\nEOF"
+        ));
+    }
+
+    #[test]
+    fn interpreter_heredoc_reads_stay_reads() {
+        let read = "python3 -I - <<'EOF'\nimport json,sys\nprint(len(sys.argv))\nEOF";
+        assert!(!interpreter_heredoc_writes(read));
+        assert_eq!(write_patterns_token(read, SkipPattern::None), None);
+        // A script FILE reading heredoc data is not a stdin script.
+        assert!(!interpreter_heredoc_writes(
+            "python3 tool.py <<'EOF'\nopen(x,'w')\nEOF"
+        ));
+        // Not an interpreter at all.
+        assert!(!interpreter_heredoc_writes("cat <<'EOF'\nopen(x,'w')\nEOF"));
+        assert_eq!(heredoc_interpreter("pythonista -"), None);
+        assert_eq!(heredoc_interpreter("/usr/bin/python3 -I -"), Some("python"));
     }
 
     #[test]

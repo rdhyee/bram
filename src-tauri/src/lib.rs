@@ -2341,6 +2341,142 @@ fn bram_trace_date_stamp_local() -> String {
     format!("{:04}-{:02}-{:02}", y, mo, d)
 }
 
+// issue-439: the guard's breadcrumb log (`hook-events.log`) used to stop for
+// good at its cap, because nothing rotated it (two weeks silent on one
+// machine). The host rotates it here: one process, on the ticker, so the
+// short-lived guard processes never race each other over a rename. Over the
+// cap, the file becomes `hook-events-YYYY-MM-DD[-n].log`; the next guard write
+// creates a fresh file, since guards open per write. The newest `keep`
+// archives survive. Returns (bytes rotated, archive path, archives pruned).
+fn rotate_hook_events_log(dir: &Path, stamp: &str, keep: usize) -> Option<(u64, PathBuf, usize)> {
+    let active = dir.join("hook-events.log");
+    let bytes = std::fs::metadata(&active).ok()?.len();
+    if bytes <= guard::EVENTS_LOG_CAP_BYTES {
+        return None;
+    }
+    let mut archive = None;
+    for n in 1..10_000 {
+        let name = if n == 1 {
+            format!("hook-events-{}.log", stamp)
+        } else {
+            format!("hook-events-{}-{}.log", stamp, n)
+        };
+        let candidate = dir.join(name);
+        if !candidate.exists() {
+            archive = Some(candidate);
+            break;
+        }
+    }
+    let archive = archive?;
+    std::fs::rename(&active, &archive).ok()?;
+    // Prune by modification time, newest first (names alone misorder "-10"
+    // before "-2").
+    let mut archives: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if !name.starts_with("hook-events-") || !name.ends_with(".log") {
+                        return None;
+                    }
+                    let modified = e.metadata().ok()?.modified().ok()?;
+                    Some((modified, e.path()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    archives.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut removed = 0;
+    for (_, p) in archives.into_iter().skip(keep) {
+        if p != archive && std::fs::remove_file(&p).is_ok() {
+            removed += 1;
+        }
+    }
+    Some((bytes, archive, removed))
+}
+
+const HOOK_EVENTS_ARCHIVES_KEPT: usize = 4;
+
+#[cfg(test)]
+mod hook_events_rotation_tests {
+    use super::{guard, rotate_hook_events_log};
+    use std::path::PathBuf;
+
+    fn dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "bram-hook-rot-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn over_cap(d: &PathBuf) {
+        std::fs::write(
+            d.join("hook-events.log"),
+            vec![b'x'; (guard::EVENTS_LOG_CAP_BYTES + 1) as usize],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn under_the_cap_is_left_alone() {
+        let d = dir("under");
+        std::fs::write(d.join("hook-events.log"), "one line\n").unwrap();
+        assert!(rotate_hook_events_log(&d, "2026-10-13", 4).is_none());
+        assert!(d.join("hook-events.log").exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn over_the_cap_rotates_with_a_dated_then_numbered_name() {
+        let d = dir("names");
+        over_cap(&d);
+        let (bytes, to, _) = rotate_hook_events_log(&d, "2026-10-13", 4).unwrap();
+        assert_eq!(bytes, guard::EVENTS_LOG_CAP_BYTES + 1);
+        assert_eq!(to, d.join("hook-events-2026-10-13.log"));
+        assert!(
+            !d.join("hook-events.log").exists(),
+            "the next guard write starts fresh"
+        );
+        over_cap(&d);
+        let (_, to2, _) = rotate_hook_events_log(&d, "2026-10-13", 4).unwrap();
+        assert_eq!(to2, d.join("hook-events-2026-10-13-2.log"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn pruning_keeps_the_newest_archives() {
+        let d = dir("prune");
+        // Five old archives, oldest first, with distinct mtimes.
+        let base = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        for i in 0..5u64 {
+            let p = d.join(format!("hook-events-2026-10-0{}.log", i + 1));
+            std::fs::write(&p, "old\n").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&p)
+                .unwrap()
+                .set_modified(base + std::time::Duration::from_secs(i * 60))
+                .unwrap();
+        }
+        over_cap(&d);
+        let (_, to, removed) = rotate_hook_events_log(&d, "2026-10-13", 4).unwrap();
+        assert_eq!(removed, 2, "6 archives with the new one; keep 4");
+        assert!(to.exists(), "the archive just made survives");
+        assert!(!d.join("hook-events-2026-10-01.log").exists());
+        assert!(!d.join("hook-events-2026-10-02.log").exists());
+        assert!(d.join("hook-events-2026-10-05.log").exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
 fn next_bram_trace_archive_path(active_path: &Path) -> Option<PathBuf> {
     let parent = active_path.parent()?;
     let stamp = bram_trace_date_stamp_local();
@@ -3718,6 +3854,19 @@ fn last_talk_session_sid_cell() -> &'static Mutex<std::collections::HashMap<Stri
 // live tail is empty (see the stash site's comment for the race this
 // repairs). Deliberately NOT fed by the menu-dismissal drain, whose
 // discarded content is an answered prompt that must not resurrect.
+// terminal-attention-folder-trust-prompts: which drain last emptied the tail,
+// and when, so an attention check that reads an empty tail names the cause.
+fn pty_tail_last_clear_cell() -> &'static Mutex<(&'static str, i64)> {
+    static CELL: OnceLock<Mutex<(&'static str, i64)>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(("none", 0)))
+}
+
+fn note_pty_tail_clear(site: &'static str) {
+    if let Ok(mut last) = pty_tail_last_clear_cell().lock() {
+        *last = (site, unix_now_ms());
+    }
+}
+
 fn pty_tail_drained_stash_cell() -> &'static Mutex<Vec<u8>> {
     static CELL: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
     CELL.get_or_init(|| Mutex::new(Vec::new()))
@@ -5871,23 +6020,86 @@ fn terminal_attention_prompt_shape(stripped_tail: &str) -> Option<&'static str> 
     // Claude's permission menus also say "Esc to cancel", but they appear
     // inside an open turn, where the tracker never evaluates. Codex's /status
     // prints and returns to its composer, so it has no entry here.
-    const SLASH_PANEL_MARKERS: &[&str] = &["esc to cancel", "status config usage stats"];
-    // Whitespace collapsed: the grid lays out tabs and footers with cursor
-    // moves that strip to irregular runs of spaces and line breaks.
-    let lower = stripped_tail
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase();
-    if HOOKS_TRUST_MARKERS
-        .iter()
-        .any(|marker| lower.contains(marker))
-    {
+    // Footer-anchored (FOOTER_WINDOW): the panel's header ("Status Config
+    // Usage Stats") is at its top, so only the footer can be required at
+    // the end.
+    const SLASH_PANEL_MARKERS: &[&str] = &["esc to cancel"];
+    // terminal-attention-folder-trust-prompts: each CLI's first-run folder
+    // trust prompt. Pairs, both of which must be present, so an agent quoting
+    // one phrase in an idle reply can't fire it. Specimens: Claude Code and
+    // Codex 0.161.0 run under a PTY in a fresh `git init` folder, 2026-10-08
+    // (pinned whole in terminal_attention_tests); the settings variant's pair
+    // is #197's catalogue ("Yes, I trust these settings / No, exit Claude
+    // Code"), its live text only previewed in tau-accounting 19:03:12Z.
+    // Checked before slash-panel: Claude's trust prompt also says "Esc to
+    // cancel", and this is the truer name.
+    // Each also names its footer, which must END the tail (see
+    // FOOTER_WINDOW below).
+    const FOLDER_TRUST_PAIRS: &[(&str, &str, &str)] = &[
+        (
+            "is this a project you created or one you trust",
+            "yes, i trust this folder",
+            "esc to cancel",
+        ),
+        (
+            "yes, i trust these settings",
+            "no, exit claude code",
+            "esc to cancel",
+        ),
+        ("trust this folder?", "trust and continue", "esc back"),
+    ];
+    // A live prompt or panel ends the screen with its footer; an agent's
+    // reply that QUOTES these phrases is followed by the composer's own
+    // chrome. Found live 2026-10-08 19:37Z: an idle Claude reply quoting
+    // "Esc to cancel" fired slash-panel ("Claude has a panel open") with no
+    // panel open. So the footer must sit in the tail's last FOOTER_WINDOW
+    // squashed characters, and the other phrases may be anywhere.
+    const FOOTER_WINDOW: usize = 40;
+    // fresh-partner-catch-up-holds-for-codex-update-prompt: Codex's update
+    // prompt, whose default (Enter) is "1. Update now". Both phrases plus the
+    // footer, so a reply quoting "Update available" can't fire it. Specimen:
+    // Codex's own snapshot (codex-rs/tui/src/snapshots/
+    // codex_tui__update_prompt__tests__update_prompt_modal.snap) and the
+    // live case 2026-10-13 03:32Z, where a catch-up's Enter ran
+    // `npm install -g @openai/codex` and exited Codex.
+    const CODEX_UPDATE: (&str, &str, &str) = (
+        "update available",
+        "update now",
+        "enter continue \u{b7} esc skip",
+    );
+    // All whitespace removed, on both sides of the match. The CLIs lay out
+    // words with cursor-column moves (CSI n G), which strip_ansi drops
+    // without leaving a space, so the tail reads "Esctocancel" and
+    // "Thesewillapply"; a space-bearing marker could never match that.
+    let squash = |s: &str| -> String {
+        s.chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            .to_lowercase()
+    };
+    let tail = squash(stripped_tail);
+    let has = |marker: &str| tail.contains(&squash(marker));
+    let end: String = {
+        let n = tail.chars().count();
+        tail.chars().skip(n.saturating_sub(FOOTER_WINDOW)).collect()
+    };
+    let ends_with_footer = |marker: &str| end.contains(&squash(marker));
+    if HOOKS_TRUST_MARKERS.iter().any(|marker| has(marker)) {
         return Some("hooks-trust");
+    }
+    if FOLDER_TRUST_PAIRS
+        .iter()
+        .any(|(a, b, footer)| has(a) && has(b) && ends_with_footer(footer))
+    {
+        return Some("folder-trust");
+    }
+    let (update_a, update_b, update_footer) = CODEX_UPDATE;
+    if has(update_a) && has(update_b) && ends_with_footer(update_footer) {
+        return Some("codex-update");
     }
     if SLASH_PANEL_MARKERS
         .iter()
-        .any(|marker| lower.contains(marker))
+        .any(|marker| ends_with_footer(marker))
     {
         return Some("slash-panel");
     }
@@ -6009,6 +6221,28 @@ fn trace_terminal_attention_transition<R: tauri::Runtime>(
             "terminal-attention",
             &format!("op=clear reason={}", reason),
         ),
+        TerminalAttentionTransition::Candidate { preview } if preview.is_empty() => {
+            // terminal-attention-folder-trust-prompts: an empty tail can't
+            // match anything; say what was there and what last drained it.
+            let live_len = pty_tail_cell().lock().map(|t| t.len()).unwrap_or(0);
+            let stash_len = pty_tail_drained_stash_cell()
+                .lock()
+                .map(|t| t.len())
+                .unwrap_or(0);
+            let (site, at) = pty_tail_last_clear_cell()
+                .lock()
+                .map(|g| *g)
+                .unwrap_or(("none", 0));
+            let age = if at > 0 { unix_now_ms() - at } else { -1 };
+            append_bram_trace_line(
+                app,
+                "terminal-attention",
+                &format!(
+                    "op=candidate preview= live_len={} stash_len={} last_clear={} last_clear_age_ms={}",
+                    live_len, stash_len, site, age
+                ),
+            )
+        }
         TerminalAttentionTransition::Candidate { preview } => append_bram_trace_line(
             app,
             "terminal-attention",
@@ -6041,7 +6275,81 @@ fn emit_terminal_attention<R: tauri::Runtime>(
 
 #[cfg(test)]
 mod terminal_attention_tests {
-    use super::terminal_attention_prompt_shape;
+    use super::{is_terminal_query_reply, terminal_attention_prompt_shape};
+
+    // terminal-attention-folder-trust-prompts: Claude Code's first-run
+    // folder trust prompt, captured under a PTY 2026-10-08 and stripped
+    // the way Bram strips it (cursor-column moves leave no space).
+    #[test]
+    fn folder_trust_claude_specimen_2026_10_08() {
+        const TAIL: &str = "Accessingworkspace: /tmp/trust-probe/empty-repo Quicksafetycheck:Isthisaprojectyoucreatedoroneyoutrust?(Likeyourowncode,awell-knownopensource project,orworkfromyourteam).Ifnot,takeamomenttoreviewwhat'sinthisfolderfirst. ClaudeCode'llbeabletoread,edit,andexecutefileshere. Securityguide \u{276f}No,exit Yes,Itrustthisfolder Entertoconfirm\u{b7}Esctocancel";
+        assert_eq!(terminal_attention_prompt_shape(TAIL), Some("folder-trust"));
+    }
+
+    // Codex 0.161.0's folder trust prompt, same capture.
+    #[test]
+    fn folder_trust_codex_specimen_2026_10_08() {
+        const TAIL: &str = "Folder access /tmp/trust-probe/empty-repo Trust this folder? Codex can read, edit, and run files here, subject to your permission settings. Folder settings can run code automatically, even without a model request. Continue only if you trust these files. Your trust decision will be saved. \u{203a} 1. Trust and continue 2. Back to Agent Command Center enter continue \u{b7} esc back";
+        assert_eq!(terminal_attention_prompt_shape(TAIL), Some("folder-trust"));
+    }
+
+    #[test]
+    fn folder_trust_needs_both_halves_of_a_pair() {
+        assert_eq!(
+            terminal_attention_prompt_shape("Codex asks: Trust this folder? I said yes."),
+            None
+        );
+        assert_eq!(
+            terminal_attention_prompt_shape("Click Yes, I trust this folder in Claude."),
+            None
+        );
+    }
+
+    // fresh-partner-catch-up-holds-for-codex-update-prompt: Codex's update
+    // prompt from its own snapshot, with real versions (2026-10-13 03:32Z:
+    // 0.161.0 -> 0.162.1), stripped the way Bram strips it.
+    #[test]
+    fn codex_update_prompt_specimen() {
+        const TAIL: &str = "Update available \u{b7} 0.161.0 \u{2192} 0.162.1 Release notes: https://github.com/openai/codex/releases/latest \u{203a} 1. Update now (runs `npm install -g @openai/codex`) 2. Skip 3. Skip until next version enter continue \u{b7} esc skip";
+        assert_eq!(terminal_attention_prompt_shape(TAIL), Some("codex-update"));
+        // Glued by cursor moves, as the live tail reads.
+        let glued: String = TAIL.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(
+            terminal_attention_prompt_shape(&glued),
+            Some("codex-update")
+        );
+    }
+
+    #[test]
+    fn quoting_the_update_prompt_does_not_fire_it() {
+        assert_eq!(
+            terminal_attention_prompt_shape(
+                "Codex said Update available, and I chose Update now. Done."
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn markers_match_words_glued_by_cursor_moves() {
+        assert_eq!(
+            terminal_attention_prompt_shape("Entertoconfirm\u{b7}Esctocancel"),
+            Some("slash-panel")
+        );
+    }
+
+    #[test]
+    fn terminal_query_replies_are_not_user_input() {
+        assert!(is_terminal_query_reply("\x1b[?1;2c"));
+        assert!(is_terminal_query_reply("\x1b[>0;276;0c"));
+        assert!(is_terminal_query_reply("\x1b[12;40R"));
+        assert!(is_terminal_query_reply("\x1b]11;rgb:1e1e/1e1e/1e1e\x1b\\"));
+        assert!(is_terminal_query_reply("\x1b]10;rgb:ffff/ffff/ffff\x07"));
+        assert!(!is_terminal_query_reply("c"));
+        assert!(!is_terminal_query_reply("1\r"));
+        assert!(!is_terminal_query_reply("\x1b[A"));
+        assert!(!is_terminal_query_reply("\x1b"));
+    }
 
     #[test]
     fn hooks_trust_markers_classify() {
@@ -6109,14 +6417,25 @@ mod terminal_attention_tests {
     fn slash_panel_claude_status_specimen_2026_10_04() {
         const TAIL: &str = "\u{276f} /status \u{2500}\u{2500}\u{2500}\u{2500}\n  Se tings   Status   Config   Usage   Stats\n\n  Version:          2.1.289\n  Session name:     Worklist item for concurrent messaging\n\n  Esc to cancel";
         assert_eq!(terminal_attention_prompt_shape(TAIL), Some("slash-panel"));
-        for line in ["Esc to cancel", "Status   Config   Usage   Stats"] {
-            assert!(TAIL.contains(line), "specimen no longer contains {line:?}");
-            assert_eq!(
-                terminal_attention_prompt_shape(line),
-                Some("slash-panel"),
-                "{line:?} should classify on its own"
-            );
-        }
+        assert!(TAIL.contains("Status   Config   Usage   Stats"));
+        assert_eq!(
+            terminal_attention_prompt_shape("Esc to cancel"),
+            Some("slash-panel")
+        );
+        // The header alone is not the footer (footer-anchored since
+        // terminal-attention-folder-trust-prompts).
+        assert_eq!(
+            terminal_attention_prompt_shape("Status   Config   Usage   Stats"),
+            None
+        );
+    }
+
+    // The live false positive, 2026-10-08 19:37Z: an idle agent reply that
+    // quotes a prompt's phrases, followed by the composer's chrome.
+    #[test]
+    fn quoted_prompt_phrases_mid_tail_do_not_classify() {
+        const TAIL: &str = "Claude's trust prompt also says \"Esc to cancel\". Codex 0.161.0: \"Trust this folder? ... 1. Trust and continue ...\" \u{273b} Baked for 9s \u{2500}\u{2500}\u{2500} General (Oct 8, 0.7.4) \u{2500} \u{276f} \u{23f5}\u{23f5} auto mode on (shift+tab to cycle) \u{b7} \u{2190} for agents";
+        assert_eq!(terminal_attention_prompt_shape(TAIL), None);
     }
 
     #[test]
@@ -9773,6 +10092,7 @@ fn pty_agent_status_update<R: tauri::Runtime>(app: &AppHandle<R>) {
                     }
                 }
                 tail.clear();
+                note_pty_tail_clear("turn-start");
             }
         }
     }
@@ -12647,6 +12967,36 @@ fn codex_cancel_output_is_current(
         && (turn_started_ms <= 0 || last_escape_ms >= turn_started_ms)
 }
 
+// terminal-attention-folder-trust-prompts: a write that is the terminal
+// answering a query, not a person typing: DA1/DA2 (CSI ? … c, CSI > … c),
+// cursor position (CSI row ; col R), and OSC 10/11/12 color replies.
+fn is_terminal_query_reply(data: &str) -> bool {
+    if let Some(body) = data.strip_prefix("\x1b[") {
+        let params = |s: &str| {
+            !s.is_empty()
+                && s.chars()
+                    .all(|c| c.is_ascii_digit() || c == ';' || c == '?' || c == '>')
+        };
+        if let Some(p) = body.strip_suffix('c') {
+            return p.starts_with('?') || p.starts_with('>') || (!p.is_empty() && params(p));
+        }
+        if let Some(p) = body.strip_suffix('R') {
+            return params(p) && p.contains(';');
+        }
+        return false;
+    }
+    if let Some(body) = data.strip_prefix("\x1b]") {
+        let body = body
+            .strip_suffix('\x07')
+            .or_else(|| body.strip_suffix("\x1b\\"));
+        return body.is_some_and(|b| {
+            (b.starts_with("10;") || b.starts_with("11;") || b.starts_with("12;"))
+                && b.contains("rgb:")
+        });
+    }
+    false
+}
+
 // Called from pty_write on user input. Records the dismissed menu's
 // tool name into PTY_MENU_SUPPRESSED so the detector won't immediately
 // re-fire when the next PTY chunk arrives (the dismissed text is still
@@ -12711,6 +13061,7 @@ fn pty_menu_clear<R: tauri::Runtime>(app: &AppHandle<R>, input: &str) {
     if let Ok(mut tail) = pty_tail_cell().lock() {
         tail.clear();
     }
+    note_pty_tail_clear("menu-input");
     // Clear any grid-loss hold: user input is a definitive outcome.
     if let Ok(mut held) = pty_menu_held_cell().lock() {
         *held = None;
@@ -16930,6 +17281,35 @@ fn pty_spawn(
                         guard_link_last_ensure_ms = now;
                         let _ = guard::ensure_bram_guard_link();
                         record_own_guard_target(&app_for_throughput);
+                        // issue-439: rotate the guard's breadcrumb log at its
+                        // cap (first pass is at launch: last_ensure starts 0).
+                        if let Some(root) = project_root(Some(&app_for_throughput)) {
+                            let dir = root.join("resources").join("bram-traces");
+                            if let Some((bytes, to, removed)) = rotate_hook_events_log(
+                                &dir,
+                                &bram_trace_date_stamp_local(),
+                                HOOK_EVENTS_ARCHIVES_KEPT,
+                            ) {
+                                append_bram_trace_line(
+                                    &app_for_throughput,
+                                    "guard",
+                                    &format!(
+                                        "op=hook-events-rotated bytes={} to={}",
+                                        bytes,
+                                        to.file_name()
+                                            .map(|n| n.to_string_lossy().into_owned())
+                                            .unwrap_or_default()
+                                    ),
+                                );
+                                if removed > 0 {
+                                    append_bram_trace_line(
+                                        &app_for_throughput,
+                                        "guard",
+                                        &format!("op=hook-events-pruned removed={}", removed),
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
                 // codex-trust-menu-arm-until-settled: commit an armed
@@ -17600,10 +17980,10 @@ fn pty_spawn(
             gate: !cfg!(windows),
             first_command: true,
             hook: Box::new(move |app, phase| {
+                // issue-429-digest-publish-watermark: autostart no longer
+                // marks the session it enters; digests advance their own
+                // watermark when written.
                 if phase == LaunchPhase::Confirmed {
-                    if let Some(id) = live_session_id(app, launch_provider) {
-                        mark_session_entered(app, launch_provider, &id);
-                    }
                     return;
                 }
                 if phase != LaunchPhase::Written {
@@ -17797,7 +18177,14 @@ fn pty_write_internal<R: tauri::Runtime>(
         // the focus signal). Closes #94.
         let is_focus_track = data == "\x1b[O" || data == "\x1b[I";
         let is_control_escape = data == "\x1b" && !pty_escape_is_user_interrupt_source(caller_hint);
-        if !is_focus_track && !is_control_escape {
+        // terminal-attention-folder-trust-prompts: xterm.js answers the
+        // CLI's own terminal queries (device attributes, cursor position,
+        // colors) by writing replies into the PTY. Those aren't keystrokes,
+        // and pty_menu_clear drains the tail: Claude's trust dialog painted
+        // at 19:03:12.44Z in tau-accounting and the ESC[?1;2c reply 200 ms
+        // later wiped it, so the attention check read an empty tail.
+        let is_query_reply = is_terminal_query_reply(data);
+        if !is_focus_track && !is_control_escape && !is_query_reply {
             pty_menu_clear(app, data);
         } else if bram_trace_enabled() {
             let tool = pty_menu_cell()
@@ -18104,6 +18491,19 @@ fn drain_pty_intents<R: tauri::Runtime>(
     let launch_pending = agent_launch_pending();
     let mut launch_held: usize = 0;
     let mut shell_restores: Vec<(String, String)> = Vec::new();
+    // pane-send-refuses-into-trust-prompt: a CLI's trust prompt ending the
+    // screen answers an Enter with its default, "Trust and continue". A send
+    // pasted there grants the trust and is lost (tau-parsers 2026-10-08
+    // 21:45Z, Bram's own catch-up). The attention detector's footer-anchored
+    // shapes say when one is up; such sends go back to the message box, as
+    // for a bare shell. sendKeys and menuAnswer still pass: keys are how the
+    // user answers the prompt. codex-update joins them: its Enter runs
+    // "Update now" and exits Codex. slash-panel is left out: Esc closes it,
+    // and an Enter there grants nothing.
+    let prompt_shape =
+        terminal_attention_prompt_shape(&pty_tail_snippet(TERMINAL_ATTENTION_TAIL_CHARS))
+            .filter(|shape| matches!(*shape, "folder-trust" | "hooks-trust" | "codex-update"));
+    let mut prompt_restores: Vec<(String, String)> = Vec::new();
 
     for line in content.lines() {
         if line.is_empty() {
@@ -18256,6 +18656,27 @@ fn drain_pty_intents<R: tauri::Runtime>(
                 }
                 shell_restores.push((id, data.to_string()));
                 continue;
+            } else if let Some(shape) = prompt_shape {
+                let id = intent
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("intent")
+                    .to_string();
+                if bram_trace_enabled() {
+                    append_bram_trace_line(
+                        app,
+                        "send-gate",
+                        &format!(
+                            "op=refuse-prompt shape={} id={} kind={} chars={}",
+                            shape,
+                            id,
+                            kind,
+                            data.chars().count()
+                        ),
+                    );
+                }
+                prompt_restores.push((id, data.to_string()));
+                continue;
             } else if launch_pending {
                 held += 1;
                 launch_held += 1;
@@ -18352,8 +18773,11 @@ fn drain_pty_intents<R: tauri::Runtime>(
     }
     // One emit for both kinds of hand-back: two rapid `send-restore` emits
     // coalesce in the iframe and drop all but the last text (#306).
-    if !boot_restores.is_empty() || !shell_restores.is_empty() {
-        let all = boot_restores.iter().chain(shell_restores.iter());
+    if !boot_restores.is_empty() || !shell_restores.is_empty() || !prompt_restores.is_empty() {
+        let all = boot_restores
+            .iter()
+            .chain(shell_restores.iter())
+            .chain(prompt_restores.iter());
         let ids = all
             .clone()
             .map(|(id, _)| id.as_str())
@@ -18365,14 +18789,23 @@ fn drain_pty_intents<R: tauri::Runtime>(
             .collect::<Vec<_>>()
             .join("\n\n");
         // `reason` lets the pane say why the text came back.
-        let reason = if shell_restores.is_empty() {
-            serde_json::Value::Null
-        } else {
+        let reason = if !shell_restores.is_empty() {
             serde_json::json!("shell-foreground")
+        } else if !prompt_restores.is_empty() {
+            serde_json::json!("prompt-on-screen")
+        } else {
+            serde_json::Value::Null
         };
         let _ = app.emit(
             "send-restore",
-            serde_json::json!({"id":ids,"text":text,"aborted":false,"reason":reason}),
+            serde_json::json!({
+                "id": ids,
+                "text": text,
+                "aborted": false,
+                "reason": reason,
+                "shape": prompt_shape,
+                "provider": current_provider_label,
+            }),
         );
         if !boot_restores.is_empty() {
             append_strand_forensics_line(
@@ -18393,6 +18826,16 @@ fn drain_pty_intents<R: tauri::Runtime>(
                 &format!(
                     "op=send-refused-shell-foreground entries={}",
                     shell_restores.len()
+                ),
+            );
+        }
+        if !prompt_restores.is_empty() {
+            append_strand_forensics_line(
+                app,
+                &format!(
+                    "op=send-refused-prompt shape={} entries={}",
+                    prompt_shape.unwrap_or(""),
+                    prompt_restores.len()
                 ),
             );
         }
@@ -19816,14 +20259,28 @@ fn switch_agent(
     // Only a session never paired or unpaired qualifies (an Unpair must
     // survive the next switch), and only with "Pair new sessions across
     // providers" on: this branch pairs, so it obeys the same setting.
-    let wants_fresh = leaving.as_ref().is_some_and(|(p, sid)| {
-        worklist_state_open(&app)
-            .and_then(|conn| {
-                worklist_state::session_wants_fresh_partner(&conn, session_provider_label(*p), sid)
-                    .ok()
-            })
-            .unwrap_or(false)
+    // first-switch-to-unused-provider-starts-named-partner: the second
+    // reason. A target provider with no sessions in this repo launches fresh
+    // anyway, and with nothing else on that side the new session is the only
+    // partner the switch could mean (tau-accounting 2026-10-08 20:40Z: an
+    // unnamed, unpaired Codex session and no offer). Both reasons require the
+    // leaving session never to have been paired or unpaired.
+    let fresh_reason: Option<&'static str> = leaving.as_ref().and_then(|(p, sid)| {
+        let conn = worklist_state_open(&app)?;
+        let label = session_provider_label(*p);
+        if !worklist_state::session_never_paired(&conn, label, sid).ok()? {
+            return None;
+        }
+        fresh_partner_reason(
+            worklist_state::session_born_from_new_session(&conn, label, sid).unwrap_or(false),
+            has_session,
+        )
     });
+    let wants_fresh = fresh_reason.is_some();
+    let pair_source = match fresh_reason {
+        Some("first-session") => "switch-first-session",
+        _ => "switch-new-session-born",
+    };
     let fresh: Option<(String, Option<String>)> = if switch_starts_fresh_partner(
         partner.is_some(),
         provider_key == "codex" && pending.is_some(),
@@ -19924,17 +20381,54 @@ fn switch_agent(
     // new-session-switch-starts-fresh-partner: queue the fresh partner's name
     // (applied when its session surfaces), and note the target's live session
     // now so a Codex partner, whose id isn't known yet, pairs once it changes.
-    let fresh_baseline = if resume_reason == "fresh-for-new-session" {
+    // first-switch-to-unused-provider-starts-named-partner: a switch that
+    // starts the session a queued Codex name was waiting for pairs it too,
+    // when the session being left has never been paired or unpaired.
+    // tau-accounting 2026-10-08 20:54Z: this path named the Codex session
+    // but left it unpaired, so the trip back could not find its partner.
+    let pending_pairs = matches!(resume_reason, "restart-pending" | "resume-pending")
+        && partner.is_none()
+        && pair_offers_enabled(&app)
+        && leaving.as_ref().is_some_and(|(p, sid)| {
+            worklist_state_open(&app)
+                .and_then(|conn| {
+                    worklist_state::session_never_paired(&conn, session_provider_label(*p), sid)
+                        .ok()
+                })
+                .unwrap_or(false)
+        });
+    let pairs_on_launch = resume_reason == "fresh-for-new-session" || pending_pairs;
+    let pair_source = if pending_pairs {
+        "switch-pending-name"
+    } else {
+        pair_source
+    };
+    if pending_pairs && bram_trace_enabled() {
+        append_bram_trace_line(
+            &app,
+            "agent-switch",
+            &format!(
+                "op=pending-name-pairs provider={} from={} target={}",
+                provider_key,
+                leaving.as_ref().map(|(_, id)| id.as_str()).unwrap_or(""),
+                target_sid.as_deref().unwrap_or("unbound")
+            ),
+        );
+    }
+    let fresh_baseline = if pending_pairs {
+        live_session_id(&app, target_provider)
+    } else if resume_reason == "fresh-for-new-session" {
         let baseline = live_session_id(&app, target_provider);
         if let Some((title, sid)) = fresh.as_ref() {
-            write_pending_session_title(&app, provider_key, title, sid.clone());
+            write_pending_session_title(&app, provider_key, title, sid.clone(), "switch");
             if bram_trace_enabled() {
                 append_bram_trace_line(
                     &app,
                     "agent-switch",
                     &format!(
-                        "op=fresh-partner provider={} from={} sid={}",
+                        "op=fresh-partner provider={} reason={} from={} sid={}",
                         provider_key,
+                        fresh_reason.unwrap_or(""),
                         leaving.as_ref().map(|(_, id)| id.as_str()).unwrap_or(""),
                         sid.as_deref().unwrap_or("unbound")
                     ),
@@ -20008,15 +20502,16 @@ fn switch_agent(
                 );
                 // new-session-switch-starts-fresh-partner: pair the fresh
                 // partner with the session it was started for; a Codex one
-                // pairs once its id surfaces (PENDING_PAIR).
-                if resume_reason == "fresh-for-new-session" {
+                // pairs once its id surfaces (PENDING_PAIR). Also a queued
+                // Codex name's session (pending_pairs).
+                if pairs_on_launch {
                     if let Some(from) = pair_from.as_ref() {
                         match target_sid.as_ref() {
                             Some(id) => record_pair_for(
                                 app,
                                 from,
                                 &(target_provider, id.clone()),
-                                "switch-new-session-born",
+                                pair_source,
                             ),
                             None => {
                                 let mut guard = match PENDING_PAIR.lock() {
@@ -20028,7 +20523,7 @@ fn switch_agent(
                                     to: target_provider,
                                     baseline: fresh_baseline.clone(),
                                     at_ms: unix_now_ms(),
-                                    source: "switch-new-session-born",
+                                    source: pair_source,
                                 });
                             }
                         }
@@ -20050,7 +20545,34 @@ fn switch_agent(
                 // first message, so the catch-up is sent rather than offered:
                 // the partner gets its context and surfaces at once, before
                 // the queued name (10 min) or pending pair (15 min) expire.
+                //
+                // Never into a prompt. tau-parsers 2026-10-08 21:45Z: Codex's
+                // first run there opened its folder-trust prompt, the catch-up
+                // was pasted into it, and its Enter accepted "Trust and
+                // continue" on the user's behalf; the text itself was lost.
+                // If the screen ends in a recognized prompt (the attention
+                // detector's footer-anchored shapes), hold the turn and offer
+                // it instead: the user answers the prompt, then clicks
+                // Catch … up.
+                let prompt_on_screen = terminal_attention_prompt_shape(&pty_tail_snippet(
+                    TERMINAL_ATTENTION_TAIL_CHARS,
+                ));
                 if resume_reason == "fresh-for-new-session" {
+                    if let Some(shape) = prompt_on_screen {
+                        if bram_trace_enabled() {
+                            append_bram_trace_line(
+                                app,
+                                "agent-switch",
+                                &format!(
+                                    "op=fresh-partner-catch-up provider={} result=held reason=prompt-on-screen shape={}",
+                                    session_provider_label(target_provider),
+                                    shape
+                                ),
+                            );
+                        }
+                    }
+                }
+                if resume_reason == "fresh-for-new-session" && prompt_on_screen.is_none() {
                     if let (Some((fp, fid)), Some((path, turns))) =
                         (pair_from.as_ref(), digest.as_ref())
                     {
@@ -20087,17 +20609,11 @@ fn switch_agent(
                         }
                         if queued.is_ok() {
                             emit_catch_up_offer(app, None, None, None);
-                            if let Some(id) = target_sid.as_deref() {
-                                mark_session_entered(app, target_provider, id);
-                            }
                             return;
                         }
                     }
                 }
                 emit_catch_up_offer(app, pair_from.as_ref(), Some(target_provider), digest);
-                if let Some(id) = target_sid.as_deref() {
-                    mark_session_entered(app, target_provider, id);
-                }
                 return;
             }
             if phase != LaunchPhase::Written {
@@ -20413,14 +20929,22 @@ fn session_digest_rel_path(provider: SessionProvider, id: &str) -> String {
     )
 }
 
-fn session_digest_marks_path<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
-    session_digest_dir(app).map(|d| d.join(".marks.json"))
+// issue-429-digest-publish-watermark: per session, the turn total its last
+// written digest reached ("published to the partner through turn N"). It
+// advances only when a digest is written. The old `.marks.json` held ENTRY
+// marks, re-set on every switch, autostart and reload into a session, so the
+// session being worked in kept skipping its unpublished turns and went dark to
+// its partner (#429: mark 2162 against a last digest of 2157, `turns=0`). A
+// fresh file, because those entry marks already run ahead of what was
+// published; the old one is left alone, inert.
+fn session_digest_published_path<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
+    session_digest_dir(app).map(|d| d.join(".published.json"))
 }
 
-fn read_session_digest_marks<R: tauri::Runtime>(
+fn read_session_digest_published<R: tauri::Runtime>(
     app: &AppHandle<R>,
 ) -> serde_json::Map<String, serde_json::Value> {
-    session_digest_marks_path(app)
+    session_digest_published_path(app)
         .and_then(|p| std::fs::read(p).ok())
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
         .and_then(|v| v.as_object().cloned())
@@ -20444,18 +20968,16 @@ fn session_turns<R: tauri::Runtime>(
 }
 
 // Record a session's turn total as it is entered.
-fn mark_session_entered<R: tauri::Runtime>(
+fn record_session_published<R: tauri::Runtime>(
     app: &AppHandle<R>,
     provider: SessionProvider,
     id: &str,
+    total: usize,
 ) {
-    let Some((total, _)) = session_turns(app, provider, id) else {
+    let Some(path) = session_digest_published_path(app) else {
         return;
     };
-    let Some(path) = session_digest_marks_path(app) else {
-        return;
-    };
-    let mut marks = read_session_digest_marks(app);
+    let mut marks = read_session_digest_published(app);
     marks.insert(
         format!("{}-{}", session_provider_label(provider), id),
         serde_json::json!(total),
@@ -20464,6 +20986,44 @@ fn mark_session_entered<R: tauri::Runtime>(
         let _ = std::fs::create_dir_all(dir);
     }
     let _ = std::fs::write(&path, serde_json::Value::Object(marks).to_string());
+}
+
+// issue-429-digest-publish-watermark: how many of the latest turns a digest
+// covers. No watermark, or one AHEAD of the total (a rotated or compacted
+// session, or a different file behind the id): the latest window, never a
+// silent zero.
+fn digest_new_turns(total: usize, watermark: Option<usize>, window_len: usize) -> usize {
+    match watermark {
+        Some(m) if m <= total => total - m,
+        _ => window_len,
+    }
+}
+
+#[cfg(test)]
+mod session_digest_watermark_tests {
+    use super::digest_new_turns;
+
+    #[test]
+    fn new_turns_cover_none_behind_and_ahead() {
+        // No watermark: the latest window.
+        assert_eq!(digest_new_turns(2157, None, 40), 40);
+        // Behind: exactly the unpublished turns.
+        assert_eq!(digest_new_turns(2162, Some(2157), 40), 5);
+        // Ahead (rotated or compacted session): the window, not a silent 0.
+        assert_eq!(digest_new_turns(100, Some(2162), 40), 40);
+        // Caught up: nothing new, so nothing is written.
+        assert_eq!(digest_new_turns(2162, Some(2162), 40), 0);
+    }
+
+    // #429's sequence: published at 10, the session re-entered at 15
+    // (relaunch / reload), worked to 20, then left. Entry no longer moves
+    // the watermark, so the digest covers 10 -> 20, not 15 -> 20.
+    #[test]
+    fn re_entering_a_session_does_not_hide_its_unpublished_turns() {
+        let published = Some(10);
+        // (entry at 15 records nothing)
+        assert_eq!(digest_new_turns(20, published, 40), 10);
+    }
 }
 
 fn clip_chars(s: &str, n: usize) -> String {
@@ -20540,17 +21100,17 @@ fn write_session_digest<R: tauri::Runtime>(
 ) -> Option<(String, usize)> {
     let (total, window) = session_turns(app, provider, id)?;
     let mark = if since_mark {
-        read_session_digest_marks(app)
+        read_session_digest_published(app)
             .get(&format!("{}-{}", session_provider_label(provider), id))
             .and_then(|v| v.as_u64())
             .map(|m| m as usize)
     } else {
         None
     };
-    let new = match mark {
-        Some(m) => total.saturating_sub(m),
-        None => window.len(),
-    };
+    let from = mark
+        .map(|m| m.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let new = digest_new_turns(total, mark, window.len());
     let candidates = drop_catch_up_exchanges(&window[window.len() - new.min(window.len())..]);
     let take = candidates.len();
     if bram_trace_enabled() && take == 0 {
@@ -20558,9 +21118,11 @@ fn write_session_digest<R: tauri::Runtime>(
             app,
             "agent-switch",
             &format!(
-                "op=digest-written provider={} session={} turns=0",
+                "op=digest-written provider={} session={} turns=0 from={} total={}",
                 session_provider_label(provider),
-                id
+                id,
+                from,
+                total
             ),
         );
     }
@@ -20582,16 +21144,21 @@ fn write_session_digest<R: tauri::Runtime>(
     let _ = std::fs::create_dir_all(&dir);
     let file = dir.join(format!("{}-{}.md", session_provider_label(provider), id));
     std::fs::write(&file, body.as_bytes()).ok()?;
+    // Published through `total`: the next digest starts here, however many
+    // times the session is entered (switch, autostart, reload) before then.
+    record_session_published(app, provider, id, total);
     if bram_trace_enabled() {
         append_bram_trace_line(
             app,
             "agent-switch",
             &format!(
-                "op=digest-written provider={} session={} turns={} bytes={}",
+                "op=digest-written provider={} session={} turns={} bytes={} from={} total={}",
                 session_provider_label(provider),
                 id,
                 take,
-                body.len()
+                body.len(),
+                from,
+                total
             ),
         );
     }
@@ -20695,6 +21262,23 @@ fn switch_starts_fresh_partner(
     wants_fresh: bool,
 ) -> bool {
     !has_partner && !codex_pending && pairing_enabled && wants_fresh
+}
+
+// Why a switch starts a fresh partner, given a leaving session never paired
+// or unpaired: it was started with New session, or the target provider has
+// no sessions in this repo (first-switch-to-unused-provider-starts-named-
+// partner). None: resume as before.
+fn fresh_partner_reason(
+    born_from_new_session: bool,
+    target_has_session: bool,
+) -> Option<&'static str> {
+    if born_from_new_session {
+        Some("new-session")
+    } else if !target_has_session {
+        Some("first-session")
+    } else {
+        None
+    }
 }
 
 // new-session-switch-starts-fresh-partner: the name of a fresh partner is the
@@ -21126,9 +21710,6 @@ fn reload_agent_session(
         first_command: false,
         hook: Box::new(move |app, phase| {
             if phase == LaunchPhase::Confirmed {
-                if session_exists {
-                    mark_session_entered(app, session_provider, &session);
-                }
                 if let (Some(from), true) = (leaving.as_ref(), session_exists) {
                     record_pair_for(
                         app,
@@ -21252,6 +21833,14 @@ struct PendingSessionTitle {
     session_id: Option<String>,
     #[serde(default)]
     previous_session_id: Option<String>,
+    // first-switch-to-unused-provider-starts-named-partner: who queued the
+    // name. Only "new-session" (the New session dialog) marks the session
+    // as started with New session; a name a switch queued, or one with no
+    // origin (older files), does not. tau-accounting 2026-10-08 20:55Z: a
+    // queued name of unknown origin counted, and the switch back started a
+    // new Claude session instead of resuming the one being worked in.
+    #[serde(default)]
+    origin: Option<String>,
 }
 
 fn pending_session_title_file<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
@@ -21263,6 +21852,7 @@ fn write_pending_session_title<R: tauri::Runtime>(
     provider: &str,
     title: &str,
     session_id: Option<String>,
+    origin: &str,
 ) {
     let Some(path) = pending_session_title_file(app) else {
         return;
@@ -21274,10 +21864,17 @@ fn write_pending_session_title<R: tauri::Runtime>(
         session_id,
         previous_session_id: SessionProvider::from_str(provider)
             .and_then(|session_provider| live_session_id(app, session_provider)),
+        origin: Some(origin.to_string()),
     };
     if let Ok(bytes) = serde_json::to_vec(&rec) {
         let _ = std::fs::write(&path, bytes);
     }
+}
+
+// first-switch-to-unused-provider-starts-named-partner: only the New session
+// dialog's names mark a session as started with New session.
+fn pending_title_marks_new_session(origin: Option<&str>) -> bool {
+    origin == Some("new-session")
 }
 
 fn read_pending_session_title<R: tauri::Runtime>(
@@ -21491,8 +22088,11 @@ fn apply_pending_session_title<R: tauri::Runtime>(
                 let _ = std::fs::remove_file(&path);
                 // new-session-switch-starts-fresh-partner: remember that this
                 // session began as a new line of work, so the first switch
-                // away from it starts a fresh partner (switch_agent).
-                if let Some(conn) = worklist_state_open(app) {
+                // away from it starts a fresh partner (switch_agent). Only
+                // for a name the New session dialog queued.
+                if let Some(conn) = worklist_state_open(app)
+                    .filter(|_| pending_title_marks_new_session(rec.origin.as_deref()))
+                {
                     let _ = worklist_state::record_session_born(
                         &conn,
                         want,
@@ -21536,11 +22136,11 @@ fn apply_pending_session_title<R: tauri::Runtime>(
 #[cfg(test)]
 mod pending_session_title_tests {
     use super::{
-        claim_pending_session_title, codex_session_is_visible, fresh_partner_title,
-        merge_pending_session_entry, new_session_launch_command,
+        claim_pending_session_title, codex_session_is_visible, fresh_partner_reason,
+        fresh_partner_title, merge_pending_session_entry, new_session_launch_command,
         pending_session_title_abandoned_by_resume, pending_session_title_can_claim,
-        provider_switch_launch, session_change_snapshot, switch_starts_fresh_partner,
-        PendingSessionTitle, SessionEntry, SessionProvider,
+        pending_title_marks_new_session, provider_switch_launch, session_change_snapshot,
+        switch_starts_fresh_partner, PendingSessionTitle, SessionEntry, SessionProvider,
     };
 
     #[test]
@@ -21551,6 +22151,7 @@ mod pending_session_title_tests {
             created_at_ms: 1,
             session_id: None,
             previous_session_id: Some("previous-codex-id".to_string()),
+            origin: None,
         };
 
         assert!(pending_session_title_abandoned_by_resume(
@@ -21577,6 +22178,7 @@ mod pending_session_title_tests {
             created_at_ms: 10_000,
             session_id: None,
             previous_session_id: Some("old-codex".into()),
+            origin: None,
         }
     }
 
@@ -21835,6 +22437,23 @@ mod pending_session_title_tests {
         assert!(!switch_starts_fresh_partner(false, false, true, false));
     }
 
+    // A name queued by a switch, or one with no origin (older files), does
+    // not mark its session as started with New session.
+    #[test]
+    fn only_the_new_session_dialog_marks_a_session_born() {
+        assert!(pending_title_marks_new_session(Some("new-session")));
+        assert!(!pending_title_marks_new_session(Some("switch")));
+        assert!(!pending_title_marks_new_session(None));
+    }
+
+    #[test]
+    fn fresh_partner_reason_new_session_first_then_first_session() {
+        assert_eq!(fresh_partner_reason(true, true), Some("new-session"));
+        assert_eq!(fresh_partner_reason(true, false), Some("new-session"));
+        assert_eq!(fresh_partner_reason(false, false), Some("first-session"));
+        assert_eq!(fresh_partner_reason(false, true), None);
+    }
+
     #[test]
     fn fresh_partner_title_names_the_target_provider_once() {
         assert_eq!(
@@ -21855,6 +22474,7 @@ mod pending_session_title_tests {
             created_at_ms: 1,
             session_id: Some("claimed-id".to_string()),
             previous_session_id: Some("claimed-id".to_string()),
+            origin: None,
         };
 
         assert!(!pending_session_title_abandoned_by_resume(
@@ -21995,7 +22615,13 @@ fn create_new_session(
     };
     // Queue the title so the new session is renamed to the exact name when its
     // session file surfaces. The title is metadata, never a user turn.
-    write_pending_session_title(&app, provider_key, &trimmed, session_id.clone());
+    write_pending_session_title(
+        &app,
+        provider_key,
+        &trimmed,
+        session_id.clone(),
+        "new-session",
+    );
     if bram_trace_enabled() {
         append_bram_trace_line(
             &app,
@@ -43646,6 +44272,412 @@ fn mime_for(path: &std::path::Path) -> &'static str {
     }
 }
 
+// more-files-tree-view: flat Tree rows for a repo listing. Every directory
+// on a path gets its own row; directories come before files, each group
+// sorted case-insensitively by full path so siblings land in order. Ids are
+// repo-relative paths, which is what __bramOpenLocalLinkPreview takes.
+// files-tab-lists-bram-state-in-resources: Bram's own state under
+// resources/ is gitignored, so `git ls-files --exclude-standard` never lists
+// it and the Files tab showed six tracked icons out of ~16,750 files. The
+// state the tab should show regardless: these files as ordinary rows, these
+// folders as dynamic rows whose contents load on expand
+// (/__repo/tree/dir), because listing them up front would add ~15,750 rows
+// (worklist-history alone is 11,560) to a 272-row tree.
+const BRAM_STATE_FILES: &[&str] = &["resources/worklist.json"];
+const BRAM_STATE_DIRS: &[&str] = &[
+    "resources/worklist-drafts",
+    "resources/worklist-history",
+    "resources/feedback-drafts",
+    "resources/feedback-history",
+    "resources/session-digests",
+    "resources/handoffs",
+    "resources/outbound-turns",
+    "resources/bram-traces",
+];
+// The state the content search also covers: everything but the traces
+// (1.4 GB of logs). History was first left out on a guess that it would be
+// slow; measured, the three history folders (~123 MB) grep in 0.21-0.27 s
+// warm, and the tab searches on Enter, not per keystroke. Jon's first
+// search, for an event name, matched only in worklist-history.
+//
+// Order is priority: results are capped (REPO_GREP_CAP), so the current
+// state comes before the histories. bram_state_grep_ordered sorts by it.
+const BRAM_STATE_GREP: &[&str] = &[
+    "resources/worklist.json",
+    "resources/worklist-drafts",
+    "resources/feedback-drafts",
+    "resources/session-digests",
+    "resources/handoffs",
+    "resources/worklist-history",
+    "resources/feedback-history",
+    "resources/outbound-turns",
+];
+// Each history entry is a .json and .md pair. The .json is a snapshot of the
+// whole board after the change, so a term in one long-lived item matches
+// every snapshot taken while it existed (on the demo board,
+// "talk-session-changed" hit 273 .json files and 119 .md). The .md records
+// what changed, which is what a search is looking for.
+const BRAM_STATE_GREP_EXCLUDE: &[&str] = &[":(exclude)resources/worklist-history/*.json"];
+
+// Reorder `git grep -n -z` output from the state search before the cap:
+// files grouped by the BRAM_STATE_GREP root they fall under (in that
+// order), and within a root, timestamp-named files (names starting with a
+// digit) newest first, others alphabetically. git grep lists by path, which
+// put the OLDEST history first, so a capped search showed only stale lines.
+fn bram_state_grep_ordered(out: &str) -> String {
+    let rank = |path: &str| {
+        BRAM_STATE_GREP
+            .iter()
+            .position(|r| path == *r || path.starts_with(&format!("{}/", r)))
+            .unwrap_or(BRAM_STATE_GREP.len())
+    };
+    // Records are "path\0line\0text\n", contiguous per file.
+    let mut files: Vec<(String, String)> = Vec::new();
+    for rec in out.split_inclusive('\n') {
+        let path = rec.split('\0').next().unwrap_or("").to_string();
+        match files.last_mut() {
+            Some((p, chunk)) if *p == path => chunk.push_str(rec),
+            _ => files.push((path, rec.to_string())),
+        }
+    }
+    files.sort_by(|(a, _), (b, _)| {
+        let base = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
+        let (na, nb) = (base(a), base(b));
+        let digit = |n: &str| n.as_bytes().first().is_some_and(|c| c.is_ascii_digit());
+        rank(a).cmp(&rank(b)).then_with(|| {
+            if digit(&na) && digit(&nb) {
+                nb.cmp(&na)
+            } else {
+                a.to_lowercase().cmp(&b.to_lowercase())
+            }
+        })
+    });
+    files.into_iter().map(|(_, chunk)| chunk).collect()
+}
+
+// May /__repo/tree/dir list this path? Only a state folder or a folder
+// beneath one, with no `..`, `.` or empty segments.
+fn bram_state_dir_allowed(dir: &str) -> bool {
+    if dir
+        .split('/')
+        .any(|s| s.is_empty() || s == "." || s == "..")
+    {
+        return false;
+    }
+    BRAM_STATE_DIRS
+        .iter()
+        .any(|d| dir == *d || dir.starts_with(&format!("{}/", d)))
+}
+
+// Rows for one state folder's immediate children: subfolders first (dynamic,
+// so they load on expand too), then files. Names that all start with a digit
+// are timestamps (worklist-history, outbound-turns, feedback-history), so
+// those list newest first; anything else is alphabetical.
+fn bram_state_dir_rows(dir: &str, subdirs: &[String], files: &[String]) -> Vec<serde_json::Value> {
+    let order = |names: &[String]| -> Vec<String> {
+        let mut v = names.to_vec();
+        if !v.is_empty()
+            && v.iter()
+                .all(|n| n.as_bytes().first().is_some_and(|b| b.is_ascii_digit()))
+        {
+            v.sort_by(|a, b| b.cmp(a));
+        } else {
+            v.sort_by_key(|n| n.to_lowercase());
+        }
+        v
+    };
+    let mut rows = Vec::with_capacity(subdirs.len() + files.len());
+    for d in order(subdirs) {
+        rows.push(serde_json::json!({
+            "id": format!("{}/{}", dir, d), "name": d, "parentId": dir,
+            "isDir": true, "dynamic": true,
+        }));
+    }
+    for f in order(files) {
+        rows.push(serde_json::json!({
+            "id": format!("{}/{}", dir, f), "name": f, "parentId": dir, "isDir": false,
+        }));
+    }
+    rows
+}
+
+// The state entries that exist under `root`: files to list as rows, and
+// folders to show collapsed.
+fn bram_state_present(root: &Path) -> (Vec<String>, Vec<String>) {
+    let files = BRAM_STATE_FILES
+        .iter()
+        .filter(|f| root.join(f).is_file())
+        .map(|f| f.to_string())
+        .collect();
+    let dirs = BRAM_STATE_DIRS
+        .iter()
+        .filter(|d| root.join(d).is_dir())
+        .map(|d| d.to_string())
+        .collect();
+    (files, dirs)
+}
+
+// `lazy` folders become rows marked `dynamic` (their ancestors are added as
+// usual) unless the listing already gives them children, in which case they
+// are ordinary folders.
+fn repo_tree_rows_with_lazy(paths: &[String], lazy: &[String]) -> Vec<serde_json::Value> {
+    let parent = |p: &str| p.rfind('/').map(|i| p[..i].to_string());
+    let name = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
+    let mut dirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut files: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for p in paths {
+        if p.is_empty() {
+            continue;
+        }
+        let mut acc = String::new();
+        let segs: Vec<&str> = p.split('/').collect();
+        for seg in &segs[..segs.len() - 1] {
+            if !acc.is_empty() {
+                acc.push('/');
+            }
+            acc.push_str(seg);
+            dirs.insert(acc.clone());
+        }
+        files.insert(p.clone());
+    }
+    let mut dynamic: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for l in lazy {
+        if l.is_empty() {
+            continue;
+        }
+        if !dirs.contains(l) {
+            dynamic.insert(l.clone());
+        }
+        let mut acc = String::new();
+        for seg in l.split('/') {
+            if !acc.is_empty() {
+                acc.push('/');
+            }
+            acc.push_str(seg);
+            dirs.insert(acc.clone());
+        }
+    }
+    let mut dir_list: Vec<String> = dirs.into_iter().collect();
+    dir_list.sort_by_key(|d| d.to_lowercase());
+    let mut file_list: Vec<String> = files.into_iter().collect();
+    file_list.sort_by_key(|f| f.to_lowercase());
+    let mut rows = Vec::with_capacity(dir_list.len() + file_list.len());
+    for d in &dir_list {
+        let mut row = serde_json::json!({
+            "id": d, "name": name(d), "parentId": parent(d), "isDir": true,
+        });
+        if dynamic.contains(d) {
+            row["dynamic"] = serde_json::json!(true);
+        }
+        rows.push(row);
+    }
+    for f in &file_list {
+        rows.push(serde_json::json!({
+            "id": f, "name": name(f), "parentId": parent(f), "isDir": false,
+        }));
+    }
+    rows
+}
+
+const REPO_GREP_CAP: usize = 200;
+const REPO_GREP_PER_FILE: usize = 20;
+const REPO_GREP_WINDOW: usize = 60;
+
+// more-files-tree-view: parse `git grep -n -z` output ("path\0line\0text\n")
+// into at most `cap` hits, each line windowed around the first match so a
+// minified one-line bundle can't flood the response. Returns (hits, total).
+fn repo_grep_hits(out: &str, q: &str, cap: usize) -> (Vec<serde_json::Value>, usize) {
+    let needle = q.to_lowercase();
+    let mut hits = Vec::new();
+    let mut total = 0usize;
+    for rec in out.split('\n') {
+        let mut parts = rec.splitn(3, '\0');
+        let (Some(path), Some(line), Some(text)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let Ok(line) = line.parse::<u64>() else {
+            continue;
+        };
+        total += 1;
+        if hits.len() >= cap {
+            continue;
+        }
+        let chars: Vec<char> = text.chars().collect();
+        let lower: String = text.to_lowercase();
+        // Char index of the match (lowercasing can change byte lengths).
+        let at = lower
+            .find(&needle)
+            .map(|b| lower[..b].chars().count())
+            .unwrap_or(0);
+        let from = at.saturating_sub(REPO_GREP_WINDOW);
+        let to = (at + needle.chars().count() + REPO_GREP_WINDOW).min(chars.len());
+        let mut snippet: String = chars[from..to]
+            .iter()
+            .collect::<String>()
+            .trim()
+            .to_string();
+        if from > 0 {
+            snippet = format!("\u{2026}{}", snippet);
+        }
+        if to < chars.len() {
+            snippet.push('\u{2026}');
+        }
+        hits.push(serde_json::json!({ "path": path, "line": line, "text": snippet }));
+    }
+    (hits, total)
+}
+
+#[cfg(test)]
+mod repo_files_tests {
+    use super::{
+        bram_state_dir_allowed, bram_state_dir_rows, bram_state_grep_ordered, repo_grep_hits,
+        repo_tree_rows_with_lazy,
+    };
+
+    // files-tab-lists-bram-state-in-resources
+    #[test]
+    fn lazy_state_folders_are_dynamic_rows_with_their_ancestors() {
+        let rows = repo_tree_rows_with_lazy(
+            &[
+                "resources/up.svg".to_string(),
+                "resources/worklist.json".to_string(),
+            ],
+            &["resources/worklist-history".to_string()],
+        );
+        let ids: Vec<&str> = rows.iter().map(|r| r["id"].as_str().unwrap()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "resources",
+                "resources/worklist-history",
+                "resources/up.svg",
+                "resources/worklist.json"
+            ]
+        );
+        assert_eq!(rows[1]["dynamic"], true);
+        assert_eq!(rows[1]["parentId"], "resources");
+        assert!(rows[0].get("dynamic").is_none());
+        // A lazy folder the listing already fills is an ordinary folder.
+        let filled = repo_tree_rows_with_lazy(&["a/b/c.txt".to_string()], &["a/b".to_string()]);
+        assert!(filled.iter().all(|r| r.get("dynamic").is_none()));
+    }
+
+    #[test]
+    fn state_grep_puts_current_state_first_and_history_newest_first() {
+        let out = "resources/worklist-history/1700000000000.md\u{0}3\u{0}old\n\
+                   resources/worklist-history/1700000000000.md\u{0}9\u{0}old2\n\
+                   resources/worklist-history/1790000000000.md\u{0}1\u{0}new\n\
+                   resources/worklist-drafts/b.md\u{0}2\u{0}draft\n";
+        let ordered = bram_state_grep_ordered(out);
+        let paths: Vec<&str> = ordered
+            .lines()
+            .map(|l| l.split('\u{0}').next().unwrap())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "resources/worklist-drafts/b.md",
+                "resources/worklist-history/1790000000000.md",
+                "resources/worklist-history/1700000000000.md",
+                "resources/worklist-history/1700000000000.md",
+            ]
+        );
+        // A file's lines stay together and in order.
+        assert!(ordered.ends_with(
+            "\u{0}3\u{0}old\nresources/worklist-history/1700000000000.md\u{0}9\u{0}old2\n"
+        ));
+    }
+
+    #[test]
+    fn state_dir_route_only_lists_state_folders() {
+        assert!(bram_state_dir_allowed("resources/worklist-history"));
+        assert!(bram_state_dir_allowed("resources/bram-traces/archive"));
+        assert!(!bram_state_dir_allowed("resources"));
+        assert!(!bram_state_dir_allowed("src-tauri"));
+        assert!(!bram_state_dir_allowed(
+            "resources/worklist-history/../../etc"
+        ));
+        assert!(!bram_state_dir_allowed("resources/worklist-historyX"));
+        assert!(!bram_state_dir_allowed("/resources/worklist-history"));
+    }
+
+    #[test]
+    fn state_dir_rows_list_timestamps_newest_first() {
+        let rows = bram_state_dir_rows(
+            "resources/worklist-history",
+            &["sub".to_string()],
+            &[
+                "1791757368337.md".to_string(),
+                "1791828392077.json".to_string(),
+                "1789000000000.md".to_string(),
+            ],
+        );
+        let names: Vec<&str> = rows.iter().map(|r| r["name"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "sub",
+                "1791828392077.json",
+                "1791757368337.md",
+                "1789000000000.md"
+            ]
+        );
+        assert_eq!(rows[0]["dynamic"], true);
+        assert_eq!(
+            rows[1]["id"],
+            "resources/worklist-history/1791828392077.json"
+        );
+        let drafts = bram_state_dir_rows(
+            "resources/worklist-drafts",
+            &[],
+            &["b-item.md".to_string(), "A-item.md".to_string()],
+        );
+        let names: Vec<&str> = drafts.iter().map(|r| r["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["A-item.md", "b-item.md"]);
+    }
+
+    #[test]
+    fn tree_rows_add_every_directory_and_put_directories_first() {
+        let rows = repo_tree_rows_with_lazy(
+            &[
+                "src/b.rs".to_string(),
+                "README.md".to_string(),
+                "src/a/x.rs".to_string(),
+            ],
+            &[],
+        );
+        let ids: Vec<&str> = rows.iter().map(|r| r["id"].as_str().unwrap()).collect();
+        assert_eq!(
+            ids,
+            vec!["src", "src/a", "README.md", "src/a/x.rs", "src/b.rs"]
+        );
+        assert_eq!(rows[1]["parentId"], "src");
+        assert!(rows[0]["parentId"].is_null());
+        assert_eq!(rows[3]["name"], "x.rs");
+        assert_eq!(rows[0]["isDir"], true);
+    }
+
+    #[test]
+    fn grep_hits_parse_window_and_cap() {
+        let long = format!("{}needle{}", "a".repeat(200), "b".repeat(200));
+        let out = format!(
+            "x.rs\u{0}3\u{0}let Needle = 1;\nv.js\u{0}1\u{0}{}\nbad line\n",
+            long
+        );
+        let (hits, total) = repo_grep_hits(&out, "needle", 200);
+        assert_eq!(total, 2);
+        assert_eq!(hits[0]["path"], "x.rs");
+        assert_eq!(hits[0]["line"], 3);
+        assert_eq!(hits[0]["text"], "let Needle = 1;");
+        let t = hits[1]["text"].as_str().unwrap();
+        assert!(t.starts_with('\u{2026}') && t.ends_with('\u{2026}') && t.contains("needle"));
+        assert!(t.chars().count() < 140);
+        let (capped, total) = repo_grep_hits(&out, "needle", 1);
+        assert_eq!((capped.len(), total), (1, 2));
+    }
+}
+
 fn local_file_preview_language(path: &std::path::Path) -> &'static str {
     match path
         .extension()
@@ -47735,209 +48767,6 @@ fn claim_intervals_partition(
     (keep, retire)
 }
 
-// issue-327 attribution. Ownership of a changed line is decided by WHICH CLAIM
-// INTERVAL introduced it, replayed positionally through the boundary chain.
-//
-// Two properties make this affordable, both measured before building:
-//   * one whole-tree `git diff` per boundary pair covers every file at once, so
-//     cost is independent of how many paths the board touches (the #323 lesson,
-//     applied up front rather than after a regression);
-//   * a CLOSED interval compares two fixed trees, so its edit script is immutable
-//     and cacheable for the process lifetime. Only the open interval, last
-//     boundary to worktree, is recomputed per board build.
-//
-// Attribution is POSITIONAL, never by line content. A content-keyed lookup
-// silently misattributes duplicate lines -- blank lines and code fences get
-// credited to whichever claimant's patch first contained that text. It looks
-// right on sparse fixtures and produces confident nonsense on real files.
-#[derive(Clone, Debug, PartialEq)]
-struct AttrHunk {
-    old_start: usize,
-    lines: Vec<(char, ())>,
-}
-
-// One file's edit script from a single interval.
-fn parse_attr_diff(out: &str) -> std::collections::HashMap<String, Vec<AttrHunk>> {
-    let mut per_file: std::collections::HashMap<String, Vec<AttrHunk>> = Default::default();
-    let mut path: Option<String> = None;
-    let mut cur: Option<AttrHunk> = None;
-    for line in out.lines() {
-        // attribution-run-line-offset-in-views: take the path from the
-        // `diff --git a/X b/X` header, which is present for EVERY file —
-        // add, modify, delete, rename. The old code keyed on `+++ b/<path>`,
-        // but a DELETED file's target line is `+++ /dev/null`, so its path
-        // was never set and its `-` hunks were attributed to the
-        // alphabetically-preceding file. Live case 2026-09-05: two deleted
-        // files (.needs-you-dismissed.json -13, downloads.sh -16) bled a
-        // phantom -29 onto docs/trace-vocabulary.md, shifting every run and
-        // rendering the change as "no item". The b/ path is the target
-        // (the new name on a rename), which is what attribution wants.
-        if let Some(rest) = line.strip_prefix("diff --git ") {
-            if let (Some(p), Some(h)) = (path.take(), cur.take()) {
-                per_file.entry(p).or_default().push(h);
-            }
-            cur = None;
-            // The b/ target: present for add/modify/delete/rename, so it is
-            // set even when the later `+++` line is `/dev/null` (a deletion).
-            path = rest.split(" b/").nth(1).map(|s| s.to_string());
-            continue;
-        }
-        // `+++ b/<path>` still sets the path — it is the only header in the
-        // synthetic diffs the unit tests feed (no `diff --git` line), and in
-        // a real diff it merely re-confirms the diff --git target. A deletion
-        // is `+++ /dev/null`, which correctly does NOT match and so leaves the
-        // diff --git path in place.
-        if let Some(rest) = line.strip_prefix("+++ b/") {
-            if let (Some(p), Some(h)) = (path.take(), cur.take()) {
-                per_file.entry(p).or_default().push(h);
-            }
-            cur = None;
-            path = Some(rest.to_string());
-            continue;
-        }
-        if line.starts_with("+++ ") || line.starts_with("--- ") {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("@@ -") {
-            if let (Some(p), Some(h)) = (path.clone(), cur.take()) {
-                per_file.entry(p).or_default().push(h);
-            }
-            let start: usize = rest
-                .split(|c| c == ',' || c == ' ')
-                .next()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(1);
-            cur = Some(AttrHunk {
-                old_start: start,
-                lines: Vec::new(),
-            });
-            continue;
-        }
-        if let Some(h) = cur.as_mut() {
-            match line.chars().next() {
-                Some(c @ ('+' | '-' | ' ')) => h.lines.push((c, ())),
-                // "\ No newline at end of file" and anything else advances nothing.
-                _ => {}
-            }
-        }
-    }
-    if let (Some(p), Some(h)) = (path, cur) {
-        per_file.entry(p).or_default().push(h);
-    }
-    per_file
-}
-
-// Apply one interval's hunks for one file to that file's ownership vector.
-// `delta` tracks how far earlier hunks in the same file have shifted positions,
-// because each hunk's `old_start` addresses the file as it was BEFORE this
-// interval, while `owners` is mutated in place as we go.
-fn apply_attr_hunks(owners: &mut Vec<Option<String>>, hunks: &[AttrHunk], owner: &str) {
-    let mut delta: isize = 0;
-    for h in hunks {
-        let mut i = (h.old_start as isize - 1 + delta).max(0) as usize;
-        for (c, _) in &h.lines {
-            match c {
-                ' ' => i = (i + 1).min(owners.len()),
-                '-' => {
-                    if i < owners.len() {
-                        owners.remove(i);
-                        delta -= 1;
-                    }
-                }
-                '+' => {
-                    let at = i.min(owners.len());
-                    owners.insert(at, Some(owner.to_string()));
-                    i = at + 1;
-                    delta += 1;
-                }
-                _ => {}
-            }
-        }
-    }
-}
-
-// The per-path replay core, pure and testable: given the base tree's line
-// count and the ordered (owner, hunks) steps that touch this path, produce the
-// ownership runs. Extracted from claim_attribution_runs so the chain-replay —
-// the part that failed to reproduce a 2026-09-03 field anomaly and that #327's
-// interval staging depends on for positional exactness — is unit-testable
-// without a git repo or an AppHandle. Verified against the adversarial shape:
-// an old base, an intervening committed resize applied by an earlier step, and
-// a sole claimant editing at a high line number, all land at the true
-// positions (see attribution_replay_survives_intervening_resize).
-// attribution-run-line-offset-in-views: the replay reconstructs a file's
-// length as base_n + the net +/- of every interval step; if that does not
-// equal the actual working-file length, the runs are line-shifted by the
-// difference and every view that maps a working-diff line to a run is wrong.
-// Returns Some(offset) — file_len minus reconstructed length, signed — when
-// they diverge; None when they agree (the healthy state). Pure so the
-// tripwire's arithmetic is verifiable without a repo.
-fn attr_replay_line_offset(base_n: usize, net: isize, file_len: usize) -> Option<isize> {
-    let replay_len = (base_n as isize + net).max(0);
-    let offset = file_len as isize - replay_len;
-    if offset != 0 {
-        Some(offset)
-    } else {
-        None
-    }
-}
-
-// Returns the runs plus the count of surviving lines inserted by an UNOWNED
-// step (the NUL-sentinel owner: cleared-boundary spans, work by nobody).
-// That count IS the path's unattributed residue — base lines are None from
-// birth and never counted, which is the accounting bug the first field run
-// of the residue feature exposed within the hour (74,978 "unattributed" ≈
-// the whole unchanged body of lib.rs; the old computation subtracted run
-// spans from the full replay length).
-fn attribution_runs_for_path(
-    base_n: usize,
-    path_steps: &[(Option<String>, Vec<AttrHunk>)],
-) -> Vec<serde_json::Value> {
-    let mut owners: Vec<Option<String>> = vec![None; base_n];
-    for (owner, hunks) in path_steps {
-        let who = owner.as_deref().unwrap_or("\u{0}");
-        apply_attr_hunks(&mut owners, hunks, who);
-    }
-    for o in owners.iter_mut() {
-        if o.as_deref() == Some("\u{0}") {
-            *o = None;
-        }
-    }
-    attr_runs(&owners)
-}
-
-// Collapse a per-line ownership vector into contiguous runs. Unowned lines are
-// a first-class state -- work predating the capture phase, or done with no claim
-// live -- and are reported as such rather than folded into a neighbour.
-fn attr_runs(owners: &[Option<String>]) -> Vec<serde_json::Value> {
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    while i < owners.len() {
-        let who = owners[i].clone();
-        let start = i;
-        while i < owners.len() && owners[i] == who {
-            i += 1;
-        }
-        if let Some(id) = who {
-            // joint-interval-files-disambiguation: a joint owner rides the
-            // same Option<String> plumbing as a marker-prefixed member list
-            // and expands here into an itemIds run — a first-class shared
-            // state, distinct from both a single owner and unowned.
-            if let Some(rest) = id.strip_prefix(JOINT_RUN_SEP) {
-                let members: Vec<&str> = rest.split(JOINT_RUN_SEP).collect();
-                out.push(serde_json::json!({
-                    "startLine": start + 1, "endLine": i, "itemIds": members
-                }));
-            } else {
-                out.push(serde_json::json!({
-                    "startLine": start + 1, "endLine": i, "itemId": id
-                }));
-            }
-        }
-    }
-    out
-}
-
 // joint-interval-files-disambiguation: per-(interval, path) ownership for
 // multi-id claims. A one-click plural approval writes ONE claim covering all
 // its ids, so edits in that window land in a JOINT interval; ownership used
@@ -47951,7 +48780,6 @@ fn attr_runs(owners: &[Option<String>]) -> Vec<serde_json::Value> {
 // none → unowned as before. A joint set whose members ghost away is NOT
 // promoted to the survivor — that is the display-only inflation lie of
 // 2026-09-04 (see the ghost rules above).
-const JOINT_RUN_SEP: char = '\u{2}';
 
 enum IntervalPathOwner {
     Single(String),
@@ -48011,34 +48839,6 @@ fn declared_covers(declared: &str, path: &str) -> bool {
     path == d || path.starts_with(&format!("{}/", d))
 }
 
-// One trace line per (path, owner) resolution per process — the board build
-// runs this on every serve, and an unbounded emit would flood the log with
-// identical lines (the describe-rebroadcast lesson applied to tracing).
-fn trace_joint_interval_resolved<R: tauri::Runtime>(
-    app: &AppHandle<R>,
-    path: &str,
-    owner: &str,
-    candidates: usize,
-) {
-    static TRACED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
-    let key = format!("{}\u{1}{}", path, owner);
-    let fresh = TRACED
-        .get_or_init(|| Mutex::new(Default::default()))
-        .lock()
-        .map(|mut s| s.insert(key))
-        .unwrap_or(false);
-    if fresh {
-        append_bram_trace_line(
-            app,
-            "claim-interval",
-            &format!(
-                "op=joint-interval-resolved path={} owner={} candidates={}",
-                path, owner, candidates
-            ),
-        );
-    }
-}
-
 fn resolve_interval_path_owner(
     ids: &[String],
     path: &str,
@@ -48064,34 +48864,6 @@ fn resolve_interval_path_owner(
         }
     }
 }
-
-// Drive the replay across the whole boundary chain and return per-path runs.
-//
-// Closed intervals are immutable (two fixed trees), so their parsed edit scripts
-// are cached for the process lifetime with no invalidation logic. Only the final
-// pair -- last boundary against the working tree -- is recomputed per call, which
-// is one `git diff` on top of the board build's existing four spawns.
-type AttributionResult = (
-    std::collections::HashMap<String, Vec<serde_json::Value>>,
-    // issue-327: per-item interval-patch shortstat (added, removed) — what
-    // committing that item actually takes, since interval staging commits the
-    // item's own patch. Differs from the surviving-owned run count under
-    // supersession, and carries the removed count the runs cannot.
-    std::collections::HashMap<String, (usize, usize)>,
-    // will-commit-matches-the-button: the same shortstat broken down per
-    // path (path → itemId → (added, removed)), so the will-commit
-    // computation can charge an item its interval take on entangled paths
-    // and the whole-file stat on exclusive ones — the way worklist-commit
-    // actually executes.
-    std::collections::HashMap<String, std::collections::HashMap<String, (usize, usize)>>,
-    // issue-273: per-path unowned residue — surviving lines the replay
-    // INSERTED under no owner (attribution_runs_for_path's second return;
-    // base lines are unowned-by-birth and are not residue). A
-    // non-zero entry means committing this path whole-file would silently
-    // fold in work nobody claimed; will-commit must take the item's own
-    // interval instead, even when no OTHER begun item contests the path.
-    std::collections::HashMap<String, usize>,
-);
 
 // iterate-edits-need-claim-boundaries / ghost-reassignment-inflates-totals:
 // an interval whose recorded owner has left the board (committed and pruned)
@@ -48161,8 +48933,10 @@ fn trace_ghost_reassignments<R: tauri::Runtime>(
     );
 }
 
-// issue-395-attribution-diffs-scoped-to-declared-paths: the replay's diffs
-// run under a pathspec of every item's declared files. A claim boundary
+// issue-395-attribution-diffs-scoped-to-declared-paths: the pathspec of every
+// item's declared files. Today it scopes the claim-boundary capture
+// (`capture_claim_tree`); it was first written for the claim-interval replay's
+// diffs (deleted by issue-425-retire-replay), whose cost story follows. A claim boundary
 // captures non-ignored untracked content (capture_claim_tree -- deliberate,
 // creation must be attributable), so an unscoped `git diff <tree>` reports
 // every snapshot-only path as a deletion: 28,265 virtualenv files, 198 MB of
@@ -48173,8 +48947,8 @@ fn trace_ghost_reassignments<R: tauri::Runtime>(
 //
 // Each declared entry contributes its literal path (a directory entry covers
 // its contents -- plain pathspecs prefix-match directories) plus the
-// worktree twins declared_covers also accepts (#309). Sorted and deduped so
-// the cache key below is independent of declaration order.
+// worktree twins declared_covers also accepts (#309). Sorted and deduped, so
+// the result is independent of declaration order.
 fn attribution_pathspec(declared: &std::collections::HashMap<String, Vec<String>>) -> Vec<String> {
     let mut set: std::collections::BTreeSet<String> = Default::default();
     for f in declared.values().flatten() {
@@ -48187,414 +48961,6 @@ fn attribution_pathspec(declared: &std::collections::HashMap<String, Vec<String>
         set.insert(format!(":(glob).claude/worktrees/*/{}/**", f));
     }
     set.into_iter().collect()
-}
-
-// `git diff <a> [<b>] -- <pathspec…>`. An empty pathspec means "diff
-// nothing", never "diff everything": callers skip the spawn instead.
-fn attr_diff_args(a: &str, b: Option<&str>, pathspec: &[String]) -> Vec<String> {
-    let mut args = vec!["diff".to_string(), a.to_string()];
-    if let Some(b) = b {
-        args.push(b.to_string());
-    }
-    if !pathspec.is_empty() {
-        args.push("--".to_string());
-        args.extend(pathspec.iter().cloned());
-    }
-    args
-}
-
-// A closed interval's diff is immutable per tree pair AND pathspec: a pair
-// cached under one declared set must not serve another, or a file added to
-// an item's `files` would never have its history attributed.
-fn attr_interval_cache_key(a: &str, b: &str, pathspec: &[String]) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    pathspec.hash(&mut h);
-    format!("{}..{}#{:016x}", a, b, h.finish())
-}
-
-static CLAIM_ATTR_PATHSPEC: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-fn claim_attribution_runs<R: tauri::Runtime>(app: &AppHandle<R>) -> AttributionResult {
-    let mut empty: AttributionResult = Default::default();
-    let Some(root) = project_root(Some(app)) else {
-        return empty;
-    };
-    let sidecar = root.join(CLAIM_INTERVALS_REL);
-    let Ok(text) = std::fs::read_to_string(&sidecar) else {
-        return empty;
-    };
-    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return empty;
-    };
-    let Some(arr) = doc.get("intervals").and_then(|v| v.as_array()) else {
-        return empty;
-    };
-    if arr.is_empty() {
-        return empty;
-    }
-    let ghosts = ghost_owner_index(app);
-    let mut ghost_notes: std::collections::BTreeSet<String> = Default::default();
-    // Spawns are counted and traced, the way #323 counts the board build's own.
-    // A cache whose hit rate is asserted rather than measured is how a "cached"
-    // path quietly keeps paying full price.
-    let spawns = std::cell::Cell::new(0usize);
-    let git = |args: &[&str]| -> Option<String> {
-        spawns.set(spawns.get() + 1);
-        let out = std::process::Command::new("git")
-            .current_dir(&root)
-            .args(args)
-            .output()
-            .ok()?;
-        Some(String::from_utf8_lossy(&out.stdout).into_owned())
-    };
-    // attribution-run-line-offset-in-views: resolve a claim ref to its
-    // content-addressed OID. The interval and base caches are keyed by this,
-    // NOT by the ref NAME — a claim ref (refs/bram/claims/<at_ms>) is
-    // overwritten when an at_ms collides (the same duplicate-boundary hazard
-    // seen at 246 ms), so a name-keyed cache serves the FIRST tree's diff/
-    // count while the ref now points at another tree. That staleness was the
-    // #324/trace-vocabulary offset: cached base_n=136 while the ref's tree
-    // was 166, shifting every run by 30. OID keys make a reused name a fresh
-    // entry. Falls back to the ref name if rev-parse fails (an unresolved
-    // ref cannot be diffed anyway).
-    let oid = |r: &str| -> String {
-        git(&["rev-parse", &format!("{}^{{tree}}", r)])
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| r.to_string())
-    };
-    // attribution-stops-re-deriving-what-it-stored: the boundary's tree OID,
-    // taken from the record instead of re-derived by a subprocess.
-    //
-    // `record_claim_interval` already writes `tree` (from `capture_claim_tree`'s
-    // write-tree), and `update-ref <refname> <tree>` points the ref DIRECTLY at
-    // that tree object -- so `rev-parse <ref>^{tree}` was an identity returning
-    // a value sitting in the same JSON this loop is iterating. Two spawns per
-    // interval, on every board build, paid BEFORE the cache could be consulted
-    // and therefore on hits too. Measured: 2,000 intervals => 4,000 spawns =>
-    // ~21.8 s of attribution and a ~30 s board build, linear in interval count
-    // (judell/bram#369).
-    //
-    // Keying on the record's own tree is also STRONGER than the `^{tree}` peel
-    // it replaces, not a relaxation. That peel exists because a reused
-    // `refs/bram/claims/<at_ms>` name would otherwise serve a prior tree's
-    // cached diff (#324). The stored tree is the tree this boundary MEANT, so a
-    // later ref overwrite cannot alias it at all.
-    //
-    // The refs stay: they are the GC anchors keeping these trees reachable, and
-    // `record_claim_interval` refuses to record a boundary it could not ref for
-    // exactly that reason. Falls back to the old derivation for any record
-    // predating the `tree` field, so this is not a flag day.
-    let tree_of = |rec: &serde_json::Value| -> String {
-        rec.get("tree")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| {
-                rec.get("ref")
-                    .and_then(|v| v.as_str())
-                    .map(|r| oid(r))
-                    .unwrap_or_default()
-            })
-    };
-    static CACHE: OnceLock<
-        Mutex<std::collections::HashMap<String, std::collections::HashMap<String, Vec<AttrHunk>>>>,
-    > = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(Default::default()));
-
-    // (claimed id-set, per-file hunks) for each interval, oldest first. The
-    // id-set resolves to an owner PER PATH (joint-interval-files-
-    // disambiguation): a multi-id claim's path declared by exactly one of
-    // its ids attributes to that id; declared by several, the lines carry
-    // the joint set; declared by none, unowned — the pre-resolution rule.
-    let declared = worklist_declared_files(app);
-    let pathspec = attribution_pathspec(&declared);
-    CLAIM_ATTR_PATHSPEC.store(pathspec.len(), std::sync::atomic::Ordering::Relaxed);
-    if pathspec.is_empty() {
-        // Nothing declared, so nothing can own a line: no diffs to run.
-        CLAIM_ATTR_SPAWNS.store(0, std::sync::atomic::Ordering::Relaxed);
-        return empty;
-    }
-    let diff = |a: &str, b: Option<&str>| -> String {
-        let args = attr_diff_args(a, b, &pathspec);
-        let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        git(&refs).unwrap_or_default()
-    };
-    let mut steps: Vec<(
-        Vec<String>,
-        std::collections::HashMap<String, Vec<AttrHunk>>,
-    )> = Vec::new();
-    for (i, rec) in arr.iter().enumerate() {
-        // A record with no ref names no reachable tree: skip it. (The ref is no
-        // longer used for the diff -- see tree_of above -- but its presence is
-        // still what makes the boundary meaningful.)
-        if rec.get("ref").and_then(|v| v.as_str()).is_none() {
-            continue;
-        }
-        let ids: Vec<String> = rec
-            .get("ids")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str())
-                    .map(String::from)
-                    .collect()
-            })
-            .unwrap_or_default();
-        // `a` is still read above as the existence check (a record with no ref
-        // names no tree and is skipped); the DIFF now runs on tree OIDs, so the
-        // key and the diff move together. Keying on the tree while still
-        // diffing ref names would be the #324 bug in new dress.
-        let a_tree = tree_of(rec);
-        let next_tree = arr.get(i + 1).map(&tree_of);
-        let parsed = match next_tree {
-            Some(b_tree) => {
-                let key = attr_interval_cache_key(&a_tree, &b_tree, &pathspec);
-                if let Some(hit) = cache.lock().ok().and_then(|c| c.get(&key).cloned()) {
-                    hit
-                } else {
-                    let out = diff(&a_tree, Some(&b_tree));
-                    let parsed = parse_attr_diff(&out);
-                    if let Ok(mut c) = cache.lock() {
-                        c.insert(key, parsed.clone());
-                    }
-                    parsed
-                }
-            }
-            // The OPEN interval: never cached, it changes with every edit.
-            None => parse_attr_diff(&diff(&a_tree, None)),
-        };
-        steps.push((ids, parsed));
-    }
-    let base_tree = tree_of(&arr[0]);
-    let mut paths: std::collections::HashSet<String> = Default::default();
-    for (_, m) in &steps {
-        for k in m.keys() {
-            paths.insert(k.clone());
-        }
-    }
-    let mut out: std::collections::HashMap<String, Vec<serde_json::Value>> = Default::default();
-    // issue-273 postscript: reserved and deliberately never populated — the
-    // residue feature was withdrawn same-evening after three wrong renders;
-    // the tuple slot stays so the redesign (drawing-board item) can refill
-    // it without re-plumbing every consumer.
-    let unowned_by_path: std::collections::HashMap<String, usize> = Default::default();
-    static BASE: OnceLock<Mutex<std::collections::HashMap<String, usize>>> = OnceLock::new();
-    let base_cache = BASE.get_or_init(|| Mutex::new(Default::default()));
-    let base_oid = base_tree;
-    for path in paths {
-        // Key by the base tree's OID, not the ref name (attribution-run-line-
-        // offset-in-views): a reused ref name would otherwise serve a stale
-        // line count from a prior tree — the #324/trace-vocabulary offset.
-        let bkey = format!("{}:{}", base_oid, path);
-        let n = match base_cache.lock().ok().and_then(|c| c.get(&bkey).copied()) {
-            Some(hit) => Some(hit),
-            None => {
-                // fix-attribution-run-line-offset: distinguish a git FAILURE
-                // (base ref pruned mid-read, unreadable) from an honestly
-                // empty base (file created after the base — 0 is correct
-                // there). A failure previously fell through to n=0, which
-                // collapses every run toward line 1 and emits WRONG
-                // attribution; the honest fallback is to skip the path and
-                // report it unattributed. Only successful reads are cached.
-                match git(&["show", &bkey]) {
-                    Some(c) => {
-                        let v = if c.is_empty() { 0 } else { c.lines().count() };
-                        if let Ok(mut cache) = base_cache.lock() {
-                            cache.insert(bkey, v);
-                        }
-                        Some(v)
-                    }
-                    None => {
-                        append_bram_trace_line(
-                            app,
-                            "claim-interval",
-                            &format!("op=attr-base-unreadable path={}", path),
-                        );
-                        None
-                    }
-                }
-            }
-        };
-        let Some(n) = n else { continue };
-        // Collect this path's ordered (owner, hunks) steps and replay through
-        // the pure, unit-tested core. Ghost owners strip to unowned so the
-        // rendered runs never credit a departed item; a joint set drops its
-        // ghost members for display but never promotes to a lone survivor.
-        let path_steps: Vec<(Option<String>, Vec<AttrHunk>)> = steps
-            .iter()
-            .filter_map(|(ids, m)| {
-                m.get(&path).map(|h| {
-                    let eff = match resolve_interval_path_owner(ids, &path, &declared) {
-                        IntervalPathOwner::Single(id) => {
-                            if ids.len() > 1 {
-                                trace_joint_interval_resolved(app, &path, &id, ids.len());
-                            }
-                            let (eff, from) = ghosts.strip_ghost(Some(id));
-                            if let Some(f) = from {
-                                ghost_notes.insert(format!("{}→unowned", f));
-                            }
-                            eff
-                        }
-                        IntervalPathOwner::Joint(set) => {
-                            let live: Vec<String> = set
-                                .into_iter()
-                                .filter(|i| ghosts.live.contains(i))
-                                .collect();
-                            if live.is_empty() {
-                                None
-                            } else {
-                                Some(format!(
-                                    "{}{}",
-                                    JOINT_RUN_SEP,
-                                    live.join(&JOINT_RUN_SEP.to_string())
-                                ))
-                            }
-                        }
-                        IntervalPathOwner::Unowned => None,
-                    };
-                    (eff, h.clone())
-                })
-            })
-            .collect();
-        let runs = attribution_runs_for_path(n, &path_steps);
-        // attribution-run-line-offset-in-views (observe-only): the replay
-        // reconstructs the file from the OLDEST surviving boundary tree
-        // forward; if that reconstruction's length diverges from the actual
-        // working file, every run's line number is off by the difference, and
-        // the Ownership tab / Diff scope selector then map working-diff lines
-        // to the wrong run (or to none — the "no item" #324/trace-vocabulary
-        // case: run at 56, real diff at 86). Boundary retirement on commit is
-        // the suspected cause (a retired tree drops the interval that captured
-        // an intervening committed resize). This tripwire makes the offset
-        // loud: replay_len is base_n plus the net +/- of every step for this
-        // path; file_len is ground truth. A mismatch means the rendered
-        // attribution for this path is line-shifted. Zero is the healthy
-        // state; any line is a real offset to chase.
-        let net: isize = path_steps
-            .iter()
-            .flat_map(|(_, hunks)| hunks.iter())
-            .flat_map(|h| h.lines.iter())
-            .map(|(c, _)| match c {
-                '+' => 1,
-                '-' => -1,
-                _ => 0,
-            })
-            .sum();
-        if let Some(root) = project_root(Some(app)) {
-            if let Ok(content) = std::fs::read_to_string(root.join(&path)) {
-                let file_len = content.lines().count();
-                if let Some(offset) = attr_replay_line_offset(n, net, file_len) {
-                    let replay_len = (n as isize + net).max(0) as usize;
-                    if !runs.is_empty() {
-                        // Dump the inputs, not just the verdict — the 2026-09-05
-                        // hunt kept theorizing base_n/net from outside while the
-                        // process saw different values. base_oid + base_n + net +
-                        // steps make the next fire self-diagnosing.
-                        append_bram_trace_line(
-                            app,
-                            "claim-interval",
-                            &format!(
-                                "op=run-line-mismatch path={} base_oid={} base_n={} net={} steps={} replay_len={} file_len={} offset={}",
-                                path,
-                                &base_oid[..base_oid.len().min(12)],
-                                n,
-                                net,
-                                path_steps.len(),
-                                replay_len,
-                                file_len,
-                                offset
-                            ),
-                        );
-                    }
-                }
-            }
-        }
-        if !runs.is_empty() {
-            out.insert(path, runs);
-        }
-    }
-    // issue-327: per-item interval-patch totals — the '+'/'-' counts across
-    // each single-owner interval's hunks. This is exactly what interval
-    // staging commits for the item, and it is what the strip's "will commit"
-    // figure should report on a contended path.
-    let mut totals: std::collections::HashMap<String, (usize, usize)> = Default::default();
-    let mut totals_by_path: std::collections::HashMap<
-        String,
-        std::collections::HashMap<String, (usize, usize)>,
-    > = Default::default();
-    for (ids, m) in &steps {
-        for (path, hunks) in m {
-            // Only a per-path SINGLE resolution contributes to an item's
-            // totals — joint sets are display-only, exactly like unowned,
-            // so no will-commit figure inflates on a shared claim.
-            let eff = match resolve_interval_path_owner(ids, path, &declared) {
-                IntervalPathOwner::Single(id) => {
-                    let (eff, from) = ghosts.strip_ghost(Some(id));
-                    if let Some(f) = from {
-                        ghost_notes.insert(format!("{}→unowned", f));
-                    }
-                    eff
-                }
-                _ => None,
-            };
-            let Some(id) = eff else { continue };
-            for h in hunks {
-                for (c, _) in &h.lines {
-                    let e = totals.entry(id.clone()).or_insert((0, 0));
-                    let p = totals_by_path
-                        .entry(path.clone())
-                        .or_default()
-                        .entry(id.clone())
-                        .or_insert((0, 0));
-                    match c {
-                        '+' => {
-                            e.0 += 1;
-                            p.0 += 1;
-                        }
-                        '-' => {
-                            e.1 += 1;
-                            p.1 += 1;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-    }
-    trace_ghost_reassignments(app, "attribution", &ghost_notes);
-    let _ = &mut empty;
-    CLAIM_ATTR_SPAWNS.store(spawns.get(), std::sync::atomic::Ordering::Relaxed);
-    (out, totals, totals_by_path, unowned_by_path)
-}
-
-static CLAIM_ATTR_SPAWNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-// avoid-futile-joint-commit: per-path index of items whose lines on that path
-// are JOINTLY attributed (an `itemIds` run — a same-click approval, one
-// shared capture boundary). Pure and unit-tested so the /__worklist board's
-// per-item `jointWith` field and the commit-time refusal
-// (op=refuse-joint-interval, above) reason from the identical logic without
-// either one needing an app handle.
-fn joint_owners_from_runs(
-    runs_by_path: &std::collections::HashMap<String, Vec<serde_json::Value>>,
-) -> std::collections::HashMap<String, std::collections::HashSet<String>> {
-    let mut out: std::collections::HashMap<String, std::collections::HashSet<String>> =
-        Default::default();
-    for (path, runs) in runs_by_path {
-        for run in runs {
-            if let Some(members) = run.get("itemIds").and_then(|v| v.as_array()) {
-                let set = out.entry(path.clone()).or_default();
-                for m in members {
-                    if let Some(s) = m.as_str() {
-                        set.insert(s.to_string());
-                    }
-                }
-            }
-        }
-    }
-    out
 }
 
 // avoid-futile-joint-commit: this item's `jointWith` — the other item ids it
@@ -48756,6 +49122,305 @@ fn claim_interval_diff<R: tauri::Runtime>(
 
 // issue-327 interval staging: commit the requested items' OWN hunks by
 // applying their interval patches to a scratch index seeded from HEAD and
+// issue-430-dependent-commit-offer: the combined interval patch for `ids`,
+// built the way the commit builds it, shared by `interval_stage_commit` and
+// `interval_commit_precheck` so the pane's offer and the gate cannot drift.
+// Each requested id's own hunks across its files. A per-path chunk ALREADY IN
+// HEAD (reverse-applies cleanly against the HEAD-seeded index) is skipped
+// rather than accumulated — issue-364's resume case: an item retained after a
+// partial commit still has its intervals on record, and re-deriving the
+// committed patch would fail the order-independence gate with a misleading
+// "defined relative to another item's work". With every chunk already applied,
+// the honest answer is the no-interval refusal.
+fn interval_build_patch<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    ids: &[String],
+    item_files: &std::collections::HashMap<String, Vec<String>>,
+    git_idx: &dyn Fn(&[&str]) -> Result<String, String>,
+    pfile: &std::path::Path,
+) -> (String, Vec<String>) {
+    let pfile_chk = pfile.to_string_lossy().to_string();
+    let mut patch = String::new();
+    let mut committed: Vec<String> = Vec::new();
+    for id in ids {
+        for path in item_files.get(id).cloned().unwrap_or_default() {
+            let d = claim_interval_diff(app, id, &path);
+            let Some(p) = d.get("patch").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if p.trim().is_empty() {
+                continue;
+            }
+            // issue-430 (problem 4): a chunk that CREATES the file cannot be
+            // already in HEAD unless HEAD has the path. #430's trace logged
+            // `interval-already-applied` for an untracked new file, #419's
+            // signature for a declared new file left out of a commit.
+            let creates = patch_creates_file(p);
+            let in_head =
+                !creates || git_idx(&["cat-file", "-e", &format!("HEAD:{}", path)]).is_ok();
+            if in_head
+                && std::fs::write(pfile, p).is_ok()
+                && git_idx(&["apply", "--cached", "--check", "--reverse", &pfile_chk]).is_ok()
+            {
+                append_bram_trace_line(
+                    app,
+                    "worklist-commit",
+                    &format!(
+                        "op=interval-already-applied path={} creates={} sections={}",
+                        path,
+                        creates,
+                        p.matches("diff --git ").count()
+                    ),
+                );
+                continue;
+            }
+            patch.push_str(p);
+            if !committed.contains(&path) {
+                committed.push(path);
+            }
+        }
+    }
+    (patch, committed)
+}
+
+// `git diff --numstat` lines → path → (added, removed). Binary files report
+// "-\t-" and count as (0, 0).
+fn parse_numstat_take(text: &str) -> std::collections::BTreeMap<String, (usize, usize)> {
+    let mut out = std::collections::BTreeMap::new();
+    for line in text.lines() {
+        let mut parts = line.splitn(3, '\t');
+        let (Some(a), Some(r), Some(p)) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        let path = p.trim().trim_matches('"').to_string();
+        if path.is_empty() {
+            continue;
+        }
+        out.insert(path, (a.parse().unwrap_or(0), r.parse().unwrap_or(0)));
+    }
+    out
+}
+
+fn patch_creates_file(patch: &str) -> bool {
+    patch
+        .lines()
+        .any(|l| l.starts_with("new file mode") || l == "--- /dev/null")
+}
+
+fn interval_dependent_refusal(git_err: &str) -> String {
+    format!(
+        "commit refused: the requested item's interval patch does not apply to HEAD — its \
+         change is defined relative to another begun item's work not in this request. Commit \
+         that item first, or approve both together. (git apply: {})",
+        git_err
+    )
+}
+
+// The paths `git apply --check` names as failing: "error: patch failed:
+// <path>:<line>" and "error: <path>: patch does not apply".
+fn git_apply_failed_paths(err: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in err.split(['\n', '|']) {
+        let l = line.trim();
+        let path = if let Some(rest) = l.strip_prefix("error: patch failed: ") {
+            rest.rsplit_once(':').map(|(p, _)| p.to_string())
+        } else if let Some(rest) = l.strip_prefix("error: ") {
+            rest.strip_suffix(": patch does not apply")
+                .map(String::from)
+        } else {
+            None
+        };
+        if let Some(p) = path {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod issue_430_tests {
+    use super::{git_apply_failed_paths, parse_numstat_take, patch_creates_file};
+
+    // issue-425-retire-replay: the entangled take is read from numstat.
+    #[test]
+    fn numstat_take_parses_text_binary_and_quoted_paths() {
+        let t = parse_numstat_take("3\t1\ta.txt\n-\t-\timg.png\n2\t0\t\"dir/b c.txt\"\n\n");
+        assert_eq!(t.get("a.txt"), Some(&(3, 1)));
+        assert_eq!(t.get("img.png"), Some(&(0, 0)));
+        assert_eq!(t.get("dir/b c.txt"), Some(&(2, 0)));
+        assert_eq!(t.len(), 3);
+    }
+
+    #[test]
+    fn failed_paths_parse_the_issue_430_error() {
+        // The git half of #430's refusal, verbatim.
+        let e = "error: patch failed: Main.xmlui:62\nerror: Main.xmlui: patch does not apply\nerror: patch failed: Globals.xs:380\nerror: Globals.xs: patch does not apply\nerror: patch failed: layout.json:7\nerror: layout.json: patch does not apply";
+        assert_eq!(
+            git_apply_failed_paths(e),
+            vec!["Main.xmlui", "Globals.xs", "layout.json"]
+        );
+        assert!(git_apply_failed_paths("fatal: something else").is_empty());
+        assert_eq!(
+            git_apply_failed_paths("error: patch failed: dir/a b.txt:3"),
+            vec!["dir/a b.txt"]
+        );
+    }
+
+    #[test]
+    fn creation_chunks_are_recognized() {
+        let create = "diff --git a/s.sh b/s.sh\nnew file mode 100755\nindex 0000000..23d2ecc\n--- /dev/null\n+++ b/s.sh\n@@ -0,0 +1 @@\n+x\n";
+        assert!(patch_creates_file(create));
+        let modify = "diff --git a/s.sh b/s.sh\n--- a/s.sh\n+++ b/s.sh\n@@ -1 +1 @@\n-x\n+y\n";
+        assert!(!patch_creates_file(modify));
+    }
+}
+
+// issue-430-dependent-commit-offer: precheck results keyed by (HEAD, take,
+// interval paths), so the Worklist's frequent recompute runs git only when
+// something moved.
+fn commit_precheck_cached<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    id: &str,
+    declared: &[String],
+    key: &str,
+) -> Result<std::collections::BTreeMap<String, (usize, usize)>, Vec<String>> {
+    type Take = std::collections::BTreeMap<String, (usize, usize)>;
+    static CACHE: std::sync::OnceLock<
+        Mutex<std::collections::HashMap<String, (String, Result<Take, Vec<String>>)>>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(Default::default()));
+    if let Ok(g) = cache.lock() {
+        if let Some((k, r)) = g.get(id) {
+            if k == key {
+                return r.clone();
+            }
+        }
+    }
+    let mut files: std::collections::HashMap<String, Vec<String>> = Default::default();
+    files.insert(id.to_string(), declared.to_vec());
+    let pre_started = std::time::Instant::now();
+    let r = interval_commit_precheck(app, &[id.to_string()], &files);
+    let pre_ms = pre_started.elapsed().as_millis();
+    if bram_trace_enabled() {
+        append_bram_trace_line(
+            app,
+            "worklist-commit",
+            &format!(
+                "op=commit-precheck item={} ms={} result={}",
+                id,
+                pre_ms,
+                match &r {
+                    Ok(take) => {
+                        let (a, rm) = take
+                            .values()
+                            .fold((0, 0), |acc, v| (acc.0 + v.0, acc.1 + v.1));
+                        format!("applies take=+{}-{}", a, rm)
+                    }
+                    Err(p) => format!("dependent paths={}", p.join(",")),
+                }
+            ),
+        );
+    }
+    if let Ok(mut g) = cache.lock() {
+        g.insert(id.to_string(), (key.to_string(), r.clone()));
+    }
+    r
+}
+
+// issue-430: the last commit refusal per item, shown on its row until HEAD
+// moves (a commit landed, so the board is different). In memory: a relaunch
+// starts clean.
+fn last_commit_refusal_cell(
+) -> &'static Mutex<std::collections::HashMap<String, (i64, String, String)>> {
+    static C: std::sync::OnceLock<Mutex<std::collections::HashMap<String, (i64, String, String)>>> =
+        std::sync::OnceLock::new();
+    C.get_or_init(|| Mutex::new(Default::default()))
+}
+
+fn record_last_commit_refusal(ids: &[String], head: &str, reason: &str) {
+    if let Ok(mut g) = last_commit_refusal_cell().lock() {
+        for id in ids {
+            g.insert(
+                id.clone(),
+                (unix_now_ms(), reason.to_string(), head.to_string()),
+            );
+        }
+    }
+}
+
+fn last_commit_refusal_for(id: &str, head: &str) -> Option<(i64, String)> {
+    let mut g = last_commit_refusal_cell().lock().ok()?;
+    match g.get(id) {
+        Some((at, reason, h)) if h == head => Some((*at, reason.clone())),
+        Some(_) => {
+            g.remove(id);
+            None
+        }
+        None => None,
+    }
+}
+
+// issue-430-dependent-commit-offer: the gate's own order-independence check,
+// run ahead of the click on a scratch index (worktree and real index never
+// touched). Ok(()) when committing `ids` alone would apply; Err(failing paths)
+// when the patch is defined relative to work not in the request. A request
+// with nothing to stage is Ok here; the gate's no-interval refusal covers it.
+// issue-425-retire-replay: on success, also returns what the commit would
+// take per path, (added, removed) from `git diff --cached --numstat HEAD`
+// after applying the patch to the scratch index. That is the staged result,
+// so an item that created a file and later rewrote it counts the file once,
+// as the commit will, not once per interval section.
+fn interval_commit_precheck<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    ids: &[String],
+    item_files: &std::collections::HashMap<String, Vec<String>>,
+) -> Result<std::collections::BTreeMap<String, (usize, usize)>, Vec<String>> {
+    let Some(root) = project_root(Some(app)) else {
+        return Ok(Default::default());
+    };
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let idx = std::env::temp_dir().join(format!(
+        "bram-precheck-index-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let pfile = idx.with_extension("patch");
+    let git_idx = |args: &[&str]| -> Result<String, String> {
+        let out = std::process::Command::new("git")
+            .current_dir(&root)
+            .env("GIT_INDEX_FILE", &idx)
+            .args(args)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let result = (|| {
+        if git_idx(&["read-tree", "HEAD"]).is_err() {
+            return Ok(Default::default());
+        }
+        let (patch, _) = interval_build_patch(app, ids, item_files, &git_idx, &pfile);
+        if patch.trim().is_empty() || std::fs::write(&pfile, &patch).is_err() {
+            return Ok(Default::default());
+        }
+        // A real apply, not --check: the index is scratch, and the applied
+        // state is what the take is read from. Fails exactly when --check would.
+        if let Err(e) = git_idx(&["apply", "--cached", &pfile.to_string_lossy()]) {
+            return Err(git_apply_failed_paths(&e));
+        }
+        let numstat =
+            git_idx(&["diff", "--cached", "--numstat", "--no-renames", "HEAD"]).unwrap_or_default();
+        Ok(parse_numstat_take(&numstat))
+    })();
+    let _ = std::fs::remove_file(&idx);
+    let _ = std::fs::remove_file(&pfile);
+    result
+}
+
 // committing that tree — the worktree and the real index are NEVER touched.
 // This is what makes committing one entangled item safe while another begun
 // item's uncommitted work remains in shared files: whole-file staging takes
@@ -48803,42 +49468,7 @@ fn interval_stage_commit<R: tauri::Runtime>(
         cleanup();
         return Err(format!("scratch index seed failed: {}", e));
     }
-    let pfile_chk = pfile.to_string_lossy().to_string();
-    // Combined interval patch: each requested id's own hunks across its files.
-    // A per-path chunk ALREADY IN HEAD (reverse-applies cleanly against the
-    // HEAD-seeded index) is skipped rather than accumulated — issue-364's
-    // resume case: an item retained after a partial commit still has its
-    // intervals on record, and re-deriving the committed patch would fail the
-    // order-independence gate below with a misleading "defined relative to
-    // another item's work". With every chunk already applied, the honest
-    // answer is the no-interval refusal (nothing interval-attributed remains
-    // to stage).
-    let mut patch = String::new();
-    let mut committed: Vec<String> = Vec::new();
-    for id in ids {
-        for path in item_files.get(id).cloned().unwrap_or_default() {
-            let d = claim_interval_diff(app, id, &path);
-            if let Some(p) = d.get("patch").and_then(|v| v.as_str()) {
-                if !p.trim().is_empty() {
-                    if std::fs::write(&pfile, p).is_ok()
-                        && git_idx(&["apply", "--cached", "--check", "--reverse", &pfile_chk])
-                            .is_ok()
-                    {
-                        append_bram_trace_line(
-                            app,
-                            "worklist-commit",
-                            &format!("op=interval-already-applied path={}", path),
-                        );
-                        continue;
-                    }
-                    patch.push_str(p);
-                    if !committed.contains(&path) {
-                        committed.push(path);
-                    }
-                }
-            }
-        }
-    }
+    let (patch, committed) = interval_build_patch(app, ids, item_files, &git_idx, &pfile);
     if patch.trim().is_empty() {
         cleanup();
         return Err("no-interval".to_string());
@@ -48853,12 +49483,7 @@ fn interval_stage_commit<R: tauri::Runtime>(
     // which would commit `<<<<<<<` under an item's id.
     if let Err(e) = git_idx(&["apply", "--cached", "--check", &pfile_s]) {
         cleanup();
-        return Err(format!(
-            "commit refused: the requested item's interval patch does not apply to HEAD — its \
-             change is defined relative to another begun item's work not in this request. Commit \
-             that item first, or approve both together. (git apply: {})",
-            e
-        ));
+        return Err(interval_dependent_refusal(&e));
     }
     if let Err(e) = git_idx(&["apply", "--cached", &pfile_s]) {
         cleanup();
@@ -49210,11 +49835,11 @@ mod residual_disclosure_tests {
     }
 }
 
-// issue-273-membership-engine-observe: the HEAD-diff MEMBERSHIP engine,
-// observe-only (docs/attribution-model.md §4, Migration step 1). Runs beside
-// the replay (`claim_attribution_runs`) on every board serve and feeds
-// NOTHING but traces — the board payload, pane, gate, and staging all keep
-// reading the replay until the observation earns the flip (§6 criteria 1, 7).
+// issue-273-membership-engine-observe: the HEAD-diff MEMBERSHIP engine
+// (docs/attribution-model.md §4). It began observe-only beside the
+// claim-interval replay; it is now the only ownership model. The pane reads
+// it (7d19f27), the gate routes by it (8c0d7d5), and the replay is deleted
+// (issue-425-retire-replay).
 //
 // Universe: the current `git diff HEAD` restricted to live BEGUN items'
 // declared paths, plus untracked non-ignored files under those paths
@@ -49225,179 +49850,22 @@ mod residual_disclosure_tests {
 // untracked files ≈ 315,000 phantom diff lines, `ms=10230`; membership's
 // universe never contains that bulk).
 //
-// Owner assignment: per candidate (live begun item × declared path), the
-// candidate patch is the item's claim-interval evidence (`claim_interval_diff`
-// for single-owner intervals; `membership_joint_patches` for multi-id claims,
-// declaration-disambiguated per path exactly as `resolve_interval_path_owner`
-// does). Membership is decided by whether that evidence accounts for CURRENT
-// content: `git apply --cached --check --reverse` against a scratch capture
-// of the present state — a temp GIT_INDEX_FILE seeded `read-tree HEAD` plus a
-// pathspec-scoped `add -A` (the `capture_claim_tree` machinery bounded to
-// declared paths, so untracked declared files are probe-visible without
-// hashing the tree at large). Evidence that reverse-applies against HEAD
-// itself is already committed — out of the universe, no membership (the
-// `op=interval-already-applied` insight applied before counting, not after).
-// A candidate hunk whose new-side block occurs at multiple placements in the
-// current file is AMBIGUOUS — §4's identical-context duplicate rule, the
-// fourth first-class state; the occurrence count is used ONLY to declare
-// ambiguity, never to assign an owner (the lib.rs positional-not-content
-// discipline, see the warning above `parse_attr_diff`). Everything in the
-// universe accounted to no candidate is UNOWNED — by subtraction, not by
-// error term. Conservation (§6 criterion 1): per path,
+// Owner assignment (the line rule, `membership_line_credit`): the claim store
+// is a linear history of boundary trees, and each line that differs from HEAD
+// is credited to the step that last wrote it (a removed HEAD line, to the step
+// that last removed it). A step's holders — the ids of the record before it,
+// resolved per path exactly as `resolve_interval_path_owner` does — take its
+// lines, so a holder that wrote nothing earns nothing. Credit is positional:
+// a line's origin is the step that wrote that position, never a content
+// match, so there is no placement ambiguity (the lib.rs positional-not-content
+// discipline, see the warning above `parse_attr_diff`; `ambiguous` stays
+// (0, 0)). Everything in the universe credited to no holder is UNOWNED — by
+// subtraction, not by error term. Conservation (§6 criterion 1): per path,
 // single + joint + ambiguous + unowned must sum to the path's `git diff
 // HEAD` counts; a breach traces `op=membership-conservation-broken` — a
 // TRIPWIRE whose provenance check is the deliberate-violation unit test
 // `conservation_breach_reports_deliberate_violation`, per the
 // soak-vs-tripwire rule in docs/developing-bram.md.
-
-// The reverse-application footprint of a candidate patch, mapped to new-side
-// line numbers by walking each hunk's BODY — the `diff_residual_lines`
-// body-walk generalized to multi-file patches and to counting removed lines.
-// `removed` is evidence-BASELINE-relative, not HEAD-relative: it counts what
-// the candidate's own patch text removes, which is only the same thing as a
-// HEAD-relative deletion when the candidate's baseline (its `base_tree`,
-// membership-attributes-deletions below) coincides with HEAD. The caller
-// decides that by the blob-equality rule; this struct only measures.
-// Superseded by the line rule (issue-273); kept, with its tests, until the
-// replay-retirement step decides what the frozen staging path still needs.
-#[allow(dead_code)]
-struct MembershipFootprint {
-    added_lines: Vec<usize>,
-    removed: usize,
-}
-
-// Superseded by the line rule (issue-273); kept, with its tests, until the
-// replay-retirement step decides what the frozen staging path still needs.
-#[allow(dead_code)]
-fn membership_patch_footprint(patch: &str) -> MembershipFootprint {
-    let mut added_lines: Vec<usize> = Vec::new();
-    let mut removed = 0usize;
-    let mut new_line = 0usize;
-    let mut in_hunk = false;
-    for line in patch.lines() {
-        if let Some(rest) = line.strip_prefix("@@ ") {
-            in_hunk = true;
-            new_line = rest
-                .split_whitespace()
-                .find(|t| t.starts_with('+'))
-                .map(|t| {
-                    let spec = &t[1..];
-                    spec.split_once(',')
-                        .map(|(s, _)| s)
-                        .unwrap_or(spec)
-                        .parse()
-                        .unwrap_or(0)
-                })
-                .unwrap_or(0);
-            continue;
-        }
-        if line.starts_with("diff ") || line.starts_with("index ") {
-            in_hunk = false;
-            continue;
-        }
-        if !in_hunk {
-            continue;
-        }
-        if line.starts_with("+++") || line.starts_with("---") {
-            continue;
-        }
-        if line.starts_with('+') {
-            added_lines.push(new_line);
-            new_line += 1;
-        } else if line.starts_with('-') {
-            removed += 1;
-        } else if !line.starts_with('\\') {
-            // Context line; "\ No newline at end of file" advances nothing.
-            new_line += 1;
-        }
-    }
-    MembershipFootprint {
-        added_lines,
-        removed,
-    }
-}
-
-// Each hunk's NEW-SIDE text block — context plus added lines, prefixes
-// stripped — the unit of the ambiguity probe: a block occurring at more than
-// one placement in the current file means reverse-apply could have anchored
-// the hunk at either (identical context), so the region's membership is
-// declared ambiguous rather than resolved by coin flip (§4, the never-guess
-// principle). Hunks with no changed line are skipped: pure context anchors
-// nothing.
-// Superseded by the line rule (issue-273); kept, with its tests, until the
-// replay-retirement step decides what the frozen staging path still needs.
-#[allow(dead_code)]
-fn membership_hunk_new_blocks(patch: &str) -> Vec<Vec<String>> {
-    let mut blocks: Vec<Vec<String>> = Vec::new();
-    let mut cur: Option<(Vec<String>, bool)> = None;
-    let close = |cur: &mut Option<(Vec<String>, bool)>, blocks: &mut Vec<Vec<String>>| {
-        if let Some((lines, changed)) = cur.take() {
-            if changed && !lines.is_empty() {
-                blocks.push(lines);
-            }
-        }
-    };
-    for line in patch.lines() {
-        if line.starts_with("@@ ") {
-            close(&mut cur, &mut blocks);
-            cur = Some((Vec::new(), false));
-            continue;
-        }
-        if line.starts_with("diff ") || line.starts_with("index ") {
-            close(&mut cur, &mut blocks);
-            continue;
-        }
-        if line.starts_with("+++") || line.starts_with("---") {
-            continue;
-        }
-        if let Some((lines, changed)) = cur.as_mut() {
-            if let Some(rest) = line.strip_prefix('+') {
-                lines.push(rest.to_string());
-                *changed = true;
-            } else if line.starts_with('-') {
-                // A deletion contributes no new-side line but marks the hunk
-                // as carrying a change, so a pure-deletion hunk's CONTEXT
-                // still gets its placement checked.
-                *changed = true;
-            } else if let Some(rest) = line.strip_prefix(' ') {
-                lines.push(rest.to_string());
-            } else if line.is_empty() {
-                // An empty context line can arrive with its leading space
-                // trimmed by transport; it is still a new-side line.
-                lines.push(String::new());
-            }
-        }
-    }
-    close(&mut cur, &mut blocks);
-    blocks
-}
-
-// Non-overlapping occurrences of `block` as consecutive lines of `content`.
-// > 1 is the ambiguity signal.
-// Superseded by the line rule (issue-273); kept, with its tests, until the
-// replay-retirement step decides what the frozen staging path still needs.
-#[allow(dead_code)]
-fn membership_block_occurrences(content: &str, block: &[String]) -> usize {
-    if block.is_empty() {
-        return 0;
-    }
-    let lines: Vec<&str> = content.lines().collect();
-    let mut n = 0usize;
-    let mut i = 0usize;
-    while i + block.len() <= lines.len() {
-        if block
-            .iter()
-            .zip(&lines[i..i + block.len()])
-            .all(|(b, l)| b == l)
-        {
-            n += 1;
-            i += block.len();
-        } else {
-            i += 1;
-        }
-    }
-    n
-}
 
 // Unowned by SUBTRACTION — the conservation law's defining move (§4: "not by
 // error term"). Returns the unowned bucket plus whether the subtraction had
@@ -49528,284 +49996,6 @@ fn membership_conservation_breach(
     }
 }
 
-// Joint candidate patches for one path: the multi-id claims' intervals whose
-// per-path declaration resolves to a JOINT set (several declarers — exactly
-// `resolve_interval_path_owner`'s rule), filtered to live begun members and
-// grouped by the surviving member set. The single-declarer case never reaches
-// here: it resolves to Single and rides `claim_interval_diff`'s scope for
-// that id. Ghosts fall out for free — a ghost is not on the board, so it is
-// never begun.
-// Superseded by the line rule (issue-273); kept, with its tests, until the
-// replay-retirement step decides what the frozen staging path still needs.
-#[allow(dead_code)]
-fn membership_joint_patches(
-    root: &Path,
-    path: &str,
-    declared: &std::collections::HashMap<String, Vec<String>>,
-    begun: &std::collections::HashSet<String>,
-    spawns: &std::cell::Cell<usize>,
-) -> Vec<(Vec<String>, String, Vec<String>)> {
-    let Ok(text) = std::fs::read_to_string(root.join(CLAIM_INTERVALS_REL)) else {
-        return Vec::new();
-    };
-    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return Vec::new();
-    };
-    let Some(arr) = doc.get("intervals").and_then(|v| v.as_array()) else {
-        return Vec::new();
-    };
-    // fix-patch-composition-for-repeated-paths: carry each joint group's
-    // per-interval sections alongside its concatenated patch, in record
-    // order — the same additive shape as `claim_interval_diff`'s `sections`.
-    let mut grouped: std::collections::BTreeMap<Vec<String>, (String, Vec<String>)> =
-        Default::default();
-    for (i, rec) in arr.iter().enumerate() {
-        let Some(a) = rec.get("ref").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let ids: Vec<String> = rec
-            .get("ids")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str())
-                    .map(String::from)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let IntervalPathOwner::Joint(set) = resolve_interval_path_owner(&ids, path, declared)
-        else {
-            continue;
-        };
-        let mut members: Vec<String> = set.into_iter().filter(|m| begun.contains(m)).collect();
-        if members.len() < 2 {
-            continue;
-        }
-        members.sort();
-        let next = arr
-            .get(i + 1)
-            .and_then(|r| r.get("ref"))
-            .and_then(|v| v.as_str());
-        let mut args: Vec<&str> = vec!["diff", a];
-        if let Some(b) = next {
-            args.push(b);
-        }
-        args.push("--");
-        args.push(path);
-        spawns.set(spawns.get() + 1);
-        if let Ok(o) = std::process::Command::new("git")
-            .current_dir(root)
-            .args(&args)
-            .output()
-        {
-            let s = String::from_utf8_lossy(&o.stdout);
-            if !s.trim().is_empty() {
-                let entry = grouped.entry(members).or_default();
-                entry.0.push_str(&s);
-                entry.1.push(s.into_owned());
-            }
-        }
-    }
-    grouped
-        .into_iter()
-        .map(|(members, (patch, sections))| (members, patch, sections))
-        .collect()
-}
-
-// A candidate's own reverse-applied BASELINE: present content (`idx_now`)
-// with this candidate's own patch reversed out of it, written as a tree and
-// returned by oid. This is "what existed before this candidate's recorded
-// work" — the shared primitive behind two things that both need exactly
-// that tree: #367's net-effect normalization below (diffs base_tree →
-// now_tree) and the deletion-attribution rule
-// (membership-attributes-deletions, docs/attribution-model.md §4) that
-// compares base_tree's blob for a path against HEAD's. Fail-open: `None` on
-// any git failure — observe-only code must never block a serve.
-//
-// fix-patch-composition-for-repeated-paths: `sections` are the candidate's
-// per-interval diffs FOR THIS PATH, in record order (oldest first — the
-// order `claim_interval_diff` / `membership_joint_patches` matched them in,
-// never re-derived from splitting concatenated text on `diff --git`). A
-// single `git apply --cached --reverse` over a concatenation of several
-// sections for the SAME path does not compose: it reverses only the LAST
-// section and silently drops the earlier ones, exit code 0
-// (docs/attribution-model.md §4, case 5). So each section is reverse-applied
-// on its own, newest-interval-first (i.e. walking `sections` backward), each
-// one against the tree the PRIOR reversal produced — which is what "undo
-// this candidate's work" actually means. A candidate that touched the path
-// in exactly one interval takes the same single-`git apply` path as before.
-// Any section that fails to apply aborts the WHOLE derivation and returns
-// `None` — a partially-reversed base is a wrong answer that looks like a
-// right one, which is this defect's entire character, so there is no
-// partial-success return here.
-fn membership_candidate_base(
-    root: &Path,
-    idx_now: &Path,
-    sections: &[String],
-    spawns: &std::cell::Cell<usize>,
-) -> Option<String> {
-    if sections.is_empty() {
-        return None;
-    }
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let tag = format!(
-        "{}-{}",
-        std::process::id(),
-        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    );
-    let idx_tmp = std::env::temp_dir().join(format!("bram-membership-base-{}", tag));
-    let pfile = std::env::temp_dir().join(format!("bram-membership-base-{}.patch", tag));
-    let cleanup = || {
-        let _ = std::fs::remove_file(&idx_tmp);
-        let _ = std::fs::remove_file(&pfile);
-    };
-    if std::fs::copy(idx_now, &idx_tmp).is_err() {
-        cleanup();
-        return None;
-    }
-    let git = |idx: Option<&Path>, args: &[&str]| -> Option<std::process::Output> {
-        spawns.set(spawns.get() + 1);
-        let mut cmd = std::process::Command::new("git");
-        cmd.current_dir(root).args(args);
-        if let Some(idx) = idx {
-            cmd.env("GIT_INDEX_FILE", idx);
-        }
-        cmd.output().ok()
-    };
-    let pfile_s = pfile.to_string_lossy().to_string();
-    for section in sections.iter().rev() {
-        if std::fs::write(&pfile, section).is_err() {
-            cleanup();
-            return None;
-        }
-        // The intermediate state is asserted after every reversal, not just
-        // at the end: `git apply`'s own exit status IS that assertion — a
-        // section that applies without effect, or to the wrong place, fails
-        // this check rather than being indistinguishable from success the
-        // way the old single-shot concatenated form was.
-        let applied = git(
-            Some(&idx_tmp),
-            &["apply", "--cached", "--reverse", &pfile_s],
-        )
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-        if !applied {
-            cleanup();
-            return None;
-        }
-    }
-    let base_tree = git(Some(&idx_tmp), &["write-tree"]).and_then(|o| {
-        o.status
-            .success()
-            .then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
-    });
-    cleanup();
-    base_tree.filter(|t| !t.is_empty())
-}
-
-// One path's diff between two trees, as text — the shared plumbing behind
-// `membership_net_patch`'s re-diff and nothing else; split out so a caller
-// that already holds a `base_tree` (the probe loop, which needs it for the
-// blob-equality test regardless) does not reverse-apply the candidate a
-// second time to get the same tree `membership_net_patch` would recompute.
-fn membership_diff_tree_path(
-    root: &Path,
-    tree_a: &str,
-    tree_b: &str,
-    path: &str,
-    spawns: &std::cell::Cell<usize>,
-) -> Option<String> {
-    spawns.set(spawns.get() + 1);
-    let out = std::process::Command::new("git")
-        .current_dir(root)
-        .args(["diff", tree_a, tree_b, "--", path])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout).into_owned();
-    if s.trim().is_empty() {
-        None
-    } else {
-        Some(s)
-    }
-}
-
-// Net-normalization for a concatenated multi-interval candidate (#367). An
-// item whose evidence spans several of its own intervals counts a re-edited
-// line once per interval that touched it — interval 1 adds it, interval 2's
-// modification adds it again — while the HEAD-relative universe counts it
-// once, so `single` exceeds the universe and the conservation tripwire
-// fires (its third catch, 2026-09-08: got−expected equalled the re-touched
-// lines in every field episode, exactly 2x when every line was re-edited).
-// The net form reverse-applies the evidence OUT of the present state (the
-// membership probe has already proven it reverse-applies) and re-diffs the
-// present against that base, so each surviving line counts once. Fail-open:
-// None falls back to the raw concatenated patch — observe-only code must
-// never block a serve, and an over-count is exactly what the tripwire
-// exists to report. Single-diff candidates never come here. Callers that
-// already have a `base_tree` in hand (the probe loop) should call
-// `membership_diff_tree_path` directly instead — this function exists for
-// callers that want the net patch alone, computed end to end. No production
-// caller needs that end-to-end form today (the probe loop always already
-// has `base_tree` for the deletion-attribution test), so this is currently
-// exercised only by its own test — kept, not deleted, as the one-call
-// convenience the next caller of the net form will otherwise have to
-// reinvent.
-#[allow(dead_code)]
-fn membership_net_patch(
-    root: &Path,
-    idx_now: &Path,
-    now_tree: &str,
-    sections: &[String],
-    path: &str,
-    spawns: &std::cell::Cell<usize>,
-) -> Option<String> {
-    if now_tree.is_empty() {
-        return None;
-    }
-    let base_tree = membership_candidate_base(root, idx_now, sections, spawns)?;
-    membership_diff_tree_path(root, &base_tree, now_tree, path, spawns)
-}
-
-// membership-attributes-deletions (docs/attribution-model.md §4, the
-// deletion matrix): whether a candidate's baseline coincides with HEAD for
-// this path — the discriminator the whole rule rests on. `base_tree`
-// (`membership_candidate_base`) is "present content minus this candidate's
-// own work"; when that equals HEAD's content for the path, this candidate
-// is the sole contributor between HEAD and now, and its removed lines ARE
-// HEAD-relative deletions. When it differs, this candidate sat on top of
-// other work (still-live or already-superseded), and its removed count
-// describes a line that never existed relative to HEAD — the dependency
-// fixture's original double-booking fire. `git diff --quiet` reports "no
-// difference" (success) whether the path is absent from both trees or
-// present and identical in both, which is exactly the equality this needs
-// — no special-casing for a path HEAD never had (a candidate that created
-// the path from nothing). Fail-open: any git failure reads as "not
-// HEAD-relative", the same conservative direction as every other
-// degradation here.
-// Superseded by the line rule (issue-273); kept, with its tests, until the
-// replay-retirement step decides what the frozen staging path still needs.
-#[allow(dead_code)]
-fn membership_blob_matches_head(
-    root: &Path,
-    tree: &str,
-    path: &str,
-    spawns: &std::cell::Cell<usize>,
-) -> bool {
-    if tree.is_empty() {
-        return false;
-    }
-    spawns.set(spawns.get() + 1);
-    std::process::Command::new("git")
-        .current_dir(root)
-        .args(["diff", "--quiet", "--no-renames", tree, "HEAD", "--", path])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
 // One path's membership partition while the engine accumulates. Counts are
 // (added, removed); `owners` is the id set membership attributes on the path
 // (single + joint + ambiguous candidates alike), the coarse unit the
@@ -49843,6 +50033,35 @@ struct MembershipPathBuckets {
     // which runs off a bare partition with no access to the probe loop's
     // local state, has everything the check needs.
     universe: (usize, usize),
+    // issue-425-retire-replay: which present-file lines each owner wrote, as
+    // (startLine, endLine, members), 1-based and inclusive; one member is a
+    // single owner, several a joint one. Unowned lines have no run. The same
+    // contract the replay's `attribution_runs_for_path` serves the pane.
+    runs: Vec<(usize, usize, Vec<String>)>,
+    // The same for removed lines, numbered by their position in HEAD's
+    // version of the file.
+    removed_runs: Vec<(usize, usize, Vec<String>)>,
+}
+
+// Collapse a path's (present line, step) list into ownership runs: adjacent
+// lines whose steps resolve to the same non-empty member set form one run.
+// A step missing from `step_members`, or resolving to no members, leaves its
+// lines unowned, so they break a run rather than joining a neighbour's.
+fn membership_runs(
+    added_lines: &[(usize, usize)],
+    step_members: &std::collections::BTreeMap<usize, Vec<String>>,
+) -> Vec<(usize, usize, Vec<String>)> {
+    let mut out: Vec<(usize, usize, Vec<String>)> = Vec::new();
+    for &(line, step) in added_lines {
+        let Some(members) = step_members.get(&step).filter(|m| !m.is_empty()) else {
+            continue;
+        };
+        match out.last_mut() {
+            Some((_, end, who)) if *end + 1 == line && who == members => *end = line,
+            _ => out.push((line, line, members.clone())),
+        }
+    }
+    out
 }
 
 // Two-slot process-local memo: current plus previous. Single-slot (the
@@ -50085,6 +50304,15 @@ fn parse_line_diff(text: &str) -> Vec<LineDiffFile> {
 struct MembershipLineCredit {
     by_step: std::collections::BTreeMap<usize, (usize, usize)>,
     unexplained: (usize, usize),
+    // issue-425-retire-replay: the per-line truth behind `by_step`'s added
+    // counts, (1-based present line, step) in ascending line order, one entry
+    // per changed line a step explains. `membership_runs` turns it into the
+    // ownership runs the pane reads, so the replay can stop being their source.
+    added_lines: Vec<(usize, usize)>,
+    // The same for `by_step`'s removed counts: (1-based HEAD line, step) for
+    // each removed line a step explains, so a scoped diff can show an item's
+    // deletions as well as its additions.
+    removed_lines: Vec<(usize, usize)>,
 }
 
 fn membership_diff_u0(
@@ -50184,13 +50412,19 @@ fn membership_line_credit(
         for (old_start, old_count, new_start, new_count) in file.hunks {
             for j in new_start..new_start + new_count {
                 match hist.origin_at(j) {
-                    Some(LineOrigin::Step(k)) => credit.by_step.entry(k).or_insert((0, 0)).0 += 1,
+                    Some(LineOrigin::Step(k)) => {
+                        credit.by_step.entry(k).or_insert((0, 0)).0 += 1;
+                        credit.added_lines.push((j, k));
+                    }
                     _ => credit.unexplained.0 += 1,
                 }
             }
             for i in old_start..old_start + old_count {
                 match hist.removed_by.get(&i) {
-                    Some(k) => credit.by_step.entry(*k).or_insert((0, 0)).1 += 1,
+                    Some(k) => {
+                        credit.by_step.entry(*k).or_insert((0, 0)).1 += 1;
+                        credit.removed_lines.push((i, *k));
+                    }
                     None => credit.unexplained.1 += 1,
                 }
             }
@@ -50253,6 +50487,36 @@ fn membership_step_chain(
     (steps, holders)
 }
 
+// Set when a compute stores a new partition; the precompute worker emits
+// worklist-changed for it, so the board refetches once ownership is ready.
+static MEMBERSHIP_STORED_NEW: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+// docs/decisions/2026-10-12-membership-cost-budget.md: per-event bounds,
+// checked where each cost is already measured. A run over its bound traces
+// op=membership-over-budget, so a breach reports itself.
+const MEMBERSHIP_BUDGET_SERVE_MS: u128 = 200;
+const MEMBERSHIP_BUDGET_COMPUTE_MS: u128 = 5_000;
+const MEMBERSHIP_BUDGET_GATE_MS: u128 = 1_000;
+
+fn membership_budget_check<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    kind: &str,
+    ms: u128,
+    limit: u128,
+) {
+    if ms > limit {
+        append_bram_trace_line(
+            app,
+            "claim-interval",
+            &format!(
+                "op=membership-over-budget kind={} ms={} limit={}",
+                kind, ms, limit
+            ),
+        );
+    }
+}
+
 // The engine driver, split along the seam
 // membership-precomputed-off-the-render-path found: everything here is
 // replay-free, so it is safe to run off the request path. Traces
@@ -50283,6 +50547,169 @@ fn membership_partition_engine<R: tauri::Runtime>(
 ) -> Option<(
     std::collections::BTreeMap<String, MembershipPathBuckets>,
     bool,
+)> {
+    membership_partition_engine_keyed(app, allow_compute).map(|(p, f, _)| (p, f))
+}
+
+// The membership engine's universe: per changed path under `pathspecs`,
+// (added, removed) vs HEAD, tracked and untracked alike. Paths come back as
+// git reports them (core.quotePath=false), so they are literal file names
+// membership_seed_now_index can stage. Split out of the engine for issue-437,
+// so the declared-entries-to-seeded-tree path is testable without an app.
+fn membership_universe(
+    root: &Path,
+    pathspecs: &[String],
+    spawns: &std::cell::Cell<usize>,
+) -> std::collections::BTreeMap<String, (usize, usize)> {
+    let git = |args: &[&str]| -> Option<String> {
+        spawns.set(spawns.get() + 1);
+        let out = std::process::Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .output()
+            .ok()?;
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    // Universe, tracked half: one pathspec-scoped numstat — per concrete
+    // changed path, (added, removed) vs HEAD. Never the whole tree.
+    let mut universe: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
+    {
+        // core.quotePath=false, as membership_diff_u0 runs, so a non-ASCII
+        // path's universe key is the raw name the line-credit diff reports
+        // (and a literal name the scratch-index add below can stage).
+        let mut args: Vec<&str> = vec![
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "HEAD",
+            "--no-renames",
+            "--numstat",
+            "--",
+        ];
+        args.extend(pathspecs.iter().map(|s| s.as_str()));
+        for line in git(&args).unwrap_or_default().lines() {
+            let mut parts = line.splitn(3, '\t');
+            let (Some(a), Some(r), Some(p)) = (parts.next(), parts.next(), parts.next()) else {
+                continue;
+            };
+            // Binary files numstat as "-\t-"; they carry no line counts and
+            // contribute a (0, 0) universe entry — present, but lineless.
+            let path = p.trim().trim_matches('"').to_string();
+            if path.is_empty() {
+                continue;
+            }
+            universe.insert(
+                path,
+                (
+                    a.parse::<usize>().unwrap_or(0),
+                    r.parse::<usize>().unwrap_or(0),
+                ),
+            );
+        }
+    }
+    // Universe, untracked half: names only via scoped status (-uall so a
+    // wholly-untracked directory lists its files, not the directory); content
+    // is read solely to count a DECLARED untracked file's lines — the model's
+    // universe includes untracked non-ignored files as pure additions.
+    {
+        let mut args: Vec<&str> = vec![
+            "-c",
+            "core.quotePath=false",
+            "status",
+            "--porcelain",
+            "--no-renames",
+            "-uall",
+            "--",
+        ];
+        args.extend(pathspecs.iter().map(|s| s.as_str()));
+        for line in git(&args).unwrap_or_default().lines() {
+            let Some(rest) = line.strip_prefix("?? ") else {
+                continue;
+            };
+            let path = rest.trim().trim_matches('"').to_string();
+            if path.is_empty() {
+                continue;
+            }
+            let n = std::fs::read(root.join(&path))
+                .map(|b| String::from_utf8_lossy(&b).lines().count())
+                .unwrap_or(0);
+            // UNION with the numstat half, never first-wins: a path can be
+            // deleted-vs-HEAD on the tracked side AND present as untracked
+            // content at once (HEAD has it, the index dropped it, the
+            // worktree recreated it — the scenario machinery's reset-mixed
+            // shape, and any real flow that unstages a rewrite). Skipping
+            // the untracked count there missed the present line entirely:
+            // the second live conservation fire, universe=0,1 single=1,0.
+            let entry = universe.entry(path).or_insert((0, 0));
+            entry.0 += n;
+        }
+    }
+    universe
+}
+
+// issue-437: seed the membership engine's present-state index: HEAD, plus
+// exactly `paths` (the universe: git's own list of changed and untracked
+// files) staged as a literal list. Err carries git's stderr, for the
+// `reason=seed-failed` trace.
+//
+// Never the declared entries. `add -A -- <declared>` failed the whole compute
+// on two ordinary boards: a declared file not yet created ("pathspec did not
+// match", exit 128, nothing staged) and a declared new file an ignore rule
+// hides (exit 1, even when force-staged in the real index, because this index
+// starts from HEAD). Every gate commit on such a board was refused as "no
+// membership answer". capture_claim_tree lists before it adds for the same
+// reason. A deletion in the list stages as a removal, and `--force` is safe
+// because the list holds only file names, never a directory an ignored
+// subtree could ride in under.
+fn membership_seed_now_index(
+    root: &Path,
+    idx: &Path,
+    list_path: &Path,
+    paths: &[String],
+    spawns: &std::cell::Cell<usize>,
+) -> Result<(), String> {
+    let run = |args: &[&str]| -> Result<(), String> {
+        spawns.set(spawns.get() + 1);
+        match std::process::Command::new("git")
+            .current_dir(root)
+            .env("GIT_INDEX_FILE", idx)
+            .args(args)
+            .output()
+        {
+            Ok(o) if o.status.success() => Ok(()),
+            Ok(o) => Err(String::from_utf8_lossy(&o.stderr).into_owned()),
+            Err(e) => Err(e.to_string()),
+        }
+    };
+    run(&["read-tree", "HEAD"])?;
+    let mut list: Vec<u8> = Vec::new();
+    for p in paths {
+        list.extend_from_slice(p.as_bytes());
+        list.push(0);
+    }
+    std::fs::write(list_path, &list).map_err(|e| e.to_string())?;
+    let list_arg = format!("--pathspec-from-file={}", list_path.display());
+    run(&[
+        "--literal-pathspecs",
+        "add",
+        "-A",
+        "--force",
+        &list_arg,
+        "--pathspec-file-nul",
+    ])
+}
+
+// issue-425-retire-replay (Codex review): the engine, also returning the
+// state key computed in THIS call, so a caller can stamp its answer with the
+// state that answer was evaluated against. A shared "last key" slot, read
+// after the fact, could carry another request's key.
+fn membership_partition_engine_keyed<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    allow_compute: bool,
+) -> Option<(
+    std::collections::BTreeMap<String, MembershipPathBuckets>,
+    bool,
+    String,
 )> {
     let started = std::time::Instant::now();
     let spawns = std::cell::Cell::new(0usize);
@@ -50318,6 +50745,45 @@ fn membership_partition_engine<R: tauri::Runtime>(
                 fresh
             ),
         );
+        // A memo hit is a serve's whole cost; a miss is a compute.
+        let ms = started.elapsed().as_millis();
+        if cached {
+            membership_budget_check(app, "serve", ms, MEMBERSHIP_BUDGET_SERVE_MS);
+        } else {
+            membership_budget_check(app, "compute", ms, MEMBERSHIP_BUDGET_COMPUTE_MS);
+        }
+    };
+    // issue-437: a compute that gives up. Same line as trace_cost's no-answer
+    // shape (paths=0 cached=false fresh=false), plus WHY, so a `paths=0` line
+    // explains itself: four field refusals carried `paths=0 spawns=7` and
+    // nothing else, and the seventh spawn had to be inferred by counting.
+    let trace_fail = |app: &AppHandle<R>,
+                      spawns: usize,
+                      started: std::time::Instant,
+                      reason: &str,
+                      detail: Option<&str>| {
+        let detail = detail
+            .map(|d| d.lines().next().unwrap_or("").trim().replace('"', "'"))
+            .filter(|d| !d.is_empty())
+            .map(|d| format!(" detail=\"{}\"", d.chars().take(160).collect::<String>()))
+            .unwrap_or_default();
+        append_bram_trace_line(
+            app,
+            "claim-interval",
+            &format!(
+                "op=membership paths=0 ms={} spawns={} ambiguous=0 cached=false fresh=false reason={}{}",
+                started.elapsed().as_millis(),
+                spawns,
+                reason,
+                detail
+            ),
+        );
+        membership_budget_check(
+            app,
+            "compute",
+            started.elapsed().as_millis(),
+            MEMBERSHIP_BUDGET_COMPUTE_MS,
+        );
     };
     let Some(root) = project_root(Some(app)) else {
         return None;
@@ -50352,7 +50818,7 @@ fn membership_partition_engine<R: tauri::Runtime>(
         }
     }
     if begun_files.is_empty() {
-        trace_cost(app, 0, spawns.get(), 0, started, false, false);
+        trace_fail(app, spawns.get(), started, "no-begun", None);
         return None;
     }
     let begun_ids: std::collections::HashSet<String> =
@@ -50403,6 +50869,21 @@ fn membership_partition_engine<R: tauri::Runtime>(
         head.hash(&mut hasher);
         diff.hash(&mut hasher);
         untracked.join("\u{1}").hash(&mut hasher);
+        // issue-425-retire-replay (Codex review): names alone miss an edit to
+        // an untracked file, which `git diff HEAD` doesn't show. Size and
+        // mtime of the untracked files a begun item declares, not the whole
+        // untracked tree (#395's 28k-file virtualenv is why).
+        for u in &untracked {
+            if begun_files
+                .iter()
+                .any(|(_, fs)| fs.iter().any(|f| declared_covers(f, u)))
+            {
+                if let Ok(md) = std::fs::metadata(root.join(u)) {
+                    md.len().hash(&mut hasher);
+                    md.modified().ok().hash(&mut hasher);
+                }
+            }
+        }
         roster.join("\u{1}").hash(&mut hasher);
         intervals_raw.hash(&mut hasher);
         format!("{:016x}", hasher.finish())
@@ -50430,7 +50911,7 @@ fn membership_partition_engine<R: tauri::Runtime>(
                         true,
                         true,
                     );
-                    return Some((cached, true));
+                    return Some((cached, true, state_key));
                 }
             }
             if !allow_compute {
@@ -50450,7 +50931,7 @@ fn membership_partition_engine<R: tauri::Runtime>(
                         true,
                         false,
                     );
-                    Some((prev, false))
+                    Some((prev, false, state_key))
                 } else {
                     membership_trace_unavailable_once(app, &state_key);
                     None
@@ -50477,69 +50958,30 @@ fn membership_partition_engine<R: tauri::Runtime>(
         .collect();
     pathspecs.sort();
     pathspecs.dedup();
-    // Universe, tracked half: one pathspec-scoped numstat — per concrete
-    // changed path, (added, removed) vs HEAD. Never the whole tree.
-    let mut universe: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
-    {
-        let mut args: Vec<&str> = vec!["diff", "HEAD", "--no-renames", "--numstat", "--"];
-        args.extend(pathspecs.iter().map(|s| s.as_str()));
-        for line in git(&args).unwrap_or_default().lines() {
-            let mut parts = line.splitn(3, '\t');
-            let (Some(a), Some(r), Some(p)) = (parts.next(), parts.next(), parts.next()) else {
-                continue;
-            };
-            // Binary files numstat as "-\t-"; they carry no line counts and
-            // contribute a (0, 0) universe entry — present, but lineless.
-            let path = p.trim().trim_matches('"').to_string();
-            if path.is_empty() {
-                continue;
-            }
-            universe.insert(
-                path,
-                (
-                    a.parse::<usize>().unwrap_or(0),
-                    r.parse::<usize>().unwrap_or(0),
-                ),
-            );
-        }
-    }
-    // Universe, untracked half: names only via scoped status (-uall so a
-    // wholly-untracked directory lists its files, not the directory); content
-    // is read solely to count a DECLARED untracked file's lines — the model's
-    // universe includes untracked non-ignored files as pure additions.
-    {
-        let mut args: Vec<&str> = vec!["status", "--porcelain", "--no-renames", "-uall", "--"];
-        args.extend(pathspecs.iter().map(|s| s.as_str()));
-        for line in git(&args).unwrap_or_default().lines() {
-            let Some(rest) = line.strip_prefix("?? ") else {
-                continue;
-            };
-            let path = rest.trim().trim_matches('"').to_string();
-            if path.is_empty() {
-                continue;
-            }
-            let n = std::fs::read(root.join(&path))
-                .map(|b| String::from_utf8_lossy(&b).lines().count())
-                .unwrap_or(0);
-            // UNION with the numstat half, never first-wins: a path can be
-            // deleted-vs-HEAD on the tracked side AND present as untracked
-            // content at once (HEAD has it, the index dropped it, the
-            // worktree recreated it — the scenario machinery's reset-mixed
-            // shape, and any real flow that unstages a rewrite). Skipping
-            // the untracked count there missed the present line entirely:
-            // the second live conservation fire, universe=0,1 single=1,0.
-            let entry = universe.entry(path).or_insert((0, 0));
-            entry.0 += n;
-        }
-    }
+    let universe = membership_universe(&root, &pathspecs, &spawns);
+    // issue-437: nothing under the begun items' declared paths differs from
+    // HEAD. That is an answer (nobody owns anything), not a missing one, so it
+    // is memoized and returned like any compute. As `None` it read as "no
+    // membership answer", and the gate refused a commit whose real obstacle
+    // was elsewhere: a declared file that git ignores (#373's refusal names
+    // it) or nothing to commit (`refuse-empty-commit` does). Seen on the
+    // issue-437 demo the moment the board's only begun item declared nothing
+    // but an ignored file.
     if universe.is_empty() {
-        trace_cost(app, 0, spawns.get(), 0, started, false, false);
-        return None;
+        let empty: std::collections::BTreeMap<String, MembershipPathBuckets> = Default::default();
+        trace_cost(app, 0, spawns.get(), 0, started, false, true);
+        if let Ok(mut guard) = memo.lock() {
+            let old_current = guard.current.take();
+            guard.previous = old_current;
+            guard.current = Some((state_key.clone(), empty.clone()));
+        }
+        MEMBERSHIP_STORED_NEW.store(true, std::sync::atomic::Ordering::SeqCst);
+        return Some((empty, true, state_key));
     }
-    // Scratch state for the present-state tree. idx_now is HEAD plus a
-    // pathspec-scoped `add -A` — the present state of exactly the declared
-    // paths, untracked content included (why a plain HEAD index cannot
-    // serve: a created file has to exist in the tree the history ends at).
+    // Scratch state for the present-state tree. idx_now is HEAD plus the
+    // present state of exactly the universe's paths, untracked content
+    // included (why a plain HEAD index cannot serve: a created file has to
+    // exist in the tree the history ends at).
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let tag = format!(
         "{}-{}",
@@ -50547,30 +50989,21 @@ fn membership_partition_engine<R: tauri::Runtime>(
         SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
     let idx_now = std::env::temp_dir().join(format!("bram-membership-now-{}", tag));
+    let idx_list = std::env::temp_dir().join(format!("bram-membership-now-{}.list", tag));
     let cleanup = || {
         let _ = std::fs::remove_file(&idx_now);
+        let _ = std::fs::remove_file(&idx_list);
     };
-    let git_idx = |idx: &Path, args: &[&str]| -> bool {
-        spawns.set(spawns.get() + 1);
-        std::process::Command::new("git")
-            .current_dir(&root)
-            .env("GIT_INDEX_FILE", idx)
-            .args(args)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    };
-    let seeded = git_idx(&idx_now, &["read-tree", "HEAD"]) && {
-        let mut args: Vec<&str> = vec!["add", "-A", "--"];
-        args.extend(pathspecs.iter().map(|s| s.as_str()));
-        git_idx(&idx_now, &args)
-    };
-    if !seeded {
+    // issue-437: the universe's own paths, as a literal list, never the
+    // declared entries (see membership_seed_now_index).
+    let universe_list: Vec<String> = universe.keys().cloned().collect();
+    let seeded = membership_seed_now_index(&root, &idx_now, &idx_list, &universe_list, &spawns);
+    if let Err(stderr) = seeded {
         // Fail open, like capture_claim_tree: an observe-only engine must be
         // incapable of blocking a board serve. The cost line still lands so
         // the absence of partition traces is attributable.
         cleanup();
-        trace_cost(app, 0, spawns.get(), 0, started, false, false);
+        trace_fail(app, spawns.get(), started, "seed-failed", Some(&stderr));
         return None;
     }
     // Present-state tree of the declared paths: the last step of the line
@@ -50601,7 +51034,7 @@ fn membership_partition_engine<R: tauri::Runtime>(
     if now_tree.is_empty() {
         // Fail open, like the seeding failure above.
         cleanup();
-        trace_cost(app, 0, spawns.get(), 0, started, false, false);
+        trace_fail(app, spawns.get(), started, "now-tree-empty", None);
         return None;
     }
     let intervals_raw = std::fs::read_to_string(root.join(CLAIM_INTERVALS_REL)).unwrap_or_default();
@@ -50614,7 +51047,7 @@ fn membership_partition_engine<R: tauri::Runtime>(
             Some(c) => c,
             None => {
                 cleanup();
-                trace_cost(app, 0, spawns.get(), 0, started, false, false);
+                trace_fail(app, spawns.get(), started, "line-credit-failed", None);
                 return None;
             }
         }
@@ -50657,6 +51090,7 @@ fn membership_partition_engine<R: tauri::Runtime>(
         let Some(buckets) = per_path.get_mut(path) else {
             continue;
         };
+        let mut step_members: std::collections::BTreeMap<usize, Vec<String>> = Default::default();
         for (step, &(added, removed)) in &credit.by_step {
             if added == 0 && removed == 0 {
                 continue;
@@ -50699,8 +51133,11 @@ fn membership_partition_engine<R: tauri::Runtime>(
             let entry = buckets.per_item.entry(members.clone()).or_insert((0, 0));
             entry.0 += added;
             entry.1 += removed;
-            buckets.owners.extend(members);
+            buckets.owners.extend(members.iter().cloned());
+            step_members.insert(*step, members);
         }
+        buckets.runs = membership_runs(&credit.added_lines, &step_members);
+        buckets.removed_runs = membership_runs(&credit.removed_lines, &step_members);
     }
     cleanup();
     // Per-path finalization: stash this path's universe on the bucket so
@@ -50724,9 +51161,10 @@ fn membership_partition_engine<R: tauri::Runtime>(
     if let Ok(mut guard) = memo.lock() {
         let old_current = guard.current.take();
         guard.previous = old_current;
-        guard.current = Some((state_key, per_path.clone()));
+        guard.current = Some((state_key.clone(), per_path.clone()));
     }
-    Some((per_path, true))
+    MEMBERSHIP_STORED_NEW.store(true, std::sync::atomic::Ordering::SeqCst);
+    Some((per_path, true, state_key))
 }
 
 // Read-only entry point for the board serve. Delegates to
@@ -50741,7 +51179,30 @@ fn membership_partition<R: tauri::Runtime>(
     std::collections::BTreeMap<String, MembershipPathBuckets>,
     bool,
 )> {
-    membership_partition_engine(app, false)
+    membership_partition_keyed(app).map(|(p, f, _)| (p, f))
+}
+
+// The serve entry point with the state key of this read (see
+// `membership_partition_engine_keyed`).
+fn membership_partition_keyed<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+) -> Option<(
+    std::collections::BTreeMap<String, MembershipPathBuckets>,
+    bool,
+    String,
+)> {
+    let got = membership_partition_engine_keyed(app, false);
+    // issue-425-retire-replay: a serve that finds no live answer asks for
+    // one. Event triggers alone left a fresh launch with no partition until
+    // something changed on disk (the startup precompute had run, but the
+    // state moved before the first serve and nothing re-ran it), so the pane
+    // showed the replay's ownership, and with the replay gone would show
+    // none. This only queues the background precompute, which coalesces
+    // concurrent triggers; the serve itself still never computes.
+    if !matches!(got, Some((_, true, _))) {
+        membership_precompute(app);
+    }
+    got
 }
 
 static MEMBERSHIP_PRECOMPUTE_INFLIGHT: std::sync::atomic::AtomicBool =
@@ -50755,8 +51216,10 @@ static MEMBERSHIP_PRECOMPUTE_PENDING: std::sync::atomic::AtomicBool =
 
 // Runs the expensive probe loop on a background thread, filling the memo
 // for the next serve to read. Called after the events that invalidate the
-// state key (worklist-changed, git-status-changed) and once at startup —
-// never from a board serve. Concurrent triggers collapse to one run: a
+// state key (worklist-changed, git-status-changed), once at startup, and by
+// a board serve that found no fresh partition (`membership_partition`; the
+// serve queues this and returns, it never computes inline). Concurrent
+// triggers collapse to one run: a
 // trigger arriving while one is already in flight is dropped rather than
 // queued. That is safe: either the in-flight run already covers the state
 // that would have driven the dropped trigger, or it doesn't and the NEXT
@@ -50779,6 +51242,13 @@ fn membership_precompute<R: tauri::Runtime>(app: &AppHandle<R>) {
     std::thread::spawn(move || {
         loop {
             membership_partition_engine(&app, true);
+            // A new partition is ready: tell the pane, so the board and any
+            // selection prediction refetch now rather than on the next edit.
+            // The precompute this emit triggers finds an exact memo hit,
+            // stores nothing, and emits nothing, so this cannot loop.
+            if MEMBERSHIP_STORED_NEW.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                emit_replayable_signal(&app, "worklist-changed");
+            }
             // Keep the inflight latch held while consuming coalesced triggers,
             // so an event racing the final check either becomes this loop's
             // next pass or, after the latch is released, starts its own worker.
@@ -50823,6 +51293,21 @@ fn membership_precompute<R: tauri::Runtime>(app: &AppHandle<R>) {
 // * `membershipStale` (written beside this) scopes the WHOLE partition, not
 //   any path within it. A fallback serves one coherent snapshot; marking parts
 //   of it fresh would assert a mixture that never existed.
+// Membership runs in the replay's wire shape: `itemId` for a single owner,
+// `itemIds` for a joint one. One encoder for the board payload and the commit
+// gate's residual check, so both read runs the same way.
+fn membership_runs_json(runs: &[(usize, usize, Vec<String>)]) -> Vec<serde_json::Value> {
+    runs.iter()
+        .map(|(start, end, members)| {
+            if members.len() == 1 {
+                serde_json::json!({ "startLine": start, "endLine": end, "itemId": members[0] })
+            } else {
+                serde_json::json!({ "startLine": start, "endLine": end, "itemIds": members })
+            }
+        })
+        .collect()
+}
+
 fn membership_payload_json(
     partition: &std::collections::BTreeMap<String, MembershipPathBuckets>,
 ) -> serde_json::Value {
@@ -50850,9 +51335,15 @@ fn membership_payload_json(
                 e.1 += counts.1;
             }
         }
+        // The replay's run shape, so a pane consumer can switch source without
+        // changing how it reads one: `itemId` for a single owner, `itemIds`
+        // for a joint one.
+        // `removedRuns` has the same shape, numbered by HEAD-side lines.
         by_path.insert(
             path.clone(),
             serde_json::json!({
+                "runs": membership_runs_json(&m.runs),
+                "removedRuns": membership_runs_json(&m.removed_runs),
                 "owners": m.owners.iter().cloned().collect::<Vec<String>>(),
                 "single": pair(m.single),
                 "joint": pair(m.joint),
@@ -50868,12 +51359,11 @@ fn membership_payload_json(
     serde_json::json!({ "byPath": by_path, "itemTotals": totals_json })
 }
 
-// The conservation check and the divergence comparison, split out of the
-// old membership_engine_observe along the seam
-// membership-precomputed-off-the-render-path found: both are cheap (the
-// first is arithmetic over a partition already in hand, the second a set
-// comparison), so both stay on the serve, called right after
-// `membership_partition`.
+// The conservation check, split out of the old membership_engine_observe
+// along the seam membership-precomputed-off-the-render-path found: it is
+// arithmetic over a partition already in hand, so it stays on the serve,
+// called right after `membership_partition`. (The divergence comparison
+// against the replay went with the replay, issue-425-retire-replay.)
 //
 // `fresh` gates the conservation check — this is the load-bearing rule.
 // The check compares `partition`'s buckets against the diff `partition` was
@@ -50883,18 +51373,10 @@ fn membership_payload_json(
 // honestly (docs/developing-bram.md, soak-vs-tripwire). So the check runs
 // fresh-only; a stale serve skips it and traces the skip — "did not run"
 // must never look like "ran and found nothing".
-//
-// The divergence comparison is a set-equality check over data already in
-// the buckets, not an arithmetic identity against the partition's own
-// provenance, so it MAY still run when stale — but a stale disagreement
-// carries `stale=true` so nobody adjudicates it as a real one. Fresh lines
-// keep the exact pre-split format, with no added field.
 fn membership_report<R: tauri::Runtime>(
     app: &AppHandle<R>,
     partition: &std::collections::BTreeMap<String, MembershipPathBuckets>,
     fresh: bool,
-    replay_owners_by_path: &std::collections::HashMap<String, std::collections::HashSet<String>>,
-    replay_joint_by_path: &std::collections::HashMap<String, std::collections::HashSet<String>>,
 ) {
     if !fresh {
         append_bram_trace_line(
@@ -50946,139 +51428,392 @@ fn membership_report<R: tauri::Runtime>(
                 );
             }
         }
-        let mut replay: std::collections::BTreeSet<String> = replay_owners_by_path
-            .get(path)
-            .map(|s| s.iter().cloned().collect())
-            .unwrap_or_default();
-        if let Some(j) = replay_joint_by_path.get(path) {
-            replay.extend(j.iter().cloned());
+    }
+}
+
+// Real-git scaffolding shared by the tests that drive the line rule through
+// the claim-store chain (`membership_step_chain` -> `membership_line_credit`),
+// the way the engine does. Hoisted when the engine, acceptance and
+// deletion-matrix modules all needed it (each had carried its own copy of
+// the whole-patch scaffolding this replaced).
+// issue-437: the membership engine's present-state index, from declared
+// entries through the universe to the seeded tree, on the board shapes that
+// made every gate commit refuse as "no membership answer".
+#[cfg(test)]
+mod issue_437_seed_tests {
+    use super::membership_port_support::{commit_all, git, scratch_repo};
+    use super::{membership_seed_now_index, membership_universe};
+    use std::path::Path;
+
+    // Seed the way the engine does, then report what the scratch index holds
+    // relative to HEAD, as sorted "<status>\t<path>" lines.
+    fn seed(root: &Path, declared: &[&str]) -> Result<Vec<String>, String> {
+        let spawns = std::cell::Cell::new(0usize);
+        let pathspecs: Vec<String> = declared.iter().map(|s| s.to_string()).collect();
+        let universe = membership_universe(root, &pathspecs, &spawns);
+        let paths: Vec<String> = universe.keys().cloned().collect();
+        let idx = root.join("../").join(format!(
+            "{}-idx",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        let list = idx.with_extension("list");
+        let _ = std::fs::remove_file(&idx);
+        membership_seed_now_index(root, &idx, &list, &paths, &spawns)?;
+        let out = git(
+            root,
+            Some(&idx),
+            &["diff", "--cached", "--name-status", "HEAD"],
+        );
+        let _ = std::fs::remove_file(&idx);
+        let _ = std::fs::remove_file(&list);
+        let mut lines: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|s| s.to_string())
+            .collect();
+        lines.sort();
+        Ok(lines)
+    }
+
+    #[test]
+    fn a_declared_file_not_yet_created_does_not_fail_the_seed() {
+        let root = scratch_repo("i437-missing");
+        std::fs::write(root.join("edited.js"), "a\n").unwrap();
+        commit_all(&root, "head");
+        std::fs::write(root.join("edited.js"), "a\nb\n").unwrap();
+        // The premise: the old seed's `add -A -- <declared>` is fatal here.
+        let idx = root.join("../i437-premise-idx");
+        let _ = std::fs::remove_file(&idx);
+        assert!(git(&root, Some(&idx), &["read-tree", "HEAD"])
+            .status
+            .success());
+        let old = git(
+            &root,
+            Some(&idx),
+            &["add", "-A", "--", "edited.js", "planned.js"],
+        );
+        assert!(
+            !old.status.success(),
+            "premise: a missing pathspec fails add -A"
+        );
+        let _ = std::fs::remove_file(&idx);
+        assert_eq!(
+            seed(&root, &["edited.js", "planned.js"]),
+            Ok(vec!["M\tedited.js".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_declared_ignored_new_file_does_not_fail_the_seed() {
+        let root = scratch_repo("i437-ignored");
+        std::fs::write(root.join(".gitignore"), "/*.md\n!README.md\n").unwrap();
+        std::fs::write(root.join("README.md"), "r\n").unwrap();
+        commit_all(&root, "head");
+        std::fs::write(root.join("README.md"), "r\ns\n").unwrap();
+        std::fs::write(root.join("NOTICES.md"), "n\n").unwrap();
+        // Unstaged, an ignored file is outside the universe (git status hides
+        // it), so the seed leaves it out rather than failing on it.
+        assert_eq!(
+            seed(&root, &["README.md", "NOTICES.md"]),
+            Ok(vec!["M\tREADME.md".to_string()])
+        );
+        // Force-staged in the real index (Andrew's `git add -f`), it is in the
+        // universe, and the scratch index, which starts from HEAD, must still
+        // take it.
+        assert!(git(&root, None, &["add", "-f", "NOTICES.md"])
+            .status
+            .success());
+        assert_eq!(
+            seed(&root, &["README.md", "NOTICES.md"]),
+            Ok(vec![
+                "A\tNOTICES.md".to_string(),
+                "M\tREADME.md".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn a_deleted_tracked_file_stages_as_a_removal() {
+        let root = scratch_repo("i437-deleted");
+        std::fs::write(root.join("gone.js"), "x\n").unwrap();
+        std::fs::write(root.join("kept.js"), "k\n").unwrap();
+        commit_all(&root, "head");
+        std::fs::remove_file(root.join("gone.js")).unwrap();
+        assert_eq!(
+            seed(&root, &["gone.js", "kept.js"]),
+            Ok(vec!["D\tgone.js".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_declared_directory_keeps_its_ignored_content_out() {
+        let root = scratch_repo("i437-dir");
+        std::fs::create_dir_all(root.join("app/node_modules/dep")).unwrap();
+        std::fs::write(root.join(".gitignore"), "node_modules/\n").unwrap();
+        std::fs::write(root.join("app/main.js"), "m\n").unwrap();
+        commit_all(&root, "head");
+        std::fs::write(root.join("app/node_modules/dep/index.js"), "d\n").unwrap();
+        std::fs::write(root.join("app/new.js"), "n\n").unwrap();
+        assert_eq!(seed(&root, &["app"]), Ok(vec!["A\tapp/new.js".to_string()]));
+    }
+}
+
+#[cfg(test)]
+mod membership_port_support {
+    use super::{membership_line_credit, membership_step_chain, MembershipLineCredit};
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    pub(super) fn scratch_repo(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "bram-port-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main", "."],
+            vec!["config", "user.email", "t@t"],
+            vec!["config", "user.name", "t"],
+        ] {
+            assert!(Command::new("git")
+                .current_dir(&root)
+                .args(&args)
+                .status()
+                .unwrap()
+                .success());
         }
-        if replay != m.owners {
-            let join = |s: &std::collections::BTreeSet<String>| -> String {
-                if s.is_empty() {
-                    "-".to_string()
-                } else {
-                    s.iter().cloned().collect::<Vec<_>>().join(",")
-                }
-            };
-            let line = if fresh {
-                format!(
-                    "op=membership-diverges path={} replay={} membership={}",
-                    path,
-                    join(&replay),
-                    join(&m.owners)
-                )
+        root
+    }
+
+    pub(super) fn git(root: &Path, idx: Option<&Path>, args: &[&str]) -> std::process::Output {
+        let mut cmd = Command::new("git");
+        cmd.current_dir(root).args(args);
+        if let Some(i) = idx {
+            cmd.env("GIT_INDEX_FILE", i);
+        }
+        cmd.output().unwrap()
+    }
+
+    pub(super) fn commit_all(root: &Path, msg: &str) {
+        assert!(git(root, None, &["add", "-A"]).status.success());
+        assert!(git(root, None, &["commit", "-q", "-m", msg])
+            .status
+            .success());
+    }
+
+    // A boundary tree, captured the way the claim store does: HEAD plus
+    // `add -A` in a scratch index OUTSIDE the repo, written as a tree.
+    pub(super) fn snap(root: &Path) -> String {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let idx = std::env::temp_dir().join(format!(
+            "bram-port-idx-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&idx);
+        assert!(git(root, Some(&idx), &["read-tree", "HEAD"])
+            .status
+            .success());
+        assert!(git(root, Some(&idx), &["add", "-A"]).status.success());
+        let out = git(root, Some(&idx), &["write-tree"]);
+        assert!(out.status.success(), "write-tree failed: {:?}", out);
+        let _ = std::fs::remove_file(&idx);
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    // (added, removed) between two revs/trees for one path.
+    pub(super) fn numstat_between(root: &Path, a: &str, b: &str, path: &str) -> (usize, usize) {
+        let out = git(root, None, &["diff", "--numstat", a, b, "--", path]);
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let mut it = text.split_whitespace();
+        (
+            it.next().and_then(|s| s.parse().ok()).unwrap_or(0),
+            it.next().and_then(|s| s.parse().ok()).unwrap_or(0),
+        )
+    }
+
+    // The universe: `git diff --numstat HEAD <now>` for one path.
+    pub(super) fn numstat(root: &Path, now: &str, path: &str) -> (usize, usize) {
+        numstat_between(root, "HEAD", now, path)
+    }
+
+    // Runs the line rule over a claim-store chain. `records` is oldest-first
+    // `(ids, boundary tree)`: `ids` is a comma-joined id list (a same-click
+    // joint claim), and "" is a `cleared` record. Returns the per-path credit
+    // and the holders of each step, as `membership_step_chain` resolves them.
+    pub(super) fn chain_credit(
+        root: &Path,
+        records: &[(&str, &str)],
+        now: &str,
+        paths: &[&str],
+    ) -> (BTreeMap<String, MembershipLineCredit>, Vec<Vec<String>>) {
+        let recs: Vec<serde_json::Value> = records
+            .iter()
+            .enumerate()
+            .map(|(i, (ids, tree))| {
+                let ids: Vec<&str> = ids.split(',').filter(|s| !s.is_empty()).collect();
+                serde_json::json!({
+                    "atMs": i + 1,
+                    "ids": ids,
+                    "kind": if ids.is_empty() { "cleared" } else { "approved" },
+                    "ref": format!("r{}", i + 1),
+                    "tree": tree,
+                })
+            })
+            .collect();
+        let json = serde_json::json!({ "intervals": recs }).to_string();
+        let (steps, holders) = membership_step_chain(&json, now);
+        assert!(!steps.is_empty(), "the chain has steps");
+        let paths: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
+        let spawns = std::cell::Cell::new(0usize);
+        let map = membership_line_credit(root, &steps, &paths, &spawns).expect("git succeeds");
+        assert!(spawns.get() > 0, "the line rule's git spawns are counted");
+        (map, holders)
+    }
+
+    // What the engine's bucket routing does with one path's credit, minus the
+    // declared-file filter: a step's lines go to its holders, one holder is
+    // `single`, several are `joint`, and a step nobody held credits no one
+    // (its lines are unowned by subtraction).
+    pub(super) struct Routed {
+        pub single: (usize, usize),
+        pub joint: (usize, usize),
+        pub per_item: BTreeMap<Vec<String>, (usize, usize)>,
+        pub step_members: BTreeMap<usize, Vec<String>>,
+    }
+
+    pub(super) fn route(credit: &MembershipLineCredit, holders: &[Vec<String>]) -> Routed {
+        let mut r = Routed {
+            single: (0, 0),
+            joint: (0, 0),
+            per_item: BTreeMap::new(),
+            step_members: BTreeMap::new(),
+        };
+        for (step, &(added, removed)) in &credit.by_step {
+            if added == 0 && removed == 0 {
+                continue;
+            }
+            let mut members: Vec<String> = holders.get(*step).cloned().unwrap_or_default();
+            members.sort();
+            members.dedup();
+            if members.is_empty() {
+                continue;
+            }
+            let bucket = if members.len() > 1 {
+                &mut r.joint
             } else {
-                format!(
-                    "op=membership-diverges path={} replay={} membership={} stale=true",
-                    path,
-                    join(&replay),
-                    join(&m.owners)
-                )
+                &mut r.single
             };
-            append_bram_trace_line(app, "claim-interval", &line);
+            bucket.0 += added;
+            bucket.1 += removed;
+            let e = r.per_item.entry(members.clone()).or_insert((0, 0));
+            e.0 += added;
+            e.1 += removed;
+            r.step_members.insert(*step, members);
         }
+        r
+    }
+
+    // Everything the buckets attribute, summed.
+    pub(super) fn attributed(r: &Routed) -> (usize, usize) {
+        (r.single.0 + r.joint.0, r.single.1 + r.joint.1)
     }
 }
 
 #[cfg(test)]
 mod membership_engine_tests {
-    use super::{
-        membership_block_occurrences, membership_conservation_breach, membership_hunk_new_blocks,
-        membership_patch_footprint, membership_unowned,
+    use super::membership_port_support::{
+        attributed, chain_credit, commit_all, numstat, numstat_between, route, scratch_repo, snap,
     };
+    use super::{membership_conservation_breach, membership_line_credit, membership_unowned};
 
     #[test]
     fn concatenated_reedit_patch_counts_net_once() {
-        // #367's deliberate violation: create-then-re-edit evidence across
-        // two intervals sums to 10 added lines while the file holds 5; the
-        // net form counts each surviving line once. Real git, temp repo.
-        use std::process::Command;
-        let root = std::env::temp_dir().join(format!(
-            "bram-net-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let git = |args: &[&str], idx: Option<&std::path::Path>| -> std::process::Output {
-            let mut cmd = Command::new("git");
-            cmd.current_dir(&root).args(args);
-            if let Some(idx) = idx {
-                cmd.env("GIT_INDEX_FILE", idx);
-            }
-            cmd.output().unwrap()
-        };
-        assert!(git(&["init", "-q"], None).status.success());
+        // #367's deliberate violation, restated for the line rule: an item
+        // creates a file in one window and re-edits every line in a second
+        // window of its own. Summing each window's diff gives 10 added lines
+        // while the file holds 5; the line rule credits each surviving line
+        // once, to the window that last wrote it. Real git, temp repo.
+        let root = scratch_repo("net");
+        std::fs::write(root.join("seed.txt"), "seed\n").unwrap();
+        commit_all(&root, "head");
+        let b0 = snap(&root);
         let first: String = (1..=5).map(|n| format!("line {n}: first\n")).collect();
         let second: String = (1..=5).map(|n| format!("line {n}: second\n")).collect();
-        let idx1 = root.join("idx1");
-        let idx2 = root.join("idx2");
         std::fs::write(root.join("f.txt"), &first).unwrap();
-        assert!(git(&["add", "f.txt"], Some(&idx1)).status.success());
-        let t1 = String::from_utf8_lossy(&git(&["write-tree"], Some(&idx1)).stdout)
-            .trim()
-            .to_string();
+        let b1 = snap(&root);
         std::fs::write(root.join("f.txt"), &second).unwrap();
-        assert!(git(&["add", "f.txt"], Some(&idx2)).status.success());
-        let t2 = String::from_utf8_lossy(&git(&["write-tree"], Some(&idx2)).stdout)
-            .trim()
-            .to_string();
-        const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
-        let d1 =
-            String::from_utf8_lossy(&git(&["diff", EMPTY_TREE, &t1], None).stdout).into_owned();
-        let d2 = String::from_utf8_lossy(&git(&["diff", &t1, &t2], None).stdout).into_owned();
-        let concat = format!("{d1}{d2}");
+        let now = snap(&root);
+
         assert_eq!(
-            super::membership_patch_footprint(&concat).added_lines.len(),
+            numstat_between(&root, &b0, &b1, "f.txt").0
+                + numstat_between(&root, &b1, &now, "f.txt").0,
             10,
-            "the raw concatenated evidence double-counts re-edited lines"
+            "the raw per-window evidence double-counts re-edited lines"
         );
-        let spawns = std::cell::Cell::new(0usize);
-        let sections = vec![d1.clone(), d2.clone()];
-        let net = super::membership_net_patch(&root, &idx2, &t2, &sections, "f.txt", &spawns)
-            .expect("net normalization should succeed");
-        assert_eq!(super::membership_patch_footprint(&net).added_lines.len(), 5);
-        assert!(spawns.get() > 0, "net normalization spawns are counted");
+        let universe = numstat(&root, &now, "f.txt");
+        assert_eq!(universe, (5, 0));
+
+        let (map, holders) = chain_credit(&root, &[("a", &b0), ("a", &b1)], &now, &["f.txt"]);
+        let credit = &map["f.txt"];
+        assert_eq!(
+            credit.by_step.get(&1),
+            None,
+            "window 1's lines were all overwritten"
+        );
+        assert_eq!(credit.by_step.get(&2), Some(&(5, 0)));
+        assert_eq!(credit.unexplained, (0, 0));
+        let routed = route(credit, &holders);
+        assert_eq!(routed.single, (5, 0), "the item is credited each line once");
+        let (unowned, clamped) = membership_unowned(universe, attributed(&routed));
+        assert!(!clamped);
+        assert_eq!(unowned, (0, 0));
+        assert_eq!(
+            membership_conservation_breach(universe, routed.single, (0, 0), (0, 0), unowned),
+            None
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn footprint_maps_plus_lines_to_new_side_numbers() {
-        let patch =
-            "@@ -1,3 +1,4 @@\n a\n+new-two\n b\n c\n@@ -10,2 +11,3 @@\n j\n+new-twelve\n k\n";
-        let fp = membership_patch_footprint(patch);
-        assert_eq!(fp.added_lines, vec![2, 12]);
-        assert_eq!(fp.removed, 0);
-    }
+    fn credit_maps_added_lines_to_present_positions_per_file() {
+        // The line rule's analogue of the old footprint parser's contract:
+        // added lines are placed at their PRESENT 1-based positions, removals
+        // are numbered by their HEAD line, and each file is tracked on its own
+        // (a second file's lines never shift or inherit the first's).
+        let root = scratch_repo("perfile");
+        std::fs::write(root.join("x.txt"), "a\nold\nb\n").unwrap();
+        std::fs::write(root.join("y.txt"), "p\nq\nr\ns\nt\n").unwrap();
+        commit_all(&root, "head");
+        let b0 = snap(&root);
+        std::fs::write(root.join("x.txt"), "a\nnew\nb\n").unwrap();
+        std::fs::write(root.join("y.txt"), "p\nq\nadded\nr\ns\nt\n").unwrap();
+        let now = snap(&root);
 
-    #[test]
-    fn footprint_counts_removed_and_resets_per_file() {
-        let patch = "diff --git a/x b/x\nindex 111..222 100644\n--- a/x\n+++ b/x\n\
-                     @@ -1,2 +1,2 @@\n a\n-old\n+new\n\
-                     diff --git a/y b/y\n--- a/y\n+++ b/y\n@@ -5,1 +5,2 @@\n ctx\n+added\n";
-        let fp = membership_patch_footprint(patch);
-        assert_eq!(fp.added_lines, vec![2, 6]);
-        assert_eq!(fp.removed, 1);
-    }
-
-    #[test]
-    fn hunk_new_blocks_capture_context_and_added_lines() {
-        let patch = "@@ -1,3 +1,4 @@\n a\n+x\n b\n@@ -9,2 +10,2 @@\n c\n c\n";
-        let blocks = membership_hunk_new_blocks(patch);
-        // The second hunk carries no change and anchors nothing.
-        assert_eq!(blocks, vec![vec!["a", "x", "b"]]);
-    }
-
-    #[test]
-    fn duplicate_block_placements_are_counted() {
-        let content = "a\nx\nb\nq\na\nx\nb\n";
-        let block = vec!["a".to_string(), "x".to_string(), "b".to_string()];
-        assert_eq!(membership_block_occurrences(content, &block), 2);
-        let unique = vec!["q".to_string()];
-        assert_eq!(membership_block_occurrences(content, &unique), 1);
+        let steps = vec![(b0, 0usize), (now, 1usize)];
+        let spawns = std::cell::Cell::new(0usize);
+        let map = membership_line_credit(
+            &root,
+            &steps,
+            &["x.txt".to_string(), "y.txt".to_string()],
+            &spawns,
+        )
+        .expect("git succeeds");
+        let x = &map["x.txt"];
+        assert_eq!(x.added_lines, vec![(2, 1)]);
+        assert_eq!(x.removed_lines, vec![(2, 1)]);
+        assert_eq!(x.by_step.get(&1), Some(&(1, 1)));
+        let y = &map["y.txt"];
+        assert_eq!(y.added_lines, vec![(3, 1)]);
+        assert!(y.removed_lines.is_empty());
+        assert_eq!(y.by_step.get(&1), Some(&(1, 0)));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -51176,6 +51911,7 @@ mod membership_wire_contract_tests {
                 .iter()
                 .map(|(m, c)| (m.iter().map(|s| s.to_string()).collect::<Vec<_>>(), *c))
                 .collect(),
+            ..Default::default()
         }
     }
 
@@ -51308,6 +52044,32 @@ mod membership_wire_contract_tests {
 
     // An empty partition still produces a well-formed envelope rather than
     // null-shaped surprises for the consumer that step 3 will add.
+    // issue-425-retire-replay: runs cross the wire in the replay's shape, so
+    // the pane's run readers can switch source unchanged.
+    #[test]
+    fn runs_serialize_in_the_replays_shape() {
+        let mut b = buckets((3, 0), (2, 0), (0, 0), (5, 0), &["a", "b"], &[]);
+        b.runs = vec![
+            (1, 3, vec!["a".to_string()]),
+            (7, 8, vec!["a".to_string(), "b".to_string()]),
+        ];
+        b.removed_runs = vec![(4, 4, vec!["b".to_string()])];
+        let v = one("f.txt", b);
+        assert_eq!(
+            v["byPath"]["f.txt"]["removedRuns"],
+            serde_json::json!([{"startLine": 4, "endLine": 4, "itemId": "b"}])
+        );
+        assert_eq!(
+            v["byPath"]["f.txt"]["runs"],
+            serde_json::json!([
+                {"startLine": 1, "endLine": 3, "itemId": "a"},
+                {"startLine": 7, "endLine": 8, "itemIds": ["a", "b"]}
+            ])
+        );
+        let empty = one("g.txt", buckets((0, 0), (0, 0), (0, 0), (1, 0), &[], &[]));
+        assert_eq!(empty["byPath"]["g.txt"]["runs"], serde_json::json!([]));
+    }
+
     #[test]
     fn an_empty_partition_serves_an_empty_envelope() {
         let v = membership_payload_json(&std::collections::BTreeMap::new());
@@ -51319,8 +52081,8 @@ mod membership_wire_contract_tests {
 #[cfg(test)]
 mod membership_line_credit_tests {
     use super::{
-        membership_line_credit, membership_step_chain, parse_line_diff, LineDiffFile, LineHistory,
-        LineOrigin, MembershipLineCredit,
+        membership_line_credit, membership_runs, membership_step_chain, parse_line_diff,
+        LineDiffFile, LineHistory, LineOrigin, MembershipLineCredit,
     };
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
@@ -51704,10 +52466,10 @@ diff --git a/bin.dat b/bin.dat\nindex {b2}..{b3} 100644\nBinary files a/bin.dat 
 
         // Deletion after a prior rewrite: HEAD [old], step A old->middle,
         // step B middle->new. The removal of `old` is tallied to step A and
-        // the added `new` to step B. This deliberately differs from
-        // `matrix_2_deletion_after_prior_rewrite_lands_unowned`, which tests
-        // the superseded helpers where that removal falls to unowned: the
-        // history knows who removed the HEAD line.
+        // the added `new` to step B: the history knows who removed the HEAD
+        // line. Same shape as
+        // `matrix_2_deletion_after_prior_rewrite_goes_to_the_step_that_removed_it`,
+        // which asserts it through the claim-store chain.
         let root = scratch_repo("g3");
         std::fs::write(root.join("f.txt"), "keep\nold\ntail\n").unwrap();
         commit_all(&root, "head");
@@ -51810,187 +52572,162 @@ diff --git a/bin.dat b/bin.dat\nindex {b2}..{b3} 100644\nBinary files a/bin.dat 
         );
         assert!(membership_step_chain("{}", "now").0.is_empty());
     }
+
+    // issue-425-retire-replay: `added_lines` places each step's lines at
+    // their PRESENT positions (an insertion shifts what follows), and
+    // `membership_runs` turns them into the runs the pane reads. Step 1 is
+    // item `a`; step 2 is unclaimed, so its line is unowned and has no run.
+    #[test]
+    fn added_lines_become_present_file_runs() {
+        let root = scratch_repo("k");
+        std::fs::write(root.join("f.txt"), lines("line-", 10)).unwrap();
+        commit_all(&root, "head");
+        let b0 = snap(&root, "k0");
+        let mut v: Vec<String> = lines("line-", 10).lines().map(String::from).collect();
+        v[3] = "a4".into();
+        v.insert(8, "a-ins-1".into());
+        v.insert(9, "a-ins-2".into());
+        std::fs::write(root.join("f.txt"), v.join("\n") + "\n").unwrap();
+        let b1 = snap(&root, "k1");
+        v[1] = "chat2".into();
+        std::fs::write(root.join("f.txt"), v.join("\n") + "\n").unwrap();
+        let now = snap(&root, "k2");
+        let (credit, _) = credit_of(&root, &[b0, b1], &now, "f.txt");
+        assert_eq!(credit.added_lines, vec![(2, 2), (4, 1), (9, 1), (10, 1)]);
+        // Removals are numbered by HEAD line: `a` replaced HEAD line 4, the
+        // unclaimed step replaced HEAD line 2.
+        assert_eq!(credit.removed_lines, vec![(2, 2), (4, 1)]);
+        let step_members: BTreeMap<usize, Vec<String>> =
+            [(1usize, vec!["a".to_string()])].into_iter().collect();
+        assert_eq!(
+            membership_runs(&credit.added_lines, &step_members),
+            vec![
+                (4, 4, vec!["a".to_string()]),
+                (9, 10, vec!["a".to_string()])
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Adjacent lines join one run only when their member sets match; a gap,
+    // a different owner, or a joint set each start a new run.
+    #[test]
+    fn runs_break_on_gaps_and_owner_changes() {
+        let a = vec!["a".to_string()];
+        let b = vec!["b".to_string()];
+        let ab = vec!["a".to_string(), "b".to_string()];
+        let step_members: BTreeMap<usize, Vec<String>> = [
+            (1, a.clone()),
+            (2, b.clone()),
+            (3, ab.clone()),
+            (4, a.clone()),
+        ]
+        .into_iter()
+        .collect();
+        // Line 3 is step 9 (no members): unowned, so it splits a's lines.
+        let added = vec![(1, 1), (2, 4), (3, 9), (4, 1), (5, 2), (6, 3), (7, 3)];
+        assert_eq!(
+            membership_runs(&added, &step_members),
+            vec![(1, 2, a.clone()), (4, 4, a), (5, 5, b), (6, 7, ab),]
+        );
+    }
 }
 
 #[cfg(test)]
 mod membership_acceptance_fixture_tests {
-    use super::{
-        item_joint_with, joint_owners_from_runs, membership_blob_matches_head,
-        membership_candidate_base, membership_conservation_breach, membership_net_patch,
-        membership_patch_footprint, membership_unowned, resolve_interval_path_owner,
-        untracked_declared_paths, IntervalPathOwner,
+    use super::membership_port_support::{
+        attributed, chain_credit, commit_all, git, numstat, route, scratch_repo, snap,
     };
-    use std::path::{Path, PathBuf};
-    use std::process::Command;
+    use super::{
+        item_joint_with, membership_conservation_breach, membership_joint_owners, membership_runs,
+        membership_unowned, resolve_interval_path_owner, untracked_declared_paths,
+        IntervalPathOwner,
+    };
 
-    // Same real-git scaffolding the deletion matrix uses. Duplicated rather
-    // than shared because the two modules are peers and neither owns the
-    // other's fixtures; if a third module needs them, hoist then.
-    fn scratch_repo(tag: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "bram-acceptance-{}-{}-{}",
-            tag,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        for args in [
-            vec!["init", "-q", "-b", "main", "."],
-            vec!["config", "user.email", "t@t"],
-            vec!["config", "user.name", "t"],
-        ] {
-            assert!(Command::new("git")
-                .current_dir(&root)
-                .args(&args)
-                .status()
-                .unwrap()
-                .success());
-        }
-        root
-    }
-
-    fn git(root: &Path, idx: Option<&Path>, args: &[&str]) -> std::process::Output {
-        let mut cmd = Command::new("git");
-        cmd.current_dir(root).args(args);
-        if let Some(i) = idx {
-            cmd.env("GIT_INDEX_FILE", i);
-        }
-        cmd.output().unwrap()
-    }
-
-    fn commit_all(root: &Path, msg: &str) {
-        assert!(git(root, None, &["add", "-A"]).status.success());
-        assert!(git(root, None, &["commit", "-q", "-m", msg])
-            .status
-            .success());
-    }
-
-    fn rev_parse(root: &Path, rev: &str) -> String {
-        String::from_utf8_lossy(&git(root, None, &["rev-parse", rev]).stdout)
-            .trim()
-            .to_string()
-    }
-
-    fn scratch_index(tag: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!(
-            "bram-acceptance-idx-{}-{}",
-            tag,
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&p);
-        p
-    }
-
-    fn seed_now_index(root: &Path, idx: &Path) {
-        assert!(git(root, Some(idx), &["read-tree", "HEAD"])
-            .status
-            .success());
-        assert!(git(root, Some(idx), &["add", "-A"]).status.success());
-    }
-
-    fn write_tree(root: &Path, idx: &Path) -> String {
-        String::from_utf8_lossy(&git(root, Some(idx), &["write-tree"]).stdout)
-            .trim()
-            .to_string()
-    }
-
-    fn diff(root: &Path, a: &str, b: &str, path: &str) -> String {
-        String::from_utf8_lossy(&git(root, None, &["diff", a, b, "--", path]).stdout).into_owned()
-    }
+    // The criteria below are driven through the line rule: a claim-store chain
+    // of boundary trees (`chain_credit`), the credit each step earns, and the
+    // buckets that credit routes to (`route`). Each fixture builds real git
+    // state, so a regression in the rule shows up as a wrong count, not a
+    // wrong mock.
 
     #[test]
     fn criterion_2_declaring_a_path_earns_no_membership_without_evidence() {
-        // #327's `dummy-a` shape, built for real: an item DECLARES a path and
-        // writes nothing, while a neighbour does all the work on it.
+        // #327's `dummy-a` shape, built for real: an item holds a window and
+        // writes nothing, while a neighbour does all the work on the path.
         //
         // The criterion (attribution-model.md §6) is that dummy-a reads 0/0.
-        // This fixture proves the ENGINE half of it, and passing today is the
-        // honest result rather than a weak one: membership already refuses to
-        // credit a declarer with no evidence. What is unmet is the CONSUMER
-        // half -- the strip, tooltip and willCommit still source from the
-        // declared-path proxy, which is what #273 reported. That half cannot
-        // be reached from Rust; it flips with migration step 3 and is guarded
-        // by rendered verification there.
+        // This fixture proves the ENGINE half of it, and passing is the
+        // honest result rather than a weak one: the line rule credits a line
+        // only to the step that wrote it, so a holder with no writes earns no
+        // credit at all. What is unmet at the engine level is nothing; the
+        // CONSUMER half -- the strip, tooltip and willCommit sourcing from the
+        // declared-path proxy -- is what #273 reported, and cannot be reached
+        // from Rust. It is guarded by rendered verification.
         //
         // So this test's job is to stop the engine from ever regressing INTO
-        // the behaviour the pane still has. It fails the moment a declarer
-        // without evidence is credited.
+        // the behaviour the pane once had. It fails the moment a holder
+        // without writes is credited.
         let root = scratch_repo("c2");
         let body_57: String = (0..57).map(|n| format!("old-{n}\n")).collect();
         std::fs::write(root.join("shared.txt"), &body_57).unwrap();
         std::fs::write(root.join("untouched.txt"), "stable\n").unwrap();
         commit_all(&root, "head: 57 lines");
-        let head = rev_parse(&root, "HEAD");
+        let b0 = snap(&root);
 
-        // The neighbour rewrites shared.txt: -57 +104. dummy-a writes nothing,
-        // anywhere, while declaring BOTH files.
+        // dummy-a's window opens and closes with nothing written anywhere;
+        // the neighbour's window then rewrites shared.txt: -57 +104.
         let body_104: String = (0..104).map(|n| format!("new-{n}\n")).collect();
         std::fs::write(root.join("shared.txt"), &body_104).unwrap();
+        let now = snap(&root);
 
-        let idx_now = scratch_index("c2-now");
-        seed_now_index(&root, &idx_now);
-        let now_tree = write_tree(&root, &idx_now);
-
-        let universe_fp = membership_patch_footprint(&diff(&root, &head, &now_tree, "shared.txt"));
-        let universe = (universe_fp.added_lines.len(), universe_fp.removed);
+        let universe = numstat(&root, &now, "shared.txt");
         assert_eq!(universe, (104, 57), "sanity: the #327 shape, +104 -57");
 
-        let spawns = std::cell::Cell::new(0usize);
-        let mut per_item: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
-
-        // The neighbour's evidence is its interval diff. Run the real probe.
-        let neighbour_patch = diff(&root, &head, &now_tree, "shared.txt");
-        let base = membership_candidate_base(
+        let (map, holders) = chain_credit(
             &root,
-            &idx_now,
-            std::slice::from_ref(&neighbour_patch),
-            &spawns,
-        )
-        .expect("the neighbour's evidence must reverse-apply from present content");
-        let head_relative = membership_blob_matches_head(&root, &base, "shared.txt", &spawns);
-        assert!(
-            head_relative,
-            "sole contributor: its base is HEAD, so both axes are HEAD-relative"
+            &[("dummy-a", &b0), ("neighbour", &b0)],
+            &now,
+            &["shared.txt", "untouched.txt"],
         );
-        let fp = membership_patch_footprint(&neighbour_patch);
-        per_item.insert(
-            "neighbour".to_string(),
-            (
-                fp.added_lines.len(),
-                if head_relative { fp.removed } else { 0 },
-            ),
-        );
-
-        // dummy-a: declares shared.txt AND untouched.txt, holds no interval, so
-        // it contributes no candidate patch and the probe loop never runs for
-        // it. Declaration alone reaches the engine nowhere.
-        let dummy_a_declared = ["shared.txt", "untouched.txt"];
-        assert_eq!(dummy_a_declared.len(), 2, "declares two files");
-
         assert_eq!(
-            per_item.get("dummy-a"),
+            holders[1],
+            vec!["dummy-a".to_string()],
+            "dummy-a really held a window"
+        );
+        assert_eq!(holders[2], vec!["neighbour".to_string()]);
+        let shared = &map["shared.txt"];
+        assert_eq!(
+            shared.by_step.get(&1),
             None,
-            "THE CRITERION: an item that declared the path and wrote nothing \
+            "dummy-a's window wrote nothing"
+        );
+        assert!(map["untouched.txt"].by_step.is_empty());
+
+        let mut per_item: std::collections::BTreeMap<Vec<String>, (usize, usize)> =
+            Default::default();
+        for credit in map.values() {
+            per_item.extend(route(credit, &holders).per_item);
+        }
+        assert_eq!(
+            per_item.get(&vec!["dummy-a".to_string()]),
+            None,
+            "THE CRITERION: an item that held a window and wrote nothing \
              carries no membership entry -- not a zeroed one, none at all"
         );
         assert_eq!(
-            per_item.get("neighbour"),
+            per_item.get(&vec!["neighbour".to_string()]),
             Some(&(104usize, 57usize)),
             "and the work is credited to whoever actually did it"
         );
 
         // Conservation still holds: everything in the universe is accounted
         // for by the neighbour, nothing is unowned, nothing is invented.
-        let attributed = *per_item.get("neighbour").unwrap();
-        let (unowned, clamped) = membership_unowned(universe, attributed);
+        let routed = route(shared, &holders);
+        let (unowned, clamped) = membership_unowned(universe, attributed(&routed));
         assert!(!clamped, "no over-attribution");
         assert_eq!(unowned, (0, 0), "nothing orphaned");
         assert_eq!(
-            membership_conservation_breach(universe, attributed, (0, 0), (0, 0), unowned),
+            membership_conservation_breach(universe, routed.single, (0, 0), (0, 0), unowned),
             None,
             "the partition sums to the universe"
         );
@@ -52000,29 +52737,52 @@ mod membership_acceptance_fixture_tests {
 
     #[test]
     fn criterion_3_orphan_lines_are_explicit_unowned_residue() {
-        // bcb2a7e shape: a neighbour's claim-era work exists, but the
-        // requested item has no owned contribution.  The membership model
-        // must expose the orphan lines instead of letting whole-file staging
-        // absorb them silently.
+        // bcb2a7e shape: a neighbour's claim-era work exists, but lines
+        // landed in the shared file after its claim was cleared, so no
+        // requested item owns them. The membership model must expose the
+        // orphan lines instead of letting whole-file staging absorb them
+        // silently.
         let root = scratch_repo("c3");
         std::fs::write(root.join("shared.txt"), "base\n").unwrap();
         commit_all(&root, "head: base");
-        let head = rev_parse(&root, "HEAD");
+        let b0 = snap(&root);
+        // The neighbour's claim window writes its own file.
+        std::fs::write(root.join("neighbour.txt"), "n1\n").unwrap();
+        let b1 = snap(&root);
+        // The claim is cleared; then orphan lines land in shared.txt.
         std::fs::write(root.join("shared.txt"), "base\norphan-1\norphan-2\n").unwrap();
-        let idx_now = scratch_index("c3-now");
-        seed_now_index(&root, &idx_now);
-        let now = write_tree(&root, &idx_now);
-        let universe_fp = membership_patch_footprint(&diff(&root, &head, &now, "shared.txt"));
-        let universe = (universe_fp.added_lines.len(), universe_fp.removed);
+        let now = snap(&root);
+
+        let universe = numstat(&root, &now, "shared.txt");
         assert_eq!(universe, (2, 0));
-        let attributed = (0usize, 0usize);
-        let (unowned, clamped) = membership_unowned(universe, attributed);
+        let (map, holders) = chain_credit(
+            &root,
+            &[("neighbour", &b0), ("", &b1)],
+            &now,
+            &["shared.txt", "neighbour.txt"],
+        );
+        assert_eq!(
+            map["neighbour.txt"].by_step.get(&1),
+            Some(&(1, 0)),
+            "the neighbour's claim-era work is real and credited"
+        );
+        let shared = &map["shared.txt"];
+        // The line rule SEES the lines (step 2 wrote them) ...
+        assert_eq!(shared.by_step.get(&2), Some(&(2, 0)));
+        assert_eq!(shared.unexplained, (0, 0));
+        // ... but nobody held step 2, so no one owns them and they have no run.
+        let routed = route(shared, &holders);
+        assert!(routed.per_item.is_empty());
+        assert!(membership_runs(&shared.added_lines, &routed.step_members).is_empty());
+        let owned = attributed(&routed);
+        assert_eq!(owned, (0, 0));
+        let (unowned, clamped) = membership_unowned(universe, owned);
         assert_eq!(unowned, (2, 0));
         assert!(!clamped);
         // A balanced partition is still diagnostically healthy; the gate's
         // refusal/disclosure is the later consumer criterion.
         assert_eq!(
-            membership_conservation_breach(universe, attributed, (0, 0), (0, 0), unowned),
+            membership_conservation_breach(universe, owned, (0, 0), (0, 0), unowned),
             None
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -52040,32 +52800,46 @@ mod membership_acceptance_fixture_tests {
         )
         .unwrap();
         commit_all(&root, "head: large file");
-        let head = rev_parse(&root, "HEAD");
-        let idx_unchanged = scratch_index("c4-unchanged");
-        seed_now_index(&root, &idx_unchanged);
-        let unchanged_tree = write_tree(&root, &idx_unchanged);
-        let large_unchanged =
-            membership_patch_footprint(&diff(&root, &head, &unchanged_tree, "large.txt"));
+
+        // Shape 1, unchanged: the boundary and the present state are HEAD.
+        let unchanged_tree = snap(&root);
+        let (map, _) = chain_credit(
+            &root,
+            &[("a", &unchanged_tree)],
+            &unchanged_tree,
+            &["large.txt"],
+        );
+        let large_unchanged = &map["large.txt"];
+        assert_eq!(numstat(&root, &unchanged_tree, "large.txt"), (0, 0));
+        assert!(large_unchanged.by_step.is_empty());
+        assert!(large_unchanged.added_lines.is_empty());
+
+        // Shape 2, after a commit: the work was inside a claim window, then
+        // landed. The boundary predates the commit; the present state is the
+        // new HEAD, so nothing differs from HEAD any more.
         std::fs::write(root.join("large.txt"), "committed\n").unwrap();
+        let pre_commit = snap(&root);
         commit_all(&root, "post-commit");
-        let post_head = rev_parse(&root, "HEAD");
-        let idx_post = scratch_index("c4-post");
-        seed_now_index(&root, &idx_post);
-        let post_tree = write_tree(&root, &idx_post);
-        let post_commit =
-            membership_patch_footprint(&diff(&root, &post_head, &post_tree, "large.txt"));
+        let post_tree = snap(&root);
+        let (map, _) = chain_credit(&root, &[("a", &pre_commit)], &post_tree, &["large.txt"]);
+        let post_commit = &map["large.txt"];
+        assert_eq!(numstat(&root, &post_tree, "large.txt"), (0, 0));
+        assert!(post_commit.by_step.is_empty());
+        assert!(post_commit.added_lines.is_empty());
+
+        // Shape 3, entirely unowned: an item held a window (writing nothing),
+        // its claim was cleared, and then a line lands.
         std::fs::write(root.join("large.txt"), "committed\nunowned\n").unwrap();
-        let idx_unowned = scratch_index("c4-unowned");
-        seed_now_index(&root, &idx_unowned);
-        let unowned_tree = write_tree(&root, &idx_unowned);
-        let unowned_fp =
-            membership_patch_footprint(&diff(&root, &post_head, &unowned_tree, "large.txt"));
-        let unowned_only =
-            membership_unowned((unowned_fp.added_lines.len(), unowned_fp.removed), (0, 0));
-        assert_eq!(large_unchanged.added_lines.len(), 0);
-        assert_eq!(large_unchanged.removed, 0);
-        assert_eq!(post_commit.added_lines.len(), 0);
-        assert_eq!(post_commit.removed, 0);
+        let unowned_tree = snap(&root);
+        let universe = numstat(&root, &unowned_tree, "large.txt");
+        let (map, holders) = chain_credit(
+            &root,
+            &[("a", &post_tree), ("", &post_tree)],
+            &unowned_tree,
+            &["large.txt"],
+        );
+        let routed = route(&map["large.txt"], &holders);
+        let unowned_only = membership_unowned(universe, attributed(&routed));
         assert_eq!(unowned_only, ((1, 0), false));
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -52107,49 +52881,39 @@ mod membership_acceptance_fixture_tests {
 
     #[test]
     fn criterion_5_entangled_staging_fixture_preserves_line_exactness() {
-        // #336's two-item entangled shape: each isolated patch remains the
-        // exact line-level contribution, and residual metadata is retained.
+        // #336's two-item entangled shape: item a appends two lines, item b
+        // appends one after it, in the same file. Each item's credit is its
+        // exact line-level contribution -- positions included -- and the
+        // buckets conserve against the HEAD diff.
         let root = scratch_repo("c5");
         std::fs::write(root.join("shared.txt"), "base\n").unwrap();
         commit_all(&root, "head: base");
-        let head = rev_parse(&root, "HEAD");
+        let b0 = snap(&root);
         std::fs::write(root.join("shared.txt"), "base\na1\na2\n").unwrap();
-        let idx_a = scratch_index("c5-a");
-        seed_now_index(&root, &idx_a);
-        let tree_a = write_tree(&root, &idx_a);
-        let d_a = diff(&root, &head, &tree_a, "shared.txt");
+        let tree_a = snap(&root);
         std::fs::write(root.join("shared.txt"), "base\na1\na2\nb1\n").unwrap();
-        let idx_now = scratch_index("c5-now");
-        seed_now_index(&root, &idx_now);
-        let tree_now = write_tree(&root, &idx_now);
-        let d_b = diff(&root, &tree_a, &tree_now, "shared.txt");
-        let spawns = std::cell::Cell::new(0usize);
-        let isolated_a = membership_patch_footprint(&d_a);
-        let isolated_b = membership_patch_footprint(
-            &membership_net_patch(
-                &root,
-                &idx_now,
-                &tree_now,
-                std::slice::from_ref(&d_b),
-                "shared.txt",
-                &spawns,
-            )
-            .unwrap(),
-        );
-        assert_eq!(isolated_a.added_lines.len(), 2);
-        assert_eq!(isolated_b.added_lines.len(), 1);
-        assert_eq!(isolated_b.removed, 0);
+        let now = snap(&root);
+        let universe = numstat(&root, &now, "shared.txt");
+        assert_eq!(universe, (3, 0));
+
+        let (map, holders) =
+            chain_credit(&root, &[("a", &b0), ("b", &tree_a)], &now, &["shared.txt"]);
+        let credit = &map["shared.txt"];
+        let routed = route(credit, &holders);
+        assert_eq!(routed.per_item.get(&vec!["a".to_string()]), Some(&(2, 0)));
+        assert_eq!(routed.per_item.get(&vec!["b".to_string()]), Some(&(1, 0)));
+        assert_eq!(routed.per_item.len(), 2, "no other owner appears");
+        assert_eq!(routed.joint, (0, 0), "entangled in one file, not joint");
+        assert_eq!(credit.added_lines, vec![(2, 1), (3, 1), (4, 2)]);
         assert_eq!(
-            membership_conservation_breach(
-                (3, 0),
-                (
-                    isolated_a.added_lines.len() + isolated_b.added_lines.len(),
-                    isolated_b.removed
-                ),
-                (0, 0),
-                (0, 0),
-                (0, 0),
-            ),
+            membership_runs(&credit.added_lines, &routed.step_members),
+            vec![(2, 3, vec!["a".to_string()]), (4, 4, vec!["b".to_string()])]
+        );
+        assert!(credit.removed_lines.is_empty(), "no removals to retain");
+        let (unowned, clamped) = membership_unowned(universe, attributed(&routed));
+        assert!(!clamped);
+        assert_eq!(
+            membership_conservation_breach(universe, routed.single, (0, 0), (0, 0), unowned),
             None
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -52160,12 +52924,13 @@ mod membership_acceptance_fixture_tests {
         // #356 and pre-capture-only work are refusal contracts.  Keep the
         // exact operation names beside the fixture until the integration
         // harness exercises the HTTP gate directly.
-        let mut runs = std::collections::HashMap::new();
-        runs.insert(
-            "shared.txt".to_string(),
-            vec![serde_json::json!({"startLine": 1, "endLine": 2, "itemIds": ["a", "b"]})],
-        );
-        let joint = joint_owners_from_runs(&runs);
+        // issue-425-retire-replay: the joint fact comes from membership.
+        let mut b = super::MembershipPathBuckets::default();
+        b.per_item
+            .insert(vec!["a".to_string(), "b".to_string()], (2, 0));
+        let mut partition = std::collections::BTreeMap::new();
+        partition.insert("shared.txt".to_string(), b);
+        let joint = membership_joint_owners(&partition);
         assert_eq!(joint["shared.txt"].len(), 2);
         assert_eq!(
             item_joint_with("a", &["shared.txt".to_string()], &joint),
@@ -52187,206 +52952,53 @@ mod membership_acceptance_fixture_tests {
 
 // membership-attributes-deletions: the deletion matrix from the item's
 // worklist draft (docs/attribution-model.md §4, "Review response: the
-// deletion matrix"), driven against real git in temp repos -- the same
-// method as `membership_engine_tests::concatenated_reedit_patch_counts_net_once`,
-// generalized to a small shared harness since every case needs the same
-// idx_now / idx_head / HEAD scaffolding. Each test reproduces the probe
-// loop's own gate (`git apply --cached --check --reverse`) before measuring,
-// so a fixture that failed the gate would be caught, not silently measured
-// anyway.
+// deletion matrix"), driven against real git in temp repos and ported to the
+// line rule (issue-425-retire-replay). The whole-patch model needed a
+// discriminator (does the candidate's baseline equal HEAD?) to decide whether
+// a removed line was a HEAD-relative deletion. The line rule has no such
+// question: every removed HEAD line is credited to the step that last removed
+// it (`removed_by`), and a line a step added and a later step deleted never
+// reaches HEAD's diff at all. Each case below keeps the matrix's repo shape
+// and asserts who owns what, and that the partition still conserves.
 #[cfg(test)]
 mod membership_deletion_matrix_tests {
-    use super::{
-        membership_blob_matches_head, membership_candidate_base, membership_diff_tree_path,
-        membership_patch_footprint, membership_unowned, MembershipPathBuckets,
+    use super::membership_port_support::{
+        attributed, chain_credit, commit_all, numstat, numstat_between, route, scratch_repo, snap,
     };
-    use std::path::{Path, PathBuf};
-    use std::process::Command;
+    use super::{membership_unowned, MembershipPathBuckets};
 
-    fn scratch_repo(tag: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "bram-deletion-matrix-{}-{}-{}",
-            tag,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        assert!(git(&root, None, &["init", "-q"]).status.success());
-        assert!(git(&root, None, &["config", "user.email", "t@example.com"])
-            .status
-            .success());
-        assert!(git(&root, None, &["config", "user.name", "Test"])
-            .status
-            .success());
-        root
-    }
-
-    fn git(root: &Path, idx: Option<&Path>, args: &[&str]) -> std::process::Output {
-        let mut cmd = Command::new("git");
-        cmd.current_dir(root).args(args);
-        if let Some(idx) = idx {
-            cmd.env("GIT_INDEX_FILE", idx);
-        }
-        cmd.output().unwrap()
-    }
-
-    fn commit_all(root: &Path, msg: &str) {
-        assert!(git(root, None, &["add", "-A"]).status.success());
-        assert!(git(root, None, &["commit", "-q", "-m", msg])
-            .status
-            .success());
-    }
-
-    fn rev_parse(root: &Path, rev: &str) -> String {
-        let out = git(root, None, &["rev-parse", rev]);
-        assert!(out.status.success());
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    }
-
-    // Every scratch GIT_INDEX_FILE this harness uses lives OUTSIDE the repo
-    // (std::env::temp_dir(), like the production code's idx_head/idx_now),
-    // never under `root` -- an index file written inside the working tree
-    // would itself show up as untracked content the next `add -A` sees,
-    // silently polluting whatever tree that index writes.
-    fn scratch_index(tag: &str) -> PathBuf {
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        std::env::temp_dir().join(format!(
-            "bram-deletion-matrix-idx-{}-{}-{}",
-            tag,
-            std::process::id(),
-            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ))
-    }
-
-    // Present-state scratch index: HEAD plus a full `add -A` -- the same
-    // shape the probe loop's `idx_now` is, generalized so each fixture can
-    // build it after arranging whatever working-tree content it wants.
-    fn seed_now_index(root: &Path, idx: &Path) {
-        assert!(git(root, Some(idx), &["read-tree", "HEAD"])
-            .status
-            .success());
-        assert!(git(root, Some(idx), &["add", "-A"]).status.success());
-    }
-
-    fn write_tree(root: &Path, idx: &Path) -> String {
-        let out = git(root, Some(idx), &["write-tree"]);
-        assert!(out.status.success(), "write-tree failed: {:?}", out);
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    }
-
-    // Writes `content` as a blob directly into a scratch index at `path`,
-    // without touching the working tree -- how these fixtures construct an
-    // intermediate tree (e.g. case 2's "middle") that never existed as a
-    // real commit or a real working-tree state.
-    fn set_index_blob(root: &Path, idx: &Path, path: &str, content: &str) {
-        use std::io::Write;
-        let mut child = Command::new("git")
-            .current_dir(root)
-            .args(["hash-object", "-w", "--stdin"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(content.as_bytes())
-            .unwrap();
-        let out = child.wait_with_output().unwrap();
-        assert!(out.status.success(), "hash-object failed: {:?}", out);
-        let blob = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        let out2 = git(
-            root,
-            Some(idx),
-            &[
-                "update-index",
-                "--add",
-                "--cacheinfo",
-                "100644",
-                &blob,
-                path,
-            ],
-        );
-        assert!(out2.status.success(), "update-index failed: {:?}", out2);
-    }
-
-    fn diff(root: &Path, a: &str, b: &str, path: &str) -> String {
-        let out = git(root, None, &["diff", a, b, "--", path]);
-        assert!(out.status.success(), "diff failed: {:?}", out);
-        String::from_utf8_lossy(&out.stdout).into_owned()
-    }
-
-    // The probe loop's own gate, reproduced here so each fixture drives the
-    // exact check the production code runs: does `patch` reverse-apply
-    // cleanly against `idx`? (`membership_partition_engine`'s local
-    // `probe` closure, same two args, same command.)
-    fn probe(root: &Path, idx: &Path, patch: &str, tag: &str) -> bool {
-        let pfile = std::env::temp_dir().join(format!("bram-deletion-matrix-probe-{}", tag));
-        std::fs::write(&pfile, patch).unwrap();
-        let pfile_s = pfile.to_string_lossy().to_string();
-        let ok = git(
-            root,
-            Some(idx),
-            &["apply", "--cached", "--check", "--reverse", &pfile_s],
-        )
-        .status
-        .success();
-        let _ = std::fs::remove_file(&pfile);
-        ok
-    }
-
-    // Matrix #1 — pure deletion: HEAD [a,b,c], X deletes b. X is the sole
-    // contributor, so its base_tree (present minus X's own work) IS HEAD's
-    // tree for the path; the blob-equality rule therefore lets X's removed
-    // line count. Expected: X owns (0,1); unowned (0,0).
+    // Matrix #1 — pure deletion: HEAD [a,b,c], X deletes b. X is the only
+    // step that touched the file, so the removed HEAD line is X's.
+    // Expected: X owns (0,1); unowned (0,0).
     #[test]
     fn matrix_1_pure_deletion_owns_the_removed_line() {
         let root = scratch_repo("case1");
         std::fs::write(root.join("f.txt"), "a\nb\nc\n").unwrap();
         commit_all(&root, "head: a b c");
-        let head = rev_parse(&root, "HEAD");
+        let b0 = snap(&root);
 
-        // X's interval: HEAD -> present, with b deleted.
+        // X's window: b deleted.
         std::fs::write(root.join("f.txt"), "a\nc\n").unwrap();
-        let idx_now = scratch_index("case1-now");
-        seed_now_index(&root, &idx_now);
-        let now_tree = write_tree(&root, &idx_now);
-        let idx_head = scratch_index("case1-head");
-        assert!(git(&root, Some(&idx_head), &["read-tree", "HEAD"])
-            .status
-            .success());
-
-        let universe_fp = membership_patch_footprint(&diff(&root, &head, &now_tree, "f.txt"));
-        let universe = (universe_fp.added_lines.len(), universe_fp.removed);
+        let now = snap(&root);
+        let universe = numstat(&root, &now, "f.txt");
         assert_eq!(universe, (0, 1), "sanity: HEAD..now is a pure deletion");
 
-        let patch_x = diff(&root, &head, &now_tree, "f.txt");
-        assert!(
-            !probe(&root, &idx_head, &patch_x, "case1"),
-            "not already in HEAD"
+        let (map, holders) = chain_credit(&root, &[("X", &b0)], &now, &["f.txt"]);
+        let credit = &map["f.txt"];
+        assert_eq!(credit.unexplained, (0, 0));
+        assert_eq!(
+            credit.removed_lines,
+            vec![(2, 1)],
+            "HEAD line 2 went at step 1"
         );
-        assert!(
-            probe(&root, &idx_now, &patch_x, "case1"),
-            "X's evidence must account for present content"
+        let routed = route(credit, &holders);
+        assert_eq!(
+            routed.per_item.get(&vec!["X".to_string()]),
+            Some(&(0, 1)),
+            "X owns the pure deletion"
         );
 
-        let spawns = std::cell::Cell::new(0usize);
-        let base =
-            membership_candidate_base(&root, &idx_now, std::slice::from_ref(&patch_x), &spawns)
-                .expect("reverse-apply should produce a base tree");
-        assert!(
-            membership_blob_matches_head(&root, &base, "f.txt", &spawns),
-            "X is the sole contributor: base_tree must equal HEAD for f.txt"
-        );
-        let fp = membership_patch_footprint(&patch_x);
-        let counts = (fp.added_lines.len(), fp.removed);
-        assert_eq!(counts, (0, 1), "X owns the pure deletion");
-
-        let (unowned, clamped) = membership_unowned(universe, counts);
+        let (unowned, clamped) = membership_unowned(universe, attributed(&routed));
         assert!(!clamped);
         assert_eq!(unowned, (0, 0), "nothing left unowned");
 
@@ -52394,171 +53006,92 @@ mod membership_deletion_matrix_tests {
     }
 
     // Matrix #2 — deletion after a prior rewrite: HEAD [old]; A rewrites
-    // old->middle; B rewrites middle->new (still open). A's evidence is
-    // superseded (its patch does not reverse-apply against present
-    // content) and contributes nothing. B's evidence DOES account for
-    // present content, but B's own baseline (middle) is not HEAD's blob
-    // (old) -- B sat on top of A's now-superseded work -- so B's removed
-    // line is NOT HEAD-relative and does not count. Expected: B owns
-    // (1,0); the "-old" deletion is UNOWNED (0,1); universe (1,1). This is
-    // the case the review's counter-example named, and the case the
-    // blob-equality rule exists to get right.
+    // old->middle; B rewrites middle->new (still open). Under the old
+    // whole-patch model A's evidence was superseded and B's baseline was not
+    // HEAD, so the "-old" deletion landed UNOWNED. The line rule knows who
+    // removed the HEAD line: A did (its window is the one that took `old`
+    // out), and B owns the `new` line it wrote; `middle` never reaches the
+    // HEAD diff. That is the one deliberate difference from the old matrix,
+    // and the stronger answer: nothing is orphaned, nothing is double-booked
+    // (universe (1,1) = A (0,1) + B (1,0)).
     #[test]
-    fn matrix_2_deletion_after_prior_rewrite_lands_unowned() {
+    fn matrix_2_deletion_after_prior_rewrite_goes_to_the_step_that_removed_it() {
         let root = scratch_repo("case2");
         std::fs::write(root.join("f.txt"), "old\n").unwrap();
         commit_all(&root, "head: old");
-        let head = rev_parse(&root, "HEAD");
-
-        // "middle" never exists as a commit or a working-tree state -- it
-        // is A's boundary, a pure scratch tree, exactly like a real claim
-        // boundary capture.
-        let idx_mid = scratch_index("case2-mid");
-        assert!(git(&root, Some(&idx_mid), &["read-tree", "HEAD"])
-            .status
-            .success());
-        set_index_blob(&root, &idx_mid, "f.txt", "middle\n");
-        let middle = write_tree(&root, &idx_mid);
-
-        // Present state: B's open interval has taken it to "new".
+        let b0 = snap(&root);
+        // A's window: old -> middle.
+        std::fs::write(root.join("f.txt"), "middle\n").unwrap();
+        let middle = snap(&root);
+        // B's still-open window: middle -> new.
         std::fs::write(root.join("f.txt"), "new\n").unwrap();
-        let idx_now = scratch_index("case2-now");
-        seed_now_index(&root, &idx_now);
-        let now_tree = write_tree(&root, &idx_now);
-        let idx_head = scratch_index("case2-head");
-        assert!(git(&root, Some(&idx_head), &["read-tree", "HEAD"])
-            .status
-            .success());
-
-        let universe_fp = membership_patch_footprint(&diff(&root, &head, &now_tree, "f.txt"));
-        let universe = (universe_fp.added_lines.len(), universe_fp.removed);
+        let now = snap(&root);
+        let universe = numstat(&root, &now, "f.txt");
         assert_eq!(universe, (1, 1), "sanity: HEAD..now is one add, one remove");
-
-        // A's own patch: HEAD(old) -> middle, exactly what claim_interval_diff
-        // derives for a single-owner interval bounded by [A_start=HEAD,
-        // A_end=B_start].
-        let patch_a = diff(&root, &head, &middle, "f.txt");
-        // B's own patch: middle -> present, B's still-open interval.
-        let patch_b = diff(&root, &middle, &now_tree, "f.txt");
-        assert!(!patch_a.trim().is_empty());
-        assert!(!patch_b.trim().is_empty());
-
-        // A is superseded: its evidence no longer accounts for present
-        // content (present is "new"; A's patch's new-side is "middle").
-        assert!(
-            !probe(&root, &idx_now, &patch_a, "case2a"),
-            "A's patch must fail the present-state probe: superseded, contributes nothing"
-        );
-
-        // B's evidence accounts for present content.
-        assert!(
-            !probe(&root, &idx_head, &patch_b, "case2b"),
-            "not already in HEAD"
-        );
-        assert!(
-            probe(&root, &idx_now, &patch_b, "case2b"),
-            "B's evidence must account for present content"
-        );
-
-        let spawns = std::cell::Cell::new(0usize);
-        let base_b =
-            membership_candidate_base(&root, &idx_now, std::slice::from_ref(&patch_b), &spawns)
-                .expect("B's reverse-apply should produce a base tree");
-        let head_relative = membership_blob_matches_head(&root, &base_b, "f.txt", &spawns);
-        assert!(
-            !head_relative,
-            "B's baseline is middle, not HEAD's old -- must NOT be HEAD-relative"
-        );
-
-        let fp_b = membership_patch_footprint(&patch_b);
         assert_eq!(
-            fp_b.added_lines.len(),
-            1,
-            "B's raw patch adds one line (new)"
+            numstat_between(&root, &b0, &middle, "f.txt"),
+            (1, 1),
+            "A's own window rewrote old -> middle"
+        );
+
+        let (map, holders) = chain_credit(&root, &[("A", &b0), ("B", &middle)], &now, &["f.txt"]);
+        let credit = &map["f.txt"];
+        assert_eq!(credit.unexplained, (0, 0));
+        let routed = route(credit, &holders);
+        assert_eq!(
+            routed.per_item.get(&vec!["A".to_string()]),
+            Some(&(0, 1)),
+            "A removed the HEAD line; its own `middle` never survives"
         );
         assert_eq!(
-            fp_b.removed, 1,
-            "B's raw patch removes one line (middle), baseline-relative"
+            routed.per_item.get(&vec!["B".to_string()]),
+            Some(&(1, 0)),
+            "B owns the addition only"
         );
 
-        // The production rule: additions always count; removed counts only
-        // when head_relative.
-        let counts_b = (
-            fp_b.added_lines.len(),
-            if head_relative { fp_b.removed } else { 0 },
-        );
-        assert_eq!(
-            counts_b,
-            (1, 0),
-            "B owns the addition only -- the matrix's exact answer"
-        );
-
-        let (unowned, clamped) = membership_unowned(universe, counts_b);
+        let (unowned, clamped) = membership_unowned(universe, attributed(&routed));
         assert!(!clamped);
-        assert_eq!(
-            unowned,
-            (0, 1),
-            "the -old deletion is UNOWNED: no surviving evidence accounts for removing it"
-        );
+        assert_eq!(unowned, (0, 0), "no deletion is orphaned");
 
         let _ = std::fs::remove_dir_all(&root);
     }
 
     // Matrix #3 — shared deletion: a same-click claim covering X and Y
-    // removes b. Mechanically identical to case 1 (same probe, same
-    // base_tree, same blob-equality test) -- membership_joint_patches
-    // derives a joint candidate's patch the same way a single-owner
-    // interval's is derived, over the joint boundary refs. Only the
-    // member SET differs, which routes the SAME counts into the `joint`
-    // bucket instead of `single` -- no special case. Expected: joint
-    // (0,1).
+    // removes b. Mechanically identical to case 1 (same history, same
+    // removal credit); only the holder SET differs, which routes the SAME
+    // counts into the `joint` bucket instead of `single` -- no special
+    // case. Expected: joint (0,1).
     #[test]
     fn matrix_3_shared_deletion_is_joint_no_special_case() {
         let root = scratch_repo("case3");
         std::fs::write(root.join("f.txt"), "a\nb\nc\n").unwrap();
         commit_all(&root, "head: a b c");
-        let head = rev_parse(&root, "HEAD");
+        let b0 = snap(&root);
 
         std::fs::write(root.join("f.txt"), "a\nc\n").unwrap();
-        let idx_now = scratch_index("case3-now");
-        seed_now_index(&root, &idx_now);
-        let now_tree = write_tree(&root, &idx_now);
-        let idx_head = scratch_index("case3-head");
-        assert!(git(&root, Some(&idx_head), &["read-tree", "HEAD"])
-            .status
-            .success());
+        let now = snap(&root);
+        let universe = numstat(&root, &now, "f.txt");
+        assert_eq!(universe, (0, 1));
 
-        let patch_joint = diff(&root, &head, &now_tree, "f.txt");
-        assert!(!probe(&root, &idx_head, &patch_joint, "case3"));
-        assert!(probe(&root, &idx_now, &patch_joint, "case3"));
+        let (map, holders) = chain_credit(&root, &[("X,Y", &b0)], &now, &["f.txt"]);
+        assert_eq!(holders[1], vec!["X".to_string(), "Y".to_string()]);
+        let routed = route(&map["f.txt"], &holders);
 
-        let spawns = std::cell::Cell::new(0usize);
-        let base =
-            membership_candidate_base(&root, &idx_now, std::slice::from_ref(&patch_joint), &spawns)
-                .expect("reverse-apply should produce a base tree");
-        assert!(membership_blob_matches_head(&root, &base, "f.txt", &spawns));
-        let fp = membership_patch_footprint(&patch_joint);
-        let counts = (fp.added_lines.len(), fp.removed);
-        assert_eq!(counts, (0, 1));
-
-        // Bucket routing, mirroring the probe loop's own selection: a
-        // multi-member candidate lands in `joint`, not `single`, and the
-        // deletion rule applies identically either way.
-        let members = vec!["X".to_string(), "Y".to_string()];
+        // Bucket routing, as the engine does it: a multi-member holder set
+        // lands in `joint`, not `single`, and the deletion rule applies
+        // identically either way.
         let mut buckets = MembershipPathBuckets::default();
-        let bucket = if members.len() > 1 {
-            &mut buckets.joint
-        } else {
-            &mut buckets.single
-        };
-        bucket.0 += counts.0;
-        bucket.1 += counts.1;
+        buckets.single = routed.single;
+        buckets.joint = routed.joint;
         assert_eq!(buckets.joint, (0, 1), "joint owns the shared deletion");
         assert_eq!(
             buckets.single,
             (0, 0),
             "single stays empty -- no special case"
         );
+        let (unowned, clamped) = membership_unowned(universe, attributed(&routed));
+        assert!(!clamped);
+        assert_eq!(unowned, (0, 0));
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -52570,38 +53103,22 @@ mod membership_deletion_matrix_tests {
         let root = scratch_repo("case4");
         std::fs::write(root.join("f.txt"), "a\n").unwrap();
         commit_all(&root, "head: a");
-        let head = rev_parse(&root, "HEAD");
+        let b0 = snap(&root);
 
         std::fs::write(root.join("f.txt"), "a-prime\n").unwrap();
-        let idx_now = scratch_index("case4-now");
-        seed_now_index(&root, &idx_now);
-        let now_tree = write_tree(&root, &idx_now);
-        let idx_head = scratch_index("case4-head");
-        assert!(git(&root, Some(&idx_head), &["read-tree", "HEAD"])
-            .status
-            .success());
-
-        let universe_fp = membership_patch_footprint(&diff(&root, &head, &now_tree, "f.txt"));
-        let universe = (universe_fp.added_lines.len(), universe_fp.removed);
+        let now = snap(&root);
+        let universe = numstat(&root, &now, "f.txt");
         assert_eq!(universe, (1, 1));
 
-        let patch_x = diff(&root, &head, &now_tree, "f.txt");
-        assert!(!probe(&root, &idx_head, &patch_x, "case4"));
-        assert!(probe(&root, &idx_now, &patch_x, "case4"));
-
-        let spawns = std::cell::Cell::new(0usize);
-        let base =
-            membership_candidate_base(&root, &idx_now, std::slice::from_ref(&patch_x), &spawns)
-                .expect("reverse-apply should produce a base tree");
-        assert!(
-            membership_blob_matches_head(&root, &base, "f.txt", &spawns),
-            "X is the sole contributor: base_tree must equal HEAD"
+        let (map, holders) = chain_credit(&root, &[("X", &b0)], &now, &["f.txt"]);
+        let routed = route(&map["f.txt"], &holders);
+        assert_eq!(
+            routed.per_item.get(&vec!["X".to_string()]),
+            Some(&(1, 1)),
+            "X owns both the addition and the removal"
         );
-        let fp = membership_patch_footprint(&patch_x);
-        let counts = (fp.added_lines.len(), fp.removed);
-        assert_eq!(counts, (1, 1), "X owns both the addition and the removal");
 
-        let (unowned, clamped) = membership_unowned(universe, counts);
+        let (unowned, clamped) = membership_unowned(universe, attributed(&routed));
         assert!(!clamped);
         assert_eq!(unowned, (0, 0));
 
@@ -52609,153 +53126,64 @@ mod membership_deletion_matrix_tests {
     }
 
     // Matrix #5 — multi-interval re-edit with deletion: X creates [p,q] in
-    // one interval, then deletes q in a later interval of its OWN.
+    // one window, then deletes q in a later window of its OWN.
     //
-    // *** FIXED (fix-patch-composition-for-repeated-paths). *** This case
-    // used to falsify the matrix: `git apply --cached --reverse` on a patch
-    // carrying TWO "diff --git a/f.txt b/f.txt" sections for the SAME path
-    // does not compose them when reverse-applied as one concatenation -- it
-    // reverses only the LAST section and silently drops the earlier one,
-    // exit code 0. Proven directly with plain git (no Bram code involved):
-    // concatenating `git diff HEAD t1 -- f.txt` (new-file, +p+q) with
-    // `git diff t1 t2 -- f.txt` (-q) and reverse-applying the concatenation
-    // against an index holding t2 landed at t1 (f.txt = "p\nq\n"), NOT at
-    // HEAD (no f.txt at all) -- so `membership_candidate_base`'s `base_tree`
-    // for a multi-interval candidate came out "present state minus only its
-    // LAST interval's section," not "present state minus ALL of its
-    // evidence."
-    //
-    // The fix: `membership_candidate_base` no longer takes one concatenated
-    // patch. It takes the candidate's per-interval SECTIONS, in the record
-    // order they were matched (never re-derived from splitting concatenated
-    // text on "diff --git"), and reverse-applies them one at a time,
-    // newest-interval-first -- each reversal against the tree the PRIOR
-    // reversal produced, which is what "undo this candidate's work" actually
-    // means. Here that is `[d2, d1]`: reversing d2 (t1->t2, i.e. "-q")
-    // restores "p\nq\n"; reversing d1 (HEAD->t1, i.e. "+p+q") on top of that
-    // restores HEAD (no f.txt). `base_tree` now lands at HEAD, so
-    // `membership_blob_matches_head` reports true, X reads as the path's
-    // sole contributor (which it truly is), and the net patch (`base_tree`
-    // -> `now_tree`) is the honest "+p" -- X's own, unambiguous line. Any
-    // section that fails to apply aborts the whole derivation and returns
-    // `None` rather than a partially-reversed base (see
-    // `membership_candidate_base`'s doc comment).
+    // The whole-patch model needed a fix here
+    // (fix-patch-composition-for-repeated-paths): `git apply --reverse` on
+    // two sections for the same path reversed only the last one, so the
+    // candidate's baseline came out wrong. The line rule has no composition
+    // step to get wrong. X's second window removes a line that is not in
+    // HEAD (X added it), so it is credited to no one and never appears in
+    // the HEAD diff; the surviving `p` is credited to the window that wrote
+    // it. Naively summing each window's own diff would claim (2,1).
+    // Expected: X owns (1,0); unowned (0,0).
     #[test]
     fn matrix_5_multi_interval_create_then_delete_counts_net_once() {
         let root = scratch_repo("case5");
-        // HEAD has no f.txt at all -- X creates it fresh, in its first
-        // interval.
+        // HEAD has no f.txt at all -- X creates it fresh, in its first window.
         std::fs::write(root.join("keep.txt"), "keep\n").unwrap();
         commit_all(&root, "head: no f.txt");
-        let head = rev_parse(&root, "HEAD");
+        let b0 = snap(&root);
 
-        // Interval 1: HEAD -> [p,q].
-        let idx1 = scratch_index("case5-1");
-        assert!(git(&root, Some(&idx1), &["read-tree", "HEAD"])
-            .status
-            .success());
-        set_index_blob(&root, &idx1, "f.txt", "p\nq\n");
-        let t1 = write_tree(&root, &idx1);
-        let d1 = diff(&root, &head, &t1, "f.txt");
-
-        // Interval 2 (X's own, still open): [p,q] -> [p].
-        let idx2 = scratch_index("case5-2");
-        assert!(git(&root, Some(&idx2), &["read-tree", "HEAD"])
-            .status
-            .success());
-        set_index_blob(&root, &idx2, "f.txt", "p\n");
-        let t2 = write_tree(&root, &idx2);
-        let d2 = diff(&root, &t1, &t2, "f.txt");
-
-        let concat = format!("{d1}{d2}");
-        let sections = vec![d1.clone(), d2.clone()];
-        assert!(
-            concat.matches("diff --git").count() > 1,
-            "concatenated evidence spans two intervals"
-        );
-        assert_eq!(
-            membership_patch_footprint(&concat).added_lines.len(),
-            2,
-            "the raw concatenated evidence double-counts p and q"
-        );
-
-        // Present state matches t2.
+        // Window 1: HEAD -> [p,q].
+        std::fs::write(root.join("f.txt"), "p\nq\n").unwrap();
+        let b1 = snap(&root);
+        // Window 2 (X's own, still open): [p,q] -> [p].
         std::fs::write(root.join("f.txt"), "p\n").unwrap();
-        let idx_now = scratch_index("case5-now");
-        seed_now_index(&root, &idx_now);
-        let now_tree = write_tree(&root, &idx_now);
-        assert_eq!(now_tree, t2, "sanity: idx_now's write-tree matches t2");
-        let idx_head = scratch_index("case5-head");
-        assert!(git(&root, Some(&idx_head), &["read-tree", "HEAD"])
-            .status
-            .success());
+        let now = snap(&root);
 
-        let universe_fp = membership_patch_footprint(&diff(&root, &head, &now_tree, "f.txt"));
-        let universe = (universe_fp.added_lines.len(), universe_fp.removed);
+        let w1 = numstat_between(&root, &b0, &b1, "f.txt");
+        let w2 = numstat_between(&root, &b1, &now, "f.txt");
+        assert_eq!(
+            (w1.0 + w2.0, w1.1 + w2.1),
+            (2, 1),
+            "the raw per-window evidence double-counts p and q"
+        );
+        let universe = numstat(&root, &now, "f.txt");
         assert_eq!(
             universe,
             (1, 0),
             "HEAD..now is a plain one-line add of p -- X's true, unambiguous net effect"
         );
 
-        assert!(
-            !probe(&root, &idx_head, &concat, "case5"),
-            "not already in HEAD"
-        );
-        assert!(
-            probe(&root, &idx_now, &concat, "case5"),
-            "X's full concatenated evidence must account for present content"
-        );
-
-        // HEAD's own tree oid (`head` above is the commit, not the tree) --
-        // what `base_tree` must equal once both sections are reversed.
-        let head_tree = rev_parse(&root, "HEAD^{tree}");
-
-        let spawns = std::cell::Cell::new(0usize);
-        let base = membership_candidate_base(&root, &idx_now, &sections, &spawns)
-            .expect("reverse-applying each section in turn should succeed");
-        eprintln!(
-            "case5 base_tree={base} t1(old-wrong-base)={t1} head_tree(expected-base)={head_tree}"
-        );
-        // THE FIX, measured directly: reversing d2 then d1 (newest-interval-
-        // first) lands base_tree at HEAD's tree, not at t1 (the old
-        // single-shot concatenated form's wrong answer).
+        let (map, holders) = chain_credit(&root, &[("X", &b0), ("X", &b1)], &now, &["f.txt"]);
+        let credit = &map["f.txt"];
+        assert_eq!(credit.unexplained, (0, 0));
+        assert_eq!(credit.by_step.get(&1), Some(&(1, 0)));
+        assert_eq!(credit.by_step.len(), 1);
+        let routed = route(credit, &holders);
         assert_eq!(
-            base, head_tree,
-            "fixed: base_tree lands at HEAD's tree -- both sections reversed, not just the last one"
+            routed.per_item.get(&vec!["X".to_string()]),
+            Some(&(1, 0)),
+            "X owns its own net addition, the matrix's expected answer"
         );
 
-        let head_relative = membership_blob_matches_head(&root, &base, "f.txt", &spawns);
-        eprintln!("case5 head_relative={head_relative} (expected true)");
-        assert!(
-            head_relative,
-            "fixed: base_tree's f.txt now equals HEAD's f.txt (both have none) -- \
-             X is correctly recognized as the path's sole contributor"
-        );
-
-        let net = membership_diff_tree_path(&root, &base, &now_tree, "f.txt", &spawns)
-            .expect("net-normalized patch (HEAD -> now_tree, X's true net effect)");
-        let fp = membership_patch_footprint(&net);
-        // The production rule: additions always count; removals only when
-        // head_relative.
-        let counts = (
-            fp.added_lines.len(),
-            if head_relative { fp.removed } else { 0 },
-        );
-        eprintln!("case5 counts={counts:?} matrix_expected=(1, 0)");
-        assert_eq!(
-            counts,
-            (1, 0),
-            "fixed: X owns its own net addition, the matrix's expected answer"
-        );
-
-        let (unowned, clamped) = membership_unowned(universe, counts);
+        let (unowned, clamped) = membership_unowned(universe, attributed(&routed));
         assert!(!clamped);
-        eprintln!("case5 unowned={unowned:?} -- expected (0, 0), nothing left over");
         assert_eq!(
             unowned,
             (0, 0),
-            "fixed: X's own addition is credited to X, nothing lands unowned"
+            "X's own addition is credited to X, nothing lands unowned"
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -54036,6 +54464,81 @@ fn claude_turn_is_done(content: &str, turn_user_ts_ms: Option<i64>) -> bool {
     decision.detected && !claude_jsonl_end_is_stale(deciding_ts_ms, turn_user_ts_ms)
 }
 
+// turn-end-ignores-previous-turns-end-record: is this Claude `end_turn` stale,
+// judged against the newest genuine user prompt in the SAME content? The
+// prompt time used to come only from `claude_turn_stats_cell`, which a 300 ms
+// poll refreshes. On 2026-10-12 a message queued behind a running turn was
+// dequeued 103 ms before the scan (prompt 23:34:58.854Z, scan 58.957Z); the
+// cell still held the previous prompt's time, the previous turn's genuine
+// `end_turn` (58.780Z) read as current, and the new turn's claim was cleared
+// mid-turn, so its edits landed owned by no item. Reading the prompt from the
+// content removes the race. The cached value stays as a fallback and as a
+// floor: the later of the two wins.
+fn claude_end_is_stale_in(content: &str, cached_user_ts_ms: Option<i64>) -> bool {
+    let from_content = compute_claude_turn_stats(content.as_bytes()).map(|s| s.user_ts_ms);
+    let user_ts = match (from_content, cached_user_ts_ms) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    };
+    !claude_turn_is_done(content, user_ts)
+}
+
+#[cfg(test)]
+mod claude_stale_end_tests {
+    use super::claude_end_is_stale_in;
+
+    // The 2026-10-12 23:34:58Z shape, records as they were written: the
+    // previous turn's genuine end, then a queued message dequeued as the new
+    // turn's prompt. The polled cell still held the previous prompt (23:33:19).
+    fn queued_turn_tail(with_new_end: bool) -> String {
+        let mut lines = vec![
+            r#"{"type":"user","timestamp":"2026-10-12T23:33:19.174Z","message":{"role":"user","content":"iterate: previous"}}"#,
+            r#"{"type":"assistant","timestamp":"2026-10-12T23:34:56.128Z","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"thinking","thinking":""}]}}"#,
+            r#"{"type":"assistant","timestamp":"2026-10-12T23:34:58.780Z","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}"#,
+            r#"{"type":"system","timestamp":"2026-10-12T23:34:58.820Z"}"#,
+            r#"{"type":"user","timestamp":"2026-10-12T23:34:58.854Z","message":{"role":"user","content":"iterate: the queued message"}}"#,
+            r#"{"type":"attachment","timestamp":"2026-10-12T23:34:58.853Z"}"#,
+        ];
+        if with_new_end {
+            lines.push(r#"{"type":"assistant","timestamp":"2026-10-12T23:36:10.000Z","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"new turn done"}]}}"#);
+        }
+        lines.join("\n")
+    }
+
+    fn ms(iso: &str) -> Option<i64> {
+        super::parse_iso_to_ms(iso)
+    }
+
+    #[test]
+    fn a_dequeued_prompt_makes_the_previous_end_stale_even_with_a_lagging_cache() {
+        // The cache lags at the previous prompt: the bug. Content wins.
+        let lagging = ms("2026-10-12T23:33:19.174Z");
+        assert!(claude_end_is_stale_in(&queued_turn_tail(false), lagging));
+        // No cache at all: content alone decides.
+        assert!(claude_end_is_stale_in(&queued_turn_tail(false), None));
+    }
+
+    #[test]
+    fn the_new_turns_own_end_is_not_stale() {
+        let lagging = ms("2026-10-12T23:33:19.174Z");
+        assert!(!claude_end_is_stale_in(&queued_turn_tail(true), lagging));
+    }
+
+    #[test]
+    fn an_ordinary_finished_turn_is_not_stale() {
+        let tail = [
+            r#"{"type":"user","timestamp":"2026-10-12T23:00:00.000Z","message":{"role":"user","content":"do it"}}"#,
+            r#"{"type":"assistant","timestamp":"2026-10-12T23:00:05.000Z","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}"#,
+        ]
+        .join("\n");
+        assert!(!claude_end_is_stale_in(
+            &tail,
+            ms("2026-10-12T23:00:00.000Z")
+        ));
+        assert!(!claude_end_is_stale_in(&tail, None));
+    }
+}
+
 #[cfg(test)]
 mod notification_turn_boundary_tests {
     use super::{
@@ -54576,7 +55079,7 @@ fn check_jsonl_for_turn_end<R: tauri::Runtime>(app: &AppHandle<R>, path: &std::p
     // apart on which record freshness is measured against (#259).
     let claude_stale_end = provider == JsonlCompletionProvider::Claude
         && decision.detected
-        && !claude_turn_is_done(
+        && claude_end_is_stale_in(
             &content,
             claude_turn_stats_cell()
                 .lock()
@@ -59592,7 +60095,30 @@ fn spawn_forge_awaiting_refresher(app: AppHandle) {
         std::thread::sleep(std::time::Duration::from_secs(3));
         let mut last_sig = String::new();
         loop {
-            let fresh = forge_awaiting_items_fetch(&app);
+            // needs-you-dismissals-survive-forge-outage: a failed fetch used
+            // to return an empty list, indistinguishable from "nothing
+            // awaiting you", and overwrite the cache with it. Every
+            // notification row vanished for a cycle, and the local sweep
+            // took those issues over under ids their dismissals did not
+            // match (2026-10-12: three dismissed issues resurfaced). Keep the
+            // last good result instead; a genuine empty result still lands.
+            let fresh = match forge_awaiting_items_fetch(&app) {
+                Ok(f) => f,
+                Err(stage) => {
+                    let kept = FORGE_AWAITING_CACHE
+                        .lock()
+                        .ok()
+                        .and_then(|c| c.as_ref().map(|(_, v)| v.len()))
+                        .unwrap_or(0);
+                    append_bram_trace_line(
+                        &app,
+                        "needs-you",
+                        &format!("op=forge-error stage={} kept={}", stage, kept),
+                    );
+                    std::thread::sleep(std::time::Duration::from_secs(90));
+                    continue;
+                }
+            };
             let mut keys: Vec<String> = fresh
                 .iter()
                 .map(|(_, v)| {
@@ -60281,15 +60807,15 @@ fn trace_cross_machine_agent_move<R: tauri::Runtime>(
 
 fn forge_awaiting_items_fetch<R: tauri::Runtime>(
     app: &AppHandle<R>,
-) -> Vec<(NeedsYouLane, serde_json::Value)> {
+) -> Result<Vec<(NeedsYouLane, serde_json::Value)>, &'static str> {
     let mut out: Vec<(NeedsYouLane, serde_json::Value)> = Vec::new();
     let root = match project_root(Some(app)) {
         Some(r) if project_forge(app) == Forge::GitHub => r,
-        _ => return out,
+        _ => return Ok(out),
     };
     let repo = match repo_owner_name(app) {
         Some(r) if !r.is_empty() => r,
-        _ => return out,
+        _ => return Ok(out),
     };
     let me = needs_you_forge_login(app);
     // all=true: the unread flag is the wrong signal — a notification Jon
@@ -60305,15 +60831,13 @@ fn forge_awaiting_items_fetch<R: tauri::Runtime>(
     ) {
         Ok(s) => s,
         Err(_) => {
-            append_bram_trace_line(app, "needs-you", "op=forge-error stage=fetch");
-            return out;
+            return Err("fetch");
         }
     };
     let threads: Vec<serde_json::Value> = match serde_json::from_slice(&stdout) {
         Ok(v) => v,
         Err(_) => {
-            append_bram_trace_line(app, "needs-you", "op=forge-error stage=parse");
-            return out;
+            return Err("parse");
         }
     };
     // GitHub returns threads newest-first; the cap bounds the per-thread
@@ -60504,7 +61028,7 @@ fn forge_awaiting_items_fetch<R: tauri::Runtime>(
             out.len()
         ),
     );
-    out
+    Ok(out)
 }
 
 // inbox-dismiss-forge-items: dismiss-until-new-activity for forge items.
@@ -60586,6 +61110,166 @@ fn needs_you_dismissed_pairs<R: tauri::Runtime>(app: &AppHandle<R>) -> Vec<(Stri
                 .collect()
         })
         .unwrap_or_default()
+}
+
+// needs-you-dismissals-survive-forge-outage: the issue a forge row is about,
+// whichever source produced it. Notification rows are
+// `forge-https://api.github.com/repos/<o>/<r>/issues/<n>` (or `/pulls/<n>`);
+// sweep rows are `forge-issue-<n>`. None for anything else.
+fn needs_you_issue_key(id: &str) -> Option<String> {
+    let num_ok = |n: &str| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
+    if let Some(n) = id.strip_prefix("forge-issue-") {
+        return num_ok(n).then(|| format!("issue:{}", n));
+    }
+    if !id.starts_with("forge-") {
+        return None;
+    }
+    let mut parts = id.rsplit('/');
+    let n = parts.next()?;
+    let kind = parts.next()?;
+    if !num_ok(n) {
+        return None;
+    }
+    match kind {
+        "issues" => Some(format!("issue:{}", n)),
+        "pulls" => Some(format!("pr:{}", n)),
+        _ => None,
+    }
+}
+
+// Is this row hidden by a dismissal? The exact (id, marker) pair as before,
+// OR a dismissal of the same issue (either id form) recorded at or after the
+// row's latest activity. The second rule is what keeps a dismissal working
+// when the other source takes over the row: on 2026-10-12 a failed
+// notifications fetch handed three dismissed issues to the local sweep,
+// whose ids and markers matched none of the notification-keyed dismissals.
+// Activity after the dismissal still brings the row back (#338).
+fn needs_you_dismissal_matches(
+    id: &str,
+    marker: &str,
+    activity_at: &str,
+    dismissed: &[(String, String, i64)],
+) -> bool {
+    if dismissed.iter().any(|(i, m, _)| i == id && m == marker) {
+        return true;
+    }
+    let (Some(key), Some(activity_ms)) =
+        (needs_you_issue_key(id), parse_iso_to_epoch_ms(activity_at))
+    else {
+        return false;
+    };
+    dismissed.iter().any(|(i, _, at)| {
+        *at >= activity_ms && needs_you_issue_key(i).as_deref() == Some(key.as_str())
+    })
+}
+
+#[cfg(test)]
+mod needs_you_dismissal_match_tests {
+    use super::{needs_you_dismissal_matches, needs_you_issue_key, parse_iso_to_epoch_ms};
+
+    const NOTIF_401: &str = "forge-https://api.github.com/repos/judell/bram/issues/401";
+    const NOTIF_MARKER: &str =
+        "https://api.github.com/repos/judell/bram/issues/comments/5824489141";
+
+    fn ms(iso: &str) -> i64 {
+        parse_iso_to_epoch_ms(iso).unwrap()
+    }
+
+    #[test]
+    fn issue_key_reads_both_id_forms() {
+        assert_eq!(
+            needs_you_issue_key("forge-issue-401").as_deref(),
+            Some("issue:401")
+        );
+        assert_eq!(needs_you_issue_key(NOTIF_401).as_deref(), Some("issue:401"));
+        assert_eq!(
+            needs_you_issue_key("forge-https://api.github.com/repos/judell/bram/pulls/394")
+                .as_deref(),
+            Some("pr:394")
+        );
+        assert_eq!(needs_you_issue_key("issue-425-docs"), None);
+        assert_eq!(needs_you_issue_key("forge-issue-"), None);
+    }
+
+    // The 2026-10-12 field case: #401 dismissed as a notification row on
+    // 2026-09-30, then served by the local sweep under its own id and a
+    // timestamp marker during a failed notifications fetch.
+    #[test]
+    fn notification_dismissal_hides_the_sweep_row_for_the_same_issue() {
+        let dismissed = vec![(
+            NOTIF_401.to_string(),
+            NOTIF_MARKER.to_string(),
+            ms("2026-09-30T22:52:21Z"),
+        )];
+        assert!(needs_you_dismissal_matches(
+            "forge-issue-401",
+            "2026-09-25T00:19:17Z",
+            "2026-09-25T00:19:17Z",
+            &dismissed
+        ));
+    }
+
+    #[test]
+    fn sweep_dismissal_hides_the_notification_row_for_the_same_issue() {
+        let dismissed = vec![(
+            "forge-issue-401".to_string(),
+            "2026-09-25T00:19:17Z".to_string(),
+            ms("2026-09-30T22:52:21Z"),
+        )];
+        assert!(needs_you_dismissal_matches(
+            NOTIF_401,
+            NOTIF_MARKER,
+            "2026-09-25T00:19:17Z",
+            &dismissed
+        ));
+    }
+
+    #[test]
+    fn activity_after_the_dismissal_brings_the_row_back() {
+        let dismissed = vec![(
+            NOTIF_401.to_string(),
+            NOTIF_MARKER.to_string(),
+            ms("2026-09-30T22:52:21Z"),
+        )];
+        assert!(!needs_you_dismissal_matches(
+            "forge-issue-401",
+            "2026-10-12T19:00:00Z",
+            "2026-10-12T19:00:00Z",
+            &dismissed
+        ));
+    }
+
+    #[test]
+    fn a_pr_dismissal_does_not_hide_the_issue_with_the_same_number() {
+        let dismissed = vec![(
+            "forge-https://api.github.com/repos/judell/bram/pulls/401".to_string(),
+            "m".to_string(),
+            ms("2026-10-12T00:00:00Z"),
+        )];
+        assert!(!needs_you_dismissal_matches(
+            "forge-issue-401",
+            "2026-09-25T00:19:17Z",
+            "2026-09-25T00:19:17Z",
+            &dismissed
+        ));
+    }
+
+    #[test]
+    fn exact_pair_still_hides_without_a_timestamp() {
+        let dismissed = vec![("worklist-x".to_string(), "m1".to_string(), 0)];
+        assert!(needs_you_dismissal_matches(
+            "worklist-x",
+            "m1",
+            "",
+            &dismissed
+        ));
+        assert!(!needs_you_dismissal_matches(
+            "worklist-x",
+            "m2",
+            "",
+            &dismissed
+        ));
+    }
 }
 
 fn write_needs_you_dismissed<R: tauri::Runtime>(
@@ -60990,7 +61674,12 @@ fn serve_needs_you<R: tauri::Runtime>(app: &AppHandle<R>) -> (u16, &'static str,
                 .get("activityMarker")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            if dismissed.iter().any(|(i, m, _)| i == id && m == marker) {
+            let activity_at = entry
+                .1
+                .get("activityAt")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if needs_you_dismissal_matches(id, marker, activity_at, &dismissed) {
                 filtered += 1;
                 continue;
             }
@@ -62763,6 +63452,21 @@ fn maybe_enforce_worklist_policy<R: tauri::Runtime>(
     );
 
     if violations.is_empty() {
+        // issue-433: this watcher pass writes the changelog next; tell it
+        // which removals the drop auth names. Not `dropped_via_auth`, which
+        // skips applied items -- #433's own shape on the direct-edit path.
+        if auth.as_ref().map(|a| a.kind.as_str()) == Some("drop") {
+            let current_ids: HashSet<String> =
+                current_items.iter().filter_map(worklist_item_id).collect();
+            let removed: Vec<String> = prior_items
+                .iter()
+                .filter_map(worklist_item_id)
+                .filter(|id| !current_ids.contains(id) && auth_ids.contains(id))
+                .collect();
+            if !removed.is_empty() {
+                record_dropped_prunes(&removed);
+            }
+        }
         if !dropped_via_auth.is_empty() {
             // Agent-path-symmetry fix: when an agent (Codex) edits
             // worklist.json directly to prune a drop-authorized item
@@ -62852,6 +63556,46 @@ fn maybe_enforce_worklist_policy<R: tauri::Runtime>(
 // rename_from was retired in 67eff19, and unauthorized prunes are already
 // blocked by maybe_enforce_worklist_policy before they can reach the watcher,
 // so every removal flows through either the approved or drop channel.
+// Which history section a removed item belongs to: "cleared", "dropped",
+// "committed", or None (skip). Pure, so the order is unit-testable. In order:
+//   1. Cleared as landed (issue-406) → cleared, whatever its status.
+//   2. Dropped → dropped, whatever its status. Two signals: the prune route
+//      recorded it as a drop (`route_dropped`, which no later click can
+//      erase), or the auth record on disk is a drop naming the id.
+//      issue-433: this used to come after rule 3, so an applied item dropped
+//      with nothing to commit was filed as committed and linked to HEAD.
+//      A committed item can't be misread here: its prune removes it from
+//      the board, so no later drop click can name it.
+//   3. Prior status "applied" → committed (022802d). A commit-prune whose
+//      single-slot auth record was overwritten before the watcher ran would
+//      otherwise fall into no bucket and read as "change".
+//   4. An approved authorization naming the id → committed (a proposed item
+//      removed by approved auth without first becoming applied).
+//   5. Otherwise skip; the policy hook reverts any other removal.
+fn changelog_removal_bucket(
+    prior_status: &str,
+    id: &str,
+    landed: bool,
+    route_dropped: bool,
+    auth_kind: Option<&str>,
+    auth_ids: &[String],
+) -> Option<&'static str> {
+    if landed {
+        return Some("cleared");
+    }
+    let named = auth_ids.iter().any(|i| i == id);
+    if route_dropped || (named && auth_kind == Some("drop")) {
+        return Some("dropped");
+    }
+    if prior_status == "applied" {
+        return Some("committed");
+    }
+    if named && auth_kind == Some("approved") {
+        return Some("committed");
+    }
+    None
+}
+
 fn generate_worklist_changelog<R: tauri::Runtime>(
     app: &AppHandle<R>,
     prior: &serde_json::Value,
@@ -62915,6 +63659,17 @@ fn generate_worklist_changelog<R: tauri::Runtime>(
             .collect(),
         Err(_) => HashMap::new(),
     };
+    // issue-433: drops recorded by the prune routes, taken for the ids this
+    // transition removed. Unlike the auth record, no later click can erase them.
+    let route_dropped: HashSet<String> = match dropped_prunes_cell().lock() {
+        Ok(mut set) => prior_items
+            .iter()
+            .filter_map(|i| worklist_item_id(i))
+            .filter(|id| !current_by_id.contains_key(id))
+            .filter(|id| set.remove(id))
+            .collect(),
+        Err(_) => HashSet::new(),
+    };
     if !landed_shas.is_empty() {
         append_bram_trace_line(
             app,
@@ -62930,40 +63685,31 @@ fn generate_worklist_changelog<R: tauri::Runtime>(
         if current_by_id.contains_key(&id) {
             continue;
         }
-        // Removal classification, in order:
-        //   1. Prior status == "applied" → committed unconditionally. Matches
-        //      the maybe_enforce_worklist_policy hook, which lets applied-status
-        //      items prune freely (commit-then-prune is legitimate, no fresh
-        //      auth required). Without this branch, a commit-prune whose auth
-        //      record was overwritten between approve and prune (any subsequent
-        //      drop:/approved: payload replaces the single-slot record) falls
-        //      out of both buckets and the history UI shows "change".
-        //   2. auth.kind == "drop" and id in auth.ids → dropped (user pruned
-        //      a still-proposed item via the drop authorization channel).
-        //   3. auth.kind == "approved" and id in auth.ids → committed (unusual:
-        //      a proposed item was removed via approved auth without first
-        //      transitioning to applied — included for completeness).
-        //   4. else → skip silently; the policy hook would have reverted any
-        //      other case before the watcher saw it.
-        let prior_status = worklist_item_status(item).to_string();
-        // issue-406: rows cleared as landed, whatever their status, linked
-        // below to their own landing commit.
-        if landed_shas.contains_key(&id) {
-            cleared.push(item);
-            continue;
-        }
-        if prior_status == "applied" {
-            committed.push(item);
-            continue;
-        }
-        if let Some(rec) = auth.as_ref() {
-            if rec.ids.iter().any(|i| i == &id) {
-                match rec.kind.as_str() {
-                    "drop" => dropped.push(item),
-                    "approved" => committed.push(item),
-                    _ => {}
+        let prior_status = worklist_item_status(item);
+        let bucket = changelog_removal_bucket(
+            prior_status,
+            &id,
+            landed_shas.contains_key(&id),
+            route_dropped.contains(&id),
+            auth.as_ref().map(|r| r.kind.as_str()),
+            auth.as_ref().map(|r| r.ids.as_slice()).unwrap_or(&[]),
+        );
+        match bucket {
+            Some("cleared") => cleared.push(item),
+            Some("dropped") => {
+                // issue-433: an applied item dropped with nothing to commit.
+                // Before the reorder this read as "1 committed" + HEAD's link.
+                if prior_status == "applied" {
+                    append_bram_trace_line(
+                        app,
+                        "worklist-history",
+                        &format!("op=changelog-drop-of-applied id={}", id),
+                    );
                 }
+                dropped.push(item);
             }
+            Some("committed") => committed.push(item),
+            _ => {}
         }
     }
 
@@ -66374,6 +67120,164 @@ fn route_request<R: tauri::Runtime>(
         return (200, "application/json; charset=utf-8", body);
     }
 
+    // more-files-tree-view: the Files page's listing. Tracked plus untracked
+    // files that aren't ignored, as flat Tree rows (repo_tree_rows_with_lazy, plus Bram's ignored state).
+    if path == "__repo/tree" {
+        let out = git_run(
+            app,
+            &[
+                "ls-files",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "-z",
+            ],
+        );
+        let body = match out {
+            Ok(text) => {
+                let mut paths: Vec<String> = text
+                    .split('\0')
+                    .filter(|p| !p.is_empty())
+                    .map(|p| p.to_string())
+                    .collect();
+                // files-tab-lists-bram-state-in-resources: Bram's ignored
+                // state, its files as rows and its folders collapsed.
+                let (state_files, state_dirs) = project_root(Some(app))
+                    .map(|root| bram_state_present(&root))
+                    .unwrap_or_default();
+                for f in state_files {
+                    if !paths.contains(&f) {
+                        paths.push(f);
+                    }
+                }
+                serde_json::json!({
+                    "rows": repo_tree_rows_with_lazy(&paths, &state_dirs),
+                    "files": paths.len(),
+                })
+            }
+            Err(e) => serde_json::json!({ "rows": [], "error": "not-a-git-repo", "detail": e }),
+        };
+        return (
+            200,
+            "application/json; charset=utf-8",
+            serde_json::to_vec(&body).unwrap_or_default(),
+        );
+    }
+
+    // files-tab-lists-bram-state-in-resources: one state folder's children,
+    // fetched when the Files tree expands it. Only Bram's state folders and
+    // folders beneath them; anything else is a 403, so this can't become a
+    // general directory browser.
+    if path == "__repo/tree/dir" {
+        let mut dir = String::new();
+        for pair in query.split('&') {
+            if let Some(enc) = pair.strip_prefix("path=") {
+                dir = percent_decode(enc);
+            }
+        }
+        let dir = dir.trim_end_matches('/').to_string();
+        if !bram_state_dir_allowed(&dir) {
+            return (
+                403,
+                "application/json; charset=utf-8",
+                br#"{"error":"not a Bram state folder"}"#.to_vec(),
+            );
+        }
+        let Some(root) = project_root(Some(app)) else {
+            return (
+                500,
+                "application/json; charset=utf-8",
+                br#"{"error":"no project root"}"#.to_vec(),
+            );
+        };
+        let mut subdirs: Vec<String> = Vec::new();
+        let mut files: Vec<String> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(root.join(&dir)) {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                match e.file_type() {
+                    Ok(t) if t.is_dir() => subdirs.push(name),
+                    Ok(t) if t.is_file() => files.push(name),
+                    _ => {}
+                }
+            }
+        }
+        let rows = bram_state_dir_rows(&dir, &subdirs, &files);
+        append_bram_trace_line(
+            app,
+            "files",
+            &format!("op=state-dir path={} rows={}", dir, rows.len()),
+        );
+        return (
+            200,
+            "application/json; charset=utf-8",
+            serde_json::to_vec(&serde_json::json!({ "rows": rows })).unwrap_or_default(),
+        );
+    }
+
+    // more-files-tree-view: content search for the Files page. A literal,
+    // case-insensitive `git grep` over tracked and untracked-not-ignored text
+    // files, at most REPO_GREP_PER_FILE hits per file and REPO_GREP_CAP rows,
+    // each line windowed around its match (vendored bundles are one-line).
+    if path == "__repo/grep" {
+        let mut q = String::new();
+        for pair in query.split('&') {
+            if let Some(enc) = pair.strip_prefix("q=") {
+                q = percent_decode(enc);
+            }
+        }
+        let q = q.trim().to_string();
+        let body = if q.is_empty() {
+            serde_json::json!({ "hits": [], "total": 0, "capped": false })
+        } else {
+            let per_file = format!("--max-count={}", REPO_GREP_PER_FILE);
+            let out = git_run_allow_exit(
+                app,
+                &[
+                    "grep",
+                    "-n",
+                    "-I",
+                    "-i",
+                    "-F",
+                    "-z",
+                    "--untracked",
+                    &per_file,
+                    "-e",
+                    &q,
+                ],
+            )
+            .unwrap_or_default();
+            // files-tab-lists-bram-state-in-resources: the same search over
+            // the small, current state paths, which are ignored and so
+            // skipped above. Same output format, so the two concatenate.
+            let mut state_args: Vec<&str> = vec![
+                "grep",
+                "-n",
+                "-I",
+                "-i",
+                "-F",
+                "-z",
+                "--untracked",
+                "--no-exclude-standard",
+                &per_file,
+                "-e",
+                &q,
+                "--",
+            ];
+            state_args.extend(BRAM_STATE_GREP.iter().copied());
+            state_args.extend(BRAM_STATE_GREP_EXCLUDE.iter().copied());
+            let state_out = git_run_allow_exit(app, &state_args).unwrap_or_default();
+            let out = format!("{}{}", out, bram_state_grep_ordered(&state_out));
+            let (hits, total) = repo_grep_hits(&out, &q, REPO_GREP_CAP);
+            serde_json::json!({ "hits": hits, "total": total, "capped": total > REPO_GREP_CAP })
+        };
+        return (
+            200,
+            "application/json; charset=utf-8",
+            serde_json::to_vec(&body).unwrap_or_default(),
+        );
+    }
+
     if path == "__local-file-preview" {
         const MAX_PREVIEW_BYTES: u64 = 200_000;
         // file-tab-truncation-misses-changes: the worklist File tab views
@@ -67508,6 +68412,36 @@ fn route_request<R: tauri::Runtime>(
         return (200, "application/json; charset=utf-8", body);
     }
 
+    // issue-425-retire-replay (Codex review): what committing the ticked
+    // items TOGETHER would take. Per-row willCommit assumes each item commits
+    // alone; a selection can route differently (both owners of a file
+    // selected leaves no outside owner, so the gate takes the whole file).
+    if path == "__worklist/will-commit" {
+        let mut ids: Vec<String> = Vec::new();
+        for pair in query.split('&') {
+            if let Some(v) = pair.strip_prefix("ids=") {
+                ids = percent_decode(v)
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+        }
+        if ids.is_empty() {
+            return (
+                400,
+                "application/json; charset=utf-8",
+                br#"{"error":"ids required"}"#.to_vec(),
+            );
+        }
+        let mut pred = worklist_selection_prediction(app, &ids);
+        // Echo the selection, so a pane holding an answer for an earlier
+        // selection can tell it isn't this one's.
+        pred["ids"] = serde_json::json!(ids);
+        let body = serde_json::to_vec(&pred).unwrap_or_default();
+        return (200, "application/json; charset=utf-8", body);
+    }
+
     // issue-327 independence: measured per-claimant separability for one path,
     // fetched on demand when a file expander renders its Ownership summary.
     if path == "__worklist/independence" {
@@ -67861,13 +68795,28 @@ fn route_request<R: tauri::Runtime>(
                         // diff rows showed no claimants while the column beside
                         // them showed three). The pane reads claimants from the
                         // changedFiles row it is already rendering.
-                        by_file.push(serde_json::json!({
+                        let mut rec = serde_json::json!({
                             "path": fp,
                             "patch": diff,
                             "untracked": untracked.contains(fp.as_str()),
                             "lines": diff.lines().count(),
                             "bytes": diff.len(),
-                        }));
+                        });
+                        // issue-425-retire-replay: `patch` is plain `git diff`
+                        // (index baseline). When the file has staged changes the
+                        // HEAD-based body differs, and membership's removed-line
+                        // numbers only match that one, so the scoped view reads
+                        // `headPatch` when it is present.
+                        if let Some(head) = change_index
+                            .as_ref()
+                            .and_then(|idx| idx.head_diff_by_path.get(fp.as_str()))
+                        {
+                            if per_file.get(fp.as_str()) != Some(head) {
+                                rec["headPatch"] =
+                                    serde_json::Value::String(cap_patch(fp, head.clone()));
+                            }
+                        }
+                        by_file.push(rec);
                     }
                     if !combined.is_empty() && !diff.is_empty() {
                         combined.push('\n');
@@ -68010,43 +68959,10 @@ fn route_request<R: tauri::Runtime>(
                 serde_json::Value::Array(unclaimed),
             );
         }
-        // issue-327: per-path ownership runs from the claim-interval replay, so
-        // the overlaps panel can say what each claimant DID rather than only
-        // that they share a path, and the diff view can mark where authorship
-        // changes. One source of truth for both surfaces. Always present, same
-        // absent-vs-empty reasoning as above.
+        // issue-425-retire-replay: ownership comes from membership alone (the
+        // claim-interval replay that fed `attribution` / `attributionTotals`
+        // is deleted). The pane reads runs from `membership.byPath[*].runs`.
         {
-            let attr_started = std::time::Instant::now();
-            let (runs, totals, totals_by_path, _unowned_by_path) = claim_attribution_runs(app);
-            let paths = runs.len();
-            let total: usize = runs.values().map(|v| v.len()).sum();
-            // Which begun items have attributed lines on each path — the
-            // entanglement test the will-commit computation below shares
-            // with the commit route's own scan.
-            let owners_by_path = replay_owners_from_runs(&runs);
-            // avoid-futile-joint-commit: surface the same joint-attribution
-            // fact the commit-time refusal (op=refuse-joint-interval) would
-            // hit, BEFORE any commit is attempted — computed from `&runs`
-            // while it is still borrowed, ahead of the move into `map` below.
-            let joint_owners_by_path = joint_owners_from_runs(&runs);
-            let mut map = serde_json::Map::new();
-            for (k, v) in runs {
-                map.insert(k, serde_json::Value::Array(v));
-            }
-            // issue-327: per-item interval-patch shortstat, so the strip can
-            // report what a commit actually takes rather than the whole-file
-            // total. `{ itemId: { added, removed } }`.
-            let mut totals_map = serde_json::Map::new();
-            for (id, (a, r)) in totals {
-                totals_map.insert(id, serde_json::json!({ "added": a, "removed": r }));
-            }
-            if let Some(obj) = doc.as_object_mut() {
-                obj.insert("attribution".to_string(), serde_json::Value::Object(map));
-                obj.insert(
-                    "attributionTotals".to_string(),
-                    serde_json::Value::Object(totals_map),
-                );
-            }
             // will-commit-matches-the-button: per begun item, the headline
             // number computed the way worklist-commit EXECUTES — per path,
             // whole-file stat where this item is the only begun claimant
@@ -68063,9 +68979,18 @@ fn route_request<R: tauri::Runtime>(
             // Routing this per path from the replay (as before) predicted an
             // interval take the gate no longer makes — the gate-425-r2 demo,
             // 2026-10-06, whose agent wrote its message from that expectation.
-            // Display tolerates a stale partition; with none, fall back to the
-            // replay's owners, per path, as before.
+            // Display tolerates a stale partition; with none, no take is
+            // served and the pane says ownership is pending.
             let wc_partition = membership_partition(app).map(|(p, _)| p);
+            // issue-430: the HEAD the precheck cache and refusal records key on.
+            let wc_head = git_run(app, &["rev-parse", "HEAD"])
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            // issue-425-retire-replay: part of the precheck key below; the
+            // interval patch is built from this record.
+            let wc_intervals_raw = project_root(Some(app))
+                .and_then(|r| std::fs::read_to_string(r.join(CLAIM_INTERVALS_REL)).ok())
+                .unwrap_or_default();
             if let Some(items) = doc.get_mut("items").and_then(|v| v.as_array_mut()) {
                 // Begun the way the gate counts it (handle_worklist_commit's
                 // begun_outside): `applied` OR a host-stamped begunAtMs. Keying
@@ -68107,6 +69032,41 @@ fn route_request<R: tauri::Runtime>(
                             }
                             _ => Vec::new(),
                         };
+                    // issue-425-retire-replay: an entangled item is
+                    // interval-staged, so its take is what that staging
+                    // produces: the precheck applies the same patch to a
+                    // scratch index and reads the result's numstat. Keyed on
+                    // what the patch is built from (HEAD, the claim record,
+                    // the item's current per-file diffs), so a serve re-runs
+                    // git only when one of them moved. When the patch doesn't
+                    // apply (issue-430's dependent case) the gate refuses;
+                    // the strip then shows membership's own lines for the item.
+                    let precheck: Option<
+                        Result<std::collections::BTreeMap<String, (usize, usize)>, Vec<String>>,
+                    > = if item_entangled == Some(true) {
+                        use std::hash::{Hash, Hasher};
+                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                        wc_intervals_raw.hash(&mut h);
+                        // The real content, never the display-capped
+                        // `diffByFile` (Codex review: a capped placeholder can
+                        // survive an edit unchanged).
+                        if let Some(idx) = change_index.as_ref() {
+                            precheck_content_hash(idx, &declared).hash(&mut h);
+                        }
+                        declared.hash(&mut h);
+                        let key = format!("{}|{:016x}", wc_head, h.finish());
+                        Some(commit_precheck_cached(app, &id, &declared, &key))
+                    } else {
+                        None
+                    };
+                    let own_lines = |path: &str| -> (usize, usize) {
+                        wc_partition
+                            .as_ref()
+                            .and_then(|p| p.get(path))
+                            .and_then(|b| b.per_item.get(&vec![id.clone()]))
+                            .copied()
+                            .unwrap_or((0, 0))
+                    };
                     let Some(records) = item.get_mut("changedFiles").and_then(|v| v.as_array_mut())
                     else {
                         continue;
@@ -68123,15 +69083,9 @@ fn route_request<R: tauri::Runtime>(
                         else {
                             continue;
                         };
-                        let entangled = match item_entangled {
-                            Some(e) => e,
-                            None => owners_by_path
-                                .get(&path)
-                                .map(|o| {
-                                    o.iter().any(|owner| *owner != id && begun.contains(owner))
-                                })
-                                .unwrap_or(false),
-                        };
+                        // No partition: nothing is entangled, and no take is
+                        // served (below); the pane says ownership is pending.
+                        let entangled = item_entangled.unwrap_or(false);
                         // issue-273 postscript: the residue-driven interval
                         // branch (and its two successor corrections) were
                         // withdrawn the same evening they shipped — three
@@ -68141,11 +69095,10 @@ fn route_request<R: tauri::Runtime>(
                         // re-grounded (see the drawing-board design item).
                         let (a, r) = if entangled {
                             interval_paths.push(path.clone());
-                            totals_by_path
-                                .get(&path)
-                                .and_then(|m| m.get(&id))
-                                .copied()
-                                .unwrap_or((0, 0))
+                            match &precheck {
+                                Some(Ok(take)) => take.get(&path).copied().unwrap_or((0, 0)),
+                                Some(Err(_)) | None => own_lines(&path),
+                            }
                         } else {
                             (
                                 rec.get("added").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
@@ -68159,9 +69112,11 @@ fn route_request<R: tauri::Runtime>(
                         // not add up", 2026-09-04: the header was honest but
                         // its addends were invisible — the entangled row
                         // showed only the file total).
-                        if let Some(obj) = rec.as_object_mut() {
-                            obj.insert("takeAdded".to_string(), serde_json::json!(a));
-                            obj.insert("takeRemoved".to_string(), serde_json::json!(r));
+                        if wc_partition.is_some() {
+                            if let Some(obj) = rec.as_object_mut() {
+                                obj.insert("takeAdded".to_string(), serde_json::json!(a));
+                                obj.insert("takeRemoved".to_string(), serde_json::json!(r));
+                            }
                         }
                     }
                     if !interval_paths.is_empty() {
@@ -68174,11 +69129,63 @@ fn route_request<R: tauri::Runtime>(
                         );
                         append_bram_trace_line(app, "claim-interval", &line);
                     }
+                    // issue-430-dependent-commit-offer: an entangled item is
+                    // interval-staged, and the gate refuses a patch that does
+                    // not apply to HEAD on its own. The precheck above ran that
+                    // same check, so the pane can withhold the single-item
+                    // Commit and name what it depends on.
+                    let depends_on: Option<(Vec<String>, Vec<String>)> = match &precheck {
+                        Some(Err(failing)) => {
+                            let owners: Vec<String> = wc_partition
+                                .as_ref()
+                                .map(|p| {
+                                    let outside: std::collections::HashSet<String> =
+                                        begun.iter().filter(|b| **b != id).cloned().collect();
+                                    let mut o: Vec<String> = Vec::new();
+                                    for (path, owner) in membership_entangling_owners(
+                                        p,
+                                        &declared,
+                                        &[id.clone()],
+                                        &outside,
+                                    ) {
+                                        if (failing.is_empty() || failing.contains(&path))
+                                            && !o.contains(&owner)
+                                        {
+                                            o.push(owner);
+                                        }
+                                    }
+                                    o
+                                })
+                                .unwrap_or_default();
+                            Some((owners, failing.clone()))
+                        }
+                        _ => None,
+                    };
+                    let refusal = last_commit_refusal_for(&id, &wc_head);
                     if let Some(obj) = item.as_object_mut() {
-                        obj.insert(
-                            "willCommit".to_string(),
-                            serde_json::json!({ "added": wc.0, "removed": wc.1 }),
-                        );
+                        if let Some((owners, failing)) = &depends_on {
+                            obj.insert("commitDependsOn".to_string(), serde_json::json!(owners));
+                            obj.insert(
+                                "commitCheckFailedPaths".to_string(),
+                                serde_json::json!(failing),
+                            );
+                        }
+                        if let Some((at_ms, reason)) = &refusal {
+                            obj.insert(
+                                "lastCommitRefusal".to_string(),
+                                serde_json::json!({ "atMs": at_ms, "reason": reason }),
+                            );
+                        }
+                        // issue-425-retire-replay (Codex review): with no
+                        // membership partition there is no honest take to
+                        // promise, so none is served; the pane shows
+                        // "Calculating ownership…" until the ready signal.
+                        if wc_partition.is_some() {
+                            obj.insert(
+                                "willCommit".to_string(),
+                                serde_json::json!({ "added": wc.0, "removed": wc.1 }),
+                            );
+                        }
                         // issue-425-gate-routes-by-membership: what a whole-file
                         // commit of this item would take that no item wrote —
                         // the same lines the commit response will disclose as
@@ -68206,6 +69213,12 @@ fn route_request<R: tauri::Runtime>(
             // Runs over every item with declared files, not only begun ones:
             // a joint run only ever exists on a path a begun item's capture
             // touched, so an unbegun item's files simply never match.
+            // issue-432: from membership, the model the gate's refusal now
+            // reads, so pane and gate agree.
+            let joint_owners_by_path = wc_partition
+                .as_ref()
+                .map(membership_joint_owners)
+                .unwrap_or_default();
             if let Some(items) = doc.get_mut("items").and_then(|v| v.as_array_mut()) {
                 for item in items.iter_mut() {
                     let Some(id) = item.get("id").and_then(|v| v.as_str()).map(String::from) else {
@@ -68228,64 +69241,40 @@ fn route_request<R: tauri::Runtime>(
                     }
                 }
             }
-            append_bram_trace_line(
-                app,
-                "claim-interval",
-                &format!(
-                    "op=attribute paths={} runs={} spawns={} pathspec={} ms={}",
-                    paths,
-                    total,
-                    CLAIM_ATTR_SPAWNS.load(std::sync::atomic::Ordering::Relaxed),
-                    CLAIM_ATTR_PATHSPEC.load(std::sync::atomic::Ordering::Relaxed),
-                    attr_started.elapsed().as_millis()
-                ),
-            );
-            // issue-273-membership-engine-observe (attribution-model.md §4,
-            // Migration step 1): the HEAD-diff membership engine runs beside
-            // the replay on every serve, OBSERVE-ONLY — its partition feeds
-            // only the [claim-interval] membership traces (op=membership,
-            // op=membership-diverges, op=membership-conservation-broken).
-            // Nothing in this payload reads it; the replay above stays the
-            // authority for every consumer until the observation earns the
-            // step-2+ flips.
+            // The membership partition, the board's only ownership source
+            // (issue-425-retire-replay).
             //
             // membership-precomputed-off-the-render-path: the serve now only
             // READS the memo (`membership_partition`, `allow_compute=false`)
             // — the probe loop that fills it runs off the request path, on
             // `membership_precompute`'s invalidating-event triggers and at
-            // startup. `membership_report` runs the conservation check and
-            // divergence comparison against whatever came back; `fresh`
+            // startup. `membership_report` runs the conservation check against
+            // whatever came back; `fresh`
             // (true = compute or exact-key hit, false = carried-over
             // previous partition) gates the conservation check specifically
             // — see membership_report's header for why a stale check would
             // manufacture a false breach. `membershipStale` below is the
-            // payload's observation of that same fact — carried for
-            // migration step 2 to read; nothing reads it yet.
-            let (membership_stale, membership_payload) = match membership_partition(app) {
-                Some((partition, fresh)) => {
-                    membership_report(
-                        app,
-                        &partition,
-                        fresh,
-                        &owners_by_path,
-                        &joint_owners_by_path,
-                    );
-                    (!fresh, membership_payload_json(&partition))
-                }
-                None => (false, serde_json::Value::Null),
-            };
+            // payload's observation of that same fact.
+            let (membership_stale, membership_payload, membership_key) =
+                match membership_partition_keyed(app) {
+                    Some((partition, fresh, key)) => {
+                        membership_report(app, &partition, fresh);
+                        (!fresh, membership_payload_json(&partition), key)
+                    }
+                    None => (false, serde_json::Value::Null, String::new()),
+                };
             if let Some(obj) = doc.as_object_mut() {
                 obj.insert(
                     "membershipStale".to_string(),
                     serde_json::Value::Bool(membership_stale),
                 );
-                // membership-crosses-the-wire: the partition itself, so the
-                // pane can stop inferring ownership from declared paths.
-                // DELIBERATELY UNREAD — every consumer still sources from the
-                // replay; migration step 3 spends this. Serving it first means
-                // the field can be watched against real boards before anything
-                // depends on it, which is the same observe-then-consume
-                // discipline steps 1a and 1b used.
+                obj.insert(
+                    "membershipStateKey".to_string(),
+                    serde_json::Value::String(membership_key),
+                );
+                // membership-crosses-the-wire: the partition itself: counts,
+                // and per-line `runs` / `removedRuns` the pane's ownership
+                // views read (issue-425-retire-replay).
                 obj.insert("membership".to_string(), membership_payload);
             }
         }
@@ -70430,6 +71419,33 @@ fn ensure_no_unrelated_staged_files(
     }
 }
 
+// issue-425-retire-replay: what the precheck cache key hashes for an item:
+// the full `git diff HEAD` body of each declared tracked path, and the bytes
+// of each declared untracked one. Never the display-capped `diffByFile`, whose
+// placeholders (generated files, patches over 200 KB) can survive an edit.
+fn precheck_content_hash(idx: &WorklistChangeIndex, declared: &[String]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut covered: Vec<&String> = idx
+        .head_diff_by_path
+        .keys()
+        .chain(idx.status_by_path.keys())
+        .filter(|p| declared.iter().any(|d| declared_covers(d, p)))
+        .collect();
+    covered.sort();
+    covered.dedup();
+    for p in covered {
+        p.hash(&mut h);
+        match idx.head_diff_by_path.get(p) {
+            Some(body) => body.hash(&mut h),
+            None => std::fs::read(idx.root.join(p))
+                .unwrap_or_default()
+                .hash(&mut h),
+        }
+    }
+    h.finish()
+}
+
 // count-changed-files-rung1: per-item change activity derived from disk.
 // Returns (changedFiles, changeSummary) for the /__worklist payload — one
 // record per listed file plus roll-up totals, with display labels computed
@@ -70465,7 +71481,60 @@ struct WorklistChangeIndex {
     counts: std::collections::HashMap<String, (i64, i64)>,
     hunks_by_path: std::collections::HashMap<String, i64>,
     diff_by_path: std::collections::HashMap<String, String>,
+    // issue-425-retire-replay: `git diff HEAD` bodies (staged + unstaged),
+    // uncapped. The baseline membership numbers removed lines against, and
+    // what the precheck cache key hashes.
+    head_diff_by_path: std::collections::HashMap<String, String>,
+    // issue-438: declared files that exist on disk but that git ignores, so
+    // git status never reports them and they would otherwise read as
+    // "unchanged" ("With the agent · nothing to do", with no hint why).
+    ignored_paths: std::collections::HashSet<String>,
     spawns: usize,
+}
+
+#[cfg(test)]
+mod precheck_content_hash_tests {
+    use super::{cap_patch, precheck_content_hash, WorklistChangeIndex};
+    use std::collections::HashMap;
+
+    fn idx(path: &str, body: &str) -> WorklistChangeIndex {
+        let mut head = HashMap::new();
+        head.insert(path.to_string(), body.to_string());
+        WorklistChangeIndex {
+            root: std::env::temp_dir(),
+            status_by_path: HashMap::new(),
+            counts: HashMap::new(),
+            hunks_by_path: HashMap::new(),
+            diff_by_path: HashMap::new(),
+            head_diff_by_path: head,
+            ignored_paths: std::collections::HashSet::new(),
+            spawns: 0,
+        }
+    }
+
+    // Codex review of issue-425-retire-replay: two edits to a generated file
+    // cap to the same placeholder, so a key built from the capped patch would
+    // not change. The content hash must.
+    #[test]
+    fn edits_hidden_by_the_display_cap_still_change_the_key() {
+        let path = "app/vendor/bundle.min.js";
+        let before = "@@ -1 +1 @@\n-a\n+b\n";
+        let after = "@@ -1 +1 @@\n-a\n+c\n";
+        assert_eq!(
+            cap_patch(path, before.to_string()),
+            cap_patch(path, after.to_string())
+        );
+        let declared = vec![path.to_string()];
+        assert_ne!(
+            precheck_content_hash(&idx(path, before), &declared),
+            precheck_content_hash(&idx(path, after), &declared)
+        );
+        // Undeclared paths don't move it.
+        assert_eq!(
+            precheck_content_hash(&idx(path, before), &["other.txt".to_string()]),
+            precheck_content_hash(&idx(path, after), &["other.txt".to_string()])
+        );
+    }
 }
 
 fn worklist_change_index<R: tauri::Runtime>(
@@ -70479,6 +71548,8 @@ fn worklist_change_index<R: tauri::Runtime>(
         counts: std::collections::HashMap::new(),
         hunks_by_path: std::collections::HashMap::new(),
         diff_by_path: std::collections::HashMap::new(),
+        head_diff_by_path: std::collections::HashMap::new(),
+        ignored_paths: std::collections::HashSet::new(),
         spawns: 0,
     };
     if all_paths.is_empty() {
@@ -70534,6 +71605,8 @@ fn worklist_change_index<R: tauri::Runtime>(
     for (path, body) in split_diff_by_file(&head_diff) {
         let n = body.lines().filter(|l| l.starts_with("@@")).count() as i64;
         idx.hunks_by_path.insert(path.to_string(), n);
+        idx.head_diff_by_path
+            .insert(path.to_string(), body.to_string());
     }
 
     // The displayed per-item diff bodies come from plain `git diff` (unstaged
@@ -70549,7 +71622,60 @@ fn worklist_change_index<R: tauri::Runtime>(
     for (path, body) in split_diff_by_file(&unstaged) {
         idx.diff_by_path.insert(path.to_string(), body);
     }
+
+    // issue-438: a declared file git status never mentioned but that exists
+    // on disk is either tracked-and-unchanged or ignored. One check-ignore
+    // over just those tells them apart; it runs only when such a file exists.
+    let candidates: Vec<String> = all_paths
+        .iter()
+        .filter(|p| !idx.status_by_path.contains_key(p.as_str()))
+        .filter(|p| idx.root.join(p.as_str()).is_file())
+        .cloned()
+        .collect();
+    if !candidates.is_empty() {
+        idx.ignored_paths = worklist_ignored_declared(&idx.root, &candidates);
+        idx.spawns += 1;
+    }
     Some(idx)
+}
+
+// issue-438: which of `candidates` git ignores. Without `--no-index`, a
+// tracked file is reported as not ignored even when a rule matches it, which
+// is the point: only a file git cannot see is hidden. Fails open to empty
+// (this only adds a hint to the board).
+fn worklist_ignored_declared(
+    root: &std::path::Path,
+    candidates: &[String],
+) -> std::collections::HashSet<String> {
+    use std::io::Write;
+    let mut child = match std::process::Command::new("git")
+        .current_dir(root)
+        .args(["check-ignore", "-z", "--stdin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return Default::default(),
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let mut input: Vec<u8> = Vec::new();
+        for p in candidates {
+            input.extend_from_slice(p.as_bytes());
+            input.push(0);
+        }
+        let _ = stdin.write_all(&input);
+    }
+    // Exit 1 means "none ignored"; anything else with output is still read.
+    let Ok(out) = child.wait_with_output() else {
+        return Default::default();
+    };
+    out.stdout
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect()
 }
 
 // issue-374: a declared entry naming a DIRECTORY never matches an exact key,
@@ -70624,11 +71750,16 @@ fn worklist_change_activity_for(
     let (mut add_sum, mut rem_sum, mut changed_n) = (0i64, 0i64, 0usize);
     let mut last_ms: i64 = 0;
     for p in file_paths {
-        let status = idx
-            .status_by_path
-            .get(p.as_str())
-            .copied()
-            .unwrap_or("unchanged");
+        let status = idx.status_by_path.get(p.as_str()).copied().unwrap_or(
+            // issue-438: on disk but hidden from git. Still nothing to
+            // commit, so it counts like "unchanged" below; only the status
+            // and label say why.
+            if idx.ignored_paths.contains(p.as_str()) {
+                "ignored"
+            } else {
+                "unchanged"
+            },
+        );
         let (mut a, r) = idx.counts.get(p.as_str()).copied().unwrap_or((0, 0));
         if status == "new" && a == 0 {
             // Untracked: numstat cannot see it — the whole file counts as
@@ -70639,7 +71770,7 @@ fn worklist_change_activity_for(
             }
             hunks += 1;
         }
-        if status != "unchanged" {
+        if status != "unchanged" && status != "ignored" {
             changed_n += 1;
             add_sum += a;
             rem_sum += r;
@@ -70653,6 +71784,8 @@ fn worklist_change_activity_for(
         }
         let label = if status == "unchanged" {
             p.clone()
+        } else if status == "ignored" {
+            format!("{}  (ignored by .gitignore)", p)
         } else {
             let marker = match status {
                 "new" => " (new)",
@@ -71141,6 +72274,23 @@ fn landed_clears_cell() -> &'static Mutex<HashMap<String, String>> {
     LANDED_CLEARS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+// issue-433: ids pruned under a drop authorization, recorded by the route at
+// the moment it prunes and consumed by the history changelog. The changelog
+// used to learn "this was a drop" only from the single-slot auth record on
+// disk, which the next click overwrites; a click landing between a Drop and
+// the watcher's changelog could re-file the drop as committed.
+static DROPPED_PRUNES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn dropped_prunes_cell() -> &'static Mutex<HashSet<String>> {
+    DROPPED_PRUNES.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn record_dropped_prunes(ids: &[String]) {
+    if let Ok(mut set) = dropped_prunes_cell().lock() {
+        set.extend(ids.iter().cloned());
+    }
+}
+
 // Items already traced as landed this process (op=landed-detected fires once).
 static LANDED_SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
@@ -71614,6 +72764,12 @@ fn handle_worklist_mutate<R: tauri::Runtime>(
     }
     let new_text = serde_json::to_string_pretty(&wl).unwrap_or_default();
     let on_disk = format!("{}\n", new_text);
+    // issue-433: record the drop before the write lands, so the watcher's
+    // changelog sees it whatever happens to the auth record meanwhile. Covers
+    // the pane's host-direct Drop, which delegates here.
+    if op == "prune" && auth_kind == "drop" && !affected.is_empty() {
+        record_dropped_prunes(&affected);
+    }
     // Claim this write BEFORE it lands so the worklist watcher recognizes
     // it as self-originated: handle_worklist_change short-circuits when
     // prior_str == current_str, so it never reaches maybe_enforce_worklist_policy.
@@ -71799,7 +72955,17 @@ fn warn_missing_helper_coverage<R: tauri::Runtime>(app: &AppHandle<R>, committed
     }
 }
 
-fn release_claim_on_commit_refusal<R: tauri::Runtime>(app: &AppHandle<R>, ids: &[String]) {
+fn release_claim_on_commit_refusal<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    ids: &[String],
+    reason: &str,
+) {
+    // issue-430: the refusal used to reach only the agent's HTTP response.
+    // Record it for the rows (shown until HEAD moves).
+    let head = git_run(app, &["rev-parse", "HEAD"])
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    record_last_commit_refusal(ids, &head, reason);
     let _ = shrink_inflight_claim_sentinel(app, ids);
     append_bram_trace_line(
         app,
@@ -71808,87 +72974,18 @@ fn release_claim_on_commit_refusal<R: tauri::Runtime>(app: &AppHandle<R>, ids: &
     );
 }
 
-// Which begun items the replay credits with lines on each path: the
-// entanglement test shared by the board serve, the commit route, and (since
-// gate-computes-membership-fresh) the gate's membership comparison. Joint
-// runs carry `itemIds` instead and are gathered by joint_owners_from_runs.
-fn replay_owners_from_runs(
-    runs: &std::collections::HashMap<String, Vec<serde_json::Value>>,
-) -> std::collections::HashMap<String, std::collections::HashSet<String>> {
-    let mut owners: std::collections::HashMap<String, std::collections::HashSet<String>> =
-        Default::default();
-    for (k, v) in runs {
-        for run in v {
-            if let Some(id) = run.get("itemId").and_then(|x| x.as_str()) {
-                owners.entry(k.clone()).or_default().insert(id.to_string());
-            }
-        }
-    }
-    owners
-}
-
-// gate-computes-membership-fresh: the gate's comparison, pure. For every
-// changed path the commit would stage (a partition path covered by a
-// requested item's declared files), does membership's owner set equal the
-// replay's (single owners plus joint members) -- the same test
-// membership_report applies on board serves? Returns (paths checked,
-// divergences as (path, replay, membership)).
-fn gate_membership_comparison(
-    partition: &std::collections::BTreeMap<String, MembershipPathBuckets>,
-    requested_files: &[String],
-    replay_owners: &std::collections::HashMap<String, std::collections::HashSet<String>>,
-    replay_joint: &std::collections::HashMap<String, std::collections::HashSet<String>>,
-) -> (
-    usize,
-    Vec<(
-        String,
-        std::collections::BTreeSet<String>,
-        std::collections::BTreeSet<String>,
-    )>,
-) {
-    let mut checked = 0usize;
-    let mut diverged = Vec::new();
-    for (path, m) in partition {
-        if !requested_files.iter().any(|d| declared_covers(d, path)) {
-            continue;
-        }
-        checked += 1;
-        let mut replay: std::collections::BTreeSet<String> = replay_owners
-            .get(path)
-            .map(|s| s.iter().cloned().collect())
-            .unwrap_or_default();
-        if let Some(j) = replay_joint.get(path) {
-            replay.extend(j.iter().cloned());
-        }
-        if replay != m.owners {
-            diverged.push((path.clone(), replay, m.owners.clone()));
-        }
-    }
-    (checked, diverged)
-}
-
-// gate-computes-membership-fresh, observe-only: at every real commit, obtain a
-// membership partition that is fresh for the CURRENT state (allow_compute =
-// true either computes or hits the memo slot keyed on exactly this HEAD +
-// diff + untracked + roster + intervals -- never the stale previous slot),
-// compare it with the replay the gate is about to act on, and trace cost and
-// agreement. The replay still decides everything; nothing here can change the
-// commit's outcome or return an error into it. Migration step 4 will spend
-// this capability (and must then refuse, not proceed, when it is
-// unavailable); until then it is the pre-flip soak's instrument: gate-time
-// cost (criterion 7 has serve-time baselines only) and agreement at the
-// moment a commit actually happens.
-//
-// issue-425-gate-routes-by-membership: no longer observe-only. It returns the
-// fresh partition so the gate can ROUTE by it (see
-// membership_entangling_owners); None means membership had no answer, which
-// the gate refuses on rather than falling back to the replay. The divergence
-// traces stay, so disagreements remain visible until the replay retires.
+// gate-computes-membership-fresh: at every real commit, obtain a membership
+// partition that is fresh for the CURRENT state (allow_compute = true either
+// computes or hits the memo slot keyed on exactly this HEAD + diff +
+// untracked + roster + intervals, never the stale previous slot), and trace
+// its cost. The gate routes by it (membership_entangling_owners,
+// issue-425-gate-routes-by-membership); None means membership had no answer,
+// which the gate refuses on. The comparison with the replay that ran here
+// until issue-425-retire-replay went with the replay.
 fn gate_membership_observe<R: tauri::Runtime>(
     app: &AppHandle<R>,
     ids: &[String],
     requested_files: &[String],
-    runs_by_path: &std::collections::HashMap<String, Vec<serde_json::Value>>,
 ) -> Option<std::collections::BTreeMap<String, MembershipPathBuckets>> {
     let started = std::time::Instant::now();
     let Some((partition, fresh)) = membership_partition_engine(app, true) else {
@@ -71903,43 +73000,168 @@ fn gate_membership_observe<R: tauri::Runtime>(
         );
         return None;
     };
-    let replay_owners = replay_owners_from_runs(runs_by_path);
-    let replay_joint = joint_owners_from_runs(runs_by_path);
-    let (checked, diverged) =
-        gate_membership_comparison(&partition, requested_files, &replay_owners, &replay_joint);
-    let join = |s: &std::collections::BTreeSet<String>| -> String {
-        if s.is_empty() {
-            "-".to_string()
-        } else {
-            s.iter().cloned().collect::<Vec<_>>().join(",")
-        }
-    };
-    for (path, replay, membership) in &diverged {
-        append_bram_trace_line(
-            app,
-            "claim-interval",
-            &format!(
-                "op=gate-membership-diverges ids={} path={} replay={} membership={}",
-                ids.join(","),
-                path,
-                join(replay),
-                join(membership)
-            ),
-        );
-    }
+    let checked = partition
+        .keys()
+        .filter(|p| requested_files.iter().any(|d| declared_covers(d, p)))
+        .count();
     append_bram_trace_line(
         app,
         "claim-interval",
         &format!(
-            "op=gate-membership ids={} paths={} ms={} fresh={} agrees={}",
+            "op=gate-membership ids={} paths={} ms={} fresh={}",
             ids.len(),
             checked,
             started.elapsed().as_millis(),
-            fresh,
-            diverged.is_empty()
+            fresh
         ),
     );
+    membership_budget_check(
+        app,
+        "gate",
+        started.elapsed().as_millis(),
+        MEMBERSHIP_BUDGET_GATE_MS,
+    );
     Some(partition)
+}
+
+// issue-425-retire-replay: the gate's routing for a selection, run without
+// committing. Same inputs the gate uses: membership (stale is acceptable for
+// display, as for willCommit), begun = `applied` or `begunAtMs`, and
+// `membership_entangling_owners` over the selection's declared files with
+// every begun item outside the selection as a possible owner.
+// - entangled -> interval staging: the precheck's staged numstat for the
+//   whole selection, or the paths whose combined patch doesn't apply;
+// - otherwise -> whole files: each changed declared path's HEAD-diff universe,
+//   plus the unowned lines that ride along (what `unownedTaken` will report).
+fn worklist_selection_prediction<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    ids: &[String],
+) -> serde_json::Value {
+    let Some((partition, fresh, state_key)) = membership_partition_keyed(app) else {
+        return serde_json::json!({ "ready": false });
+    };
+    let mut begun: std::collections::HashSet<String> = Default::default();
+    let mut files_map: std::collections::HashMap<String, Vec<String>> = Default::default();
+    if let Some(wf) = worklist_file(app) {
+        if let Some(doc) = std::fs::read_to_string(&wf)
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        {
+            for it in doc
+                .get("items")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+            {
+                let Some(id) = it.get("id").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if it.get("status").and_then(|v| v.as_str()) == Some("applied")
+                    || it.get("begunAtMs").and_then(|v| v.as_i64()).unwrap_or(0) > 0
+                {
+                    begun.insert(id.to_string());
+                }
+                if ids.iter().any(|r| r == id) {
+                    files_map.insert(id.to_string(), worklist_item_files(it));
+                }
+            }
+        }
+    }
+    let mut requested_files: Vec<String> = files_map.values().flatten().cloned().collect();
+    requested_files.sort();
+    requested_files.dedup();
+    let outside: std::collections::HashSet<String> =
+        begun.iter().filter(|b| !ids.contains(b)).cloned().collect();
+    let owners = membership_entangling_owners(&partition, &requested_files, ids, &outside);
+    if !owners.is_empty() {
+        let mut entangled_with: Vec<String> = owners.into_iter().map(|(_, o)| o).collect();
+        entangled_with.sort();
+        entangled_with.dedup();
+        return match interval_commit_precheck(app, ids, &files_map) {
+            Ok(take) => {
+                let (a, r) = take
+                    .values()
+                    .fold((0, 0), |acc, v| (acc.0 + v.0, acc.1 + v.1));
+                serde_json::json!({
+                    "ready": true, "stale": !fresh, "stateKey": state_key, "mode": "interval",
+                    "added": a, "removed": r, "entangledWith": entangled_with,
+                })
+            }
+            Err(paths) => serde_json::json!({
+                "ready": true, "stale": !fresh, "stateKey": state_key, "mode": "interval",
+                "dependentPaths": paths, "entangledWith": entangled_with,
+            }),
+        };
+    }
+    selection_whole_file_json(&partition, fresh, state_key, &requested_files)
+}
+
+// The whole-file answer of `worklist_selection_prediction`, pure: the take
+// is each changed declared path's HEAD-diff universe, plus the unowned lines
+// that ride along. `state_key` is the key of the read `partition` came from,
+// stamped as given (Codex review: never a key looked up afterwards).
+fn selection_whole_file_json(
+    partition: &std::collections::BTreeMap<String, MembershipPathBuckets>,
+    fresh: bool,
+    state_key: String,
+    requested_files: &[String],
+) -> serde_json::Value {
+    let paths: Vec<String> = partition
+        .keys()
+        .filter(|p| requested_files.iter().any(|d| declared_covers(d, p)))
+        .cloned()
+        .collect();
+    let (a, r) = paths.iter().fold((0, 0), |acc, p| {
+        let u = partition.get(p).map(|m| m.universe).unwrap_or((0, 0));
+        (acc.0 + u.0, acc.1 + u.1)
+    });
+    let unowned: Vec<serde_json::Value> = membership_unowned_taken(&partition, &paths)
+        .into_iter()
+        .map(|(p, a, r)| serde_json::json!({ "path": p, "added": a, "removed": r }))
+        .collect();
+    serde_json::json!({
+        "ready": true, "stale": !fresh, "stateKey": state_key, "mode": "whole-file",
+        "added": a, "removed": r, "unowned": unowned,
+    })
+}
+
+#[cfg(test)]
+mod selection_prediction_tests {
+    use super::{selection_whole_file_json, MembershipPathBuckets};
+    use std::collections::BTreeMap;
+
+    // issue-425-retire-replay, Codex review: the answer carries the key of the
+    // read its partition came from, and freshness as given. The entangled-with-
+    // unowned demo shape: two owners' lines plus one unowned line, +3 -3.
+    #[test]
+    fn whole_file_answer_stamps_its_own_key_and_counts_unowned() {
+        let mut b = MembershipPathBuckets {
+            universe: (3, 3),
+            single: (2, 2),
+            ..Default::default()
+        };
+        b.per_item.insert(vec!["top".to_string()], (1, 1));
+        b.per_item.insert(vec!["bottom".to_string()], (1, 1));
+        let mut partition = BTreeMap::new();
+        partition.insert("demo/f.txt".to_string(), b);
+        let v = selection_whole_file_json(
+            &partition,
+            false,
+            "K-of-this-read".to_string(),
+            &["demo/f.txt".to_string()],
+        );
+        assert_eq!(v["stateKey"], "K-of-this-read");
+        assert_eq!(v["stale"], true);
+        assert_eq!(v["mode"], "whole-file");
+        assert_eq!(
+            (v["added"].as_u64(), v["removed"].as_u64()),
+            (Some(3), Some(3))
+        );
+        assert_eq!(
+            v["unowned"],
+            serde_json::json!([{"path": "demo/f.txt", "added": 1, "removed": 1}])
+        );
+    }
 }
 
 // issue-425-gate-routes-by-membership: the begun items OUTSIDE the request
@@ -71970,6 +73192,73 @@ fn membership_entangling_owners(
     out
 }
 
+// issue-432: the same-click joint refusal (#356), decided by membership — the
+// model the gate already routes by — instead of the replay's joint runs. A
+// membership joint entry is a `per_item` key with more than one member and
+// nonzero lines; members are begun items that declare the path, and lines
+// already committed are not in the diff, so a joint whose owner committed
+// (#432) or a partner with no changes there has nothing to charge. Refuse
+// only when the entry holds a REQUESTED id and an outside begun id: a joint
+// entry with no requested member is someone else's, and interval staging
+// already leaves it alone. Returns the entry's members (sorted).
+fn membership_joint_refusal(
+    partition: &std::collections::BTreeMap<String, MembershipPathBuckets>,
+    path: &str,
+    requested_ids: &[String],
+    begun_outside: &std::collections::HashSet<String>,
+) -> Option<Vec<String>> {
+    let m = partition.get(path)?;
+    m.per_item.iter().find_map(|(members, (a, r))| {
+        let joint = members.len() > 1 && a + r > 0;
+        let has_requested = members.iter().any(|x| requested_ids.contains(x));
+        let has_outside = members.iter().any(|x| begun_outside.contains(x));
+        (joint && has_requested && has_outside).then(|| members.clone())
+    })
+}
+
+// issue-432: membership's joint owners per path, in the shape
+// `joint_owners_from_runs` returns, so the board's `jointWith` and the
+// gate's refusal reason from one model.
+fn membership_joint_owners(
+    partition: &std::collections::BTreeMap<String, MembershipPathBuckets>,
+) -> std::collections::HashMap<String, std::collections::HashSet<String>> {
+    let mut out: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        Default::default();
+    for (path, m) in partition {
+        for (members, (a, r)) in &m.per_item {
+            if members.len() > 1 && a + r > 0 {
+                out.entry(path.clone())
+                    .or_default()
+                    .extend(members.iter().cloned());
+            }
+        }
+    }
+    out
+}
+
+// issue-432: when the joint set was approved, for the refusal message — the
+// latest claim interval whose ids are exactly these members.
+fn joint_click_at_ms(project_root: &Path, members: &[String]) -> Option<i64> {
+    let text = std::fs::read_to_string(project_root.join(CLAIM_INTERVALS_REL)).ok()?;
+    let doc: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let mut want: Vec<&str> = members.iter().map(|s| s.as_str()).collect();
+    want.sort();
+    doc.get("intervals")?
+        .as_array()?
+        .iter()
+        .filter(|iv| {
+            let mut ids: Vec<&str> = iv
+                .get("ids")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+                .unwrap_or_default();
+            ids.sort();
+            ids == want
+        })
+        .filter_map(|iv| iv.get("atMs").and_then(|v| v.as_i64()))
+        .max()
+}
+
 // issue-425-gate-routes-by-membership: lines a whole-file commit takes that
 // membership credits to NO item (chat-turn edits, edits between windows, a
 // neighbour's lines on a path it does not declare). Disclosed, not refused
@@ -71998,19 +73287,47 @@ fn membership_unowned_taken(
 // issue-425-gate-routes-by-membership (Codex review: "one state for
 // classification and staging"): the worktree content of every changed path
 // under the request's files, captured BEFORE membership classifies them.
-// Whole-file staging then checks the index against it, so an edit landing
-// between classification and `git add` is refused, never silently absorbed
-// into a commit membership did not see. Values are blob ids, "-" for a
-// deleted path.
+// Whole-file staging then re-checks it, so an edit landing between
+// classification and `git add` is refused, never silently absorbed into a
+// commit membership did not see. Values are RAW blob ids
+// (`hash-object --no-filters`), "-" for a deleted path.
+//
+// issue-434: this used to be `hash-object` with filters, a prediction of the
+// blob `git add` would stage, compared against the index. The prediction is
+// wrong for a file whose index blob already has CRLF: under core.autocrlf
+// `git add` skips conversion for it and stages the raw bytes, while
+// `hash-object` (no index to consult) predicts the converted blob. Every
+// commit of such a file was refused as drift. Raw bytes answer only "did the
+// file change?"; whether the index matches the file is asked of git itself
+// (gate_index_mismatch), which applies its own conversion rules.
 fn gate_worktree_snapshot<R: tauri::Runtime>(
     app: &AppHandle<R>,
+    files: &[String],
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let root = project_root(Some(app)).ok_or_else(|| "no project root".to_string())?;
+    gate_raw_snapshot_in(&root, files)
+}
+
+fn gate_git(root: &std::path::Path, args: &[String]) -> Result<String, String> {
+    let out = std::process::Command::new("git")
+        .current_dir(root)
+        .args(args)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+fn gate_raw_snapshot_in(
+    root: &std::path::Path,
     files: &[String],
 ) -> Result<std::collections::BTreeMap<String, String>, String> {
     let mut out = std::collections::BTreeMap::new();
     if files.is_empty() {
         return Ok(out);
     }
-    let root = project_root(Some(app)).ok_or_else(|| "no project root".to_string())?;
     let mut paths: std::collections::BTreeSet<String> = Default::default();
     let mut diff = vec![
         "diff".to_string(),
@@ -72020,7 +73337,7 @@ fn gate_worktree_snapshot<R: tauri::Runtime>(
         "--".to_string(),
     ];
     diff.extend(files.iter().cloned());
-    for l in git_run_owned(app, &diff)?.lines() {
+    for l in gate_git(root, &diff)?.lines() {
         if !l.trim().is_empty() {
             paths.insert(l.trim().to_string());
         }
@@ -72032,39 +73349,90 @@ fn gate_worktree_snapshot<R: tauri::Runtime>(
         "--".to_string(),
     ];
     others.extend(files.iter().cloned());
-    for l in git_run_owned(app, &others)?.lines() {
+    for l in gate_git(root, &others)?.lines() {
         if !l.trim().is_empty() {
             paths.insert(l.trim().to_string());
         }
     }
     for p in paths {
-        let blob = if root.join(&p).exists() {
-            git_run(app, &["hash-object", "--", &p])?.trim().to_string()
-        } else {
-            "-".to_string()
-        };
+        let blob = gate_raw_blob_in(root, &p)?;
         out.insert(p, blob);
     }
     Ok(out)
 }
 
-// The index side of the same comparison: the staged blob id of each path,
-// "-" when the index does not carry it (a staged deletion).
-fn gate_index_blobs<R: tauri::Runtime>(
-    app: &AppHandle<R>,
-    paths: &[String],
-) -> Result<std::collections::BTreeMap<String, String>, String> {
-    let mut out = std::collections::BTreeMap::new();
-    for p in paths {
-        let line = git_run(app, &["ls-files", "-s", "--", p])?;
-        let blob = line
-            .split_whitespace()
-            .nth(1)
-            .map(str::to_string)
-            .unwrap_or_else(|| "-".to_string());
-        out.insert(p.clone(), blob);
+// The raw blob id of one path's worktree bytes, "-" when it is absent.
+fn gate_raw_blob_in(root: &std::path::Path, p: &str) -> Result<String, String> {
+    if !root.join(p).exists() {
+        return Ok("-".to_string());
     }
-    Ok(out)
+    let args = vec![
+        "hash-object".to_string(),
+        "--no-filters".to_string(),
+        "--".to_string(),
+        p.to_string(),
+    ];
+    Ok(gate_git(root, &args)?.trim().to_string())
+}
+
+// issue-434: staged paths whose index entry does not match the worktree file
+// by git's own rules (index vs worktree, conversion applied as `git add`
+// applies it). Empty after a clean whole-file stage, CRLF index blobs
+// included.
+fn gate_index_mismatch_in(
+    root: &std::path::Path,
+    staged: &[String],
+) -> Result<Vec<String>, String> {
+    if staged.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut args = vec![
+        "diff".to_string(),
+        "--name-only".to_string(),
+        "--no-renames".to_string(),
+        "--".to_string(),
+    ];
+    args.extend(staged.iter().cloned());
+    Ok(gate_git(root, &args)?
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+// The whole-file drift check, after staging. Returns (reason, paths) for the
+// first test that fails, or None:
+//   path-set       -- the staged paths are not the snapshot's paths;
+//   changed        -- a path's raw bytes differ from the snapshot (an edit
+//                     landed after classification);
+//   index-mismatch -- git says the index does not match the file.
+fn gate_drift_after_staging(
+    root: &std::path::Path,
+    snapshot: &std::collections::BTreeMap<String, String>,
+    staged: &[String],
+) -> Result<Option<(&'static str, Vec<String>)>, String> {
+    let staged_set: std::collections::BTreeMap<String, String> = staged
+        .iter()
+        .map(|p| (p.clone(), snapshot.get(p).cloned().unwrap_or_default()))
+        .collect();
+    let path_set = gate_state_drift(snapshot, &staged_set);
+    if !path_set.is_empty() {
+        return Ok(Some(("path-set", path_set)));
+    }
+    let mut now = std::collections::BTreeMap::new();
+    for p in staged {
+        now.insert(p.clone(), gate_raw_blob_in(root, p)?);
+    }
+    let changed = gate_state_drift(snapshot, &now);
+    if !changed.is_empty() {
+        return Ok(Some(("changed", changed)));
+    }
+    let mismatch = gate_index_mismatch_in(root, staged)?;
+    if !mismatch.is_empty() {
+        return Ok(Some(("index-mismatch", mismatch)));
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -72170,6 +73538,100 @@ mod gate_routes_by_membership_tests {
         let deleted: BTreeMap<String, String> = [("a".into(), "-".into())].into_iter().collect();
         let del_staged = deleted.clone();
         assert!(gate_state_drift(&deleted, &del_staged).is_empty());
+    }
+}
+
+// issue-434: the whole-file drift check against real git, CRLF included.
+#[cfg(test)]
+mod gate_crlf_drift_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    fn git(root: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {:?} failed: {:?}", args, out);
+    }
+
+    // A repo holding crlf.js stored WITH CRLF and lf.js stored LF, committed
+    // under autocrlf=false, then switched to autocrlf=true and both edited
+    // with CRLF content: Andrew's #434 checkout.
+    fn crlf_repo(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "bram-434-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q"]);
+        git(&root, &["config", "user.email", "t@example.com"]);
+        git(&root, &["config", "user.name", "Test"]);
+        git(&root, &["config", "core.autocrlf", "false"]);
+        std::fs::write(root.join("crlf.js"), "a\r\nb\r\n").unwrap();
+        std::fs::write(root.join("lf.js"), "a\nb\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-qm", "base"]);
+        git(&root, &["config", "core.autocrlf", "true"]);
+        std::fs::write(root.join("crlf.js"), "a\r\nb\r\nc\r\n").unwrap();
+        std::fs::write(root.join("lf.js"), "a\r\nb\r\nc\r\n").unwrap();
+        root
+    }
+
+    fn files() -> Vec<String> {
+        vec!["crlf.js".to_string(), "lf.js".to_string()]
+    }
+
+    #[test]
+    fn crlf_index_blob_is_not_drift() {
+        let root = crlf_repo("clean");
+        let snap = gate_raw_snapshot_in(&root, &files()).unwrap();
+        assert_eq!(snap.len(), 2);
+        git(&root, &["add", "--", "crlf.js", "lf.js"]);
+        let drift = gate_drift_after_staging(&root, &snap, &files()).unwrap();
+        assert_eq!(
+            drift, None,
+            "#434: a CRLF index blob must not read as drift"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn edit_after_snapshot_is_drift() {
+        let root = crlf_repo("edit");
+        let snap = gate_raw_snapshot_in(&root, &files()).unwrap();
+        std::fs::write(root.join("crlf.js"), "a\r\nb\r\nc\r\nd\r\n").unwrap();
+        git(&root, &["add", "--", "crlf.js", "lf.js"]);
+        let drift = gate_drift_after_staging(&root, &snap, &files()).unwrap();
+        assert_eq!(drift, Some(("changed", vec!["crlf.js".to_string()])));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn edit_after_staging_is_drift() {
+        let root = crlf_repo("late");
+        let snap = gate_raw_snapshot_in(&root, &files()).unwrap();
+        git(&root, &["add", "--", "crlf.js", "lf.js"]);
+        std::fs::write(root.join("lf.js"), "late\r\n").unwrap();
+        let drift = gate_drift_after_staging(&root, &snap, &files()).unwrap();
+        assert_eq!(drift, Some(("changed", vec!["lf.js".to_string()])));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn staged_path_set_must_match_snapshot() {
+        let root = crlf_repo("set");
+        let snap = gate_raw_snapshot_in(&root, &files()).unwrap();
+        git(&root, &["add", "--", "crlf.js"]);
+        let drift = gate_drift_after_staging(&root, &snap, &["crlf.js".to_string()]).unwrap();
+        assert_eq!(drift, Some(("path-set", vec!["lf.js".to_string()])));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
@@ -72360,7 +73822,7 @@ fn handle_worklist_commit<R: tauri::Runtime>(
                 .unwrap_or(false);
             if unformatted {
                 append_bram_trace_line(app, "worklist-commit", "op=refuse-unformatted-rust");
-                release_claim_on_commit_refusal(app, &ids);
+                release_claim_on_commit_refusal(app, &ids, "Rust is not formatted; run cargo fmt");
                 return worklist_json_error(
                     409,
                     "commit refused: Rust is not formatted. Run `cargo fmt` in src-tauri and retry."
@@ -72389,11 +73851,6 @@ fn handle_worklist_commit<R: tauri::Runtime>(
     // The 409 survives only as the fallback when there is genuinely no interval
     // to stage (work predating capture) — the honest baseline.
     let mut needs_interval_stage = false;
-    // Hoisted from the scan block (issue-364): the residual-disclosure pass
-    // after an interval-staged commit reuses these. The runs stay valid
-    // across the commit because interval staging never touches the worktree
-    // the replay is positioned against.
-    let (runs_by_path, _, _, _unowned_by_path) = claim_attribution_runs(app);
     // issue-425-gate-routes-by-membership: the worktree snapshot comes
     // FIRST, so any edit after it — even one membership then sees — shows up
     // as drift at staging instead of being absorbed. Twins are included
@@ -72404,7 +73861,7 @@ fn handle_worklist_commit<R: tauri::Runtime>(
         match gate_worktree_snapshot(app, &snap_files) {
             Ok(s) => s,
             Err(e) => {
-                release_claim_on_commit_refusal(app, &ids);
+                release_claim_on_commit_refusal(app, &ids, "the worktree snapshot failed");
                 return worklist_json_error(500, format!("worktree snapshot failed: {}", e));
             }
         }
@@ -72421,22 +73878,28 @@ fn handle_worklist_commit<R: tauri::Runtime>(
         })
         .flat_map(worklist_item_files)
         .collect();
-    let Some(partition) = gate_membership_observe(app, &ids, &requested_files, &runs_by_path)
-    else {
+    let Some(partition) = gate_membership_observe(app, &ids, &requested_files) else {
         // Refuse rather than fall back to the replay: the replay is the
-        // model that named 21 wrong neighbours (#419), and why membership
-        // occasionally has no answer is not yet established.
+        // model that named 21 wrong neighbours (#419). Why membership has no
+        // answer is on the engine's own `op=membership … reason=` line; the
+        // field case (#437) was a scratch-index add that failed on a declared
+        // file not yet created, deterministically, so retrying never helped.
         append_bram_trace_line(
             app,
             "worklist-commit",
             &format!("op=refuse-membership-unavailable ids={}", ids.join(",")),
         );
-        release_claim_on_commit_refusal(app, &ids);
+        release_claim_on_commit_refusal(
+            app,
+            &ids,
+            "Bram couldn't tell which lines belong to which item",
+        );
         return worklist_json_error(
             409,
-            "commit refused: Bram couldn't work out which lines belong to which item right \
-             now, so it can't tell whether this commit would take another item's work. \
-             Nothing was committed. Try the commit again in a moment."
+            "commit refused: Bram couldn't work out which lines belong to which item, so it \
+             can't tell whether this commit would take another item's work. Nothing was \
+             committed. If this repeats, retrying won't clear it: the trace line \
+             `op=membership … reason=` in resources/bram-traces/bram-trace.log says why."
                 .to_string(),
         );
     };
@@ -72455,87 +73918,73 @@ fn handle_worklist_commit<R: tauri::Runtime>(
     {
         let requested: std::collections::HashSet<&str> = ids.iter().map(|s| s.as_str()).collect();
         for path in &files {
-            let Some(runs) = runs_by_path.get(path) else {
-                continue;
-            };
-            for run in runs {
-                // issue-356: a JOINT run carries `itemIds`, not `itemId`, so
-                // this scan used to skip it silently — which is exactly how a
-                // same-click plural approval (one claim, one capture
-                // boundary, joint runs on the shared declared path) let a
-                // single-id commit stage the file wholesale and absorb the
-                // neighbour's hunks under the requested item's message.
-                // Interval staging cannot split a joint run (there is no
-                // per-item interval to stage from), so the honest answer is
-                // the 409: commit the joint items together — safe, every
-                // line accounted for — or separate the hunks by hand.
-                if let Some(members) = run.get("itemIds").and_then(|v| v.as_array()) {
-                    let member_ids: Vec<String> = members
-                        .iter()
-                        .filter_map(|m| m.as_str().map(String::from))
-                        .collect();
-                    let outside_begun = member_ids.iter().any(|owner| {
-                        !requested.contains(owner.as_str())
-                            && items.iter().any(|it| {
-                                it.get("id").and_then(|v| v.as_str()) == Some(owner.as_str())
-                                    && (it.get("status").and_then(|v| v.as_str())
-                                        == Some("applied")
-                                        || it
-                                            .get("begunAtMs")
-                                            .and_then(|v| v.as_i64())
-                                            .unwrap_or(0)
-                                            > 0)
-                            })
+            // issue-356: same-click plural approvals share one capture
+            // boundary, so their lines on a shared path are JOINT and interval
+            // staging cannot split them; the honest answer is the 409.
+            // issue-432: decided by membership (the model the gate routes by
+            // below), not the replay's joint runs — the replay re-resolved a
+            // joint interval from whoever declared the path NOW, so once its
+            // owner committed and was pruned it charged the other partner
+            // (with no changes, not declaring the path) and refused an item
+            // that was never in the click.
+            if let Some(members) = membership_joint_refusal(&partition, path, &ids, &begun_outside)
+            {
+                let partners: Vec<String> = members
+                    .iter()
+                    .filter(|m| !requested.contains(m.as_str()))
+                    .cloned()
+                    .collect();
+                let when = project_root(Some(app))
+                    .and_then(|root| joint_click_at_ms(&root, &members))
+                    .map(|at| {
+                        let mins = (unix_now_ms() - at).max(0) / 60_000;
+                        if mins < 1 {
+                            "just now".to_string()
+                        } else if mins < 120 {
+                            format!("{} min ago", mins)
+                        } else {
+                            format!("{} h ago", mins / 60)
+                        }
                     });
-                    if outside_begun {
-                        append_bram_trace_line(
-                            app,
-                            "worklist-commit",
-                            &format!(
-                                "op=refuse-joint-interval path={} ids=[{}]",
-                                path,
-                                member_ids.join(",")
-                            ),
-                        );
-                        release_claim_on_commit_refusal(app, &ids);
-                        // avoid-futile-joint-commit: "separate the hunks by hand
-                        // and retry" used to close this message, and it is
-                        // unsatisfiable — attribution here is keyed on the
-                        // RECORDED interval, not the instantaneous diff, so no
-                        // amount of hand-editing the working tree produces a
-                        // per-item interval to stage from (field-tested
-                        // 2026-09-07: refused three times regardless). Name the
-                        // joint ids and the only two honest outs: commit them
-                        // together now, or approve in separate clicks next time
-                        // — before any of them begins — so each gets its own
-                        // capture boundary.
-                        return worklist_json_error(
-                            409,
-                            format!(
-                                "commit refused: {} carries work jointly attributed to [{}] \
-                                 (these items were approved together in one click, so they \
-                                 share a single capture boundary and their edits to this path \
-                                 cannot be split per item after the fact). Commit those items \
-                                 together — every line is accounted for. Per-item commits on a \
-                                 shared path require approving each item in a SEPARATE click, \
-                                 before any of them begins. Or, for separate commits NOW: park \
-                                 one item's changes (save its patch, reverse-apply it), Drop \
-                                 that item, commit this one, then restore the patch and \
-                                 re-propose it — a dropped partner no longer blocks, and \
-                                 staging follows current content. Editing the worktree WITHOUT \
-                                 the Drop does not clear this refusal: the joint attribution is \
-                                 recorded, not derived from the diff.",
-                                path,
-                                member_ids.join(", ")
-                            ),
-                        );
-                    }
-                    continue;
-                }
-                // issue-425-gate-routes-by-membership: a single-owner replay
-                // run no longer routes anything — membership decides below.
-                // (The replay named an outside item with no lines of its own
-                // 21 of 21 times in #419's adjudication.)
+                append_bram_trace_line(
+                    app,
+                    "worklist-commit",
+                    &format!(
+                        "op=refuse-joint-interval path={} ids=[{}] source=membership",
+                        path,
+                        members.join(",")
+                    ),
+                );
+                release_claim_on_commit_refusal(
+                    app,
+                    &ids,
+                    &format!(
+                        "it shares a joint change with {}; commit them together, or Drop {}",
+                        partners.join(" and "),
+                        if partners.len() == 1 { "it" } else { "them" }
+                    ),
+                );
+                // avoid-futile-joint-commit: name the joint ids and the honest
+                // outs. "Separate the hunks by hand" stays out: no hand edit
+                // produces a per-item interval to stage from.
+                return worklist_json_error(
+                    409,
+                    format!(
+                        "commit refused: {} carries work jointly attributed to [{}], which \
+                         were approved together in one click{} and so share a single capture \
+                         boundary; their edits to this path cannot be split per item after \
+                         the fact. Commit [{}] together — every line is accounted for. Or Drop \
+                         [{}] (park its changes first if you want them back: save its patch, \
+                         reverse-apply it, and re-propose it after this commit) — a dropped \
+                         partner no longer blocks. Per-item commits on a shared path require \
+                         approving each item in a SEPARATE click, before any of them begins.",
+                        path,
+                        members.join(", "),
+                        when.map(|w| format!(" ({})", w)).unwrap_or_default(),
+                        members.join(", "),
+                        partners.join(", ")
+                    ),
+                );
             }
         }
     }
@@ -72590,7 +74039,18 @@ fn handle_worklist_commit<R: tauri::Runtime>(
                 committed_paths = cp;
             }
             Err(e) if e == "no-interval" => {
-                release_claim_on_commit_refusal(app, &ids);
+                if bram_trace_enabled() {
+                    append_bram_trace_line(
+                        app,
+                        "worklist-commit",
+                        &format!("op=refuse-no-interval ids={}", ids.join(",")),
+                    );
+                }
+                release_claim_on_commit_refusal(
+                    app,
+                    &ids,
+                    "nothing of its own to stage on its shared files",
+                );
                 return worklist_json_error(
                     409,
                     "commit refused: this item's changes are entirely shared with another begun \
@@ -72600,7 +74060,25 @@ fn handle_worklist_commit<R: tauri::Runtime>(
                 );
             }
             Err(e) => {
-                release_claim_on_commit_refusal(app, &ids);
+                // issue-430: this refusal was untraced; the trace ended at the
+                // staging lines.
+                let failing = git_apply_failed_paths(&e);
+                if bram_trace_enabled() {
+                    append_bram_trace_line(
+                        app,
+                        "worklist-commit",
+                        &format!(
+                            "op=refuse-interval-dependent ids={} paths={}",
+                            ids.join(","),
+                            failing.join(",")
+                        ),
+                    );
+                }
+                release_claim_on_commit_refusal(
+                    app,
+                    &ids,
+                    "its change depends on another item's uncommitted lines; commit them together",
+                );
                 return worklist_json_error(409, e);
             }
         }
@@ -72717,7 +74195,7 @@ fn handle_worklist_commit<R: tauri::Runtime>(
                     "op=refuse-empty-commit stage=whole-file",
                 );
             }
-            release_claim_on_commit_refusal(app, &ids);
+            release_claim_on_commit_refusal(app, &ids, "no changes to commit");
             return worklist_json_error(
                 409,
                 "commit refused: this item's declared files carry no changes to commit \
@@ -72731,12 +74209,16 @@ fn handle_worklist_commit<R: tauri::Runtime>(
         // (taken before membership classified the paths) saw; otherwise an
         // edit landed in between and the commit would carry lines no
         // classification covered. Unstage and refuse — a retry re-snapshots.
-        let staged_blobs = match gate_index_blobs(app, &staged_after) {
-            Ok(b) => b,
+        // issue-434: decided from raw bytes plus git's own index-vs-file
+        // check, not a predicted staged blob (wrong for CRLF index blobs).
+        let Some(root) = project_root(Some(app)) else {
+            return worklist_json_error(500, "no project root");
+        };
+        let drift_check = match gate_drift_after_staging(&root, &worktree_snapshot, &staged_after) {
+            Ok(d) => d,
             Err(e) => return worklist_json_error(500, e),
         };
-        let drift = gate_state_drift(&worktree_snapshot, &staged_blobs);
-        if !drift.is_empty() {
+        if let Some((reason, drift)) = drift_check {
             let mut unstage = vec!["reset".to_string(), "-q".to_string(), "--".to_string()];
             unstage.extend(staged_after.iter().cloned());
             let _ = git_run_owned(app, &unstage);
@@ -72744,11 +74226,16 @@ fn handle_worklist_commit<R: tauri::Runtime>(
                 app,
                 "worklist-commit",
                 &format!(
-                    "op=refuse-state-drift paths={}",
+                    "op=refuse-state-drift reason={} paths={}",
+                    reason,
                     drift.iter().take(5).cloned().collect::<Vec<_>>().join(",")
                 ),
             );
-            release_claim_on_commit_refusal(app, &ids);
+            release_claim_on_commit_refusal(
+                app,
+                &ids,
+                "files changed while the commit was being prepared",
+            );
             return worklist_json_error(
                 409,
                 format!(
@@ -72880,7 +74367,7 @@ fn handle_worklist_commit<R: tauri::Runtime>(
         if bram_trace_enabled() {
             append_bram_trace_line(app, "worklist-commit", "op=refuse-empty-commit");
         }
-        release_claim_on_commit_refusal(app, &ids);
+        release_claim_on_commit_refusal(app, &ids, "no changes to commit");
         return worklist_json_error(
             409,
             "commit refused: the commit would create no new revision — this item's declared \
@@ -72960,9 +74447,15 @@ fn handle_worklist_commit<R: tauri::Runtime>(
                     continue;
                 }
                 let residual = diff_residual_lines(&patch);
-                let empty_runs: Vec<serde_json::Value> = Vec::new();
-                let runs = runs_by_path.get(&path).unwrap_or(&empty_runs);
-                let owner = residual_owner_label(&residual, runs, &begun_outside);
+                // issue-425-retire-replay: classify against membership's
+                // runs, from the gate's own pre-commit partition. Interval
+                // staging never touches the worktree, so present-file line
+                // numbers taken before the commit still hold after it.
+                let runs: Vec<serde_json::Value> = partition
+                    .get(&path)
+                    .map(|b| membership_runs_json(&b.runs))
+                    .unwrap_or_default();
+                let owner = residual_owner_label(&residual, &runs, &begun_outside);
                 append_bram_trace_line(
                     app,
                     "worklist-commit",
@@ -73119,8 +74612,8 @@ fn handle_worklist_commit<R: tauri::Runtime>(
 #[cfg(test)]
 mod worklist_authorization_tests {
     use super::{
-        apply_worklist_mutation, build_worklist_authorization_record, classify_worklist_removals,
-        draft_markdown_path, enqueue_pending_worklist_push_mirror_path,
+        apply_worklist_mutation, build_worklist_authorization_record, changelog_removal_bucket,
+        classify_worklist_removals, draft_markdown_path, enqueue_pending_worklist_push_mirror_path,
         ensure_no_unrelated_staged_files, ensure_worklist_commit_authorized, feedback_draft_path,
         inflight_claim_fully_covered, installed_twins_for, parse_worklist_authorization_message,
         parse_worklist_authorization_payload, read_pending_worklist_push_mirrors,
@@ -73899,6 +75392,57 @@ mod worklist_authorization_tests {
         assert_eq!(pruned, ids(&["a"]));
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].get("id").and_then(|v| v.as_str()), Some("b"));
+    }
+
+    // issue-433: a drop authorization naming the id wins over prior status.
+    #[test]
+    fn changelog_removal_bucket_drop_of_applied_reads_dropped() {
+        let ids = vec!["a".to_string()];
+        // #433's shape: applied, dropped with nothing to commit.
+        assert_eq!(
+            changelog_removal_bucket("applied", "a", false, false, Some("drop"), &ids),
+            Some("dropped")
+        );
+        assert_eq!(
+            changelog_removal_bucket("applied", "a", false, false, Some("approved"), &ids),
+            Some("committed")
+        );
+        // 022802d: a commit-prune whose auth was overwritten or is absent.
+        assert_eq!(
+            changelog_removal_bucket("applied", "a", false, false, None, &[]),
+            Some("committed")
+        );
+        let other = vec!["b".to_string()];
+        assert_eq!(
+            changelog_removal_bucket("applied", "a", false, false, Some("drop"), &other),
+            Some("committed")
+        );
+        assert_eq!(
+            changelog_removal_bucket("proposed", "a", false, false, Some("drop"), &ids),
+            Some("dropped")
+        );
+        assert_eq!(
+            changelog_removal_bucket("proposed", "a", false, false, None, &[]),
+            None
+        );
+        assert_eq!(
+            changelog_removal_bucket("applied", "a", true, false, Some("drop"), &ids),
+            Some("cleared")
+        );
+        // Codex's review: a later approval overwrote the drop auth before
+        // the changelog ran. The route's record still says dropped.
+        assert_eq!(
+            changelog_removal_bucket("applied", "a", false, true, Some("approved"), &other),
+            Some("dropped")
+        );
+        assert_eq!(
+            changelog_removal_bucket("applied", "a", false, true, None, &[]),
+            Some("dropped")
+        );
+        assert_eq!(
+            changelog_removal_bucket("applied", "a", true, true, None, &[]),
+            Some("cleared")
+        );
     }
 
     #[test]
@@ -78256,6 +79800,8 @@ mod worklist_change_projection_tests {
             counts,
             hunks_by_path,
             diff_by_path: HashMap::new(),
+            head_diff_by_path: HashMap::new(),
+            ignored_paths: std::collections::HashSet::new(),
             spawns: 0,
         }
     }
@@ -78318,6 +79864,73 @@ mod worklist_change_projection_tests {
             rows[0].get("status").and_then(|v| v.as_str()),
             Some("unchanged")
         );
+    }
+
+    // issue-438: a declared file on disk that git ignores reads "ignored",
+    // says why, and still counts as nothing to commit.
+    #[test]
+    fn an_ignored_declared_file_says_so_and_counts_as_unchanged() {
+        let mut i = idx(&[("edited.rs", "modified", 2, 1, 1)]);
+        i.ignored_paths.insert("NOTICES.md".to_string());
+        let files = vec!["NOTICES.md".to_string(), "edited.rs".to_string()];
+        let (rows, sum) = worklist_change_activity_for(&i, &files).unwrap();
+        assert_eq!(field(&sum, "changed"), 1, "only edited.rs changed");
+        assert_eq!(field(&sum, "added"), 2);
+        assert_eq!(field(&sum, "total"), 2);
+        let notices = &rows[0];
+        assert_eq!(
+            notices.get("status").and_then(|v| v.as_str()),
+            Some("ignored")
+        );
+        assert_eq!(
+            notices.get("label").and_then(|v| v.as_str()),
+            Some("NOTICES.md  (ignored by .gitignore)")
+        );
+        // Alone, it leaves the item with nothing to commit.
+        let (_, alone) = worklist_change_activity_for(&i, &["NOTICES.md".to_string()]).unwrap();
+        assert_eq!(field(&alone, "changed"), 0);
+        assert_eq!(
+            alone.get("diskLabel").and_then(|v| v.as_str()),
+            Some("no changes yet")
+        );
+    }
+
+    // issue-438: check-ignore reports only what git cannot see.
+    #[test]
+    fn ignored_declared_names_only_untracked_ignored_files() {
+        let root = super::membership_port_support::scratch_repo("i438");
+        std::fs::write(root.join(".gitignore"), "/*.md\n").unwrap();
+        std::fs::write(root.join("TRACKED.md"), "t\n").unwrap();
+        let git = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .current_dir(&root)
+                .args(args)
+                .status()
+                .unwrap()
+                .success())
+        };
+        git(&["add", ".gitignore"]);
+        git(&["add", "-f", "TRACKED.md"]);
+        git(&["commit", "-q", "-m", "head"]);
+        std::fs::write(root.join("NOTICES.md"), "n\n").unwrap();
+        std::fs::write(root.join("plain.rs"), "p\n").unwrap();
+        let got = super::worklist_ignored_declared(
+            &root,
+            &[
+                "NOTICES.md".to_string(),
+                "TRACKED.md".to_string(),
+                "plain.rs".to_string(),
+                "missing.md".to_string(),
+            ],
+        );
+        // missing.md matches the rule, but the board only asks about files
+        // that exist; check-ignore itself would name it.
+        assert!(got.contains("NOTICES.md"), "{:?}", got);
+        assert!(
+            !got.contains("TRACKED.md"),
+            "tracked files are visible to git"
+        );
+        assert!(!got.contains("plain.rs"));
     }
 
     #[test]
@@ -78761,120 +80374,8 @@ mod claim_interval_prune_tests {
 #[cfg(test)]
 mod claim_attribution_tests {
     use super::{
-        apply_attr_hunks, attr_replay_line_offset, attr_runs, item_joint_with,
-        joint_owners_from_runs, parse_attr_diff,
+        item_joint_with, membership_joint_owners, membership_joint_refusal, MembershipPathBuckets,
     };
-
-    // attribution-run-line-offset-in-views: the tripwire's arithmetic. The
-    // #324/trace-vocabulary shape was a run rendered at line 56 while the
-    // real diff sat at 86 — a +30 offset the replay length would have exposed.
-    #[test]
-    fn replay_offset_detects_length_divergence() {
-        // Healthy: base 50, net +36, file 86 → no offset.
-        assert_eq!(attr_replay_line_offset(50, 36, 86), None);
-        // The live shape: replay reconstructs 56, file is 86 → +30.
-        assert_eq!(attr_replay_line_offset(50, 6, 86), Some(30));
-        // Shrink case: replay 100, file 90 → -10.
-        assert_eq!(attr_replay_line_offset(100, 0, 90), Some(-10));
-        // Net that would underflow clamps at 0, not a panic.
-        assert_eq!(attr_replay_line_offset(3, -10, 0), None);
-        assert_eq!(attr_replay_line_offset(3, -10, 5), Some(5));
-    }
-
-    fn owners(n: usize) -> Vec<Option<String>> {
-        vec![None; n]
-    }
-    fn ids(o: &[Option<String>]) -> String {
-        o.iter()
-            .map(|x| x.as_deref().unwrap_or("."))
-            .collect::<Vec<_>>()
-            .join("")
-    }
-
-    #[test]
-    fn parses_path_and_hunk_start() {
-        let d =
-            "diff --git a/f.md b/f.md\n--- a/f.md\n+++ b/f.md\n@@ -3,2 +3,3 @@ ctx\n x\n+new\n y\n";
-        let m = parse_attr_diff(d);
-        let h = &m["f.md"];
-        assert_eq!(h.len(), 1);
-        assert_eq!(h[0].old_start, 3);
-        assert_eq!(h[0].lines.len(), 3);
-    }
-
-    #[test]
-    fn insertion_owns_only_the_added_lines() {
-        let mut o = owners(4);
-        let m = parse_attr_diff("+++ b/f\n@@ -2,1 +2,3 @@\n a\n+X\n+Y\n");
-        apply_attr_hunks(&mut o, &m["f"], "A");
-        assert_eq!(ids(&o), "..AA..");
-    }
-
-    // attribution-run-line-offset-in-views: a DELETED file's target line is
-    // `+++ /dev/null`, so its `-` hunks must attribute to the file named by
-    // `diff --git`, NOT bleed onto the preceding file. The live bug: a delete
-    // right after a modify put the deletions on the modified file, shifting
-    // every run and rendering the change as "no item".
-    #[test]
-    fn deleted_file_hunks_do_not_bleed_onto_preceding_file() {
-        let d = "diff --git a/keep.md b/keep.md\n--- a/keep.md\n+++ b/keep.md\n\
-                 @@ -1,1 +1,1 @@\n-old\n+new\n\
-                 diff --git a/gone.txt b/gone.txt\ndeleted file mode 100644\n\
-                 --- a/gone.txt\n+++ /dev/null\n@@ -1,3 +0,0 @@\n-a\n-b\n-c\n";
-        let m = parse_attr_diff(d);
-        // keep.md gets ONLY its own +1/-1, not gone.txt's three deletions.
-        let keep_net: isize = m["keep.md"]
-            .iter()
-            .flat_map(|h| h.lines.iter())
-            .map(|(c, _)| match c {
-                '+' => 1,
-                '-' => -1,
-                _ => 0,
-            })
-            .sum();
-        assert_eq!(keep_net, 0, "keep.md must not absorb gone.txt's deletions");
-        assert!(
-            m.contains_key("gone.txt"),
-            "the deletion attributes to gone.txt"
-        );
-    }
-
-    // fix-attribution-run-line-offset: the chain-replay must place a sole
-    // claimant's added lines at their TRUE positions even when the base tree
-    // is old and an earlier interval grew the file (a committed resize). This
-    // is the adversarial shape #327's interval staging depends on; it
-    // reproduces (in-repo, no git needed) the scratch case that proved the
-    // algorithm sound after the 2026-09-03 field anomaly. base is 40 lines;
-    // item-old inserts 5 after line 5 (file → 45); item-mid touches nothing;
-    // prose edits near the end. Prose's run must sit where prose actually
-    // edited, not shifted by the intervening growth.
-    fn hunks(diff: &str) -> Vec<super::AttrHunk> {
-        super::parse_attr_diff(diff)["f"].clone()
-    }
-    #[test]
-    fn attribution_replay_survives_intervening_resize() {
-        let base_n = 40;
-        let step_old = (
-            Some("item-old".to_string()),
-            hunks("+++ b/f\n@@ -5,1 +5,6 @@\n line5\n+g1\n+g2\n+g3\n+g4\n+g5\n"),
-        );
-        // item-mid touches the file in neither direction; it simply is not a
-        // step for this path (mirrors an empty interval diff).
-        let step_prose = (
-            Some("prose".to_string()),
-            hunks("+++ b/f\n@@ -41,1 +41,3 @@\n line38\n+edit1\n+edit2\n"),
-        );
-        let runs = super::attribution_runs_for_path(base_n, &[step_old, step_prose]);
-        // item-old owns the 5 grown lines at 6..10; prose owns its 2 edits at
-        // the grown position 42..43 — not shifted low.
-        assert_eq!(runs.len(), 2);
-        assert_eq!(runs[0]["itemId"], "item-old");
-        assert_eq!(runs[0]["startLine"], 6);
-        assert_eq!(runs[0]["endLine"], 10);
-        assert_eq!(runs[1]["itemId"], "prose");
-        assert_eq!(runs[1]["startLine"], 42);
-        assert_eq!(runs[1]["endLine"], 43);
-    }
 
     // joint-interval-files-disambiguation: per-(interval, path) resolution.
     #[test]
@@ -78922,40 +80423,105 @@ mod claim_attribution_tests {
         ));
     }
 
-    // A joint owner rides the marker encoding through the replay and expands
-    // into an itemIds run — never an itemId, never silently dropped.
-    #[test]
-    fn joint_marker_expands_to_item_ids_run() {
-        let sep = super::JOINT_RUN_SEP;
-        let joint = format!("{}a{}b", sep, sep);
-        let step = (Some(joint), hunks("+++ b/f\n@@ -1,0 +1,2 @@\n+j1\n+j2\n"));
-        let runs = super::attribution_runs_for_path(3, &[step]);
-        assert_eq!(runs.len(), 1);
-        assert!(runs[0].get("itemId").is_none());
-        assert_eq!(runs[0]["itemIds"], serde_json::json!(["a", "b"]));
-        assert_eq!(runs[0]["startLine"], 1);
-        assert_eq!(runs[0]["endLine"], 2);
-    }
-
     // avoid-futile-joint-commit: joint_owners_from_runs / item_joint_with feed
     // both the board's `jointWith` field and (indirectly, same logic) the
     // commit-time op=refuse-joint-interval refusal, so this pins the shape
     // both depend on: a path with an itemIds run ties its members together,
     // a path with a plain itemId run ties nobody, and an item's jointWith
     // never mentions a path it doesn't itself declare.
+    // issue-432: the same-click joint refusal reads membership. Builds a
+    // one-path partition from (members, lines) entries.
+    fn joint_partition(
+        entries: &[(&[&str], (usize, usize))],
+    ) -> std::collections::BTreeMap<String, MembershipPathBuckets> {
+        let mut m = MembershipPathBuckets::default();
+        for (members, counts) in entries {
+            let key: Vec<String> = members.iter().map(|s| s.to_string()).collect();
+            m.owners.extend(key.iter().cloned());
+            m.per_item.insert(key, *counts);
+        }
+        let mut p = std::collections::BTreeMap::new();
+        p.insert("Globals.xs".to_string(), m);
+        p
+    }
+
+    fn set(ids: &[&str]) -> std::collections::HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn strs(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn joint_refusal_ignores_a_replay_only_partner_issue_432() {
+        // #432: membership credits Globals.xs to spec-token-terms alone; the
+        // replay's stale one-member joint [revendor] has no counterpart here.
+        let p = joint_partition(&[(&["spec-token-terms"], (5, 1))]);
+        assert_eq!(
+            membership_joint_refusal(
+                &p,
+                "Globals.xs",
+                &strs(&["spec-token-terms"]),
+                &set(&["revendor-xmlui-runtime"]),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn joint_refusal_fires_for_a_requested_member_with_a_begun_partner() {
+        // criterion 6 / #356: committing one member of a same-click joint alone.
+        let p = joint_partition(&[(&["a", "b"], (3, 0))]);
+        assert_eq!(
+            membership_joint_refusal(&p, "Globals.xs", &strs(&["a"]), &set(&["b"])),
+            Some(strs(&["a", "b"]))
+        );
+        // Committing the whole joint set together is fine.
+        assert_eq!(
+            membership_joint_refusal(&p, "Globals.xs", &strs(&["a", "b"]), &set(&[])),
+            None
+        );
+    }
+
+    #[test]
+    fn joint_refusal_skips_a_joint_the_request_is_not_in() {
+        let p = joint_partition(&[(&["b", "c"], (3, 0)), (&["a"], (2, 0))]);
+        assert_eq!(
+            membership_joint_refusal(&p, "Globals.xs", &strs(&["a"]), &set(&["b", "c"])),
+            None
+        );
+    }
+
+    #[test]
+    fn joint_refusal_and_joint_with_skip_an_empty_joint_entry() {
+        let p = joint_partition(&[(&["a", "b"], (0, 0))]);
+        assert_eq!(
+            membership_joint_refusal(&p, "Globals.xs", &strs(&["a"]), &set(&["b"])),
+            None
+        );
+        assert!(membership_joint_owners(&p).is_empty());
+        let p = joint_partition(&[(&["a", "b"], (1, 0))]);
+        let owners = membership_joint_owners(&p);
+        assert_eq!(
+            item_joint_with("a", &strs(&["Globals.xs"]), &owners),
+            vec!["b"]
+        );
+    }
+
     #[test]
     fn joint_with_reflects_only_declared_shared_paths() {
-        let mut runs_by_path: std::collections::HashMap<String, Vec<serde_json::Value>> =
-            Default::default();
-        runs_by_path.insert(
-            "shared.xmlui".to_string(),
-            vec![serde_json::json!({"startLine": 1, "endLine": 4, "itemIds": ["a", "b"]})],
-        );
-        runs_by_path.insert(
-            "solo.xmlui".to_string(),
-            vec![serde_json::json!({"startLine": 1, "endLine": 2, "itemId": "a"})],
-        );
-        let joint = joint_owners_from_runs(&runs_by_path);
+        // issue-425-retire-replay: from membership, as the board serves it.
+        let mut shared = MembershipPathBuckets::default();
+        shared
+            .per_item
+            .insert(vec!["a".to_string(), "b".to_string()], (4, 0));
+        let mut solo = MembershipPathBuckets::default();
+        solo.per_item.insert(vec!["a".to_string()], (2, 0));
+        let mut partition = std::collections::BTreeMap::new();
+        partition.insert("shared.xmlui".to_string(), shared);
+        partition.insert("solo.xmlui".to_string(), solo);
+        let joint = membership_joint_owners(&partition);
 
         // "a" declares both files: the joint one names "b" back; the
         // single-owner one names nobody.
@@ -78974,123 +80540,6 @@ mod claim_attribution_tests {
 
         // An item that declares neither file has nothing to report.
         assert!(item_joint_with("a", &[], &joint).is_empty());
-    }
-
-    // The regression this whole design exists to avoid: identical line CONTENT
-    // owned by different claimants. A content-keyed lookup collapses these.
-    #[test]
-    fn duplicate_lines_are_attributed_by_position_not_content() {
-        let mut o = owners(2);
-        // A inserts a blank + fence at the top...
-        let a = parse_attr_diff("+++ b/f\n@@ -1,0 +1,2 @@\n+\n+```\n");
-        apply_attr_hunks(&mut o, &a["f"], "A");
-        // ...C inserts an IDENTICAL blank + fence further down.
-        let c = parse_attr_diff("+++ b/f\n@@ -4,0 +4,2 @@\n+\n+```\n");
-        apply_attr_hunks(&mut o, &c["f"], "C");
-        assert_eq!(ids(&o), "AA.CC.");
-    }
-
-    // Four claimants, three hunks: two edited ADJACENT regions and git merged
-    // them. Whole-hunk attribution fails here; the replay must not.
-    #[test]
-    fn adjacent_claimants_split_within_one_region() {
-        let mut o = owners(2);
-        let a = parse_attr_diff("+++ b/f\n@@ -1,0 +1,3 @@\n+a1\n+a2\n+a3\n");
-        apply_attr_hunks(&mut o, &a["f"], "A");
-        let d = parse_attr_diff("+++ b/f\n@@ -4,0 +4,2 @@\n+d1\n+d2\n");
-        apply_attr_hunks(&mut o, &d["f"], "D");
-        assert_eq!(ids(&o), "AAADD..");
-        let runs = attr_runs(&o);
-        assert_eq!(runs.len(), 2);
-        assert_eq!(runs[0]["itemId"], "A");
-        assert_eq!(runs[0]["endLine"], 3);
-        assert_eq!(runs[1]["itemId"], "D");
-        assert_eq!(runs[1]["startLine"], 4);
-        assert_eq!(runs[1]["endLine"], 5);
-    }
-
-    #[test]
-    fn deletions_remove_ownership_and_shift_later_hunks() {
-        let mut o = owners(5);
-        let a = parse_attr_diff("+++ b/f\n@@ -2,2 +2,1 @@\n-old\n+new\n");
-        apply_attr_hunks(&mut o, &a["f"], "A");
-        assert_eq!(ids(&o), ".A...");
-    }
-
-    // Unowned lines are a state, not a gap: they must not appear as runs, and
-    // must not be folded into a neighbouring claimant's run.
-    #[test]
-    fn unowned_lines_are_excluded_from_runs() {
-        let mut o = owners(3);
-        let a = parse_attr_diff("+++ b/f\n@@ -2,0 +2,1 @@\n+X\n");
-        apply_attr_hunks(&mut o, &a["f"], "A");
-        let runs = attr_runs(&o);
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0]["startLine"], 2);
-        assert_eq!(runs[0]["endLine"], 2);
-    }
-
-    #[test]
-    fn zero_work_interval_contributes_nothing() {
-        let mut o = owners(3);
-        let m = parse_attr_diff("");
-        assert!(m.is_empty());
-        apply_attr_hunks(&mut o, &[], "A");
-        assert_eq!(ids(&o), "...");
-        assert!(attr_runs(&o).is_empty());
-    }
-
-    // issue-273: a clear now cuts an empty-ids boundary (record_claim_interval
-    // called with `&[]` from clear_inflight_claim_sentinel /
-    // shrink_inflight_claim_sentinel). That boundary's effective owner
-    // resolves to `None` (resolve_interval_path_owner's `ids.len() == 0 =>
-    // Unowned` arm), so a step recorded after a clear must attribute nothing
-    // — exercised here at the same pure-replay level as
-    // unowned_lines_are_excluded_from_runs, extended to a second step so the
-    // boundary itself, not just a single unowned hunk, is under test.
-    #[test]
-    fn clear_boundary_excludes_subsequent_edits_from_runs() {
-        let step_a = (
-            Some("A".to_string()),
-            hunks("+++ b/f\n@@ -0,0 +1,1 @@\n+first\n"),
-        );
-        // The clear boundary: resolve_interval_path_owner(&[], ...) yields
-        // Unowned, i.e. `None` here — a direct edit made with no claim live.
-        let step_after_clear = (None, hunks("+++ b/f\n@@ -2,0 +2,1 @@\n+second\n"));
-        let runs = super::attribution_runs_for_path(0, &[step_a, step_after_clear]);
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0]["itemId"], "A");
-        assert_eq!(runs[0]["startLine"], 1);
-        assert_eq!(runs[0]["endLine"], 1);
-        // Line 2 (the post-clear edit) must not appear in any run.
-        assert!(runs
-            .iter()
-            .all(|r| r["startLine"] != 2 && r["endLine"] != 2));
-    }
-
-    // issue-273: a shrink cuts a boundary owned by whoever REMAINS. Modeled
-    // here as a joint [a, b] step (a same-click plural approval, per
-    // joint-interval-files-disambiguation) followed by a step owned solely by
-    // "b" — the shape a shrink-to-[b] boundary produces. Edits after the
-    // shrink must attribute to "b" alone, never staying joint and never
-    // falling to "a".
-    #[test]
-    fn shrink_boundary_attributes_subsequent_edits_to_remaining_owner() {
-        let sep = super::JOINT_RUN_SEP;
-        let joint_step = (
-            Some(format!("{}a{}b", sep, sep)),
-            hunks("+++ b/f\n@@ -0,0 +1,1 @@\n+first\n"),
-        );
-        let shrunk_step = (
-            Some("b".to_string()),
-            hunks("+++ b/f\n@@ -2,0 +2,1 @@\n+second\n"),
-        );
-        let runs = super::attribution_runs_for_path(0, &[joint_step, shrunk_step]);
-        assert_eq!(runs.len(), 2);
-        assert_eq!(runs[0]["itemIds"], serde_json::json!(["a", "b"]));
-        assert!(runs[0].get("itemId").is_none());
-        assert_eq!(runs[1]["itemId"], "b");
-        assert!(runs[1].get("itemIds").is_none());
     }
 }
 
@@ -79124,10 +80573,7 @@ mod search_not_ready_tests {
 // on a serve, while every path an item could own diffs exactly as before.
 #[cfg(test)]
 mod attribution_pathspec_tests {
-    use super::{
-        attr_diff_args, attr_interval_cache_key, attribution_pathspec, declared_covers,
-        parse_attr_diff,
-    };
+    use super::attribution_pathspec;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -79185,8 +80631,17 @@ mod attribution_pathspec_tests {
     }
 
     fn run_diff(root: &Path, a: &str, b: Option<&str>, spec: &[String]) -> String {
-        let args = attr_diff_args(a, b, spec);
-        let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        // `git diff <a> [<b>] -- <pathspec…>`, the shape the claim capture's
+        // scoped diffs use.
+        let mut args: Vec<&str> = vec!["diff", a];
+        if let Some(b) = b {
+            args.push(b);
+        }
+        if !spec.is_empty() {
+            args.push("--");
+            args.extend(spec.iter().map(|s| s.as_str()));
+        }
+        let refs = args;
         String::from_utf8_lossy(&git(root, None, &refs).stdout).into_owned()
     }
 
@@ -79199,10 +80654,6 @@ mod attribution_pathspec_tests {
             vec!["docs/y.md".to_string(), "src/z.rs".to_string()],
         );
         d
-    }
-
-    fn covered(d: &HashMap<String, Vec<String>>, path: &str) -> bool {
-        d.values().flatten().any(|f| declared_covers(f, path))
     }
 
     // Raymond's shape (#395): a big non-ignored untracked tree lands in the
@@ -79235,44 +80686,6 @@ mod attribution_pathspec_tests {
         let t2 = capture(&root);
         write(&root, "docs/y.md", "# y\n\nmore\n");
         (root, t1, t2)
-    }
-
-    // Equivalence: on every path an item could own, the scoped diff is the
-    // unscoped diff. Fails if the pathspec drops a declared path -- a
-    // directory entry, a created file under it, or a worktree twin.
-    #[test]
-    fn scoped_diff_equals_unscoped_on_declared_paths() {
-        let (root, t1, t2) = raymond_repo("equiv");
-        let d = declared();
-        let spec = attribution_pathspec(&d);
-        for (a, b) in [(t1.as_str(), Some(t2.as_str())), (t2.as_str(), None)] {
-            let full = parse_attr_diff(&run_diff(&root, a, b, &[]));
-            let scoped = parse_attr_diff(&run_diff(&root, a, b, &spec));
-            let full_declared: HashMap<_, _> =
-                full.into_iter().filter(|(p, _)| covered(&d, p)).collect();
-            assert_eq!(
-                scoped.keys().collect::<std::collections::BTreeSet<_>>(),
-                full_declared
-                    .keys()
-                    .collect::<std::collections::BTreeSet<_>>(),
-                "scoped paths must equal the declared-covered unscoped paths"
-            );
-            for (p, h) in &full_declared {
-                assert_eq!(
-                    format!("{:?}", scoped[p]),
-                    format!("{:?}", h),
-                    "hunks differ on {}",
-                    p
-                );
-            }
-        }
-        // The fixture really exercises the three declaration shapes.
-        let closed = parse_attr_diff(&run_diff(&root, &t1, Some(&t2), &spec));
-        assert!(closed.contains_key("app/new.txt"));
-        assert!(closed.contains_key(".claude/worktrees/w1/src/z.rs"));
-        let open = parse_attr_diff(&run_diff(&root, &t2, None, &spec));
-        assert!(open.contains_key("docs/y.md"));
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     // Cost: the untracked tree the boundaries captured contributes nothing
@@ -79309,34 +80722,6 @@ mod attribution_pathspec_tests {
         let mut d = HashMap::new();
         d.insert("no-files".to_string(), Vec::<String>::new());
         assert!(attribution_pathspec(&d).is_empty());
-    }
-
-    // Cache: a closed interval diffed under one declared set must not serve
-    // another, or adding a file to an item's `files` would never attribute
-    // that file's history. Fails if the key omits the pathspec.
-    #[test]
-    fn cache_key_changes_with_the_declared_set() {
-        let a = attribution_pathspec(&declared());
-        let mut more = declared();
-        more.get_mut("file-item")
-            .unwrap()
-            .push("other.txt".to_string());
-        let b = attribution_pathspec(&more);
-        assert_ne!(
-            attr_interval_cache_key("t1", "t2", &a),
-            attr_interval_cache_key("t1", "t2", &b)
-        );
-        // Same set, any declaration order -> same key (no needless misses).
-        let mut shuffled = HashMap::new();
-        shuffled.insert(
-            "file-item".to_string(),
-            vec!["src/z.rs".to_string(), "docs/y.md".to_string()],
-        );
-        shuffled.insert("dir-item".to_string(), vec!["app/".to_string()]);
-        assert_eq!(
-            attr_interval_cache_key("t1", "t2", &a),
-            attr_interval_cache_key("t1", "t2", &attribution_pathspec(&shuffled))
-        );
     }
 }
 
@@ -79991,77 +81376,5 @@ mod push_withheld_tests {
     fn default_and_origin_head_are_not_another_branch() {
         let c = vec![v(&["main", "origin/main", "origin/HEAD", "origin"])];
         assert!(push_withheld_branches("main", "main", &c).is_empty());
-    }
-}
-
-// gate-computes-membership-fresh: the gate's comparison and the shared replay
-// owner derivation, pure.
-#[cfg(test)]
-mod gate_membership_tests {
-    use super::{gate_membership_comparison, replay_owners_from_runs, MembershipPathBuckets};
-    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-
-    fn bucket(owners: &[&str]) -> MembershipPathBuckets {
-        MembershipPathBuckets {
-            owners: owners
-                .iter()
-                .map(|s| s.to_string())
-                .collect::<BTreeSet<_>>(),
-            ..Default::default()
-        }
-    }
-
-    fn set(xs: &[&str]) -> HashSet<String> {
-        xs.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn replay_owners_collects_single_item_runs_per_path() {
-        let mut runs: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
-        runs.insert(
-            "a.rs".into(),
-            vec![
-                serde_json::json!({"itemId": "x"}),
-                serde_json::json!({"itemId": "y"}),
-                serde_json::json!({"itemIds": ["x", "y"]}),
-            ],
-        );
-        let owners = replay_owners_from_runs(&runs);
-        assert_eq!(owners["a.rs"], set(&["x", "y"]));
-    }
-
-    // Agreement on the requested paths; a divergence on a path the commit
-    // does not stage is not the gate's business. Fails if the requested-path
-    // filter is dropped (the unrelated divergence would be counted).
-    #[test]
-    fn agrees_on_requested_paths_and_ignores_others() {
-        let mut partition = BTreeMap::new();
-        partition.insert("app/a.rs".to_string(), bucket(&["item-a"]));
-        partition.insert("other/b.rs".to_string(), bucket(&["item-b"]));
-        let mut replay = HashMap::new();
-        replay.insert("app/a.rs".to_string(), set(&["item-a"]));
-        replay.insert("other/b.rs".to_string(), set(&["someone-else"]));
-        let (checked, diverged) =
-            gate_membership_comparison(&partition, &["app/".to_string()], &replay, &HashMap::new());
-        assert_eq!(checked, 1);
-        assert!(diverged.is_empty());
-    }
-
-    // A disagreement on a staged path is reported with both owner sets.
-    // Joint replay members count as owners, as in membership_report.
-    #[test]
-    fn reports_divergence_with_both_owner_sets() {
-        let mut partition = BTreeMap::new();
-        partition.insert("a.rs".to_string(), bucket(&["x"]));
-        let mut joint = HashMap::new();
-        joint.insert("a.rs".to_string(), set(&["x", "y"]));
-        let (checked, diverged) =
-            gate_membership_comparison(&partition, &["a.rs".to_string()], &HashMap::new(), &joint);
-        assert_eq!(checked, 1);
-        assert_eq!(diverged.len(), 1);
-        let (path, replay, membership) = &diverged[0];
-        assert_eq!(path, "a.rs");
-        assert_eq!(replay.iter().cloned().collect::<Vec<_>>(), vec!["x", "y"]);
-        assert_eq!(membership.iter().cloned().collect::<Vec<_>>(), vec!["x"]);
     }
 }

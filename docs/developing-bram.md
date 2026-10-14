@@ -168,6 +168,38 @@ grep `console-error|console-unhandledrejection` in
 Zero matches is the pass condition; any match is triaged before
 reading anything else from the trace.
 
+#### Known noise: the ResizeObserver loop
+
+One message is exempt:
+`ResizeObserver loop completed with undelivered notifications.` Exclude
+it from the grep (`| grep -v ResizeObserver`) and don't triage it.
+Everything else still counts.
+
+It is a known XMLUI-side warning that Bram can't fix. It comes from
+[virtua](https://github.com/inokawa/virtua), the virtualizer under XMLUI's
+`List`: its per-row item resizers measure in the same frame they observe.
+Virtualized scrolling alone produces it, with no Bram markup involved.
+The record:
+
+- #275 §A2 measured it at about 204 a day, all from virtualized `List`s,
+  and traced it to Bram's initial scaffold (`b4abf0f`).
+- [xmlui-org/xmlui#3830](https://github.com/xmlui-org/xmlui/issues/3830)
+  was closed as wontfix: a bare React + virtua fixture with no XMLUI code
+  reproduces it, on virtua 0.48.8 and 0.52.7 alike.
+- We have not filed it on virtua. Jon doesn't know their policy on
+  AI-assisted contributions and won't present this work as his own.
+
+This keeps coming back. It reappeared during the `issue-425-retire-replay`
+demo check on 2026-10-12: 20 lines in the demo's trace, and 142 in the
+working instance's trace that day, starting before any pane edit.
+
+**Removing this exemption.** XMLUI's
+`xmlui/tests/isolation/virtua-ro/` specs
+([`f6369d9`](https://github.com/xmlui-org/xmlui/commit/f6369d98cc1917edc6acd13c2f970f300a1c9184))
+are marked `test.fail()`, so they turn red when a virtua release fixes the
+loop. When that lands and Bram's vendored XMLUI picks it up, delete this
+subsection and the pointer to it in `worklist-gate-walkthrough.md`.
+
 For the registered trace categories, subkinds, fields, and their diagnostic
 purpose, consult the on-demand
 [trace vocabulary](trace-vocabulary.md) while reading the log.
@@ -460,12 +492,19 @@ required is on judell/bram#322.
 
 The gate's selection matrix — which buttons light for which combination of
 items, entanglement, and lifecycle state — is exercised by the walkthrough
-in `docs/worklist-gate-walkthrough.md`: probe items doing trivial real work,
-phase-by-phase expectations, deliberate wedge attempts, and teardown trace
-greps. Born as the 0.5.3 release gate (three findings, all fixed in-run).
-Run it before a release or after touching the gate surfaces. Its graduation
-target is an automated test on transient instances, per the harness pattern
-below; the host-observable half could graduate first.
+in `docs/worklist-gate-walkthrough.md`: a demo-instance board built from
+starters, phase-by-phase expectations, deliberate wedge attempts, and
+teardown trace greps. Born as the 0.5.3 release gate (three findings, all
+fixed in-run).
+
+**Run it on demand, not before every release** — when a field report or a
+change to the gate surfaces calls for it, and only the phases that report
+points at. Field reports have been finding the gate's bugs (#432, #433,
+#434); the reasoning is in
+[`decisions/2026-10-13-gate-walkthrough-on-demand.md`](decisions/2026-10-13-gate-walkthrough-on-demand.md).
+Its graduation target is still an automated test on transient instances,
+per the harness pattern below; the host-observable half could graduate
+first.
 
 ## Developing and testing the startup dance
 
@@ -679,6 +718,7 @@ different location. The useful verbs are:
 | `reset` | rehydrate the active scenario |
 | `status [--json]` | report scenarios, active state, item/ref counts, PID, and log path |
 | `launch` / `stop` | start the real binary or stop only its recorded PID |
+| `prune [--match GLOB] [--keep N] [--dry-run] [--gc]` | remove scenario branches matching the glob (default `check-*`, the starter check's boards), keeping the newest N by name and never the active scenario; captured scenarios are untouched unless named. `--gc` then reclaims the space |
 
 The starter names are `disjoint-entanglement`, `dependency`,
 `supersession`, `unattributed`, `many-claimants`,
@@ -698,7 +738,18 @@ claim windows with a chat-turn edit to the same file in between, so the
 item's lines and the unowned chat lines sit side by side), and
 `committed-outside` (judell/bram#406: one row whose work landed through a
 plain `git commit`, and one begun-then-reverted row that must not read as
-landed). For example, a focused board is:
+landed), and `joint-owner-committed` (judell/bram#432: two items approved in
+one click whose owner of the shared file has since committed and left the
+board, a partner with no changes, and a later, separately approved item on
+the shared file whose commit must not be refused), and `entangled-with-unowned`
+(two begun owners of one file plus a third hunk written with no claim open:
+each row alone predicts only its own hunk, while committing both together
+takes the whole file; Codex's acceptance case for issue-425-retire-replay),
+and `membership-unanswerable` (judell/bram#437: one begun item declaring a
+file it hasn't created yet, another declaring a new file an ignore rule
+hides; both once failed every membership compute, so the gate refused all
+commits as "no membership answer").
+For example, a focused board is:
 
 ```sh
 scripts/demo-instance.sh new ordering \
@@ -715,8 +766,8 @@ scripts/demo-instance.sh stop
 On Windows, use the same verbs through
 `scripts\demo-instance.ps1`. Run the established `build.ps1` from a VS
 Developer PowerShell first. The launcher refuses a debug binary older
-than HEAD or a half-build where `bram-guard.exe` is newer than a locked
-`bram.exe`; it names existing Bram PIDs rather than killing them. On
+than its Rust sources (see below) or a half-build where `bram-guard.exe`
+is newer than a locked `bram.exe`; it names existing Bram PIDs rather than killing them. On
 every launch it verifies a directory junction named `app` beside the
 target-triple debug executable, pointing at this checkout's `app/`.
 That is the Windows disk-serving equivalent of Unix's repo-root
@@ -727,7 +778,12 @@ the corresponding PowerShell launch smoke on Windows before calling it
 done.
 
 Both launchers delegate process creation to the shared engine, which
-also refuses a binary older than this checkout's HEAD. It
+also refuses a stale binary: one older than the newest git-tracked file
+under `src-tauri/`, committed or not, since under the symlink (or
+junction) launch `app/**` is served from disk and only the Rust can make
+the binary stale. The refusal names that file. Until 2026-10-13 the test
+was "older than HEAD's commit time", which refused after scripts- and
+docs-only commits and missed uncommitted Rust edits. It
 captures stdout/stderr under the demo repo's git directory, records the
 exact child PID, enables tracing, and removes
 `CLAUDE_CODE_CHILD_SESSION`, `CLAUDE_CODE_SESSION_ID`,
@@ -748,6 +804,46 @@ a conspicuous marker and no remote; every destructive verb verifies
 both facts and the exact git toplevel before acting. Transfer a scenario
 branch with ordinary Git plumbing (for example, a bundle), but never add
 an upstream to the disposable instance.
+
+### Membership starter checks
+
+`scripts/membership-starter-check.py` turns the starters into a regression
+check for line ownership. It hydrates one board with every starter (or the
+ones named with `--starter`), launches the locally built Bram on it, waits for
+a fresh membership compute, and checks `/__worklist` against
+`EXPECTATIONS` in `scripts/demo_instance.py`: each path's owners and its
+single, joint and unowned line counts, paths that must have no entry, and
+selected items' `willCommit`. Any give-up (`op=membership … reason=`),
+unexplained line or conservation breach in the run's trace fails it too.
+
+```sh
+python3 -I scripts/membership-starter-check.py
+python3 -I scripts/membership-starter-check.py --starter new-file-left-out
+```
+
+The exit status is the number of failed checks. On failure the demo is left
+running on the failing board. After a passing run it prunes its own boards to
+the newest three (`prune --match 'check-*' --keep 3`); a failing run prunes
+nothing.
+
+**When to run it:** after a change to the membership engine, claim capture or
+the board serve, and before a release that touches them. The Rust tests cover
+the line rule's pure functions; this covers the integration they can't reach,
+which is where judell/bram#437 lived (the engine's scratch-index seed failed
+on two ordinary board shapes, and the field found it first).
+
+**One board is a canary.** All starters share one compute, so one broken
+starter can fail them all, as `membership-unanswerable` would have before
+#437. Rerun with `--starter` to narrow it down.
+
+**Adding a starter means adding its expectation** in the same change, written
+from what the starter is meant to show. When the engine and the table
+disagree, read the starter first: the table is a claim about intended
+behaviour, not a recording of current output. It can't check anything the pane
+computes (the board header, strip wording); those stay rendered checks.
+
+It needs a windowing session, so it runs on demand, not in CI, like
+`setup-harness.sh`.
 
 ### Relationship to the scripted sections
 

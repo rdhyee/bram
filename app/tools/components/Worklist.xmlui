@@ -27,6 +27,13 @@
        state transfer, 2026-08-20). Chevron Button + when-bound body per
        https://www.xmlui.org/docs/howto/keep-per-item-state-in-a-loop —
        the old tab's proven shape. -->
+  <!-- issue-419-header-from-membership: the files table's ⓘ explanations.
+       One dialog for every cell; each ⓘ passes {title, body} to open(),
+       read here as $param
+       (https://www.xmlui.org/docs/reference/components/ModalDialog#open). -->
+  <ModalDialog id="fileCellInfoDialog" title="{$param &amp;&amp; $param.title}">
+    <Markdown content="{($param &amp;&amp; $param.body) || ''}" />
+  </ModalDialog>
   <DataSource
     id="worklist"
     url="/__worklist"
@@ -574,8 +581,8 @@
             fontSize="$fontSize-sm"
             color="$textColor-secondary"
             overflowMode="flow"
-            tooltipMarkdown="{window.__bramWorklist2StripTooltip($item, inflightClaim.value, worklist.value &amp;&amp; worklist.value.items, worklist.value &amp;&amp; worklist.value.attributionTotals)}"
-            value="{window.__bramWorklist2Strip($item, inflightClaim.value, worklist.value &amp;&amp; worklist.value.items, worklist.value &amp;&amp; worklist.value.attribution, worklist.value &amp;&amp; worklist.value.attributionTotals, agentStatus.value)}" />
+            tooltipMarkdown="{window.__bramWorklist2StripTooltip($item, inflightClaim.value, worklist.value &amp;&amp; worklist.value.items)}"
+            value="{window.__bramWorklist2Strip($item, inflightClaim.value, worklist.value &amp;&amp; worklist.value.items, window.__bramOwnershipRunsByPath(worklist.value), agentStatus.value)}" />
           <!-- issue-278: the row backlink is GONE, on live evidence.
                It was redundant and, worse, it put a SECOND meaning of "shared"
                on a line that already had one. Live board, 2026-08-24:
@@ -710,10 +717,18 @@
                      +404 −18") so the header is visibly the sum of the
                      column's first numbers — the addends were invisible
                      before (Jon, 2026-09-04: "still does not add up"). -->
-                <Text
-                  variant="code"
-                  fontSize="$fontSize-sm"
-                  value="{window.__bramFileChangesCell($item, rowBegun)}" />
+                <HStack gap="$space-1" verticalAlignment="center">
+                  <Text
+                    variant="code"
+                    fontSize="$fontSize-sm"
+                    value="{window.__bramFileChangesCell($item, rowBegun)}" />
+                  <!-- issue-419-header-from-membership: the ⓘ explanation,
+                       the Context tab's ghost-button pattern; one shared
+                       dialog takes the text as its open() parameter. -->
+                  <Button label="ⓘ" variant="ghost" size="xs"
+                    tooltip="Explain these changes"
+                    onClick="fileCellInfoDialog.open(window.__bramFileChangesExplain($item, rowItem, worklist.value &amp;&amp; worklist.value.items, inflightClaim.value))" />
+                </HStack>
               </Column>
               <!-- worklist-files-column-wider: 1* (was 3*), so the files column's 2*
                    gets two thirds of the flexible width, about half the table
@@ -727,17 +742,28 @@
                      file now; `planned:` = it merely declares this file —
                      zero of the CHANGES-column lines are its. Style-only
                      distinction failed twice: muting read as accident, and
-                     the counts read as belonging to the sharers. -->
-                <VStack gap="$space-0">
+                     the counts read as belonging to the sharers.
+                     issue-419-header-from-membership (Jon, 2026-10-13):
+                     relabelled `has lines here:` / `declares it, no lines
+                     here:`, from membership. The tense words described
+                     progress, while the column is about lines in this file:
+                     an item whose lines were all rewritten by another read
+                     `planned:`, as if it had never started. -->
+                <HStack gap="$space-1" verticalAlignment="center">
+                <VStack gap="$space-0" width="*">
                   <Text
                     when="{window.__bramSharedWithBegun($item, worklist.value &amp;&amp; worklist.value.items, inflightClaim.value).length > 0}"
                     overflowMode="flow"
-                    value="{'done: ' + window.__bramJoinIds(window.__bramSharedWithBegun($item, worklist.value &amp;&amp; worklist.value.items, inflightClaim.value))}" />
+                    value="{'has lines here: ' + window.__bramJoinIds(window.__bramSharedWithBegun($item, worklist.value &amp;&amp; worklist.value.items, inflightClaim.value))}" />
                   <Text
                     when="{window.__bramSharedWithPlanned($item, worklist.value &amp;&amp; worklist.value.items, inflightClaim.value).length > 0}"
                     overflowMode="flow"
-                    value="{'planned: ' + window.__bramJoinIds(window.__bramSharedWithPlanned($item, worklist.value &amp;&amp; worklist.value.items, inflightClaim.value))}" />
+                    value="{'declares it, no lines here: ' + window.__bramJoinIds(window.__bramSharedWithPlanned($item, worklist.value &amp;&amp; worklist.value.items, inflightClaim.value))}" />
                 </VStack>
+                <Button label="ⓘ" variant="ghost" size="xs"
+                  tooltip="Explain who else lists this file"
+                  onClick="fileCellInfoDialog.open(window.__bramFileSharedExplain($item, rowItem, worklist.value &amp;&amp; worklist.value.items, inflightClaim.value))" />
+                </HStack>
               </Column>
             </Table>
             <Text
@@ -756,7 +782,9 @@
                   when="{rowBegun &amp;&amp; window.__bramDiffExpanded(diffKeys, rowId, $item.path) &amp;&amp; window.__bramDiffForPath(rowItem, $item.path)}"
                   paddingBottom="$space-2"
                   var.filePatch="{(window.__bramDiffForPath(rowItem, $item.path) || {}).patch || ''}"
-                  var.fileRuns="{((worklist.value &amp;&amp; worklist.value.attribution) || {})[$item.path]}">
+                  var.fileRuns="{window.__bramFileRuns(worklist.value, $item.path)}"
+                  var.fileRemovedRuns="{window.__bramFileRemovedRuns(worklist.value, $item.path)}"
+                  var.scopeBasePatch="{window.__bramScopeBasePatch(rowItem, $item.path)}">
                   <!-- issue-327: two views of one file. keepMounted because Tabs
                        mounts only the active panel by default, and DiffView owns
                        a DataSource posting to /__diff/annotate: without it every
@@ -764,26 +792,25 @@
                        https://www.xmlui.org/docs/reference/components/Tabs -->
                   <Tabs keepMounted="true">
                     <TabItem label="Diff">
-                      <!-- issue-327 scoped diff: scope, don't annotate. Every
-                           rendered diff has ONE owner — "All changes" is the
-                           combined patch (commit truth: whole-file staging takes
-                           all of it), and each claimant scope is that item's own
-                           interval diff, fetched lazily on selection. The
-                           Gerrit patch-set / GitHub per-commit convention; a
-                           scoped diff is against the item's own base, so its
-                           line numbers may not match the current file — that is
-                           what lets it show superseded work.
-                           https://www.xmlui.org/docs/reference/components/DataSource -->
+                      <!-- issue-327 scoped diff: scope, don't annotate. "All"
+                           is the combined patch (commit truth: whole-file
+                           staging takes all of it). issue-425-retire-replay:
+                           each claimant scope is cut from that SAME current
+                           patch, keeping the hunks holding lines membership
+                           credits to it (__bramScopedPatch), so it shows what
+                           the item's commit takes rather than its claim-interval
+                           history. scopedPatch sits on an inner VStack because
+                           it reads fileScope, declared on this one; variables
+                           reach descendants.
+                           https://www.xmlui.org/docs/howto/communicate-between-sibling-components -->
                       <VStack
                         gap="$space-1"
                         var.fileScope="{window.__bramDiffScope(diffScopes, rowId, $item.path, fileRuns)}">
-                          <DataSource
-                            id="scopedDiff"
-                            when="{fileScope !== '__all'}"
-                            url="/__worklist/interval-diff"
-                            queryParams="{{ id: fileScope, path: $item.path }}" />
+                        <VStack
+                          gap="$space-1"
+                          var.scopedPatch="{window.__bramScopedPatch(scopeBasePatch, fileRuns, fileRemovedRuns, fileScope, filePatch)}">
                           <HStack
-                            when="{(fileRuns || []).length > 0}"
+                            when="{(fileRuns || []).length + (fileRemovedRuns || []).length > 0}"
                             gap="$space-2"
                             verticalAlignment="center">
                             <Text variant="caption" value="Changes:" />
@@ -794,7 +821,7 @@
                                  https://www.xmlui.org/docs/howto/customize-a-selects-selected-value -->
                             <Select
                               width="30rem"
-                              data="{window.__bramDiffScopeOptions(filePatch, fileRuns, rowId)}"
+                              data="{window.__bramDiffScopeOptions(scopeBasePatch, fileRuns, rowId, fileRemovedRuns)}"
                               initialValue="{fileScope}"
                               onDidChange="(v) => diffScopes = window.__bramSetDiffScope(diffScopes, rowId, $item.path, v)">
                               <property name="valueTemplate">
@@ -809,22 +836,23 @@
                                id-keyed in hunkNavKeys; scroll finds the hunk
                                header inside the wrapper below. -->
                           <HunkNav
-                            when="{window.__bramHunkCount(cappedDiffText(fileScope === '__all' ? filePatch : ((scopedDiff.value || {}).patch || ''))) > 0}"
-                            matchCount="{window.__bramHunkCount(cappedDiffText(fileScope === '__all' ? filePatch : ((scopedDiff.value || {}).patch || '')))}"
+                            when="{window.__bramHunkCount(cappedDiffText(scopedPatch)) > 0}"
+                            matchCount="{window.__bramHunkCount(cappedDiffText(scopedPatch))}"
                             current="{window.__bramHunkNavGet(hunkNavKeys, rowId, $item.path, 'diff')}"
-                            onStep="(d) => hunkNavKeys = window.__bramDiffHunkStep(hunkNavKeys, rowId, $item.path, d, cappedDiffText(fileScope === '__all' ? filePatch : ((scopedDiff.value || {}).patch || '')), fileScope === '__all' ? diffAllView : diffScopedView)" />
+                            onStep="(d) => hunkNavKeys = window.__bramDiffHunkStep(hunkNavKeys, rowId, $item.path, d, cappedDiffText(scopedPatch), fileScope === '__all' ? diffAllView : diffScopedView)" />
                           <DiffView
                             id="diffAllView"
                             when="{fileScope === '__all'}"
                             text="{cappedDiffText(filePatch)}" />
                           <DiffView
                             id="diffScopedView"
-                            when="{fileScope !== '__all' &amp;&amp; !!(scopedDiff.value &amp;&amp; scopedDiff.value.patch)}"
-                            text="{cappedDiffText(scopedDiff.value.patch)}" />
+                            when="{fileScope !== '__all' &amp;&amp; !!scopedPatch}"
+                            text="{cappedDiffText(scopedPatch)}" />
                           <Text
-                            when="{fileScope !== '__all' &amp;&amp; scopedDiff.value &amp;&amp; !scopedDiff.value.patch}"
+                            when="{fileScope !== '__all' &amp;&amp; !scopedPatch}"
                             variant="caption"
-                            value="No changes recorded in this scope's claim intervals for this file." />
+                            value="No changes in this file are credited to this scope." />
+                        </VStack>
                       </VStack>
                     </TabItem>
                     <!-- Ownership is a SUMMARY from the row item's point of
@@ -852,9 +880,13 @@
                           queryParams="{{ path: $item.path }}" />
                         <Table data="{window.__bramOwnershipSummary(filePatch, fileRuns, rowId, pathIndependence.value)}">
                           <Column header="claimant" width="3*" headerHorizontalAlignment="start">
+                            <!-- flow: a joint row lists every member; wrap it
+                                 rather than truncate (Text's default).
+                                 https://www.xmlui.org/docs/reference/components/Text -->
                             <Text
                               variant="code"
                               fontSize="$fontSize-sm"
+                              overflowMode="flow"
                               value="{window.__bramClaimantCell($item, rowId)}" />
                           </Column>
                           <Column header="unique" width="90px" headerHorizontalAlignment="start">
@@ -875,7 +907,7 @@
                          each item's lines tinted in place — the big picture the
                          scoped Diff and the Ownership summary lose. Reuses
                          /__local-file-preview (working-tree content, 200 KB cap)
-                         and the payload's attribution runs. Fetches on expand;
+                         and the payload's ownership runs (__bramFileRuns). Fetches on expand;
                          one local read per opened file. -->
                     <TabItem label="File">
                       <VStack gap="$space-0" paddingVertical="$space-2">

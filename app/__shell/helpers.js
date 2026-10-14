@@ -3754,7 +3754,7 @@ window.__bramItemChangedSplitDeclared = function (item, items, claim, coSelected
 
 // The shared paths behind the strip's counts. Filenames only -- the row
 // stays a scan line and the paths are one hover away.
-window.__bramWorklist2StripTooltip = function (item, claim, items, attributionTotals) {
+window.__bramWorklist2StripTooltip = function (item, claim, items) {
   // issue-406: which commit took the work, by its subject (a bare SHA
   // doesn't say whether it's the right one), and why the row counts as
   // landed.
@@ -3795,13 +3795,14 @@ window.__bramWorklist2StripTooltip = function (item, claim, items, attributionTo
     // will-commit-matches-the-button: same preference order as the strip, so
     // header and tooltip quote one number with one meaning.
     var wc = item.willCommit;
-    var totals = (attributionTotals || {})[item.id];
-    var takesAdded = wc ? wc.added : totals ? totals.added : fileAdded;
-    var takesRemoved = wc ? wc.removed : totals ? totals.removed : fileRemoved;
+    if (!wc) return "Calculating ownership\u2026";
+    var takesAdded = wc.added;
+    var takesRemoved = wc.removed;
     var changed = split.exclusive.length + split.shared.length;
     var lines = [];
     lines.push(
-      "Commits +" + takesAdded + " −" + takesRemoved +
+      ((item.commitDependsOn || []).length ? "Own changes +" : "Commits +") +
+        takesAdded + " −" + takesRemoved +
         " — exclusive files whole, own hunks on shared files",
     );
     if (takesAdded !== fileAdded || takesRemoved !== fileRemoved) {
@@ -3945,6 +3946,75 @@ window.__bramSelectionAllNeedStart = function (items, sel, claim) {
 //
 // This predicate is also what the stage icon and the strip key on, so all
 // three surfaces agree by construction rather than by coincidence.
+// unowned-lines-postmortem-fixes: what a whole-file commit of `item` would
+// take that membership credits to no item. Only paths with no begun claimant
+// outside the selection, since an entangled path is interval-staged and takes
+// only the item's own hunks.
+window.__bramItemTakeableUnowned = function (item, items, claim, coSelected) {
+  var out = { added: 0, removed: 0, paths: [] };
+  var m = window.__bramBoardMembership();
+  if (!m || !item) return out;
+  var byId = {};
+  (items || []).forEach(function (o) { byId[o.id] = o; });
+  var co = coSelected || [];
+  var outsideBegun = function (other) {
+    if (other === item.id || co.indexOf(other) !== -1) return false;
+    var o = byId[other];
+    return !!(o && window.__bramWorklist2Begun(o, claim));
+  };
+  (item.changedFiles || []).forEach(function (f) {
+    var bp = f && m.byPath[f.path];
+    if (!bp) return;
+    if ((bp.owners || []).some(outsideBegun)) return;
+    var un = bp.unowned || {};
+    var a = Number(un.added) || 0, r = Number(un.removed) || 0;
+    if (a + r > 0) { out.added += a; out.removed += r; out.paths.push(f.path); }
+  });
+  return out;
+};
+
+// unowned-lines-postmortem-fixes: the Commit button's tooltip names the
+// failing check when it is withheld. With only the scope listed, a disabled
+// Commit left the user (and the agent) guessing (2026-10-09).
+window.__bramGateCommitWhyNot = function (items, sel, claim, ctx) {
+  var chosen = sel || [];
+  if (!chosen.length) return "";
+  var blocker = window.__bramInflightBlocker(claim);
+  if (blocker) return "Unavailable while Bram is working on " + blocker + "; it unlocks when that turn ends.";
+  var addressed = window.__bramAddressedBlockMessage ? window.__bramAddressedBlockMessage(chosen, ctx) : "";
+  if (addressed) return addressed;
+  if (window.__bramSelectionAllCommittable(items, chosen, claim)) return "";
+  var missing = window.__bramSelectionJointMissing(items, chosen, claim) || [];
+  if (missing.length) return "It commits only together with " + missing.join(", ") + "; tick both and commit once.";
+  var list = items || [];
+  for (var i = 0; i < chosen.length; i++) {
+    var it = list.filter(function (x) { return x.id === chosen[i]; })[0];
+    if (!it) continue;
+    if (!window.__bramWorklist2Begun(it, claim)) return it.id + " hasn't been started; use Start first.";
+    if ((it.commitCheckFailedPaths || []).length) {
+      return it.id + "'s change doesn't apply to HEAD on its own (" + it.commitCheckFailedPaths.join(", ") + ").";
+    }
+  }
+  // issue-438: nothing git can see, but a declared file is on disk behind an
+  // ignore rule. Name it and the two ways out. The remedy is its own
+  // paragraph, as in the row tooltip above (~3838): XMLUI's Tooltip has no
+  // width cap, so one long line ran off the pane's edge and hid the second
+  // way out.
+  for (var j = 0; j < chosen.length; j++) {
+    var ig = list.filter(function (x) { return x.id === chosen[j]; })[0];
+    var phrase = window.__bramIgnoredDeclaredPhrase(window.__bramIgnoredDeclaredPaths(ig));
+    if (phrase) {
+      return phrase + ".\n\nTo commit it, add a `!` exception to .gitignore, or force-stage it (`git add -f`).";
+    }
+  }
+  return "Nothing on disk is this selection's to commit.";
+};
+window.__bramGateCommitTooltip = function (sel, branch, items, claim, ctx) {
+  var scope = window.__bramGateScopeTooltip(sel, "commit", branch) || "";
+  var why = window.__bramGateCommitWhyNot(items, sel, claim, ctx);
+  return why ? scope + (scope ? "\n\n" : "") + "**Why it's off:** " + why : scope;
+};
+
 window.__bramSelectionAllCommittable = function (items, sel, claim) {
   var chosen = sel || [];
   if (!chosen.length) return false;
@@ -3968,6 +4038,9 @@ window.__bramSelectionAllCommittable = function (items, sel, claim) {
     // items were both offered a button that would land one item's work
     // under the other's id. Begun-ness is trivially true for applied items.
     if (!window.__bramWorklist2Begun(it, claim)) return false;
+    // issue-430: the host's precheck says this item's patch does not apply to
+    // HEAD on its own, and names no begun item it depends on.
+    if ((it.commitCheckFailedPaths || []).length && !(it.commitDependsOn || []).length) return false;
     // issue-327: exclusivity is no longer required to OFFER Commit. The host
     // now interval-stages an entangled item's own hunks (scratch index, HEAD
     // parent, worktree untouched), so a shared path is committable — the
@@ -3978,7 +4051,15 @@ window.__bramSelectionAllCommittable = function (items, sel, claim) {
     // names the item to commit first, so offering here is safe — the #336
     // withholding and the #337 selection-scoping both retire into this.
     var split = window.__bramItemChangedSplit(it, list, claim, chosen);
-    if (!split.exclusive.length && !split.shared.length) return false;
+    if (!split.exclusive.length && !split.shared.length) {
+      // unowned-lines-postmortem-fixes: lines no item wrote, on a file this
+      // item declares with no other begun claimant, are taken by the
+      // whole-file commit (host: membership_unowned_taken, unownedTaken).
+      // Withholding Commit for them left Drop as the only button
+      // (2026-10-09, files-tree-no-copy-button).
+      var take = window.__bramItemTakeableUnowned(it, list, claim, chosen);
+      if (!(take.added + take.removed)) return false;
+    }
     // "Changes of its own" on a shared path means lines of its own, not just a
     // changed path: a begun item with no work, sharing a file a neighbour
     // edited, was offered Commit while its strip read "Will commit +0 −0"
@@ -4102,7 +4183,7 @@ window.__bramGreenLitAge = function (item) {
 };
 
 // issue-327: how many of a file's changed lines this item actually wrote,
-// from the claim-interval runs in the payload. Runs describe lines PRESENT in
+// from the ownership runs (__bramOwnershipRunsByPath). Runs describe lines PRESENT in
 // the final file, so this counts additions only -- a deletion leaves no line to
 // attribute. Reporting a "-" figure here would be inventing one.
 window.__bramOwnClause = function (item, attribution) {
@@ -4437,9 +4518,9 @@ window.__bramOwnershipRows = function (patch, runs) {
 // per-commit convention (scope, don't annotate); "unattributed" appears only
 // when some changed line has no owner. The row's own item is listed first: it
 // is the default lens.
-window.__bramDiffScopeOptions = function (patch, runs, rowId) {
+window.__bramDiffScopeOptions = function (patch, runs, rowId, removedRuns) {
   var opts = [{ value: "__all", label: "All" }];
-  var spans = runs || [];
+  var spans = (runs || []).concat(removedRuns || []);
   var seen = {};
   var order = [];
   for (var i = 0; i < spans.length; i++) {
@@ -4456,14 +4537,134 @@ window.__bramDiffScopeOptions = function (patch, runs, rowId) {
       label: order[j] + (order[j] === rowId ? " (this item)" : ""),
     });
   }
-  var rows = window.__bramOwnershipRows(patch, spans);
-  for (var k = 0; k < rows.length; k++) {
-    if (rows[k].kind === "line" && !rows[k].owner) {
-      opts.push({ value: "__unattributed", label: "unattributed" });
-      break;
-    }
+  if (window.__bramScopedPatch(patch, runs, removedRuns, "__unattributed")) {
+    opts.push({ value: "__unattributed", label: "unattributed" });
   }
   return opts;
+};
+
+// issue-425-retire-replay: the patch a scoped view is cut from. `headPatch`
+// (HEAD-based) when the file has staged changes, since membership numbers
+// removed lines against HEAD; otherwise the displayed `patch`, which is then
+// the same diff. "All" keeps rendering `patch`.
+window.__bramScopeBasePatch = function (rowItem, path) {
+  var rec = window.__bramDiffForPath(rowItem, path) || {};
+  return rec.headPatch || rec.patch || "";
+};
+
+// issue-425-retire-replay (Codex review): what Commit takes for 2+ ticked
+// items, from the host's /__worklist/will-commit (the gate's own routing run
+// for the selection). Per-row "Will commit" assumes each item commits alone,
+// and a selection can route differently. The request is keyed on the board's
+// membership state key; an answer is shown only if it is fresh and was
+// computed under that same key, for this same selection.
+window.__bramSelectionPredictionKey = function (board, sel) {
+  var ids = sel || [];
+  if (ids.length < 2) return "";
+  // Codex review: key on the state ownership is derived from (the host's
+  // membership state key), not on line counts, which can stay the same while
+  // ownership or a dependency changes. Empty until membership has a key.
+  var k = (board && board.membershipStateKey) || "";
+  // Freshness too (Codex review): while membership computes, the board can
+  // already carry the final key, marked stale. The ready signal refetches the
+  // board, which flips it to fresh under the same key; this makes that flip
+  // change the request, so the prediction refetches instead of staying hidden.
+  return k ? ids.join(",") + "|" + k + "|" + (board.membershipStale ? "stale" : "fresh") : "";
+};
+
+window.__bramSelectionTakeLine = function (pred, sel, board) {
+  if (!pred || !pred.ready || pred.stale || (sel || []).length < 2) return "";
+  // Only this selection's answer, computed under the board's current state.
+  if ((pred.ids || []).slice().sort().join(",") !== sel.slice().sort().join(",")) return "";
+  if (!board || !board.membershipStateKey || pred.stateKey !== board.membershipStateKey) return "";
+  if ((pred.dependentPaths || []).length) {
+    return "Together these can't commit: their changes depend on work by " +
+      window.__bramNameList(pred.entangledWith || []) + ".";
+  }
+  var take = "+" + (pred.added || 0) + " \u2212" + (pred.removed || 0);
+  if (pred.mode === "whole-file") {
+    var un = pred.unowned || [];
+    var ua = 0, ur = 0;
+    for (var i = 0; i < un.length; i++) { ua += un[i].added || 0; ur += un[i].removed || 0; }
+    return "Together, Commit takes these files whole: " + take +
+      (un.length ? ", including +" + ua + " \u2212" + ur + " no item wrote" : "") + ".";
+  }
+  return "Together, Commit takes only these items' own lines: " + take +
+    " (shared with " + window.__bramNameList(pred.entangledWith || []) + ").";
+};
+
+// Removed-line ownership for one path ({startLine, endLine, itemId | itemIds},
+// numbered by HEAD-side lines), from membership. Empty without a partition.
+window.__bramFileRemovedRuns = function (board, path) {
+  var byPath = board && board.membership && board.membership.byPath;
+  return (byPath && byPath[path] && byPath[path].removedRuns) || [];
+};
+
+// issue-425-retire-replay: a scope's view of a file, cut from the CURRENT diff
+// (what a commit takes), not from the item's claim-interval history. Keeps
+// each hunk that holds at least one line credited to `scope` (an item id, as
+// sole or joint owner, or "__unattributed" for lines nobody owns). Added lines
+// are matched by present line against `runs`, removed lines by HEAD line
+// against `removedRuns`. Hunks are git's, so a hunk mixing owners shows all of
+// them. Returns "" when no hunk qualifies.
+window.__bramScopedPatch = function (patch, runs, removedRuns, scope, allPatch) {
+  // "All" renders the displayed patch (plain `git diff`), so hunk navigation
+  // counts that one; `allPatch` carries it when the base differs.
+  if (!scope || scope === "__all") return (allPatch !== undefined ? allPatch : patch) || "";
+  if (!patch) return "";
+  var ownerAt = function (spans, n) {
+    var list = spans || [];
+    for (var i = 0; i < list.length; i++) {
+      var s = list[i];
+      if (n >= s.startLine && n <= s.endLine) return s.itemIds || (s.itemId ? [s.itemId] : null);
+    }
+    return null;
+  };
+  var matches = function (owners) {
+    if (scope === "__unattributed") return !owners;
+    return !!owners && owners.indexOf(scope) !== -1;
+  };
+  var lines = patch.split("\n");
+  var head = [];
+  var hunks = [];
+  var cur = null;
+  var oldN = 0;
+  var newN = 0;
+  for (var i = 0; i < lines.length; i++) {
+    var ln = lines[i];
+    var m = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(ln);
+    if (m) {
+      cur = { lines: [ln], keep: false };
+      hunks.push(cur);
+      oldN = parseInt(m[1], 10);
+      newN = parseInt(m[2], 10);
+      continue;
+    }
+    if (!cur) {
+      head.push(ln);
+      continue;
+    }
+    cur.lines.push(ln);
+    var c = ln.charAt(0);
+    if (c === "+") {
+      if (matches(ownerAt(runs, newN))) cur.keep = true;
+      newN++;
+    } else if (c === "-") {
+      if (matches(ownerAt(removedRuns, oldN))) cur.keep = true;
+      oldN++;
+    } else if (c === " ") {
+      oldN++;
+      newN++;
+    }
+  }
+  var out = head.slice();
+  var any = false;
+  for (var h = 0; h < hunks.length; h++) {
+    if (!hunks[h].keep) continue;
+    any = true;
+    out = out.concat(hunks[h].lines);
+  }
+  return any ? out.join("\n") : "";
 };
 
 // Scope selection is CONTROLLED and id-keyed, the diffKeys discipline one
@@ -4616,7 +4817,24 @@ window.__bramClaimantCell = function (item, rowId) {
 // context ("+170 −1 of +404 −18"). On exclusive paths take == total and
 // the cell reads as it always did. Extracted from an inline markup
 // expression per the single-call handler rule.
+// issue-438: an item's declared files that exist on disk but that git ignores
+// (the host's `changedFiles` status "ignored"). Without this the row read
+// "nothing to do" and a withheld Commit said "nothing on disk", true for git
+// and baffling for a user looking at the file they just made.
+window.__bramIgnoredDeclaredPaths = function (item) {
+  return ((item && item.changedFiles) || [])
+    .filter(function (f) { return f && f.status === "ignored"; })
+    .map(function (f) { return f.path; });
+};
+window.__bramIgnoredDeclaredPhrase = function (paths) {
+  if (!paths || !paths.length) return "";
+  var more = paths.length > 1 ? " and " + (paths.length - 1) + " more" : "";
+  return paths[0] + more + " exist" + (paths.length > 1 ? "" : "s") + ", but .gitignore hides " +
+    (paths.length > 1 ? "them" : "it") + " from git";
+};
+
 window.__bramFileChangesCell = function (rec, rowBegun) {
+  if (rec && rec.status === "ignored") return "hidden by .gitignore";
   if (!rec || rec.status === "unchanged") return "";
   var suffix =
     rec.status === "new" ? " (new)" : rec.status === "deleted" ? " (deleted)" : "";
@@ -4635,6 +4853,27 @@ window.__bramFileChangesCell = function (rec, rowBegun) {
     return "+" + rec.takeAdded + " −" + rec.takeRemoved + " of " + total + suffix;
   }
   return total + suffix;
+};
+
+// issue-425-retire-replay: the pane's one source for per-line ownership runs
+// ({startLine, endLine, itemId | itemIds}, present-file lines): membership's.
+// With no partition yet there are none; the strip says ownership is pending.
+// Returns the payload's own array, never a copy: the File tab's rows are
+// memoized on input identity (see __bramFileContextRows).
+window.__bramFileRuns = function (board, path) {
+  if (!board) return undefined;
+  var byPath = board.membership && board.membership.byPath;
+  return byPath && byPath[path] ? byPath[path].runs : undefined;
+};
+
+// The same source as a path -> runs map, for readers that walk an item's files.
+window.__bramOwnershipRunsByPath = function (board) {
+  if (!board) return {};
+  var byPath = board.membership && board.membership.byPath;
+  if (!byPath) return {};
+  var out = {};
+  for (var p in byPath) if (byPath[p] && byPath[p].runs) out[p] = byPath[p].runs;
+  return out;
 };
 
 window.__bramItemOwnAdded = function (item, attribution) {
@@ -4659,8 +4898,156 @@ window.__bramItemOwnAdded = function (item, attribution) {
 // reason as d1798ca in the overlaps panel: an item that has not begun cannot
 // have written anything, so it cannot be sharing the file with anyone. That fix
 // did not reach this column because only the panel was looked at.
+// issue-419-header-from-membership: the owners membership credits with lines
+// on `path`, or null when the board carries no partition yet (fresh launch),
+// in which case callers keep the declared reading. Membership credits only
+// begun items that declare the path; an undeclared writer's lines are
+// unowned, which the header reports separately.
+window.__bramMembershipOwners = function (path) {
+  var m = window.__bramBoardMembership();
+  if (!m) return null;
+  var entry = m.byPath[path];
+  return (entry && entry.owners) || [];
+};
+
+// issue-419-header-from-membership: true when membership credits `item` no
+// line in any of its changed files (all of them rewritten by others). False
+// with no partition, or no changed files, so the strip keeps its old wording.
+window.__bramItemLinesAllRewritten = function (item) {
+  if (!window.__bramBoardMembership()) return false;
+  var changed = ((item && item.changedFiles) || []).filter(function (f) {
+    return f && ((f.added || 0) > 0 || (f.removed || 0) > 0);
+  });
+  if (!changed.length) return false;
+  return changed.every(function (f) {
+    var owners = window.__bramMembershipOwners(f.path) || [];
+    return owners.indexOf(item.id) === -1;
+  });
+};
+
+// issue-419-header-from-membership: the files table's ⓘ explanations (Jon,
+// 2026-10-13: "for these complex situations lets have a little i modal to
+// expand the explanation … for every changes and shared with"). Each returns
+// {title, body}; the body is Markdown for Worklist.xmlui's fileCellInfoDialog.
+function __bramPm(c) {
+  return "+" + ((c && c.added) || 0) + " −" + ((c && c.removed) || 0);
+}
+function __bramNonzero(c) {
+  return !!c && ((c.added || 0) > 0 || (c.removed || 0) > 0);
+}
+function __bramPerItemFor(entry, id) {
+  // This item's own lines and its jointly owned lines, separately.
+  var own = { added: 0, removed: 0 };
+  var joint = [];
+  ((entry && entry.perItem) || []).forEach(function (p) {
+    var members = p.members || [];
+    if (members.indexOf(id) === -1) return;
+    if (members.length === 1) {
+      own.added += (p.counts && p.counts.added) || 0;
+      own.removed += (p.counts && p.counts.removed) || 0;
+    } else {
+      joint.push(p);
+    }
+  });
+  return { own: own, joint: joint };
+}
+function __bramSharerReason(it, path, claim) {
+  if (!it || !window.__bramWorklist2Begun(it, claim)) return "hasn't started";
+  var wc = it.willCommit;
+  var did = wc && ((Number(wc.added) || 0) + (Number(wc.removed) || 0)) > 0;
+  if (did && window.__bramItemLinesAllRewritten(it)) {
+    return "started, but its lines here were rewritten by another item";
+  }
+  return "started, but hasn't written in this file";
+}
+
+window.__bramFileChangesExplain = function (rec, item, items, claim) {
+  var path = (rec && rec.path) || "";
+  var id = (item && item.id) || "";
+  var title = "Changes in " + path;
+  var lines = [];
+  if (rec && rec.status === "ignored") {
+    lines.push("**" + path + "** exists on disk, but `.gitignore` hides it from git, so git sees no change and there is nothing to commit.");
+    lines.push("To commit it, add a `!` exception to `.gitignore`, or force-stage it (`git add -f`).");
+    return { title: title, body: lines.join("\n\n") };
+  }
+  if (!__bramNonzero(rec)) {
+    lines.push("**" + path + "** is the same as in the last commit. " + id + " lists it, but nothing in it has changed yet.");
+    return { title: title, body: lines.join("\n\n") };
+  }
+  var kind = rec.status === "new" ? " (a new file)" : rec.status === "deleted" ? " (deleted)" : "";
+  lines.push("**" + path + "**" + kind + " differs from the last commit by **" + __bramPm(rec) + "** lines. That's the whole file's change, whoever made it.");
+  var m = window.__bramBoardMembership();
+  var entry = m && m.byPath[path];
+  if (!m) {
+    lines.push("Bram hasn't worked out who wrote which of these lines yet; this appears shortly after launch.");
+    return { title: title, body: lines.join("\n\n") };
+  }
+  var mine = __bramPerItemFor(entry, id);
+  var who = ["- **" + id + "** (this item): " + __bramPm(mine.own)];
+  mine.joint.forEach(function (p) {
+    who.push("- jointly with " + p.members.filter(function (x) { return x !== id; }).join(", ") + " (approved in one click): " + __bramPm(p.counts));
+  });
+  ((entry && entry.perItem) || []).forEach(function (p) {
+    var members = p.members || [];
+    if (members.indexOf(id) !== -1) return;
+    who.push("- " + members.join(" and ") + (members.length > 1 ? " (jointly)" : "") + ": " + __bramPm(p.counts));
+  });
+  if (__bramNonzero(entry && entry.unowned)) {
+    who.push("- no item: " + __bramPm(entry.unowned) + ". Written while no item that lists this file was being worked on: in a chat turn, by hand, or by an item that doesn't list it.");
+  }
+  lines.push("Who wrote those lines:\n\n" + who.join("\n"));
+  var others = ((entry && entry.owners) || []).filter(function (x) { return x !== id; });
+  if (window.__bramItemLinesAllRewritten(item)) {
+    lines.push(id + "'s own earlier edits here were all rewritten by " + others.join(", ") + ", so none of its lines are in the file now. Commit " + others.join(", ") + " first.");
+  } else if (others.length && typeof rec.takeAdded === "number") {
+    lines.push("Because " + others.join(", ") + " also " + (others.length === 1 ? "has" : "have") + " lines here, committing " + id + " on its own takes only its own lines, **+" + rec.takeAdded + " −" + rec.takeRemoved + "**, hunk by hunk. Committing them together takes the whole file.");
+  } else if (!others.length) {
+    lines.push("Committing " + id + " takes the whole file, **" + __bramPm(rec) + "**" + (__bramNonzero(entry && entry.unowned) ? ", including the lines no item wrote. The commit reports those as taken." : "."));
+  }
+  return { title: title, body: lines.join("\n\n") };
+};
+
+window.__bramFileSharedExplain = function (rec, item, items, claim) {
+  var path = (rec && rec.path) || "";
+  var id = (item && item.id) || "";
+  var title = "Who else lists " + path;
+  var sharers = (rec && rec.sharedWith) || [];
+  if (!sharers.length) {
+    return { title: title, body: "No other item lists **" + path + "**, so this file doesn't tie " + id + "'s commit to any other item's." };
+  }
+  var byId = {};
+  (items || []).forEach(function (it) { if (it && it.id) byId[it.id] = it; });
+  var m = window.__bramBoardMembership();
+  var entry = m && m.byPath[path];
+  var withLines = [];
+  var rows = sharers.map(function (s) {
+    if (!m) return "- **" + s + "**: " + (window.__bramWorklist2Begun(byId[s], claim) ? "started" : "hasn't started");
+    var c = __bramPerItemFor(entry, s).own;
+    if ((entry && entry.owners || []).indexOf(s) !== -1) {
+      withLines.push(s);
+      return "- **" + s + "** has lines here: " + __bramPm(c) + ".";
+    }
+    return "- **" + s + "** lists it, but has no lines here: " + __bramSharerReason(byId[s], path, claim) + ".";
+  });
+  var body = ["Other items that list **" + path + "**:", rows.join("\n")];
+  if (!m) {
+    body.push("Bram hasn't worked out who wrote which lines yet, so this shows only who has started.");
+  } else if (withLines.length && window.__bramItemLinesAllRewritten(item)) {
+    body.push(id + "'s own edits here were rewritten by " + withLines.join(", ") + ", so it has no lines in this file now. Commit " + withLines.join(", ") + " first.");
+  } else if (withLines.length) {
+    body.push("Because " + withLines.join(", ") + " " + (withLines.length === 1 ? "has" : "have") + " lines in this file, committing " + id + " on its own takes only its own lines, hunk by hunk. Committing them together takes the whole file.");
+  } else {
+    body.push("None of them has lines here now, so committing " + id + " takes this file without involving them.");
+  }
+  return { title: title, body: body.join("\n\n") };
+};
+
 window.__bramSharedWithBegun = function (file, items, claim) {
   var sharers = (file && file.sharedWith) || [];
+  // "done": a sharer that actually wrote lines here.
+  var owners = file && window.__bramMembershipOwners(file.path);
+  if (owners) return sharers.filter(function (s) { return owners.indexOf(s) !== -1; });
   var list = items || [];
   var byId = {};
   for (var i = 0; i < list.length; i++) if (list[i] && list[i].id) byId[list[i].id] = list[i];
@@ -4679,6 +5066,10 @@ window.__bramSharedWithBegun = function (file, items, claim) {
 // so the credit lie d1798ca fixed cannot return through this door.
 window.__bramSharedWithPlanned = function (file, items, claim) {
   var sharers = (file && file.sharedWith) || [];
+  // "planned": everyone who declares it but has written nothing here yet,
+  // begun or not, so a begun-but-idle declarant appears in one column.
+  var owners = file && window.__bramMembershipOwners(file.path);
+  if (owners) return sharers.filter(function (s) { return owners.indexOf(s) === -1; });
   var list = items || [];
   var byId = {};
   for (var i = 0; i < list.length; i++) if (list[i] && list[i].id) byId[list[i].id] = list[i];
@@ -4737,7 +5128,7 @@ window.__bramGateStrandedExitLine = function (claim, agentStatus, _tick) {
   return "The agent has finished \u2014 send a message to continue.";
 };
 
-window.__bramWorklist2Strip = function (item, claim, items, attribution, attributionTotals, agentStatus) {
+window.__bramWorklist2Strip = function (item, claim, items, attribution, agentStatus) {
   if (!item) return "";
   // issue-266: the close declaration belongs on the status line for
   // scannability, never buried in the expanded body.
@@ -4762,6 +5153,12 @@ window.__bramWorklist2Strip = function (item, claim, items, attribution, attribu
     return base + " · " + (asClaim ? "closes " : "for ") + closesList;
   };
   var kind = window.__bramItemInflightKind(claim, item.id, "", "", 0);
+  // issue-430-dependent-commit-offer: a refused commit used to reach only the
+  // agent's HTTP response, and the row kept offering it ("bram does not tell
+  // me that!"). The host keeps the last refusal until HEAD moves.
+  if (!kind && item.lastCommitRefusal && item.lastCommitRefusal.reason) {
+    return withCloses("Last Commit was refused: " + item.lastCommitRefusal.reason);
+  }
   if (kind) {
     // Every label below asserts that work is HAPPENING, so they are gated
     // on an agent actually working. A live claim with no working agent
@@ -4825,8 +5222,8 @@ window.__bramWorklist2Strip = function (item, claim, items, attribution, attribu
       // against its own plan -- "1 of 2 planned" is the signal that a commit
       // now would be committing something unfinished.
       // issue-327: lead with what a commit actually TAKES. Interval staging
-      // commits the item's own hunks, so the headline is its interval-patch
-      // shortstat (attributionTotals). On a contended path that is less than
+      // commits the item's own hunks, so the headline is the host's willCommit
+      // (issue-425-retire-replay: staged from the item's patch). On a contended path that is less than
       // the file total, which is shown as "on disk" context; for an
       // unentangled item the two are equal and it reads as it always did. The
       // old dual-number collapses into one honest figure. Items predating
@@ -4846,16 +5243,26 @@ window.__bramWorklist2Strip = function (item, claim, items, attribution, attribu
       // exclusive paths, interval take on entangled ones). The older
       // fallbacks — interval totals, then file sums — cover hosts that
       // predate it.
+      // issue-425-retire-replay: willCommit is the only source; the host
+      // omits it only while membership has no partition.
       var wc = item.willCommit;
-      var totals = (attributionTotals || {})[item.id];
-      var takesAdded = wc ? wc.added : totals ? totals.added : fileAdded;
-      var takesRemoved = wc ? wc.removed : totals ? totals.removed : fileRemoved;
+      // No partition yet: the host serves no take, and a whole-file sum
+      // would promise lines the gate may not take (Codex review).
+      if (!wc) return withCloses("Calculating ownership\u2026");
+      var takesAdded = wc.added;
+      var takesRemoved = wc.removed;
       var changedCount = split.exclusive.length + split.shared.length;
       var partialFlag =
         (cs.total || 0) > changedCount
           ? " · " + changedCount + " of " + (cs.total || 0)
           : "";
       var sharedFlag = split.shared.length ? " · shared" : "";
+      // unowned-lines-postmortem-fixes: say so when what Commit takes was
+      // written under no item (the strip used to read "Its changes are all
+      // in shared files", which was false).
+      if (!split.exclusive.length && !split.shared.length) {
+        sharedFlag = " · written under no item";
+      }
       // issue-273 postscript: the "(N unattributed)" flag was withdrawn the
       // evening it shipped — three renders, three different wrong numbers
       // (74,978 → 329 → 427), each a different accounting defect in the
@@ -4863,8 +5270,12 @@ window.__bramWorklist2Strip = function (item, claim, items, attribution, attribu
       // the redesign is the drawing-board item.
       // The one committable branch: here (and only here) the close reads as
       // the claim it is — the gate is about to offer the tick.
+      // issue-425-retire-replay (Codex review): when the host's precheck
+      // found the item's patch can't apply alone (commitDependsOn), the gate
+      // would refuse it, so the number is the item's own lines, not a promise.
+      var wcLabel = (item.commitDependsOn || []).length ? "Own changes +" : "Will commit +";
       return withCloses(
-        "Will commit +" + takesAdded + " −" + takesRemoved +
+        wcLabel + takesAdded + " −" + takesRemoved +
           partialFlag + sharedFlag,
         true,
       );
@@ -4897,8 +5308,17 @@ window.__bramWorklist2Strip = function (item, claim, items, attribution, attribu
       return withCloses("No changes of its own yet");
     }
     var blockers = window.__bramItemShareBlockers(item, items, claim);
+    // issue-419-header-from-membership: superseded. The item did work in its
+    // windows (ownLines > 0 above), but membership credits it no line in any
+    // of its changed files: another item rewrote them. "Shares its changed
+    // files" didn't say why it should wait (Jon, 2026-10-13: "i am unclear
+    // what this is saying").
+    var rewritten = blockers.length && window.__bramItemLinesAllRewritten(item);
     return withCloses(
-      blockers.length
+      rewritten
+        ? "Its lines here were rewritten by " + blockers.join(", ") + " · commit " +
+            (blockers.length === 1 ? "that" : "those") + " first"
+        : blockers.length
         ? "Shares its changed files with " + blockers.join(", ") + " · commit " +
             (blockers.length === 1 ? "that" : "those") + " first"
         : "Its changes are all in shared files",
@@ -4936,6 +5356,12 @@ window.__bramWorklist2Strip = function (item, claim, items, attribution, attribu
         window.__bramLandedCoverage(item.landed) +
         ". Bram can't tell whether the work is finished; if it is, Clear it",
     );
+  }
+  // issue-438: the agent made a declared file, but git can't see it. Say so
+  // before either nothing-on-disk ending, which would misstate it.
+  var ignoredPhrase = window.__bramIgnoredDeclaredPhrase(window.__bramIgnoredDeclaredPaths(item));
+  if (ignoredPhrase && !((item.changeSummary || {}).changed > 0)) {
+    return withCloses("With the agent · " + ignoredPhrase);
   }
   // Nothing on disk yet, and begun -- the two states the icon now separates.
   // Earlier this returned "" (brief, because begun-ness was transient), then
@@ -5214,7 +5640,10 @@ window.__bramSelectionJointMissing = function (items, sel, claim) {
   var missing = [];
   for (var s = 0; s < chosen.length; s++) {
     var it = byId[chosen[s]];
-    var jw = (it && it.jointWith) || [];
+    // issue-430: a patch that only applies on top of another begun item's
+    // uncommitted lines (host precheck, commitDependsOn) is refused alone,
+    // exactly like a joint run.
+    var jw = ((it && it.jointWith) || []).concat((it && it.commitDependsOn) || []);
     for (var j = 0; j < jw.length; j++) {
       var partner = byId[jw[j]];
       if (!partner) continue;
@@ -5533,10 +5962,15 @@ window.__bramStartConsequence = function (items, sel, claim) {
     // path, so an item that wrote nothing read as committable here while the
     // button stayed dark ("Commit makes one commit…" beside a lone Drop).
     var ownOnly = !!window.__bramBoardMembership();
+    // unowned-lines-postmortem-fixes: unowned lines the whole-file commit
+    // takes count too, matching __bramSelectionAllCommittable (the note said
+    // "nothing to commit" beside a lit Commit, demo 2026-10-09).
+    var take = window.__bramItemTakeableUnowned(itb, list, claim);
     var hasAnyChange =
       (!ownOnly && itb.changeSummary && itb.changeSummary.changed > 0) ||
       split.exclusive.length > 0 ||
-      split.shared.length > 0;
+      split.shared.length > 0 ||
+      take.added + take.removed > 0;
     if (!hasAnyChange) empty.push(itb.id);
   }
   if (empty.length) {
@@ -5799,17 +6233,35 @@ window.__bramOverlapHeaderLine = function (items, claim) {
   var plannedClause = plannedOnly
     ? " \u00b7 " + plannedOnly + " file" + (plannedOnly === 1 ? "" : "s") + " planned by multiple items"
     : "";
+  // issue-419-header-from-membership: #419's board said "no shared files"
+  // while a commit would take a line nobody's item wrote (an undeclared
+  // neighbour's edit, which membership leaves unowned). Say so here, before
+  // the commit's own unownedTaken disclosure.
+  var unownedClause = window.__bramUnownedFilesClause();
   if (!index.length) {
     return head + (declaredIdx.length
       ? " \u00b7 no shared files changed" + plannedClause
-      : " \u00b7 no shared files");
+      : " \u00b7 no shared files") + unownedClause;
   }
   var touched = {};
   index.forEach(function (e) { e.claimants.forEach(function (id) { touched[id] = true; }); });
   var k = Object.keys(touched).length;
   return head + " \u00b7 " + index.length + " shared file" + (index.length === 1 ? "" : "s") +
     " across " + (k === n && n > 1 ? "all " : "") + k + " item" + (k === 1 ? "" : "s") +
-    plannedClause;
+    plannedClause + unownedClause;
+};
+
+// issue-419-header-from-membership: " · N file(s) with lines no item owns",
+// from membership's per-path unowned bucket; "" with none, or with no
+// partition yet.
+window.__bramUnownedFilesClause = function () {
+  var m = window.__bramBoardMembership();
+  if (!m) return "";
+  var n = Object.keys(m.byPath).filter(function (path) {
+    var u = (m.byPath[path] || {}).unowned || {};
+    return (u.added || 0) > 0 || (u.removed || 0) > 0;
+  }).length;
+  return n ? " · " + n + " file" + (n === 1 ? "" : "s") + " with lines no item owns" : "";
 };
 
 // The overlap that MATTERS AT THE GATE: declared overlap intersected with
@@ -5827,6 +6279,24 @@ window.__bramOverlapHeaderLine = function (items, claim) {
 // won't-build) -- and two items on a dirty shared file is contention
 // PRECISELY because which of them wrote it cannot be known.
 window.__bramOverlapChangedIndex = function (items, claim) {
+  // issue-419-header-from-membership: the comment below predates membership.
+  // Bram does now know who wrote which lines: membership credits each changed
+  // line to the claim window that wrote it, among begun items that declare
+  // the path. So a changed path is shared exactly when membership credits two
+  // or more owners there; a begun declarant with no lines in the file isn't
+  // sharing it. The declared reading below stays as the fallback for a board
+  // with no partition yet.
+  var m = window.__bramBoardMembership();
+  if (m) {
+    var shared = [];
+    Object.keys(m.byPath).sort().forEach(function (path) {
+      var owners = ((m.byPath[path] || {}).owners || []).slice().sort();
+      if (owners.length >= 2) {
+        shared.push({ path: path, claimants: owners, begunCount: owners.length, total: owners.length });
+      }
+    });
+    return shared;
+  }
   var declared = window.__bramOverlapIndex(items, claim) || [];
   if (!declared.length) return [];
   var list = items || [];
@@ -9955,9 +10425,40 @@ window.__bramFormatLocalLinkPreview = function (preview) {
   if (!preview) return "";
   if (preview.error) return preview.error;
   var content = preview.content == null ? "" : String(preview.content);
-  if (preview.renderMode === "markdown") return content;
+  if (preview.renderMode === "markdown") return __bramStripMarkdownComments(content);
   return window.__bramFenceMarkdown(content, preview.language || "");
 };
+// more-files-tree-view: a Markdown file previews as prose, so it wraps
+// ("flow"); code keeps "scroll" for long lines. One "scroll" for both forced
+// every paragraph onto a single line (2026-10-09, AGENTS.md from Files).
+// https://www.xmlui.org/docs/reference/components/Markdown (overflowMode)
+window.__bramLocalLinkPreviewOverflow = function (preview) {
+  return preview && preview.renderMode === "markdown" ? "flow" : "scroll";
+};
+// With allowHtml="false" an HTML comment (Bram's <!-- bram:start --> markers)
+// renders as literal text. Drop comments outside fenced code; a comment shown
+// inside a code sample stays.
+function __bramStripMarkdownComments(text) {
+  var out = [], inFence = false, fence = "";
+  var lines = String(text).split("\n");
+  var buf = [];
+  var flush = function () {
+    if (buf.length) out.push(buf.join("\n").replace(/<!--[\s\S]*?-->/g, ""));
+    buf = [];
+  };
+  for (var i = 0; i < lines.length; i++) {
+    var m = lines[i].match(/^\s*(`{3,}|~{3,})/);
+    if (!inFence && m) { flush(); inFence = true; fence = m[1].charAt(0); out.push(lines[i]); continue; }
+    if (inFence) {
+      out.push(lines[i]);
+      if (m && m[1].charAt(0) === fence) inFence = false;
+      continue;
+    }
+    buf.push(lines[i]);
+  }
+  flush();
+  return out.join("\n");
+}
 window.__bramFenceMarkdown = function (body, lang) {
   body = body == null ? "" : String(body);
   var longest = 0, run = 0;
@@ -10013,7 +10514,7 @@ window.__bramLocalLinkRequestFromHref = function (href) {
   // opens a "File unavailable" preview instead of the page (the /queue
   // launch bug, 2026-07-23).
   var routeMatch = raw.match(
-    /^\/(needs-you|worklist2?|transcript|search|issues|commits|queue|history|sessions|tips|settings|status|context)(\/.*)?$/
+    /^\/(needs-you|worklist2?|transcript|search|issues|commits|queue|history|files|sessions|tips|settings|status|context)(\/.*)?$/
   );
   if (routeMatch) {
     var rest = routeMatch[2] ? routeMatch[2].slice(1) : "";
@@ -11662,6 +12163,59 @@ window.__bramUnseenJump = function () {
   try { window.__bramUnseenJumpRoute = String(location.hash || ""); } catch (e) { /* ignore */ }
 };
 
+// new-below-chip-dead-before-transcript-mount: the chip's click as one call.
+// Returns the route for the markup's navigate(). On the Transcript route
+// before its onMount has run, __bramUnseenJump only re-arms a pending jump
+// and navigating to the current route is a no-op, so the click did nothing
+// (three dead clicks in the tau-hub trace, 2026-10-08). Retry the jump for
+// up to ~2 s: through the mount's own path if it lands, else by scrolling
+// the tagged list's scroller directly.
+window.__bramChipJumpPending = 0;
+window.__bramUnseenChipClick = function () {
+  var route = "";
+  try { route = String(location.hash || ""); } catch (e) { /* ignore */ }
+  var onTranscript = route.indexOf("/transcript") >= 0;
+  var mounted = !!window.__bramTranscriptMounted;
+  window.__bramIframeTrace("follow-state", {
+    op: "chip-click", route: route, mounted: mounted,
+    listRegistered: !!window.__bramTranscriptScrollActions,
+    unseen: window.__bramUnseenCount || 0,
+  });
+  window.__bramUnseenJump();
+  if (onTranscript && !mounted) {
+    window.__bramChipJumpPending = Date.now();
+    window.__bramIframeTrace("follow-state", { op: "chip-jump-pending", route: route });
+    __bramChipJumpRetry(window.__bramChipJumpPending, 0);
+  }
+  return "/transcript";
+};
+function __bramChipJumpRetry(armedAt, attempt) {
+  setTimeout(function () {
+    // Consumed by the mount (or a newer click re-armed it): nothing to do.
+    if (window.__bramChipJumpPending !== armedAt) return;
+    if (window.__bramTranscriptMounted) {
+      window.__bramChipJumpPending = 0;
+      window.__bramTranscriptScroll("bottom");
+      window.__bramIframeTrace("follow-state", { op: "chip-jump-retry", via: "mounted", attempt: attempt });
+      return;
+    }
+    var info = __bramTranscriptScrollerInfo();
+    if (info.el) {
+      window.__bramChipJumpPending = 0;
+      try { info.el.scrollTop = info.el.scrollHeight; } catch (e) { /* ignore */ }
+      window.__bramFollowTransition(true, "unseen-jump");
+      window.__bramIframeTrace("follow-state", { op: "chip-jump-retry", via: info.how, attempt: attempt });
+      return;
+    }
+    if (attempt >= 9) {
+      window.__bramChipJumpPending = 0;
+      window.__bramIframeTrace("follow-state", { op: "chip-jump-gave-up", how: info.how, attempt: attempt });
+      return;
+    }
+    __bramChipJumpRetry(armedAt, attempt + 1);
+  }, 200);
+}
+
 // transcript-scroll-gestures: the footer's transcript-only jump arrows live
 // in Main.xmlui and cannot reach the Transcript component's transcriptList id
 // directly, so the Transcript registers its scroll closures at mount. The
@@ -12222,6 +12776,23 @@ window.__bramTranscriptScroll = function (dir) {
     if (dir === "top" && a.top) a.top();
     else if (a.bottom) a.bottom();
   } catch (e) {}
+};
+
+// new-below-chip-dead-before-transcript-mount: the Transcript's onMount as
+// one call (developing-bram.md: attribute handlers stay a single call). The
+// two closures stay in markup because they assign the Transcript's xs vars;
+// everything else runs here, and the enter line times the mount against the
+// render (tau-hub 2026-10-08: onMount ran ~18 s after the Transcript drew).
+window.__bramTranscriptOnMount = function (goTop, goBottom) {
+  try {
+    window.__bramIframeTrace("follow-state", {
+      op: "transcript-onmount-enter",
+      pendingChipMs: window.__bramChipJumpPending ? Date.now() - window.__bramChipJumpPending : -1,
+    });
+  } catch (e) { /* ignore */ }
+  window.__bramChipJumpPending = 0;
+  window.__bramRegisterTranscriptScroll(goTop, goBottom);
+  window.__bramTranscriptMount();
 };
 
 window.__bramTranscriptMount = function () {
@@ -13150,13 +13721,47 @@ window.__bramIssueBlockRows = function (issue, _pendingTick) {
   var comments = (issue && issue.comments) || [];
   for (var i = 0; i < comments.length; i++) {
     var c = comments[i] || {};
-    rows.push({ id: "comment:" + i, kind: "comment", body: c.body || "", author: c.author });
+    rows.push({
+      id: "comment:" + i, kind: "comment", body: c.body || "", author: c.author,
+      createdAt: c.createdAt || "",
+    });
   }
   // issue-comment-optimistic-and-reindexed: pending comments after the real
   // ones. `_pendingTick` is unused here; IssueDetail passes it so the binding
   // re-evaluates when a pending comment is added, posted or dropped.
   return rows.concat(__bramPendingCommentRows(issue));
 };
+// issue-detail-comment-timestamps: a comment's header line, "author · about 4
+// hours ago". The age is worded like XMLUI's getDateUntilNow (date-fns
+// distance style), which the body's "opened … ago" line uses, so the two read
+// alike. A pending comment has no createdAt yet and keeps its "posting…" form.
+window.__bramIssueCommentHeader = function (row) {
+  var r = row || {};
+  var who = (r.author && (r.author.login || r.author.name)) || "unknown";
+  if (r.pending === "posting") return who + " · posting…";
+  var ago = __bramDistanceAgo(r.createdAt);
+  return ago ? who + " · " + ago : who;
+};
+// The exact time, for the header's tooltip; "" when there is none.
+window.__bramIssueCommentWhen = function (row) {
+  var t = Date.parse((row && row.createdAt) || "");
+  return isNaN(t) ? "" : new Date(t).toLocaleString();
+};
+function __bramDistanceAgo(iso) {
+  var t = Date.parse(iso || "");
+  if (isNaN(t)) return "";
+  var mins = Math.round((Date.now() - t) / 60000);
+  if (mins < 1) return "less than a minute ago";
+  if (mins < 45) return mins === 1 ? "1 minute ago" : mins + " minutes ago";
+  var hrs = Math.round(mins / 60);
+  if (hrs < 24) return hrs === 1 ? "about 1 hour ago" : "about " + hrs + " hours ago";
+  var days = Math.round(hrs / 24);
+  if (days < 30) return days === 1 ? "1 day ago" : days + " days ago";
+  var months = Math.round(days / 30);
+  if (months < 12) return months === 1 ? "about 1 month ago" : "about " + months + " months ago";
+  var years = Math.round(days / 365);
+  return years <= 1 ? "about 1 year ago" : "about " + years + " years ago";
+}
 // Marked surface (counted == highlighted): the body text for both kinds.
 window.__bramIssueMarkedText = function (row) {
   return (row && row.body) || "";
@@ -14638,6 +15243,12 @@ window.__bramApplySendRestore = function (snapshot, box, toastApi) {
   } catch (e) {}
   if (p && p.reason === "shell-foreground" && typeof toastApi === "function") {
     toastApi("No agent is running in the terminal, so your message wasn't sent. It's back in the message box.");
+  }
+  // pane-send-refuses-into-trust-prompt: an Enter would have answered the
+  // prompt (its default trusts the folder), so the send came back.
+  if (p && p.reason === "prompt-on-screen" && typeof toastApi === "function") {
+    var who = p.provider === "codex" ? "Codex" : (p.provider === "claude" ? "Claude" : "The agent");
+    toastApi(who + " is waiting on a trust prompt in the terminal, so your message wasn't sent. Answer the prompt there, then send again. Your message is back in the message box.");
   }
 };
 
@@ -16710,9 +17321,12 @@ window.__bramInstallCodeBlockTools = function () {
   window.__bramCodeBlockToolsInstalled = true;
   var btn = null;
   var current = null;
+  // Not inside a Tree: the Files page's rows are Text variant="mono", which
+  // renders a <pre>, and the button covered the file names (2026-10-09).
   var preOf = function (node) {
     var el = node && (node.nodeType === 1 ? node : node.parentElement);
-    return el && el.closest ? el.closest("pre") : null;
+    if (!el || !el.closest || el.closest('[role="tree"]')) return null;
+    return el.closest("pre");
   };
   // The "Copied" label resets when the button next hides or moves to another
   // block: event-driven, no timer.
@@ -16799,3 +17413,234 @@ window.__bramInstallCodeBlockTools = function () {
   }, true);
 };
 window.__bramInstallCodeBlockTools();
+
+// more-files-tree-view: the Files page (More > Files). Browse is one flat Tree
+// over /__repo/tree; search builds its own tree of only the branches that
+// hold a hit, the way ~/tau-extractor-sandbox's catalog does
+// (review-app.js catalogSearchTree), because a mounted Tree reads `data` at
+// init. Files open in the shared LocalLinkPreview modal.
+(function () {
+  var VIEW_BASE = "bram.filesView";
+  var lastRowsOut = [];
+  var lastSearchKey = null, lastSearchOut = { nodes: [], total: 0, capped: false };
+
+  var viewKey = function () { return window.__bramProjectScopedKey(VIEW_BASE); };
+  // Focus state (where you were), so sessionStorage, project-scoped.
+  // Memoized on the stored text: Files.xmlui seeds its vars from this, and
+  // a fresh object per call would re-derive them on every evaluation and
+  // undo the page's own assignments (2026-10-09: Search set `submitted`,
+  // which reverted, so no search ever fetched).
+  var lastViewRaw = {}, lastView = null;
+  window.__bramFilesView = function () {
+    var raw = null;
+    try {
+      var k0 = viewKey();
+      raw = k0 ? window.sessionStorage.getItem(k0) : null;
+    } catch (e) {}
+    if (lastView && raw === lastViewRaw) return lastView;
+    lastViewRaw = raw;
+    var v = { query: "", expanded: [] };
+    try {
+      if (raw) {
+        var p = JSON.parse(raw);
+        v.query = String((p && p.query) || "");
+        v.expanded = Array.isArray(p && p.expanded) ? p.expanded : [];
+      }
+    } catch (e) {}
+    lastView = v;
+    return v;
+  };
+  var save = function (query, expanded) {
+    try {
+      var k = viewKey();
+      if (k) window.sessionStorage.setItem(k, JSON.stringify({ query: query || "", expanded: expanded || [] }));
+    } catch (e) {}
+  };
+
+  // `file` carries the repo path: inside the Tree's itemTemplate `$item.path`
+  // is the Tree's own ancestor-id array (2026-10-09: a click previewed
+  // "demo,chat-edit-in-item-file-file.txt"), so rows can't use `path`.
+  var withIcon = function (r) {
+    return Object.assign({}, r, { icon: r.isDir ? "folder" : "doc-outline", file: r.file || r.id });
+  };
+  // The Tree must get the SAME array across renders or it rebuilds and draws
+  // nothing (2026-10-09: tree-data alternated 30 rows / 0 rows within one
+  // millisecond, treeitems 0, height 2px). The DataSource value arrives as a
+  // different object per evaluation, sometimes without `rows`, so memoize on
+  // the rows' content and keep the last good rows through a row-less payload.
+  var rowsKey = function (rows) {
+    if (!rows.length) return "0";
+    return rows.length + "\u0000" + rows[0].id + "\u0000" + rows[rows.length - 1].id +
+      "\u0000" + rows.map(function (r) { return r.id; }).join("\u0001").length;
+  };
+  var lastRowsKey = null, lastOddLogged = false;
+  // Some evaluations see the response as its unparsed JSON text (trace
+  // tree-data-odd type=string, 2026-10-09); parse it rather than drop it.
+  var asPayload = function (payload) {
+    if (typeof payload !== "string") return payload;
+    try { return JSON.parse(payload); } catch (e) { return null; }
+  };
+  window.__bramFilesTreeData = function (payload) {
+    payload = asPayload(payload);
+    var rows = payload && Array.isArray(payload.rows) ? payload.rows : null;
+    if (!rows) {
+      if (payload && !lastOddLogged) {
+        lastOddLogged = true;
+        try {
+          window.__bramIframeTrace("files", {
+            op: "tree-data-odd",
+            type: Array.isArray(payload) ? "array" : typeof payload,
+            keys: Object.keys(payload).slice(0, 8).join(","),
+            length: Array.isArray(payload) ? payload.length : -1,
+          });
+        } catch (e) {}
+      }
+      return lastRowsOut;
+    }
+    var key = rowsKey(rows);
+    if (key === lastRowsKey) return lastRowsOut;
+    lastRowsKey = key;
+    lastRowsOut = rows.map(withIcon);
+    try {
+      var handed = lastRowsOut.length;
+      window.__bramIframeTrace("files", { op: "tree-data", rows: handed });
+    } catch (e) {}
+    return lastRowsOut;
+  };
+
+  // files-tab-lists-bram-state-in-resources: a state folder's children,
+  // fetched when the Tree expands a `dynamic` row (onLoadChildren, which
+  // takes a Promise of child rows:
+  // https://www.xmlui.org/docs/howto/lazy-load-tree-children-on-expand).
+  // A failed fetch resolves to [] so the node stops spinning.
+  window.__bramFilesLoadDir = function (node) {
+    var dir = String((node && node.id) || "");
+    var started = Date.now();
+    return window.fetch("/__repo/tree/dir?path=" + encodeURIComponent(dir), { cache: "no-store" })
+      .then(function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      })
+      .then(function (body) {
+        var rows = ((body && body.rows) || []).map(withIcon);
+        try {
+          window.__bramIframeTrace("files", { op: "load-dir", path: dir, rows: rows.length, ms: Date.now() - started });
+        } catch (e) {}
+        return rows;
+      })
+      .catch(function (e) {
+        try {
+          window.__bramIframeTrace("files", { op: "load-dir-error", path: dir, error: String((e && e.message) || e) });
+        } catch (e2) {}
+        return [];
+      });
+  };
+
+  window.__bramFilesExpanded = function (openIds, id, open) {
+    var ids = Array.isArray(openIds) ? openIds : [];
+    var next = open
+      ? (ids.indexOf(id) >= 0 ? ids : ids.concat([id]))
+      : ids.filter(function (x) { return x !== id && x.indexOf(id + "/") !== 0; });
+    save(window.__bramFilesView().query, next);
+    return next;
+  };
+
+  // files-tab-lists-bram-state-in-resources: the search is literal, so
+  // quotes typed around a phrase ("…", “…”, '…', or mismatched, as macOS
+  // smart quotes produce) were searched for as characters and nothing
+  // matched (2026-10-13: “mining a session" found nothing, unquoted found 5).
+  // A phrase is already a phrase here, so drop the surrounding quotes.
+  var stripQuotes = function (s) {
+    var m = /^["'“”‘’]+([\s\S]*?)["'“”‘’]+$/.exec(s);
+    return m && m[1].trim() ? m[1].trim() : s;
+  };
+  window.__bramFilesSubmit = function (query, openIds) {
+    var q = stripQuotes(String(query || "").trim());
+    save(q, openIds);
+    try { window.__bramIframeTrace("files", { op: "search", chars: q.length }); } catch (e) {}
+    return q;
+  };
+  // Emptying the box returns to browse.
+  window.__bramFilesAfterQueryEdit = function (query, submitted) {
+    if (String(query || "").trim()) return submitted;
+    save("", window.__bramFilesView().expanded);
+    return "";
+  };
+
+  window.__bramFilesOpen = function (item) {
+    if (!item || item.isDir) return;
+    var path = typeof item.file === "string" ? item.file : String(item.id || "");
+    try { window.__bramIframeTrace("files", { op: "open", path: path, line: item.line || null }); } catch (e) {}
+    window.__bramOpenLocalLinkPreview(item.line ? { path: path, line: item.line } : { path: path });
+  };
+
+  window.__bramFilesCaption = function (found) {
+    var n = (found && found.total) || 0;
+    if (!n) return "Nothing matched.";
+    return n + (n === 1 ? " match" : " matches") +
+      (found.capped ? ", showing the first 200 name matches and 200 lines" : "");
+  };
+
+  var NAME_CAP = 200;
+  window.__bramFilesSearchTree = function (query, rowsPayload, grepPayload) {
+    // Memoized on (query, payload objects), so re-renders hand the Tree the
+    // same array.
+    // Content-keyed for the same reason as __bramFilesTreeData: payloads
+    // arrive as a new object per evaluation.
+    rowsPayload = asPayload(rowsPayload);
+    grepPayload = asPayload(grepPayload);
+    var grepHits = (grepPayload && grepPayload.hits) || [];
+    var key = String(query || "") + "\u0000" +
+      rowsKey((rowsPayload && Array.isArray(rowsPayload.rows)) ? rowsPayload.rows : []) + "\u0000" +
+      grepHits.length + "\u0000" + ((grepPayload && grepPayload.total) || 0);
+    if (key === lastSearchKey) return lastSearchOut;
+    var q = String(query || "").trim().toLowerCase();
+    var rows = (rowsPayload && rowsPayload.rows) || [];
+    var byId = {};
+    rows.forEach(function (r) { byId[r.id] = r; });
+    var nodes = {}, order = [];
+    var ensure = function (id) {
+      if (nodes[id]) return nodes[id];
+      var src = byId[id] || { id: id, name: id.split("/").pop(), parentId: id.indexOf("/") >= 0 ? id.slice(0, id.lastIndexOf("/")) : null, isDir: false };
+      if (src.parentId) ensure(src.parentId);
+      // Children come from the search set, so no lazy load.
+      var n = Object.assign(withIcon(src), { loaded: true, dynamic: false });
+      nodes[id] = n; order.push(id);
+      return n;
+    };
+    var nameHits = 0;
+    if (q) {
+      rows.forEach(function (r) {
+        if (String(r.name).toLowerCase().indexOf(q) >= 0) {
+          nameHits++;
+          if (nameHits <= NAME_CAP) ensure(r.id).hit = true;
+        }
+      });
+    }
+    var lineRows = [];
+    var hits = (grepPayload && grepPayload.hits) || [];
+    hits.forEach(function (h, i) {
+      ensure(h.path);
+      lineRows.push({
+        id: h.path + "#L" + h.line + "#" + i,
+        name: "L" + h.line + ": " + h.text,
+        parentId: h.path,
+        file: h.path,
+        line: h.line,
+        isDir: false,
+        isLine: true,
+        hit: true,
+        loaded: true,
+        dynamic: false,
+      });
+    });
+    var out = order.map(function (id) { return nodes[id]; }).concat(lineRows);
+    lastSearchKey = key;
+    lastSearchOut = {
+      nodes: out,
+      total: nameHits + ((grepPayload && grepPayload.total) || 0),
+      capped: nameHits > NAME_CAP || !!(grepPayload && grepPayload.capped),
+    };
+    return lastSearchOut;
+  };
+})();
