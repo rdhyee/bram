@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Bram</title>
-<meta name="description" content="Agentic software development at human scale: legible, orderly, accountable, and collaborative.">
+<meta name="description" content="Agentic software development on huma terms: legible, orderly, transparent, accountable, and collaborative.">
 <style>
   :root {
     --bg: #fbfaf7;
@@ -69,19 +69,19 @@
   .caption { color: var(--muted); font-size: 0.92rem; margin-top: 8px; text-align: center; }
   table.links { width: 100%; border-collapse: collapse; table-layout: fixed; }
   table.links col.date { width: 7.5rem; }
-  /* One width for every table, sized for the longest screencast title, so
-     the link column lines up across Screencasts, Blog and Elsewhere. */
-  table.links col.src { width: 10.5rem; }
+  /* Share column widths across Screencasts, Blog and Elsewhere;
+     wrap longer labels so their full text stays readable. */
+  table.links col.src { width: 12rem; }
   table.links td { padding: 6px 12px 6px 0; vertical-align: top; }
   table.links td.date { white-space: nowrap; color: var(--muted); font-variant-numeric: tabular-nums; }
-  table.links td.src { white-space: nowrap; color: var(--muted); overflow: hidden; text-overflow: ellipsis; }
+  table.links td.src { color: var(--muted); overflow-wrap: anywhere; }
   @media (max-width: 560px) { table.links col.src { width: 0; } table.links td.src { padding: 0; font-size: 0; } }</style>
 </head>
 <body>
 <main>
 
   <h1>Bram <span class="tagline">(Bram runs agents mindfully)</span></h1>
-  <p class="lede">Agentic software development at human scale: legible, orderly, accountable, and collaborative. <a class="btn" href="https://github.com/judell/bram/releases/latest">Download</a></p>
+  <p class="lede">Agentic software development on human terms: legible, orderly, transparent, accountable, and collaborative. <a class="btn" href="https://github.com/judell/bram/releases/latest">Download</a></p>
 
   <h2>Demo</h2>
   <video controls preload="metadata" playsinline
@@ -95,8 +95,9 @@
   <table class="links">
     <colgroup><col class="date"><col class="src"><col></colgroup>
     <tbody>
-      <tr><td class="date">2026-10-12</td><td class="src">Claude and Codex</td><td><a href="https://jonudell.info/video/claude-and-codex.mp4">Bram uses Codex to review Claude’s work</a></td></tr>
-      <tr><td class="date">2026-10-05</td><td class="src">Original Bram demo</td><td><a href="https://jonudell.info/video/bram-demo-01.mp4">Bram picks up and resolves a GitHub issue</a></td></tr>
+      <tr><td class="date">2026-10-14</td><td class="src">Agent coordination via GitHub issue</td><td><a href="https://jonudell.info/video/github-agent-coordination.mp4">Bram in Bram Studio and Bram in XMLUI (5m)</a></td></tr>
+      <tr><td class="date">2026-10-12</td><td class="src">Claude and Codex</td><td><a href="https://jonudell.info/video/claude-and-codex.mp4">Bram uses Codex to review Claude’s work (2m)</a></td></tr>
+      <tr><td class="date">2026-10-05</td><td class="src">Original Bram demo</td><td><a href="https://jonudell.info/video/bram-demo-01.mp4">Bram picks up and resolves a GitHub issue (6m)</a></td></tr>
     </tbody>
   </table>
 
