@@ -2532,6 +2532,20 @@ fn is_lifecycle_path(rel: &str) -> bool {
         || LIFECYCLE_PATHS_PREFIXES.iter().any(|p| rel.starts_with(p))
 }
 
+const SESSION_SUMMARY_REL: &str = "SESSION_SUMMARY.md";
+
+/// The wrap-up exemption: exactly `SESSION_SUMMARY.md` at the project root,
+/// written by the main thread (empty `agent_id`), and not a symlink.
+fn is_session_summary_exempt(project_root: &Path, rel: &str, agent_id: &str) -> bool {
+    if rel != SESSION_SUMMARY_REL || !agent_id.is_empty() {
+        return false;
+    }
+    match std::fs::symlink_metadata(project_root.join(rel)) {
+        Ok(meta) => !meta.file_type().is_symlink(),
+        Err(_) => true, // not created yet: the first write is the file itself
+    }
+}
+
 fn is_worklist_draft(rel: &str) -> bool {
     rel.starts_with(WORKLIST_DRAFTS_PREFIX)
         && rel.ends_with(".md")
@@ -3732,6 +3746,14 @@ fn write_edit_branch(payload: &Value, tool_name: &str) -> ShadowVerdict {
 
     if rel != WORKLIST_REL && is_lifecycle_path(&rel) {
         return allow("bram-lifecycle-channel", rel);
+    }
+
+    // Standing exemption (Raymond, 2026-10-14): a session's own wrap-up write
+    // to `<project root>/SESSION_SUMMARY.md`. Narrow on purpose: that one
+    // root-level name, Write/Edit only (this branch), main thread only, and
+    // never through a symlink. The `summary-exempt` reason is the audit line.
+    if is_session_summary_exempt(&project_root, &rel, &agent_id) {
+        return allow("summary-exempt", rel);
     }
 
     if rel == WORKLIST_REL {
@@ -6785,6 +6807,55 @@ mod guard_policy_tests {
         assert!(!is_gh_body_at_antipattern(
             "gh issue comment 5 --body \"x\""
         ));
+    }
+
+    #[test]
+    fn session_summary_exemption_is_narrow() {
+        let root = scratch("ss");
+        std::fs::create_dir_all(root.join("resources")).unwrap();
+        std::fs::write(root.join(AUTH_REL), "{}").unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let verdict = |rel: &str, extra: serde_json::Value| {
+            let mut p = serde_json::json!({
+                "tool_name": "Write",
+                "tool_input": {"file_path": root.join(rel).to_string_lossy(), "content": "x"},
+                "cwd": root.to_string_lossy(),
+            });
+            if let (Some(o), Some(e)) = (p.as_object_mut(), extra.as_object()) {
+                for (k, v) in e {
+                    o.insert(k.clone(), v.clone());
+                }
+            }
+            shadow_worklist_decision("claude-rs", &p).unwrap()
+        };
+        let none = serde_json::json!({});
+        let v = verdict("SESSION_SUMMARY.md", none.clone());
+        assert_eq!(
+            (v.decision.as_str(), v.reason.as_str()),
+            ("allow", "summary-exempt")
+        );
+        assert_eq!(
+            verdict("sub/SESSION_SUMMARY.md", none.clone()).decision,
+            "deny"
+        );
+        assert_eq!(
+            verdict("SESSION_SUMMARY.md.bak", none.clone()).decision,
+            "deny"
+        );
+        assert_eq!(
+            verdict(
+                "SESSION_SUMMARY.md",
+                serde_json::json!({"agent_id": "sub1"})
+            )
+            .decision,
+            "deny"
+        );
+        // A symlink named SESSION_SUMMARY.md is not exempt.
+        let elsewhere = root.join("sub/target.txt");
+        std::fs::write(&elsewhere, "t").unwrap();
+        std::fs::remove_file(root.join("SESSION_SUMMARY.md")).ok();
+        std::os::unix::fs::symlink(&elsewhere, root.join("SESSION_SUMMARY.md")).unwrap();
+        assert_eq!(verdict("SESSION_SUMMARY.md", none).decision, "deny");
     }
 
     #[test]
