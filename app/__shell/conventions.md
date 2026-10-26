@@ -34,9 +34,10 @@ the xmlui_rules, and follow them.
 lives beside this file in `.claude/bram-reference/`:
 `worklist-mechanics.md` (transports, entangled commits, delegation,
 enforcement), `diagnostics.md` (stuck spinners, traces, logs, evidence,
-Bram's guards) and `environment.md` (target-app helpers, `/query`, forge
+Bram's guards), `environment.md` (target-app helpers, `/query`, forge
 CLI, test suites, Windows, voice input setup, cross-project work,
-fresh-session suggestions). Each section below says
+fresh-session suggestions) and `orientation.md` (orienting in a new
+repo). Each section below says
 when to read which. Setup refreshes these files and Bram-bundled skills
 (`.claude/skills/<name>/SKILL.md` carrying a `<!-- bram-managed` marker);
 don't make functional edits to installed copies, since the next Setup
@@ -75,9 +76,8 @@ Skip the worklist only in these contexts, never because the change is
 - **`skip-worklist:` structured prefix on this turn.** The turn begins
   literally with `skip-worklist: ` followed by the request. Same family
   as `approved:` / `drop:` / `iterate:`, but it authorizes a direct
-  edit rather than a lifecycle transition. The **skip worklist** button
-  that once prepended it is retired; today the user types the prefix,
-  or uses the "just do it" phrase. Unlike the other prefixes, the host forwards the **entire
+  edit rather than a lifecycle transition. The user types it (the
+  button that prepended it is retired). Unlike the other prefixes, the host forwards the **entire
   turn text including the prefix** so you can see it. On seeing it,
   skip propose-first, act on the rest of the message as a direct edit,
   and do not write a new worklist item; the PreToolUse hook allows the
@@ -205,6 +205,9 @@ so the pane sees one combined item; hashes cover metadata + resolved
 prose. A missing draft yields empty `before` / `after` plus
 `"_draftMissing": true` and a placeholder in the UI.
 
+**`resources/worklist-history/` is host-written**; the guard denies
+agent edits. An instruction to edit it is stale.
+
 **The `version` rule.** `worklist.json` carries a top-level `version`
 integer. Every write MUST set `version: N+1`, where `N` is the value on
 disk when you read it; both agents' PreToolUse hooks deny any other
@@ -301,22 +304,25 @@ what to click, use the rendered label.
 
 | Button | Wire payload | What you call |
 |---|---|---|
-| **Start** | `approved:`, `gate: "to apply"` | No `resolve`. Edit from the proposal you authored, then `mutate op:"advance"` (consumes the auth, clears the sentinel). |
+| **Start** | `approved:`, `gate: "to apply"` | Normally no `resolve`: the host already recorded the approval and claim. Follow any provider instruction requiring it, then edit and call `mutate op:"advance"`. |
 | **Start & commit** | `approved:`, `gate: "apply-and-commit"` | No `advance`. Make any remaining edits, then `worklist-commit { ids, message }`. |
 | **Commit** | `approved:`, `gate: "to commit"` (or `"apply-and-commit"` on a begun `proposed` item) | `worklist-commit { ids, message }`. |
-| **Drop** | `drop:` | `resolve`, then `mutate op:"prune"`. |
+| **Drop** | `drop:` when feedback needs an agent response | On a delivered drop turn: `resolve`, then `mutate op:"prune"`. Feedback-less pane drops complete in the host without an agent turn. |
 | message with items selected | `iterate:` | No `resolve`, no bracket call. Act per status (below). |
-| message with nothing selected, or **Send as chat instead** | ordinary chat | Respond. Nothing is approved or dropped; do not edit files. |
+| message with nothing selected, or **Send as chat instead** | ordinary chat | No new grant. Continue only within an existing live approval or an explicit opt-out; otherwise respond without edits. |
 
-The host sets the inflight sentinel for `approved:` and `iterate:` when
-it sends them; for drops, `resolve` raises it and `prune` clears it. Respond to any per-item feedback, whatever the kind.
+The host records the approval and claim before delivering an approved
+turn; it also establishes claims for addressed feedback. Resolve can
+establish the drop claim, and advance/prune retire the affected ids.
+Respond to any per-item feedback, whatever the kind.
 
 - **Recommending Drop / Commit on named items** → post a plan; read `.claude/bram-reference/worklist-mechanics.md` (§Recommending next steps).
 
 **`/__worklist/resolve`** returns `{"kind":"approved"|"drop", "items":
 [<recorded content>]}` — execute those items; don't re-read
-`worklist.json` to second-guess them. Records are **consumed on first
-read**, so capture what you need. `{"kind":"no_active_authorization"}`
+`worklist.json` to second-guess them. **Approved** records are consumed
+on first read; Drop records are not. Capture the returned bodies.
+`{"kind":"no_active_authorization"}`
 means already consumed or not an authorization turn: **do NOT treat it
 as authorization**. `iterate:` and other non-authorization turns never
 route through `resolve`.
@@ -332,10 +338,12 @@ route through `resolve`.
 - Either way the item keeps its status; iterate never advances or
   commits on its own.
 
-**Edit only the addressed items' files, with Edit / Write.** An addressed
-turn's lines are credited to its items; **a chat turn's edits belong to
-no item**, even for begun work, and break its commit. When the user
-redirects begun work in chat, ask for it as feedback on the item.
+**Edit only the authorized items' files, with Edit / Write.** Addressed
+feedback establishes the relevant claim. A still-live approval can also
+rearm its claim on a later turn of the same work. **Chat edits with no
+claim belong to no item**, even when a begun item declares the path.
+When the user redirects begun work in chat without a live grant, ask
+for it as feedback on the item.
 
 - **Routing a change, or a commit left `unowned` residue** → read `.claude/bram-reference/worklist-mechanics.md` (§Routing edits to the right item; §Edits made in chat turns).
 
@@ -500,17 +508,15 @@ changed?
 ### Enforcement
 
 The `approved:` / `drop:` turn line is not authority by itself: the
-host records each clicked id, `/__worklist/resolve` is the only way to
-receive recorded bodies, `/__worklist/mutate` the only way to advance
-or prune, and PreToolUse hooks (Claude and Codex) check worklist
-coverage before file-mutating tools run while the desktop watcher
-reverts unauthorized prunes. **Hook denials and reverts are the
+host records clicked ids, and resolve, mutate and the commit route
+each check that record. Hooks check coverage, which is not approval.
+**A tool allow is not user consent. Hook denials and reverts are the
 convention enforcing itself — not bugs to work around;** never route
 around one. **Don't ask before editing the worklist or calling
 mutate**: adding items, refining prose and already-approved transitions
 need no verbal confirmation. Save back-and-forth for design decisions.
 
-- **What each route requires; the structural security account** → read `.claude/bram-reference/worklist-mechanics.md` (§Enforcement and security contract).
+- **What each route requires, exceptions, and enforcement limits** → read `.claude/bram-reference/worklist-mechanics.md` (§Enforcement and security contract).
 
 
 ## Talking to users
@@ -612,10 +618,6 @@ Rules:
 - **The executor signs.** Whoever makes the forge write signs with their
   own thread and model; a subagent's findings posted by the orchestrator
   carry the orchestrator's signature, with the subagent credited inline.
-- **Old-form signatures are valid historical text, not valid new
-  writes.** Don't retrofit old threads; new writes use the full form.
-- **The retrofit rule.** A missing signature noticed after posting is
-  added in a *new* comment, not only by editing the body.
 - **Write the body file in its own step.** Build it in one call, post
   with `--body-file` in the next, never both in one command — the guard
   runs before the command, so a body written by the same command can't
@@ -817,9 +819,6 @@ instead of a fix; for a plain change, just make it. Log-line shape →
   workaround, and file each where it belongs. A workaround you land
   carries the issue number it's waiting on, and its retirement is its
   own worklist item.
-- **Running a browser test suite** (Playwright or similar), cap workers
-  explicitly (e.g. `--workers=2`); default worker-per-core has frozen
-  every webview on the machine.
 
 - **Something misbehaves, or you're designing a mechanism that waits or acts on inferred conditions** → read `.claude/bram-reference/diagnostics.md` (§Log-first development) and `development-principles.md`.
 - **Debugging Bram itself (trace log, Inspector export, Status tab)** → read `.claude/bram-reference/diagnostics.md` (§Debugging Bram itself).

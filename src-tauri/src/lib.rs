@@ -16,6 +16,9 @@ mod search_index;
 // phase. See worklist_state.rs's module doc comment.
 mod worklist_state;
 
+// authorization-step-0-grant-semantics: the target grant lifecycle (docs/authorization.md, "Target grant semantics"). Pure and not yet called; migration step 1 is its first caller.
+mod grant_lifecycle;
+
 use include_dir::{include_dir, Dir};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tauri::{http, ipc::Channel, AppHandle, Emitter, Manager, State};
@@ -15130,6 +15133,7 @@ fn commits_list_cached<R: tauri::Runtime>(
                             }
                             attach_pending_closes(app, &mut arr);
                             arr.truncate(count);
+                            attach_history_item_ids(app, &mut arr);
                             if let Ok(bytes) = serde_json::to_vec(&arr) {
                                 return Ok(bytes);
                             }
@@ -15143,6 +15147,7 @@ fn commits_list_cached<R: tauri::Runtime>(
         Ok(bytes) => {
             if let Ok(mut arr) = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes) {
                 attach_pending_closes(app, &mut arr);
+                attach_history_item_ids(app, &mut arr);
                 if let Ok(out) = serde_json::to_vec(&arr) {
                     return Ok(out);
                 }
@@ -16944,11 +16949,224 @@ fn history_md_cites_commit(md_text: &str, sha: &str) -> bool {
     sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()) && md_text.contains(sha)
 }
 
+// commits-list-shows-worklist-item: the LIST-path counterpart of
+// history_entries_citing_commit below. For each listed sha, the item ids
+// that history records citing it name as committed. Pure, and built from
+// the same two parsers the detail join uses, so a row's tags and its
+// detail's "Worklist history:" links agree by construction. Records are
+// visited in key (timestamp) order; ids are deduped per sha; a sha no
+// record names as committed gets no entry.
+fn history_item_ids_by_sha<'a>(
+    records: impl IntoIterator<Item = (&'a str, &'a str)>,
+    shas: &std::collections::HashSet<String>,
+) -> std::collections::HashMap<String, Vec<String>> {
+    let mut recs: Vec<(&str, &str)> = records.into_iter().collect();
+    recs.sort_by(|a, b| a.0.cmp(b.0));
+    let mut out: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for (_key, text) in recs {
+        let cited: Vec<&String> = shas
+            .iter()
+            .filter(|sha| history_md_cites_commit(text, sha))
+            .collect();
+        if cited.is_empty() {
+            continue;
+        }
+        let ids = history_committed_item_ids(text);
+        if ids.is_empty() {
+            continue;
+        }
+        for sha in cited {
+            let slot = out.entry(sha.clone()).or_default();
+            for id in &ids {
+                if !slot.contains(id) {
+                    slot.push(id.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+// Fallback bound for the list path when the search index (which holds the
+// persisted map, history_item_ids_map_cached) isn't available yet. The
+// list path can't afford the detail join's full scan: worklist-history
+// is thousands of files (5,908 / 116 MB in the source repo, 2026-10-18), and
+// #323 is the record of what a per-request cost on a hot route does on
+// Windows. A history record is written when the gate commits, so it can't
+// predate its commit's author date. Only records keyed (ms) at or after the
+// oldest listed author date can cite a listed sha; a one-day margin absorbs
+// clock skew. That bounds the scan to the listed window (510 files / 0.9 MB
+// for the 100-commit list on the same day). None when no row's date parses:
+// the caller then attaches nothing rather than scanning everything.
+fn history_window_floor_ms(rows: &[serde_json::Value]) -> Option<i64> {
+    rows.iter()
+        .filter_map(|c| c.pointer("/commit/author/date").and_then(|v| v.as_str()))
+        .filter_map(parse_iso_to_epoch_ms)
+        .min()
+        .map(|ms| ms - 86_400_000)
+}
+
+// Every full (40-hex) sha a history record mentions. A maximal hex run of
+// exactly 40 counts; longer runs (other hashes) don't. Matches
+// history_md_cites_commit's `contains` for any real sha.
+fn history_md_cited_shas(md: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = md.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_hexdigit() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
+                i += 1;
+            }
+            if i - start == 40 {
+                let s = md[start..i].to_ascii_lowercase();
+                if !out.contains(&s) {
+                    out.push(s);
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+// The persisted map: { watermark, map: { sha: [item ids] } }. History
+// records are write-once under a fresh <unix_ms> key
+// (maybe_snapshot_worklist), so records at or below the watermark never
+// change and only newer ones need reading. The rescan reaches back
+// HISTORY_ITEM_IDS_OVERLAP_MS below the watermark in case two writers land
+// out of key order; the merge dedupes, so the overlap is harmless.
+const HISTORY_ITEM_IDS_KEY: &str = "commits:history-item-ids";
+const HISTORY_ITEM_IDS_OVERLAP_MS: i64 = 60_000;
+
+// Pure merge: fold records (key, text) into `map`, returning the new
+// watermark. Only records naming committed items contribute.
+fn merge_history_item_ids(
+    map: &mut std::collections::HashMap<String, Vec<String>>,
+    mut watermark: i64,
+    records: &[(i64, String)],
+) -> i64 {
+    let mut recs: Vec<&(i64, String)> = records.iter().collect();
+    recs.sort_by_key(|r| r.0);
+    for (key, text) in recs {
+        watermark = watermark.max(*key);
+        let ids = history_committed_item_ids(text);
+        if ids.is_empty() {
+            continue;
+        }
+        for sha in history_md_cited_shas(text) {
+            let slot = map.entry(sha).or_default();
+            for id in &ids {
+                if !slot.contains(id) {
+                    slot.push(id.clone());
+                }
+            }
+        }
+    }
+    watermark
+}
+
+// Read history `.md` records whose <unix_ms> key is >= floor.
+fn read_history_records_from(dir: &Path, floor: i64) -> Vec<(i64, String)> {
+    let Ok(read_dir) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    read_dir
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().map(|x| x == "md").unwrap_or(false))
+        .filter_map(|p| {
+            let ms: i64 = p.file_stem().and_then(|s| s.to_str())?.parse().ok()?;
+            if ms < floor {
+                return None;
+            }
+            Some((ms, std::fs::read_to_string(&p).ok()?))
+        })
+        .collect()
+}
+
+// The cached map, brought up to date with records newer than its watermark
+// and written back. None when the search index isn't available.
+fn history_item_ids_map_cached<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    dir: &Path,
+) -> Option<std::collections::HashMap<String, Vec<String>>> {
+    let db = search_index_db_path(app)?;
+    let conn = search_index::open(&db.to_string_lossy()).ok()?;
+    let (mut map, watermark) = search_index::get_extra(&conn, HISTORY_ITEM_IDS_KEY)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .map(|v| {
+            let wm = v.get("watermark").and_then(|w| w.as_i64()).unwrap_or(0);
+            let m = v
+                .get("map")
+                .and_then(|m| serde_json::from_value(m.clone()).ok())
+                .unwrap_or_default();
+            (m, wm)
+        })
+        .unwrap_or_default();
+    let floor = if watermark > 0 {
+        watermark - HISTORY_ITEM_IDS_OVERLAP_MS
+    } else {
+        0
+    };
+    let records = read_history_records_from(dir, floor);
+    let new_watermark = merge_history_item_ids(&mut map, watermark, &records);
+    if new_watermark != watermark || watermark == 0 {
+        let row = search_index::IndexRow {
+            kind: "commit-history-map".to_string(),
+            source: String::new(),
+            date: String::new(),
+            link: String::new(),
+            content: String::new(), // empty: never matches FTS text queries
+            intent: String::new(),
+            file: HISTORY_ITEM_IDS_KEY.to_string(),
+            tool_ids: None,
+            extra: serde_json::json!({ "watermark": new_watermark, "map": map }).to_string(),
+        };
+        let _ = search_index::index_doc(&conn, &row, 0, 0);
+    }
+    Some(map)
+}
+
+fn attach_history_item_ids<R: tauri::Runtime>(app: &AppHandle<R>, arr: &mut [serde_json::Value]) {
+    let Some(dir) = project_resource_path(app, "worklist-history") else {
+        return;
+    };
+    let shas: std::collections::HashSet<String> = arr
+        .iter()
+        .filter_map(|c| c.get("sha").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .collect();
+    let by_sha = match history_item_ids_map_cached(app, &dir) {
+        Some(map) => map,
+        // No search index yet (first launch, initial scan): fall back to the
+        // bounded window rather than a full scan.
+        None => {
+            let Some(floor) = history_window_floor_ms(arr) else {
+                return;
+            };
+            let records = read_history_records_from(&dir, floor);
+            history_item_ids_by_sha(records.iter().map(|(_, t)| ("", t.as_str())), &shas)
+        }
+    };
+    for c in arr.iter_mut() {
+        if let Some(ids) = c
+            .get("sha")
+            .and_then(|v| v.as_str())
+            .and_then(|s| by_sha.get(s))
+        {
+            c["itemIds"] = serde_json::json!(ids);
+        }
+    }
+}
+
 // issue-67: which worklist-history record(s), if any, cite this commit's
 // full SHA? Scans every `.md` in `resources/worklist-history/` — lazy,
-// per-detail-request only (never from the commits LIST path, per #323's
-// cost-lives-on-the-click-that-asks discipline). ~2,400 small files is
-// milliseconds of grep-shaped work; a cache can be added if that changes.
+// per-detail-request only. The commits LIST path uses the bounded
+// attach_history_item_ids above instead (#323's cost discipline).
 // Each hit also carries the committed item ids the SAME record's
 // "## Items committed" section names (history_committed_item_ids, the
 // parser issues-bram-column-committed-means-committed introduces below) —
@@ -16993,9 +17211,104 @@ fn history_entries_citing_commit<R: tauri::Runtime>(
 
 #[cfg(test)]
 mod commit_history_join_tests {
-    use super::history_md_cites_commit;
+    use super::{
+        history_item_ids_by_sha, history_md_cited_shas, history_md_cites_commit,
+        history_window_floor_ms, merge_history_item_ids,
+    };
+    use std::collections::{HashMap, HashSet};
 
     const SHA: &str = "4dba1de9812ceb09c8668b7d9e166c49e710436a";
+    const SHA2: &str = "deadbeefcafef00dfeed1234deadbeefcafef00d";
+
+    fn committed(sha: &str, ids: &[&str]) -> String {
+        let mut s = format!("# Worklist change\n\n- **Commit:** https://github.com/judell/bram/commit/{}\n\n## Items committed\n\n", sha);
+        for id in ids {
+            s.push_str(&format!("- `{}` — subject\n", id));
+        }
+        s
+    }
+
+    #[test]
+    fn maps_a_commit_to_its_one_item() {
+        let mut map = HashMap::new();
+        let wm = merge_history_item_ids(&mut map, 0, &[(100, committed(SHA, &["a"]))]);
+        assert_eq!(wm, 100);
+        assert_eq!(map.get(SHA), Some(&vec!["a".to_string()]));
+    }
+
+    #[test]
+    fn maps_a_commit_carrying_several_items() {
+        let mut map = HashMap::new();
+        merge_history_item_ids(&mut map, 0, &[(100, committed(SHA, &["a", "b"]))]);
+        assert_eq!(map.get(SHA), Some(&vec!["a".to_string(), "b".to_string()]));
+    }
+
+    #[test]
+    fn a_record_with_nothing_committed_maps_nothing() {
+        // propose / iterate / drop records cite no committed items, even if
+        // their prose mentions a sha.
+        let md = format!(
+            "# Worklist change\n\nsee {}\n\n## Items proposed\n\n- `a`\n",
+            SHA
+        );
+        let mut map = HashMap::new();
+        let wm = merge_history_item_ids(&mut map, 0, &[(100, md)]);
+        assert_eq!(wm, 100, "watermark still advances past it");
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn a_commit_no_record_cites_is_absent() {
+        let mut map = HashMap::new();
+        merge_history_item_ids(&mut map, 0, &[(100, committed(SHA, &["a"]))]);
+        assert!(map.get(SHA2).is_none());
+    }
+
+    #[test]
+    fn rescanning_an_overlap_does_not_duplicate() {
+        let recs = vec![
+            (100, committed(SHA, &["a"])),
+            (200, committed(SHA2, &["b"])),
+        ];
+        let mut map = HashMap::new();
+        let wm = merge_history_item_ids(&mut map, 0, &recs);
+        let wm2 = merge_history_item_ids(&mut map, wm, &recs);
+        assert_eq!(wm2, 200);
+        assert_eq!(map.get(SHA), Some(&vec!["a".to_string()]));
+        assert_eq!(map.get(SHA2), Some(&vec!["b".to_string()]));
+    }
+
+    #[test]
+    fn cited_shas_takes_40_hex_runs_only() {
+        let long = "a".repeat(64);
+        let md = format!("{} and {} and {}", SHA, long, SHA.to_uppercase());
+        assert_eq!(history_md_cited_shas(&md), vec![SHA.to_string()]);
+    }
+
+    #[test]
+    fn persisted_map_agrees_with_the_detail_join() {
+        let recs = vec![
+            (100, committed(SHA, &["a"])),
+            (200, committed(SHA2, &["b", "c"])),
+        ];
+        let mut map = HashMap::new();
+        merge_history_item_ids(&mut map, 0, &recs);
+        let shas: HashSet<String> = [SHA, SHA2].iter().map(|s| s.to_string()).collect();
+        let by_detail_rule =
+            history_item_ids_by_sha(recs.iter().map(|(_, t)| ("", t.as_str())), &shas);
+        assert_eq!(map, by_detail_rule);
+    }
+
+    #[test]
+    fn window_floor_is_oldest_author_date_minus_a_day() {
+        let rows = vec![
+            serde_json::json!({"commit": {"author": {"date": "2026-10-04T12:00:00-07:00"}}}),
+            serde_json::json!({"commit": {"author": {"date": "2026-10-18T09:00:00-07:00"}}}),
+        ];
+        let oldest_ms = super::parse_iso_to_epoch_ms("2026-10-04T12:00:00-07:00").unwrap();
+        assert_eq!(history_window_floor_ms(&rows), Some(oldest_ms - 86_400_000));
+        assert_eq!(history_window_floor_ms(&[serde_json::json!({})]), None);
+    }
 
     #[test]
     fn hits_when_the_full_sha_appears_in_a_commit_line() {
@@ -31404,7 +31717,7 @@ fn project_is_managed(dir: &Path) -> bool {
     has_project_settings(dir) || dir.join(WORKLIST_AUTH_REL).exists()
 }
 
-const REPO_STARTUP_GREETING: &str = "Hello, this is Bram. I just woke up in a repo that I haven't seen before. You can ask me to look around, assess what is here, and suggest what might need doing next.";
+const REPO_STARTUP_GREETING: &str = "Hello, this is Bram. I just woke up in a repo that I haven't seen before. You can ask me to look around, or click Orient me for a guided tour: an overview and architecture diagrams of this repo, with every claim cited to the code.";
 // Schemas 1 and 2 meant "written to the PTY" and "landed as a provider user
 // turn" respectively. Neither represents the intended feature. Schema 3 is
 // written only after Bram has serialized the greeting into its own UI
@@ -41484,7 +41797,7 @@ mod repo_startup_greeting_tests {
     fn greeting_text_is_the_approved_copy() {
         assert_eq!(
             REPO_STARTUP_GREETING,
-            "Hello, this is Bram. I just woke up in a repo that I haven't seen before. You can ask me to look around, assess what is here, and suggest what might need doing next."
+            "Hello, this is Bram. I just woke up in a repo that I haven't seen before. You can ask me to look around, or click Orient me for a guided tour: an overview and architecture diagrams of this repo, with every claim cited to the code."
         );
     }
 
@@ -46698,32 +47011,57 @@ fn sidecar_matches_seeded<R: tauri::Runtime>(app: &AppHandle<R>, on_disk: &Path)
 const ENHANCE_REFERENCE_DIR_REL: &str = ".claude/bram-reference";
 const ENHANCE_REFERENCE_BUNDLE_DIR: &str = "__shell/reference";
 
+// new-repo-orientation: the set is the top-level *.md docs plus every file
+// in a subfolder (the orientation template: a static site the playbook has
+// the agent copy), as `/`-joined paths relative to the reference dir.
 fn bundled_reference_names<R: tauri::Runtime>(app: &AppHandle<R>) -> Vec<String> {
-    let is_md = |n: &str| n.ends_with(".md");
-    let mut v: Vec<String> = if let Some(root) = resolve_app_root(Some(app)) {
-        std::fs::read_dir(root.join(ENHANCE_REFERENCE_BUNDLE_DIR))
-            .map(|rd| {
-                rd.flatten()
-                    .filter(|e| e.path().is_file())
-                    .filter_map(|e| e.file_name().into_string().ok())
-                    .filter(|n| is_md(n))
-                    .collect()
-            })
-            .unwrap_or_default()
-    } else {
-        EMBEDDED_APP
-            .get_dir(ENHANCE_REFERENCE_BUNDLE_DIR)
-            .map(|d| {
-                d.files()
-                    .filter_map(|f| f.path().file_name().and_then(|n| n.to_str()))
-                    .filter(|n| is_md(n))
-                    .map(|n| n.to_string())
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
+    let mut v: Vec<String> = Vec::new();
+    if let Some(root) = resolve_app_root(Some(app)) {
+        fn walk(dir: &Path, prefix: &str, out: &mut Vec<String>) {
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for e in rd.flatten() {
+                let Ok(name) = e.file_name().into_string() else {
+                    continue;
+                };
+                let rel = format!("{}{}", prefix, name);
+                let path = e.path();
+                if path.is_dir() {
+                    walk(&path, &format!("{}/", rel), out);
+                } else if path.is_file() {
+                    out.push(rel);
+                }
+            }
+        }
+        walk(&root.join(ENHANCE_REFERENCE_BUNDLE_DIR), "", &mut v);
+    } else if let Some(d) = EMBEDDED_APP.get_dir(ENHANCE_REFERENCE_BUNDLE_DIR) {
+        fn walk(d: &include_dir::Dir, base: &Path, out: &mut Vec<String>) {
+            for f in d.files() {
+                if let Ok(rel) = f.path().strip_prefix(base) {
+                    out.push(rel.to_string_lossy().replace('\\', "/"));
+                }
+            }
+            for sub in d.dirs() {
+                walk(sub, base, out);
+            }
+        }
+        walk(d, Path::new(ENHANCE_REFERENCE_BUNDLE_DIR), &mut v);
+    }
+    v.retain(|n| is_reference_entry(n));
     v.sort();
     v
+}
+
+// Top level: only the *.md reference docs. In a subfolder: everything.
+fn is_reference_entry(rel: &str) -> bool {
+    rel.contains('/') || rel.ends_with(".md")
+}
+
+// Only the top-level docs carry Setup's version stamp; template files are
+// copied verbatim (a leading HTML comment would break arch.js).
+fn reference_entry_is_stamped(rel: &str) -> bool {
+    !rel.contains('/') && rel.ends_with(".md")
 }
 
 fn stamp_seeded_doc(bundle: &[u8]) -> Vec<u8> {
@@ -46737,7 +47075,11 @@ fn seeded_reference_bytes<R: tauri::Runtime>(app: &AppHandle<R>, name: &str) -> 
         Some(app),
         &format!("{}/{}", ENHANCE_REFERENCE_BUNDLE_DIR, name),
     )?;
-    Some(stamp_seeded_doc(&bundle))
+    if reference_entry_is_stamped(name) {
+        Some(stamp_seeded_doc(&bundle))
+    } else {
+        Some(bundle)
+    }
 }
 
 // Every bundled reference file present and byte-identical to its stamped
@@ -46785,7 +47127,12 @@ fn seed_reference_docs<R: tauri::Runtime>(
             continue;
         };
         // Whole-file Setup-managed, like the core sidecar: always refreshed.
-        write_template_if_safe(&dir.join(name), &bytes, true, wrote, skipped)?;
+        let path = dir.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create {}: {}", parent.display(), e))?;
+        }
+        write_template_if_safe(&path, &bytes, true, wrote, skipped)?;
     }
     let on_disk: Vec<(String, Vec<u8>)> = std::fs::read_dir(&dir)
         .map(|rd| {
@@ -47743,6 +48090,15 @@ fn enhance_status<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<Vec<u8>, Stri
         "nestedUnder": nested_under,
         "nestedUnderIgnoredHome": nested_under_ignored_home,
         "strayHomeScaffold": stray_home_scaffold,
+        // issue-445: ancestor CLAUDE.md files still carrying a legacy
+        // xmlui-desktop block (Setup names them; this shows them at startup).
+        "legacyAncestorImports": root
+            .as_ref()
+            .map(|p| ancestor_legacy_conventions_imports(p)
+                .iter()
+                .map(|m| m.to_string_lossy().to_string())
+                .collect::<Vec<_>>())
+            .unwrap_or_default(),
         "gitToplevel": git_toplevel,
         "enhanced": core_installed && claude_installed && codex_installed,
         "activeProvider": active_provider_json,
@@ -47925,10 +48281,31 @@ fn stray_home_scaffold_marker(home: &Path, root: &Path) -> Option<PathBuf> {
     marker.exists().then_some(marker)
 }
 
+// issue-445: Claude Code loads every ancestor CLAUDE.md, so a legacy
+// xmlui-desktop block above the project (typically ~/CLAUDE.md from a
+// pre-rename home Setup) feeds retired conventions into every project
+// below it -- ones the guard now denies, like editing worklist-history.
+// Setup's own migration reads only the project's CLAUDE.md, so it never
+// saw these. Unlike the #294 check this IS an any-ancestor walk: a managed
+// parent can be legitimate, a legacy block never is. Named, not edited --
+// Setup does not write outside the project.
+fn ancestor_legacy_conventions_imports(root: &Path) -> Vec<PathBuf> {
+    root.ancestors()
+        .skip(1)
+        .map(|dir| dir.join("CLAUDE.md"))
+        .filter(|md| {
+            std::fs::read_to_string(md)
+                .map(|s| s.contains(ENHANCE_LEGACY_MARKER_START))
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod home_scaffold_tests {
     use super::{
-        nested_managed_parent, path_is_home_dir, stray_home_scaffold_marker, WORKLIST_AUTH_REL,
+        ancestor_legacy_conventions_imports, nested_managed_parent, path_is_home_dir,
+        stray_home_scaffold_marker, WORKLIST_AUTH_REL,
     };
     use std::path::PathBuf;
 
@@ -48010,6 +48387,38 @@ mod home_scaffold_tests {
         // not the stray-scaffold warning's.
         assert!(stray_home_scaffold_marker(&home, &home).is_none());
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn legacy_block_in_ancestor_claude_md_is_named() {
+        let top = scratch("legacy-ancestor");
+        let proj = top.join("mid").join("proj");
+        std::fs::create_dir_all(&proj).expect("create project dir");
+
+        // A legacy block in the project's own CLAUDE.md is Setup's
+        // migration territory, not this warning's.
+        std::fs::write(
+            proj.join("CLAUDE.md"),
+            "<!-- xmlui-desktop:start -->\n@.claude/xmlui-desktop-conventions.md\n<!-- xmlui-desktop:end -->\n",
+        )
+        .expect("write project CLAUDE.md");
+        // A current Bram block in a parent is a legitimate managed parent.
+        std::fs::write(
+            top.join("mid").join("CLAUDE.md"),
+            "<!-- bram:start -->\n@.claude/bram-conventions.md\n<!-- bram:end -->\n",
+        )
+        .expect("write parent CLAUDE.md");
+        assert!(ancestor_legacy_conventions_imports(&proj).is_empty());
+
+        // A legacy block in a grandparent is named.
+        let legacy = top.join("CLAUDE.md");
+        std::fs::write(
+            &legacy,
+            "# mine\n<!-- xmlui-desktop:start -->\n@.claude/xmlui-desktop-conventions.md\n<!-- xmlui-desktop:end -->\n",
+        )
+        .expect("write grandparent CLAUDE.md");
+        assert_eq!(ancestor_legacy_conventions_imports(&proj), vec![legacy]);
+        let _ = std::fs::remove_dir_all(&top);
     }
 }
 
@@ -48279,6 +48688,17 @@ fn run_enhance<R: tauri::Runtime>(app: &AppHandle<R>, force: bool) -> Result<Vec
              treat unmanaged paths under home as a project with an empty worklist \
              (issue #294); remove or rename it",
             marker.display()
+        ));
+    }
+
+    // issue-445: a legacy xmlui-desktop block in an ancestor CLAUDE.md
+    // imports retired conventions into this project. Name it; don't edit it.
+    for md in ancestor_legacy_conventions_imports(&proj) {
+        skipped.push(format!(
+            "{} carries a legacy <!-- xmlui-desktop:start --> … <!-- xmlui-desktop:end --> block \
+             — it imports retired conventions (such as editing resources/worklist-history/) \
+             that the guard now denies, into every project below it (issue #445); delete that block",
+            md.display()
         ));
     }
 
@@ -81815,6 +82235,54 @@ mod conventions_split_tests {
             stray_seeded_reference_files(&on_disk, &bundled),
             vec!["renamed-old.md".to_string()]
         );
+    }
+
+    // new-repo-orientation: top-level docs are *.md only and stamped; a
+    // subfolder (the orientation template) ships whole and verbatim.
+    #[test]
+    fn reference_entries_and_stamping() {
+        use super::{is_reference_entry, reference_entry_is_stamped};
+        assert!(is_reference_entry("orientation.md"));
+        assert!(!is_reference_entry("notes.txt"));
+        assert!(is_reference_entry("orientation-template/arch.js"));
+        assert!(is_reference_entry(
+            "orientation-template/architecture/01-system.md"
+        ));
+        assert!(reference_entry_is_stamped("orientation.md"));
+        assert!(!reference_entry_is_stamped("orientation-template/arch.js"));
+        assert!(!reference_entry_is_stamped(
+            "orientation-template/OVERVIEW.md"
+        ));
+    }
+
+    // Every file the orientation playbook tells the agent to copy or edit is
+    // in the bundle.
+    #[test]
+    fn orientation_template_is_bundled() {
+        let base: std::path::PathBuf = [
+            env!("CARGO_MANIFEST_DIR"),
+            "..",
+            "app",
+            "__shell",
+            "reference",
+        ]
+        .iter()
+        .collect();
+        assert!(base.join("orientation.md").is_file());
+        for f in [
+            "index.html",
+            "Main.xmlui",
+            "arch.js",
+            "OVERVIEW.md",
+            "architecture/01-system.mmd",
+            "architecture/01-system.md",
+        ] {
+            assert!(
+                base.join("orientation-template").join(f).is_file(),
+                "orientation-template/{} missing",
+                f
+            );
+        }
     }
 }
 
