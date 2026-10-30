@@ -75,12 +75,12 @@ Skip the worklist only in these contexts, never because the change is
 - **`skip-worklist:` structured prefix on this turn.** The turn begins
   literally with `skip-worklist: ` followed by the request. Same family
   as `approved:` / `drop:` / `iterate:`, but it authorizes a direct
-  edit rather than a lifecycle transition. The user types it (the
-  button that prepended it is retired). Unlike the other prefixes, the host forwards the **entire
-  turn text including the prefix** so you can see it. On seeing it,
-  skip propose-first, act on the rest of the message as a direct edit,
-  and do not write a new worklist item; the PreToolUse hook allows the
-  edits.
+  edit rather than a lifecycle transition. The user types it, or sends
+  with ⌘Enter / Ctrl+Enter, adding a closing "Just do it and commit."
+  Unlike the other prefixes, the host forwards the **entire turn text
+  including the prefix**. On seeing it, skip propose-first, make the
+  change directly, write no worklist item, and commit only if the turn
+  asks; the PreToolUse hook allows the edits.
 - **Correcting code you just wrote in the current iteration.** Fixing a
   typo or off-by-one from your last turn is iteration on in-progress
   work, not a fresh change request.
@@ -287,9 +287,9 @@ status; the user's Commit button judges committability independently.
 Worklist items selected, a message the user sends (Enter in the message
 box) is **feedback addressed to those items**, and arrives as an
 `iterate:` turn. With nothing selected, it is **general chat** with you.
-An addressee line above the message box always shows where Enter will
-send ("To: <item> (feedback)" or "To: Claude (chat)"). With items
-selected, its **Send as chat instead** control sends that one message as
+The box's placeholder shows where Enter will send ("To <item>
+(feedback)", "To Claude (chat)"). With items selected, a line above it
+carries **Send as chat instead**, which sends that one message as
 general chat without clearing the selection; changing the selection
 switches it back to feedback. After **Start** the started items stay
 selected, so follow-ups arrive as `iterate:`; other gate verbs clear it.
@@ -769,7 +769,7 @@ curl -4 -sS "http://127.0.0.1:61455/__search?q=<urlencoded>&limit=20&types=commi
 **Caveats.** FTS5 is keyword, not semantic: a miss means "nothing
 matched those terms", not proof of absence. A **503** (`{"error":"search index not ready","reason":"holding|initial-scan",…}`)
 means no index yet — never read it as absence of
-history. Scope is the current project; new issues take ~45s to appear.
+history. Scope is the current project; new issues take ~30s to appear.
 Commit diffs are indexed but bounded (long lines elided, 256 KB cap);
 `git log -S` / `git grep` remain the precision tools.
 

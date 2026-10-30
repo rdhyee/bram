@@ -2574,7 +2574,18 @@ window.__bramComposerTargetsSelection = function () {
 // that turns into a status message conflates teaching with reporting — the
 // combined footer context line (__bramFooterContextLine) carries in-flight
 // status now, and the placeholder always tells you what Enter will do.
-window.__bramComposerPlaceholder = function (pathname, sel, toChat) {
+// composer-addressee-in-placeholder: the addressee shows in exactly one place.
+// In plain chat the line above the box is hidden, so the placeholder opens
+// with it ("To Claude (chat): …", same wording as __bramComposerAddressee).
+// With items ticked the line shows it, and the placeholder is the hint alone
+// (Jon: "we don't need the addressee in both places").
+window.__bramComposerPlaceholder = function (pathname, sel, toChat, provider) {
+  var hint = window.__bramComposerPlaceholderHint(pathname, sel, toChat);
+  var ticked = sel || window.__bramW2Selection || [];
+  var to = String(window.__bramComposerAddressee(ticked, toChat, provider)).replace(/^To: /, "To ");
+  return to + ": " + hint;
+};
+window.__bramComposerPlaceholderHint = function (pathname, sel, toChat) {
   // composer-addressee-line: switched to chat, the box is a chat box.
   var selection = toChat ? [] : (sel || window.__bramW2Selection || []);
   var route = String(
@@ -2583,6 +2594,8 @@ window.__bramComposerPlaceholder = function (pathname, sel, toChat) {
   // The root route renders the Worklist (and its gate bar) too — Main.xmlui's
   // gate-bar `when` includes '/', so the buttons-above sentence is true there.
   var onWorklist = route.indexOf("/worklist") >= 0 || route === "/" || route === "#/";
+  // composer-cmd-enter-just-do-it (Jon's wording).
+  var direct = " (" + window.__bramDirectEnterKeyLabel() + "Enter to \u201cjust do it and commit\u201d)";
   // Feedback elevated to a first-class concept (Jon's spec, 2026-09-07;
   // the Feedback button retired same day — with a selection, Enter and the
   // gate buttons all send feedback, so the placeholder carries the
@@ -2594,11 +2607,17 @@ window.__bramComposerPlaceholder = function (pathname, sel, toChat) {
     // verb now, and the gate buttons are pure lifecycle — each sends this
     // message along WITH its action. The wording teaches that split.
     if (onWorklist) {
-      return "Feedback about selection: Enter sends it; the buttons above send it with their action. Shift+Enter newline, Ctrl-V/Cmd-V paste screenshot.";
+      return "Enter sends it" + direct + "; the buttons above send it with their action. Shift+Enter newline, Ctrl-V/Cmd-V paste screenshot.";
     }
-    return "Feedback about selection: Enter sends, Shift+Enter newline, Ctrl-V/Cmd-V paste screenshot.";
+    return "Enter sends" + direct + ", Shift+Enter newline, Ctrl-V/Cmd-V paste screenshot.";
   }
-  return "Chat with agent: Enter sends, Shift+Enter newline, Ctrl-V/Cmd-V paste screenshot.";
+  return "Enter sends" + direct + ", Shift+Enter newline, Ctrl-V/Cmd-V paste screenshot.";
+};
+// composer-addressee-in-placeholder: the line above the box shows only with
+// items ticked, and carries only the chat/feedback toggle. The addressee
+// itself is always in the placeholder (composer-addressee-always-in-box).
+window.__bramComposerShowAddresseeLine = function (sel) {
+  return Array.isArray(sel) && sel.length > 0;
 };
 
 // switch-to-transcript-on-action: Feedback as a first-class verb. The
@@ -2640,6 +2659,12 @@ window.__bramSubmitFeedbackForSelection = function (box) {
 // sent with an item ticked, the sender unsure where it went — are why the
 // destination is shown before sending instead of inferred silently.
 window.__bramComposerEnterSubmit = function (box, toChat) {
+  // composer-cmd-enter-just-do-it: ⌘Enter / Ctrl+Enter (noted by the keydown
+  // listener below) sends a direct request, whatever is ticked.
+  if (window.__bramComposerTakeDirectEnter()) {
+    window.__bramIframeTrace("composer-send", { to: "just-do-it", selected: (window.__bramW2Selection || []).length });
+    return window.__bramSubmitMessageAgentComposer(box, "just-do-it");
+  }
   var sel = window.__bramW2Selection || [];
   var feedback = sel.length > 0 && !toChat;
   try {
@@ -2652,6 +2677,35 @@ window.__bramComposerEnterSubmit = function (box, toChat) {
     return window.__bramSubmitFeedbackForSelection(box);
   }
   return window.__bramSubmitMessageAgentComposer(box, "");
+};
+// composer-cmd-enter-just-do-it: the OS's modifier for "just do it and
+// commit" -- ⌘ on macOS, Ctrl elsewhere.
+window.__bramDirectEnterKeyIsMac = function () {
+  try { return /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent || ""); } catch (e) { return false; }
+};
+window.__bramDirectEnterKeyLabel = function () {
+  return window.__bramDirectEnterKeyIsMac() ? "\u2318" : "Ctrl+";
+};
+// XMLUI's TextArea (enterSubmits) submits the Form on any Enter without
+// Shift, modifier or not, and exposes no modifier to onSubmit; there's no
+// XMLUI prop or how-to for it. So a capture-phase keydown notes a ⌘ / Ctrl
+// Enter in the footer composer just before React's handler submits, and
+// __bramComposerEnterSubmit takes the note (one-shot, 1 s).
+window.__bramComposerDirectEnterAt = 0;
+window.__bramComposerTakeDirectEnter = function () {
+  var at = window.__bramComposerDirectEnterAt || 0;
+  window.__bramComposerDirectEnterAt = 0;
+  return at > 0 && (Date.now() - at) < 1000;
+};
+window.__bramComposerDirectEnterKeydown = function (e) {
+  try {
+    if (!e || e.key !== "Enter" || e.shiftKey) return;
+    var mod = window.__bramDirectEnterKeyIsMac() ? e.metaKey : e.ctrlKey;
+    if (!mod) return;
+    var t = e.target;
+    if (!t || t.tagName !== "TEXTAREA" || !t.closest || !t.closest('[data-testid="app-footer"]')) return;
+    window.__bramComposerDirectEnterAt = Date.now();
+  } catch (x) {}
 };
 // The addressee line's text. `provider` is the active agent ("claude" |
 // "codex" | "opencode"); `toChat` the per-message override.
@@ -3718,6 +3772,56 @@ window.__bramInflightBannerLabel = function (claim) {
 // and stops the moment the chip is clicked (unseen goes 0, chip unmounts).
 window.__bramChipShouldPulse = function (status) {
   return !(status && status.state === "working");
+};
+
+// alerts-pulse-and-startup-check: the Alerts nav link pulses, like the new
+// chip, while "Needs you now" holds an item not yet seen this session. An
+// item is its id plus its activity marker, so a fresh reply on the same
+// thread counts as new. Being on the Alerts page marks everything showing as
+// seen. Seen-ness is focus state (what you've looked at), so sessionStorage,
+// scoped by project; after a relaunch a still-waiting item pulses once more,
+// which is right, since it is still waiting on you.
+window.__bramAlertsKey = function (item) {
+  if (!item) return "";
+  return (item.id || "") + "|" + (item.activityMarker || item.activityAt || "");
+};
+window.__bramAlertsShouldPulse = function (needsYou, pathname) {
+  var items =
+    needsYou && needsYou.lanes && Array.isArray(needsYou.lanes.needsYouNow)
+      ? needsYou.lanes.needsYouNow
+      : [];
+  var storeKey = window.__bramProjectScopedKey
+    ? window.__bramProjectScopedKey("bram.alertsSeen")
+    : null;
+  var seen = {};
+  if (storeKey) {
+    try {
+      seen = JSON.parse(sessionStorage.getItem(storeKey) || "{}") || {};
+    } catch (e) {
+      seen = {};
+    }
+  }
+  if (pathname === "/needs-you") {
+    if (!storeKey) return false;
+    var changed = false;
+    for (var i = 0; i < items.length; i++) {
+      var k = window.__bramAlertsKey(items[i]);
+      if (k && !seen[k]) {
+        seen[k] = 1;
+        changed = true;
+      }
+    }
+    if (changed) {
+      try {
+        sessionStorage.setItem(storeKey, JSON.stringify(seen));
+      } catch (e) {}
+    }
+    return false;
+  }
+  for (var j = 0; j < items.length; j++) {
+    if (!seen[window.__bramAlertsKey(items[j])]) return true;
+  }
+  return false;
 };
 
 // Round 2 (Jon, from the field): COMPOSE the facts, don't choose one —
@@ -7855,7 +7959,10 @@ window.__bramRecordWorklistFeedbackConversation = function (text) {
 window.__bramPrepareWorklistMessageSubmission = function (opts) {
   opts = opts || {};
   var rawText = opts.text || "";
-  var skipWorklist = opts.mode === "skip-worklist";
+  // composer-cmd-enter-just-do-it: "just-do-it" is skip-worklist plus the
+  // closing opt-out phrase and the instruction to commit.
+  var justDoIt = opts.mode === "just-do-it";
+  var skipWorklist = opts.mode === "skip-worklist" || justDoIt;
   window.__bramWorklistMessageSubmissionSeq = (window.__bramWorklistMessageSubmissionSeq || 0) + 1;
   var seq = window.__bramWorklistMessageSubmissionSeq;
   // Every submit attempt traces BEFORE any gating/empty checks, so a send that silently goes nowhere is visible in bram-trace (2026-07-03: "message 2 resent got eaten" left zero traces).
@@ -7869,6 +7976,7 @@ window.__bramPrepareWorklistMessageSubmission = function (opts) {
   } catch (e) {}
   if (skipWorklist && !rawText.trim()) return { submitted: false, seq: seq };
   var text = skipWorklist ? ("skip-worklist: " + rawText.trim()) : rawText;
+  if (justDoIt) text += "\n\nJust do it and commit.";
   if (!text.trim()) return { submitted: false, seq: seq };
 
   if (window.__bramFlushWorklistDraft) window.__bramFlushWorklistDraft();
@@ -11359,12 +11467,6 @@ var __BRAM_DESCRIBE_CONCURRENCY = 3;
 // added upstream in xmlui feat/list-visible-range). The [data-index] DOM
 // scrape remains as fallback for the window before the first event lands.
 window.__bramSetVisibleRange = function (range, listRef, agentId) {
-  // A pending Worklist-pane close re-lands BEFORE the new range is stored,
-  // so the reading row recorded at the toggle isn't overwritten by the
-  // remounted List's top-of-list report.
-  if (window.__bramSplitToggleLand && listRef) {
-    try { __bramSplitToggleLanding(listRef, agentId); } catch (e0) {}
-  }
   window.__bramVisibleRange = range || null;
   try { __bramPumpDescribeQueue(); } catch (e) {}
   // #427: the List's first render is the moment its splitter exists to
@@ -11383,6 +11485,31 @@ window.__bramSetVisibleRange = function (range, listRef, agentId) {
 // (Transcript.xmlui's VSplitter, Main.xmlui's Footer). Emits px, or 0 before the first measurement
 // (the markup's fallback). Splitter top is taken in page coordinates (adds
 // the page scroller's scrollTop) so an already-scrolled page measures right.
+// The deepest elements under `page` whose right edge passes page's visible
+// right edge, as "tag.class testid WxP right=R" strings (up to 5). Diagnostic
+// for horizontal overflow; called only on a split-height flip.
+function __bramWidestOverflow(page) {
+  var limit = page.getBoundingClientRect().left + page.clientWidth + 1;
+  var hits = [];
+  var all = page.querySelectorAll("*");
+  for (var i = 0; i < all.length && hits.length < 200; i++) {
+    var r = all[i].getBoundingClientRect();
+    if (r.width > 0 && r.right > limit) hits.push(all[i]);
+  }
+  var deepest = hits.filter(function (el) {
+    return !hits.some(function (o) { return o !== el && el.contains(o); });
+  });
+  return deepest.slice(0, 5).map(function (el) {
+    var r = el.getBoundingClientRect();
+    var cls = (typeof el.className === "string" ? el.className : "").split(" ")[0];
+    var tid = el.getAttribute("data-testid");
+    var txt = (el.textContent || "").trim().slice(0, 40);
+    return el.tagName.toLowerCase() + (cls ? "." + cls : "") + (tid ? " [" + tid + "]" : "") +
+      " " + Math.round(r.width) + "w right=" + Math.round(r.right) + " limit=" + Math.round(limit) +
+      (txt ? " \"" + txt + "\"" : "");
+  });
+}
+
 window.bramSubscribeTranscriptSplitHeight = (function () {
   var factory;
   var subscribers = new Set();
@@ -11434,11 +11561,22 @@ window.bramSubscribeTranscriptSplitHeight = (function () {
       // leave it to be spotted in a run of lines.
       var now = Date.now();
       var flip = next === prevValue && (now - lastEmitAt) < 1000;
-      window.__bramIframeTrace("transcript-split-height", {
+      var fields = {
         px: next, prev: value, scrolled: Math.round(scrolled),
         viewH: Math.round(viewH), spOffset: Math.round(spOffset), footH: Math.round(footH),
         flip: flip,
-      });
+      };
+      // header-wraps-instead-of-overflowing: a flip with the terminal open
+      // was the page's two scrollbars taking turns (width 421<->406, viewH
+      // 1001<->1016), i.e. something wider than the page. On a flip, name it:
+      // the page's scrollWidth vs clientWidth, and the deepest elements whose
+      // right edge passes the page's.
+      if (flip && page) {
+        fields.scrollW = page.scrollWidth;
+        fields.clientW = page.clientWidth;
+        if (page.scrollWidth > page.clientWidth) fields.wide = __bramWidestOverflow(page);
+      }
+      window.__bramIframeTrace("transcript-split-height", fields);
       prevValue = value;
       lastEmitAt = now;
       value = next;
@@ -11483,29 +11621,34 @@ window.__bramTranscriptWorklistBarLabel = function (open, board) {
     (ready ? " · " + ready + " ready to commit" : "");
 };
 
-// #427: the Transcript's Worklist pane, open or closed. FOCUS (what the user
-// is looking at now), so sessionStorage: it survives a tab switch or pane
-// reload, which remount the Transcript, but not a relaunch.
-window.__bramRestoreTranscriptWorklistOpen = function () {
+// worklist-bar-on-every-page: the Worklist pane under every tab, open or
+// closed. One app-wide value (Main.xmlui's worklistOpen). FOCUS (what the
+// user is looking at now), so sessionStorage: it survives a tab switch or
+// pane reload but not a relaunch. The key is the one #427's Transcript-only
+// pane used, so an open pane stays open across this change.
+window.__bramRestoreWorklistPaneOpen = function () {
   return __bramReadSS("bram.transcriptWorklistOpen", "") === "1";
 };
-window.__bramToggleTranscriptWorklistOpen = function (open) {
-  var next = !open;
-  __bramWriteSS("bram.transcriptWorklistOpen", next ? "1" : "");
-  // XMLUI's Splitter renders one child and two children in different trees,
-  // so toggling the pane REMOUNTS the transcript List, which starts at the
-  // top. Record what the reader was looking at; the remounted List's first
-  // visible-range report re-lands it (__bramSplitToggleLanding). Opening
-  // keeps its deliberate jump to the newest turn, so only a close is
-  // recorded. (transcript-split-toggle-keeps-reading-position)
-  var following = window.__bramFollowAtBottom !== false;
-  var vr = window.__bramVisibleRange;
-  var row = (vr && typeof vr.startIndex === "number") ? vr.startIndex : -1;
-  window.__bramSplitToggleLand = next ? null : { following: following, row: row };
+window.__bramSetWorklistPaneOpen = function (next, cause) {
+  var open = !!next;
+  __bramWriteSS("bram.transcriptWorklistOpen", open ? "1" : "");
   window.__bramIframeTrace("transcript-worklist", {
-    op: next ? "open" : "close", follow: following, row: row,
+    op: open ? "open" : "close", cause: cause || "bar",
   });
-  return next;
+  return open;
+};
+// The Worklist routes show the full page, so no bar there.
+window.__bramIsWorklistRoute = function (pathname) {
+  return pathname === "/worklist2" || pathname === "/worklist" || pathname === "/";
+};
+// Arriving on the Worklist page closes the pane, so any other tab comes
+// back with the bar alone (Jon: "switching to any other tab switches back
+// to that tab with the work list bar only").
+window.__bramWorklistPaneOnRoute = function (pathname, open) {
+  if (open && window.__bramIsWorklistRoute(pathname)) {
+    return window.__bramSetWorklistPaneOpen(false, "worklist-route");
+  }
+  return open;
 };
 // The Worklist pane's own scroll position (transcript-split-toggle-keeps-
 // reading-position). FOCUS, so sessionStorage. Saved continuously while the
@@ -11517,7 +11660,7 @@ var __bramWorklistPaneState = null;
 window.__bramWorklistPaneMounted = function () {
   var KEY = "bram.transcriptWorklistPaneScroll";
   var el = null;
-  try { el = document.querySelector('[data-testid="transcript-worklist-pane"]'); } catch (e) { el = null; }
+  try { el = document.querySelector('[data-testid="worklist-pane"]'); } catch (e) { el = null; }
   if (!el) return;
   if (__bramWorklistPaneState) window.__bramWorklistPaneUnmounted();
   var saved = Number(__bramReadSS(KEY, "0")) || 0;
@@ -11565,36 +11708,6 @@ window.__bramWorklistPaneUnmounted = function () {
   st.listeners.forEach(function (l) {
     try { st.el.removeEventListener(l[0], l[1]); } catch (e) {}
   });
-};
-
-// Re-land the transcript after a close remounted it: the bottom if the
-// reader was following (the jump yields if they scroll first), else the row
-// they were reading. Called with the List's first visible-range report after
-// the toggle; one-shot.
-function __bramSplitToggleLanding(listRef, agentId) {
-  var p = window.__bramSplitToggleLand;
-  window.__bramSplitToggleLand = null;
-  if (!p || !listRef) return;
-  if (p.following) {
-    window.__bramBottomJumpRetry(listRef, "worklist-close", agentId, null);
-    return;
-  }
-  if (p.row > 0) {
-    try { listRef.scrollToIndex(p.row); } catch (e) { /* ignore */ }
-  }
-  window.__bramIframeTrace("follow-state", {
-    op: "restore", cause: "worklist-close", row: p.row, agentId: agentId || "main",
-  });
-}
-// #427: the split's resize event. Saves the divider as a percentage (a
-// DECISION, via __bramSaveSplitterSize -> localStorage) only while the
-// Worklist pane is open -- closed, the transcript fills the splitter and
-// that is not a divider position. Then re-lands the transcript on its
-// newest turn (the jump yields if the user has scrolled up).
-window.__bramTranscriptSplitResized = function (primaryPx, totalPx, open, listRef, agentId) {
-  var p = Number(primaryPx), t = Number(totalPx);
-  if (open && p > 0 && t > p) window.__bramSaveSplitterSize("transcript-worklist", [p, t - p]);
-  window.__bramBottomJumpRetry(listRef, "worklist-resize", agentId, null);
 };
 
 // Markup helper: the measured px, or a viewport-relative stand-in until the
@@ -18071,3 +18184,8 @@ window.__bramInstallCodeBlockTools();
     return lastSearchOut;
   };
 })();
+
+// composer-cmd-enter-just-do-it: registered after its definition (top-level
+// calls must follow what they call). Capture phase, so it runs before the
+// TextArea's own keydown submits the Form.
+try { document.addEventListener("keydown", window.__bramComposerDirectEnterKeydown, true); } catch (e) {}

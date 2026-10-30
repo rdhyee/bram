@@ -1,4 +1,4 @@
-<App layout="vertical-sticky" persistTheme="true" var.rightPaneSize="(measuring…)" var.updateBannerDismissedVersion="{window.__bramRestoreUpdateBannerDismissed ? window.__bramRestoreUpdateBannerDismissed() : ''}" var.toplevelBannerDismissed="{false}" var.strayScaffoldBannerDismissed="{false}" var.codexTrustBannerDismissed="{false}"var.setupCompleteProvider="{''}" var.lastSeenAgentVerb="{''}" var.transcriptAgentId="{''}" var.sendNoticeDismissed="{window.__bramRestoreSendNoticeDismissed()}" var.dismissedAgentIds="{window.__bramRestoreDismissedAgents()}"
+<App layout="vertical-sticky" persistTheme="true" noScrollbarGutters="true" var.rightPaneSize="(measuring…)" var.updateBannerDismissedVersion="{window.__bramRestoreUpdateBannerDismissed ? window.__bramRestoreUpdateBannerDismissed() : ''}" var.toplevelBannerDismissed="{false}" var.strayScaffoldBannerDismissed="{false}" var.codexTrustBannerDismissed="{false}"var.setupCompleteProvider="{''}" var.lastSeenAgentVerb="{''}" var.transcriptAgentId="{''}" var.worklistOpen="{window.__bramRestoreWorklistPaneOpen()}" var.sendNoticeDismissed="{window.__bramRestoreSendNoticeDismissed()}" var.dismissedAgentIds="{window.__bramRestoreDismissedAgents()}"
   onInit="startBramLatestJsonlPush(() => (enhanceStatus.value &amp;&amp; enhanceStatus.value.activeProvider) || '')">
   <PushSource
     id="mainAgentStatus"
@@ -17,6 +17,22 @@
     id="transcriptUnseen"
     initial="{window.__bramUnseenValue ? window.__bramUnseenValue() : 0}"
     subscribe="{window.bramSubscribeTranscriptUnseen ? window.bramSubscribeTranscriptUnseen() : null}" />
+  <!-- alerts-pulse-and-startup-check: the Alerts nav link's pulse needs the
+       Needs-you lanes on every tab, not only when the Alerts page is open.
+       Same seam and same push events as Inbox.xmlui (no poll). -->
+  <DataSource id="alertsNav" url="/__needs-you" />
+  <PushSource id="alertsNavEvt" initial="{null}"
+    subscribe="{window.bramSubscribeTauriEvent('needs-you-changed')}" />
+  <ChangeListener listenTo="{alertsNavEvt.value &amp;&amp; alertsNavEvt.value.tick}"
+    onDidChange="window.__bramRefetchOnLiveEvent(alertsNavEvt.value, alertsNav)" />
+  <PushSource id="alertsNavIssuesEvt" initial="{null}"
+    subscribe="{window.bramSubscribeTauriEvent('issues-changed')}" />
+  <ChangeListener listenTo="{alertsNavIssuesEvt.value &amp;&amp; alertsNavIssuesEvt.value.tick}"
+    onDidChange="window.__bramRefetchOnLiveEvent(alertsNavIssuesEvt.value, alertsNav)" />
+  <PushSource id="alertsNavWorklistEvt" initial="{null}"
+    subscribe="{window.bramSubscribeTauriEvent('worklist-changed')}" />
+  <ChangeListener listenTo="{alertsNavWorklistEvt.value &amp;&amp; alertsNavWorklistEvt.value.tick}"
+    onDidChange="window.__bramRefetchOnLiveEvent(alertsNavWorklistEvt.value, alertsNav)" />
   <!-- PTY-throughput subscription now lives inside ActivitySparkline so its
        per-chunk churn is isolated from the footer composer. -->
 
@@ -689,7 +705,28 @@
     <NavLink label="Commits" to="/commits" tooltip="Recent commits, and pushing them" />
     <NavLink label="Queue" to="/queue" tooltip="Notes you&apos;re holding to send the agent when it&apos;s free" />
     <NavLink label="Search" to="/search" tooltip="Search the project&apos;s history: sessions, commits, issues, worklist" />
-    <NavLink label="Alerts" to="/needs-you" tooltip="Everything waiting on your decision, in one list" />
+    <!-- alerts-pulse-and-startup-check: a dot beside the label pulses, like
+         the transcript's new chip, while Needs-you-now holds something unseen
+         this session. The first cut pulsed the whole link, and `fadein`
+         (reverse, loop) runs opacity down to 0 with no range option
+         (https://www.xmlui.org/docs/behaviors#animation), so the label
+         vanished into the panel ("goes to black in dark mode", Jon). A
+         fading dot reads as a pulse and leaves the label steady. The
+         negative margin pulls it in across NavLink's own right padding
+         (a gap can't be negative). NavLink
+         itself documents no animation prop
+         (https://www.xmlui.org/docs/reference/components/NavLink). -->
+    <HStack verticalAlignment="center" gap="0">
+      <NavLink label="Alerts" to="/needs-you" tooltip="Everything waiting on your decision, in one list" />
+      <Text
+        when="{window.__bramAlertsShouldPulse(alertsNav.value, $pathname)}"
+        color="$color-primary-500"
+        fontSize="$fontSize-sm"
+        marginLeft="-0.75rem"
+        animation="fadein"
+        animationOptions="{{ duration: 1200, reverse: true, loop: true }}"
+        tooltip="Something new is waiting in Alerts">●</Text>
+    </HStack>
     <NavLink label="History" to="/history" tooltip="Every worklist item that was committed or dropped, and why" />
     <NavLink label="Files" to="/files" tooltip="Browse and search this repo&apos;s files" />
     <NavLink label="Settings" to="/settings" tooltip="Project and personal settings for Bram" />
@@ -990,8 +1027,12 @@
 
   <!-- Explicit warn-scale highlight colors for the Markdown find <mark>
        (active match a shade darker), set app-side so the color is guaranteed
-       regardless of the bundle's defaultThemeVars emission. -->
-  <Theme paddingVertical-Pages="0" paddingVertical-content-App="0"
+       regardless of the bundle's defaultThemeVars emission.
+       transcript-worklist-bar-full-width: no Pages inset on either axis, so a
+       page can run edge to edge (the Transcript's Worklist bar and pane);
+       every page component pads its own content
+       (https://www.xmlui.org/docs/howto/build-a-full-height-scroll-layout). -->
+  <Theme paddingVertical-Pages="0" paddingHorizontal-Pages="0" paddingVertical-content-App="0"
     backgroundColor-mark-markdown="$color-warn-200"
     backgroundColor-markActive-markdown="$color-warn-400">
     <Pages fallbackPath="/worklist2">
@@ -999,7 +1040,7 @@
       <Page url="/"><Worklist /></Page>
       <Page url="/worklist"><Worklist /></Page>
       <Page url="/worklist2"><Worklist /></Page>
-      <Page url="/transcript"><Transcript agentId="{transcriptAgentId}" /></Page>
+      <Page url="/transcript"><Transcript agentId="{transcriptAgentId}" worklistOpen="{worklistOpen}" onOpenWorklist="worklistOpen = window.__bramSetWorklistPaneOpen(true, 'orient')" /></Page>
       <Page url="/search"><Search /></Page>
       <Page url="/queue"><AgentMessageQueue /></Page>
       <Page url="/status"><Status /></Page>
@@ -1013,11 +1054,74 @@
       <Page url="/files"><Files /></Page>
     </Pages>
   </Theme>
-  <!-- testId: #427 measures the Transcript Worklist split down to this
-       footer's top (helpers.js bramSubscribeTranscriptSplitHeight). -->
+  <!-- worklist-bar-on-every-page (Jon): the Worklist bar under every tab,
+       not only the Transcript. The board the bar summarizes, refreshed the
+       way Worklist.xmlui refreshes its own (push, no poll). -->
+  <DataSource id="twlBoard" url="/__worklist" />
+  <PushSource id="twlWorklistEvt" initial="{null}"
+    subscribe="{window.bramSubscribeTauriEvent('worklist-changed')}" />
+  <ChangeListener
+    listenTo="{twlWorklistEvt.value &amp;&amp; twlWorklistEvt.value.tick}"
+    onDidChange="window.__bramRefetchOnLiveEvent(twlWorklistEvt.value, twlBoard)" />
+  <PushSource id="twlGitEvt" initial="{null}"
+    subscribe="{window.bramSubscribeTauriEvent('git-status-changed', false)}" />
+  <ChangeListener
+    listenTo="{twlGitEvt.value &amp;&amp; twlGitEvt.value.tick}"
+    onDidChange="window.__bramRefetchOnLiveEvent(twlGitEvt.value, twlBoard)" />
+  <!-- Arriving on the Worklist page closes the pane, so every other tab
+       comes back with the bar alone. -->
+  <ChangeListener
+    listenTo="{$pathname}"
+    onDidChange="worklistOpen = window.__bramWorklistPaneOnRoute($pathname, worklistOpen)" />
+  <!-- testId: #427 measures the Transcript's List down to this footer's top
+       (helpers.js bramSubscribeTranscriptSplitHeight); the Worklist pane
+       below is part of that height. -->
   <Footer testId="app-footer">
     <Theme fontSize-TextArea="$fontSize-lg" fontSize-placeholder-TextArea="$fontSize-lg">
-    <VStack width="100%" gap="$space-1">
+    <VStack width="100%" gap="0">
+      <!-- worklist-bar-on-every-page: the bar, and the pane it opens, on the
+           Footer's top edge, flush on the message box under every tab but
+           the Worklist page itself (that page IS the Worklist). The Footer
+           is the surface vertical-sticky pins, so the pane needs no measured
+           split; it has a fixed height and scrolls itself. A resizable
+           VSplitter around <Pages> was rejected: XMLUI's Splitter renders one
+           child and two children in different trees, so every open or close
+           would remount the current tab
+           (https://www.xmlui.org/docs/reference/components/Splitter). The
+           Footer's own padding is zero on the sides (themes/bram.json) so the
+           bar runs edge to edge; the composer group below pads itself. -->
+      <VStack when="{!window.__bramIsWorklistRoute($pathname)}" width="100%" gap="0"
+        backgroundColor="$color-secondary-50">
+        <HStack verticalAlignment="center" gap="0">
+          <Button variant="ghost" size="sm" width="*" contentPosition="start"
+            label="{window.__bramTranscriptWorklistBarLabel(worklistOpen, twlBoard.value)}"
+            tooltip="{worklistOpen ? 'Hide the Worklist' : 'Show the Worklist'}"
+            onClick="worklistOpen = window.__bramSetWorklistPaneOpen(!worklistOpen, 'bar')" />
+          <!-- Pop out: the full Worklist page. Arriving there closes the pane
+               (the $pathname listener above). -->
+          <!-- A labeled, outlined button with room from the edge: the bare
+               ghost ↗ sat in the corner against the pane's scrollbar and was
+               easy to miss (Jon). -->
+          <Button when="{worklistOpen}" variant="outlined" size="xs" label="Open as page ↗"
+            marginRight="$space-4"
+            tooltip="Open the Worklist as a full page"
+            onClick="navigate('/worklist2')" />
+        </HStack>
+        <!-- transcript-worklist-pane-tint: a faint tint marks "the Worklist,
+             shown inside another tab". The inner VStack is the scroller and
+             carries testId + lifecycle, so the pane remembers its own scroll
+             position (helpers.js __bramWorklistPaneMounted) across Hide/Show
+             and tab switches. Lifecycle events:
+             https://www.xmlui.org/docs/howto/clean-up-when-a-panel-closes -->
+        <VStack when="{worklistOpen}" height="40vh" overflowY="auto" paddingTop="$space-2"
+          testId="worklist-pane"
+          onMount="window.__bramWorklistPaneMounted()"
+          onUnmount="window.__bramWorklistPaneUnmounted()">
+          <Worklist />
+          <WorklistGateBar />
+        </VStack>
+      </VStack>
+    <VStack width="100%" gap="$space-1" paddingHorizontal="$space-4" paddingTop="$space-2">
       <!-- issue-278: the Worklist gate, docked. The gate row could not be
            pinned where it lived (sticky cannot escape its containing block;
            `dock` needs a bounded parent height and scrollWholePage="false").
@@ -1308,125 +1412,13 @@
       <!-- Subagent chips strip (surface-subagent-activity-in-pane):
            shown only when the active session has subagents. Clicking a
            chip swaps the Transcript viewport to that agent's stream;
-           Main swaps back. Placement per approval feedback: footer,
-           below the message box, above the session-info line. Capped at
+           Main swaps back. Placement: on the session-info line below,
+           between the session text and the index status
+           (subagent-chips-on-session-line; it had its own row). Capped at
            the 3 most recently started agents; older ones collapse into
            the rightmost "+N more" dropdown so a subagent-heavy session
            can't crowd the footer. Tooltips carry type, description, and
            the model the subagent ran on. -->
-      <HStack
-        when="{window.__bramVisibleFooterAgents(footerAgents.value, dismissedAgentIds).length > 0 || (window.__bramDismissedInRoster ? window.__bramDismissedInRoster(footerAgents.value, dismissedAgentIds).length : 0) > 0}"
-        width="100%"
-        horizontalAlignment="center"
-        gap="$space-1"
-        paddingHorizontal="$space-1"
-        verticalAlignment="center">
-        <!-- Bold the chip whose stream the Transcript is currently showing
-             (App-scope transcriptAgentId): fontWeight-Button theme var per
-             https://www.xmlui.org/docs/reference/components/Button#styling.
-             bold-chip-static-theme-values: the first attempt bound a DYNAMIC
-             expression as the Theme var's value (mixing a raw 'bold' with a
-             '$token' string) and was never observed working — theme vars are
-             not reliably reactive and expression-produced token strings are
-             not reliably resolved. So: two when=-branched wrappers with
-             STATIC literal values; reactivity rides when= remounting, the
-             guaranteed path. Weight only, orthogonal to the running-state
-             variant/themeColor bindings below. -->
-        <Theme when="{transcriptAgentId === ''}" fontWeight-Button="$fontWeight-bold">
-          <Button
-            label="Main"
-            size="xs"
-            variant="outlined"
-            tooltip="{window.__bramMainChipTooltip ? window.__bramMainChipTooltip(footerAgents.value) : 'Show the main conversation in the Transcript tab'}"
-            onClick="transcriptAgentId = ''; window.__bramSetVisibleRange(null); navigate('/transcript')" />
-        </Theme>
-        <Button
-          when="{transcriptAgentId !== ''}"
-          label="Main"
-          size="xs"
-          variant="outlined"
-          tooltip="{window.__bramMainChipTooltip ? window.__bramMainChipTooltip(footerAgents.value) : 'Show the main conversation in the Transcript tab'}"
-          onClick="transcriptAgentId = ''; window.__bramSetVisibleRange(null); navigate('/transcript')" />
-        <!-- One continuous reverse-chron read: newest chip leftmost (after
-             Main), then the dropdown continues newest→oldest top-down. Each
-             chip pairs its label with a ghost ✕ that appends the agentId to
-             dismissedAgentIds (dismissible-subagent-chips); dismissing a
-             visible chip promotes the next agent up from the dropdown. The
-             Main chip is intentionally never dismissible. -->
-        <Items data="{window.__bramVisibleFooterAgents(footerAgents.value, dismissedAgentIds).slice(-3).reverse()}">
-          <HStack gap="0" verticalAlignment="center">
-            <!-- surface-delegated-work-in-flight: the ● glyph
-                 (__bramAgentChipLabel) was the only truthful signal that a
-                 subagent is still running, and it read as the quietest
-                 pixel on the page. A running chip now goes solid+primary
-                 (filled, accent) instead of the quiet outlined+secondary a
-                 finished chip keeps — Button's own themeColor/variant
-                 props, no new component. -->
-            <!-- Same static-value bolding as the Main chip above, keyed to
-                 this chip's own agentId (see bold-chip-static-theme-values
-                 comment there for why the dynamic form failed). -->
-            <Theme when="{transcriptAgentId === $item.agentId}" fontWeight-Button="$fontWeight-bold">
-              <Button
-                label="{window.__bramAgentChipLabel($item)}"
-                size="xs"
-                variant="{($item.state || ($item.finished ? 'finished' : 'running')) === 'running' ? 'solid' : 'outlined'}"
-                themeColor="{($item.state || ($item.finished ? 'finished' : 'running')) === 'finished' ? 'secondary' : 'primary'}"
-                tooltip="{(window.__bramAgentChipTooltip || window.__bramAgentChipLabel)($item)}"
-                onClick="transcriptAgentId = $item.agentId; window.__bramSetVisibleRange(null); navigate('/transcript')" />
-            </Theme>
-            <Button
-              when="{transcriptAgentId !== $item.agentId}"
-              label="{window.__bramAgentChipLabel($item)}"
-              size="xs"
-              variant="{($item.state || ($item.finished ? 'finished' : 'running')) === 'running' ? 'solid' : 'outlined'}"
-              themeColor="{($item.state || ($item.finished ? 'finished' : 'running')) === 'finished' ? 'secondary' : 'primary'}"
-              tooltip="{(window.__bramAgentChipTooltip || window.__bramAgentChipLabel)($item)}"
-              onClick="transcriptAgentId = $item.agentId; window.__bramSetVisibleRange(null); navigate('/transcript')" />
-            <Button
-              label="✕"
-              size="xs"
-              variant="ghost"
-              tooltip="Dismiss this subagent — restore it later from the hidden menu"
-              onClick="dismissedAgentIds = window.__bramDismissAgent(dismissedAgentIds, $item.agentId)" />
-          </HStack>
-        </Items>
-        <!-- Overflow MenuItems deliberately do NOT get the fontWeight-Button
-             bolding above — a collapsed agent's selection state still lives
-             in its session-info line, the same "selection lives in the
-             session line" rationale that predates this bolding change. -->
-        <DropdownMenu
-          when="{window.__bramVisibleFooterAgents(footerAgents.value, dismissedAgentIds).length > 3}"
-          label="{'+' + (window.__bramVisibleFooterAgents(footerAgents.value, dismissedAgentIds).length - 3) + ' more'}"
-          alignment="end"
-          triggerButtonVariant="outlined">
-          <Items data="{window.__bramVisibleFooterAgents(footerAgents.value, dismissedAgentIds).slice(0, -3).reverse()}">
-            <MenuItem
-              label="{window.__bramAgentChipLabel($item)}"
-              tooltip="{(window.__bramAgentChipTooltip || window.__bramAgentChipLabel)($item)}"
-              onClick="transcriptAgentId = $item.agentId; window.__bramSetVisibleRange(null); navigate('/transcript')" />
-          </Items>
-        </DropdownMenu>
-        <!-- Recover dismissed subagents (subagent-dismiss-recoverable): shown
-             only while the live roster still contains dismissed agents. Each
-             entry restores that pane; Restore all clears the set. Reachable
-             even when every subagent is hidden, because the strip's when also
-             opens for hidden-in-roster agents. -->
-        <DropdownMenu
-          when="{(window.__bramDismissedInRoster ? window.__bramDismissedInRoster(footerAgents.value, dismissedAgentIds).length : 0) > 0}"
-          label="{(window.__bramDismissedInRoster ? window.__bramDismissedInRoster(footerAgents.value, dismissedAgentIds).length : 0) + ' hidden'}"
-          alignment="end"
-          triggerButtonVariant="ghost">
-          <Items data="{window.__bramDismissedInRoster ? window.__bramDismissedInRoster(footerAgents.value, dismissedAgentIds).slice().reverse() : []}">
-            <MenuItem
-              label="{'↩ ' + window.__bramAgentChipLabel($item)}"
-              tooltip="{'Restore ' + (window.__bramAgentChipTooltip || window.__bramAgentChipLabel)($item)}"
-              onClick="dismissedAgentIds = window.__bramRestoreAgent(dismissedAgentIds, $item.agentId)" />
-          </Items>
-          <MenuItem
-            label="Restore all"
-            onClick="dismissedAgentIds = window.__bramRestoreAllAgents()" />
-        </DropdownMenu>
-      </HStack>
       <!-- Session info with the transcript viewport (Main / subagent)
            reported after the provider token — selection lives here, not
            in chip styling, so dropdown-overflow agents indicate the same
@@ -1454,14 +1446,138 @@
              __bramFooterStatusMarkdown; parts from __bramFooterSessionLineParts.
              Sizing and spacing via Markdown's theme vars
              (https://www.xmlui.org/docs/reference/components/Markdown#styling). -->
-        <Theme fontSize-Text-markdown="$fontSize-sm" textColor-Text="$textColor-secondary"
-               marginTop-Text-markdown="0" marginBottom-Text-markdown="0" width="*">
-          <Markdown
-            width="*"
-            interpolateBindings="false"
-            allowHtml="false"
-            content="{window.__bramFooterStatusMarkdown(window.__bramFooterSessionLineParts(window.__bramCurrentSessionOf(footerSessions.value), transcriptAgentId, footerAgents.value), footerIndexStatus.value)}" />
-        </Theme>
+        <!-- subagent-chips-on-session-line (Jon): the subagent chips, which
+             had their own centered row above, sit on this line between the
+             session text and the index status. The index status stays last
+             because "Indexing…" is transient. Buttons can't live inside
+             Markdown, so the line is three items in a wrapping row: the
+             session Markdown (no index), " · " + chips, " · " + index.
+             https://www.xmlui.org/docs/howto/wrap-items-across-multiple-rows -->
+        <HStack width="*" wrapContent="true" gap="$space-1" verticalAlignment="center">
+          <Theme fontSize-Text-markdown="$fontSize-sm" textColor-Text="$textColor-secondary"
+                 marginTop-Text-markdown="0" marginBottom-Text-markdown="0">
+            <Markdown
+              interpolateBindings="false"
+              allowHtml="false"
+              content="{window.__bramFooterStatusMarkdown(window.__bramFooterSessionLineParts(window.__bramCurrentSessionOf(footerSessions.value), transcriptAgentId, footerAgents.value), null)}" />
+          </Theme>
+          <HStack
+            when="{window.__bramVisibleFooterAgents(footerAgents.value, dismissedAgentIds).length > 0 || (window.__bramDismissedInRoster ? window.__bramDismissedInRoster(footerAgents.value, dismissedAgentIds).length : 0) > 0}"
+            gap="$space-1"
+            verticalAlignment="center">
+            <Text fontSize="$fontSize-sm" color="$textColor-secondary" value="·" />
+            <!-- Bold the chip whose stream the Transcript is currently showing
+                 (App-scope transcriptAgentId): fontWeight-Button theme var per
+                 https://www.xmlui.org/docs/reference/components/Button#styling.
+                 bold-chip-static-theme-values: the first attempt bound a DYNAMIC
+                 expression as the Theme var's value (mixing a raw 'bold' with a
+                 '$token' string) and was never observed working — theme vars are
+                 not reliably reactive and expression-produced token strings are
+                 not reliably resolved. So: two when=-branched wrappers with
+                 STATIC literal values; reactivity rides when= remounting, the
+                 guaranteed path. Weight only, orthogonal to the running-state
+                 variant/themeColor bindings below. -->
+            <Theme when="{transcriptAgentId === ''}" fontWeight-Button="$fontWeight-bold">
+              <Button
+                label="Main"
+                size="xs"
+                variant="outlined"
+                tooltip="{window.__bramMainChipTooltip ? window.__bramMainChipTooltip(footerAgents.value) : 'Show the main conversation in the Transcript tab'}"
+                onClick="transcriptAgentId = ''; window.__bramSetVisibleRange(null); navigate('/transcript')" />
+            </Theme>
+            <Button
+              when="{transcriptAgentId !== ''}"
+              label="Main"
+              size="xs"
+              variant="outlined"
+              tooltip="{window.__bramMainChipTooltip ? window.__bramMainChipTooltip(footerAgents.value) : 'Show the main conversation in the Transcript tab'}"
+              onClick="transcriptAgentId = ''; window.__bramSetVisibleRange(null); navigate('/transcript')" />
+            <!-- One continuous reverse-chron read: newest chip leftmost (after
+                 Main), then the dropdown continues newest→oldest top-down. Each
+                 chip pairs its label with a ghost ✕ that appends the agentId to
+                 dismissedAgentIds (dismissible-subagent-chips); dismissing a
+                 visible chip promotes the next agent up from the dropdown. The
+                 Main chip is intentionally never dismissible. -->
+            <Items data="{window.__bramVisibleFooterAgents(footerAgents.value, dismissedAgentIds).slice(-3).reverse()}">
+              <HStack gap="0" verticalAlignment="center">
+                <!-- surface-delegated-work-in-flight: the ● glyph
+                     (__bramAgentChipLabel) was the only truthful signal that a
+                     subagent is still running, and it read as the quietest
+                     pixel on the page. A running chip now goes solid+primary
+                     (filled, accent) instead of the quiet outlined+secondary a
+                     finished chip keeps — Button's own themeColor/variant
+                     props, no new component. -->
+                <!-- Same static-value bolding as the Main chip above, keyed to
+                     this chip's own agentId (see bold-chip-static-theme-values
+                     comment there for why the dynamic form failed). -->
+                <Theme when="{transcriptAgentId === $item.agentId}" fontWeight-Button="$fontWeight-bold">
+                  <Button
+                    label="{window.__bramAgentChipLabel($item)}"
+                    size="xs"
+                    variant="{($item.state || ($item.finished ? 'finished' : 'running')) === 'running' ? 'solid' : 'outlined'}"
+                    themeColor="{($item.state || ($item.finished ? 'finished' : 'running')) === 'finished' ? 'secondary' : 'primary'}"
+                    tooltip="{(window.__bramAgentChipTooltip || window.__bramAgentChipLabel)($item)}"
+                    onClick="transcriptAgentId = $item.agentId; window.__bramSetVisibleRange(null); navigate('/transcript')" />
+                </Theme>
+                <Button
+                  when="{transcriptAgentId !== $item.agentId}"
+                  label="{window.__bramAgentChipLabel($item)}"
+                  size="xs"
+                  variant="{($item.state || ($item.finished ? 'finished' : 'running')) === 'running' ? 'solid' : 'outlined'}"
+                  themeColor="{($item.state || ($item.finished ? 'finished' : 'running')) === 'finished' ? 'secondary' : 'primary'}"
+                  tooltip="{(window.__bramAgentChipTooltip || window.__bramAgentChipLabel)($item)}"
+                  onClick="transcriptAgentId = $item.agentId; window.__bramSetVisibleRange(null); navigate('/transcript')" />
+                <Button
+                  label="✕"
+                  size="xs"
+                  variant="ghost"
+                  tooltip="Dismiss this subagent — restore it later from the hidden menu"
+                  onClick="dismissedAgentIds = window.__bramDismissAgent(dismissedAgentIds, $item.agentId)" />
+              </HStack>
+            </Items>
+            <!-- Overflow MenuItems deliberately do NOT get the fontWeight-Button
+                 bolding above — a collapsed agent's selection state still lives
+                 in its session-info line, the same "selection lives in the
+                 session line" rationale that predates this bolding change. -->
+            <DropdownMenu
+              when="{window.__bramVisibleFooterAgents(footerAgents.value, dismissedAgentIds).length > 3}"
+              label="{'+' + (window.__bramVisibleFooterAgents(footerAgents.value, dismissedAgentIds).length - 3) + ' more'}"
+              alignment="end"
+              triggerButtonVariant="outlined">
+              <Items data="{window.__bramVisibleFooterAgents(footerAgents.value, dismissedAgentIds).slice(0, -3).reverse()}">
+                <MenuItem
+                  label="{window.__bramAgentChipLabel($item)}"
+                  tooltip="{(window.__bramAgentChipTooltip || window.__bramAgentChipLabel)($item)}"
+                  onClick="transcriptAgentId = $item.agentId; window.__bramSetVisibleRange(null); navigate('/transcript')" />
+              </Items>
+            </DropdownMenu>
+            <!-- Recover dismissed subagents (subagent-dismiss-recoverable): shown
+                 only while the live roster still contains dismissed agents. Each
+                 entry restores that pane; Restore all clears the set. Reachable
+                 even when every subagent is hidden, because the strip's when also
+                 opens for hidden-in-roster agents. -->
+            <DropdownMenu
+              when="{(window.__bramDismissedInRoster ? window.__bramDismissedInRoster(footerAgents.value, dismissedAgentIds).length : 0) > 0}"
+              label="{(window.__bramDismissedInRoster ? window.__bramDismissedInRoster(footerAgents.value, dismissedAgentIds).length : 0) + ' hidden'}"
+              alignment="end"
+              triggerButtonVariant="ghost">
+              <Items data="{window.__bramDismissedInRoster ? window.__bramDismissedInRoster(footerAgents.value, dismissedAgentIds).slice().reverse() : []}">
+                <MenuItem
+                  label="{'↩ ' + window.__bramAgentChipLabel($item)}"
+                  tooltip="{'Restore ' + (window.__bramAgentChipTooltip || window.__bramAgentChipLabel)($item)}"
+                  onClick="dismissedAgentIds = window.__bramRestoreAgent(dismissedAgentIds, $item.agentId)" />
+              </Items>
+              <MenuItem
+                label="Restore all"
+                onClick="dismissedAgentIds = window.__bramRestoreAllAgents()" />
+            </DropdownMenu>
+          </HStack>
+          <Text
+            when="{window.__bramFooterIndexLabel(footerIndexStatus.value)}"
+            fontSize="$fontSize-sm"
+            color="$textColor-secondary"
+            value="{'· ' + window.__bramFooterIndexLabel(footerIndexStatus.value)}" />
+        </HStack>
         <!-- composer-addressee-hugs-box (Jon): the chip slot moved from the
              line's start to its end, so the status sits flush left and does
              not shift when the chip appears. -->
@@ -1623,6 +1739,7 @@
           tooltip="{window.__bramTipDismissTooltip ? window.__bramTipDismissTooltip() : 'Dismiss this tip'}"
           onClick="footerTipTick = window.__bramDismissTip((window.__bramPickTip(footerTipSettings.value, footerSessions.value, footerTipTick) || {}).id, footerTipTick)" />
       </HStack>
+    </VStack>
     </VStack>
     </Theme>
   </Footer>

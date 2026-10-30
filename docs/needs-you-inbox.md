@@ -97,7 +97,7 @@ the unverified fallback renders.**
 
 | lane input | source | freshness |
 |---|---|---|
-| Issues | the ~45s issues indexer + `/__issues?fresh=1` on open | near-real-time, live on demand |
+| Issues | the 30s incremental issues poll + `/__issues?fresh=1` on open | near-real-time, live on demand |
 | Commits | git branch state — **including commits that arrived from elsewhere** (another machine or session, a push to the branch), reconciled against `@{u}..HEAD` and the default branch | live; reconciled, not assumed local |
 | PRs *(new)* | forge adapter — reviews-requested, checks, merge state | **new work**; GitHub first per `docs/forge-adapter.md` |
 | Bram-local | worklist items awaiting the user, queued closes | already local, already live |
@@ -168,6 +168,20 @@ extends the existing event precedents (`issues-changed`, `git-status-changed`)
 rather than adding a client poll. Putting the ownership engine host-side (see
 open questions) is what lets the ping fire even when the pane is closed.
 
+**As built (2026-10-30, `alerts-pulse-and-startup-check`):**
+
+- **The pulse.** The ping is a pulse, not a badge: a count badge was tried
+  and removed in review (`f860ff9`). The Alerts nav link pulses like the
+  Transcript's "▼ N new" chip while "Needs you now" holds an item (`id` plus
+  activity marker) not yet seen this session. Opening Alerts marks what it
+  shows as seen (`__bramAlertsShouldPulse`, `helpers.js`).
+- **The startup check.** Right after launch, `/__needs-you` carries
+  `checking: true` until the first notifications fetch and the first issue
+  pass have both answered, capped at 120 s. The page shows a spinner and
+  "Checking GitHub for new activity…" instead of "nothing waiting". This
+  closes the blank-inbox false signal named above. It was seen live on
+  2026-10-30: 40 s of "nothing waiting" while #463 was.
+
 ## A concrete v1 cut
 
 Ship first:
@@ -193,7 +207,7 @@ Per #323's lesson: verification is **per-item live checks**, so cost is real
 and must be placed deliberately. The plan says, per input, what runs:
 
 - **on open** (the user is looking; a fresh re-fetch is warranted),
-- **on a timer / on an event** (ride the ~45s issues indexer and the existing
+- **on a timer / on an event** (ride the 30s issues poll and the existing
   Tauri events; do not add a new poll — the #329 close-sweep is the precedent
   for a consumer on work already being done),
 - **lazily** (the exact-artifact link resolves only when the item is expanded).
