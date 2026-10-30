@@ -873,6 +873,36 @@ window.__bramAgentSwitcherTrace = function (stage, fields) {
     window.__bramIframeTrace("agent-switcher", payload);
   } catch (e) {}
 };
+// agent-switcher-shows-stale-provider: keep the header's RadioGroup on the
+// provider that is actually running. XMLUI's RadioGroup seeds the mount from
+// `initialValue` and ignores later rebinds — `setValue` is the documented way
+// to move the selection from code
+// (https://www.xmlui.org/docs/howto/present-choices-with-a-radiogroup). The
+// seed falls back to enhanceStatus before mainAgentStatus reports, so the pane
+// can mount on a stale provider and never revise it.
+//
+// Safe against a switch loop by construction: setValue re-fires onDidChange,
+// which lands in __bramHandleAgentSwitcherChange(next, previous, ...) with
+// previous === next (both are the live provider), and that returns early.
+// `busy` skips the correction while a switch is in flight, so a status push
+// cannot yank the user's click back to the provider it is leaving.
+window.__bramSyncAgentSwitcher = function (select, provider, busy) {
+  if (!select || busy) return;
+  var key = window.__bramProviderKey(provider);
+  if (!key) return;
+  var shown = "";
+  try { shown = window.__bramProviderKey(select.value); } catch (e) { shown = ""; }
+  if (shown === key) return;
+  window.__bramAgentSwitcherTrace("sync", { shown: shown, provider: key });
+  try {
+    select.setValue(key);
+  } catch (e) {
+    window.__bramAgentSwitcherTrace("sync-failed", {
+      provider: key,
+      error: String((e && e.message) || e),
+    });
+  }
+};
 // issue-389: true when Settings → On Bram launch is "Do not start an agent".
 // The header hides the Claude/Codex switcher then (every host path it would
 // drive refuses under "none") and says why instead. Prefers the pushed
@@ -891,8 +921,19 @@ window.__bramShowAgentSwitcher = function (pushedEvt, fetchedSettings, mainStatu
   var provider = (mainStatus && mainStatus.provider) || (enhance && enhance.activeProvider);
   return !!provider;
 };
+// opencode-provider-switch: the one place a provider string is recognized.
+// Key is "" for anything unknown, so each caller picks its own default;
+// the label defaults to Claude, as the binary checks it replaces did.
+window.__bramProviderKey = function (provider) {
+  var p = String(provider || "").toLowerCase();
+  return p === "claude" || p === "codex" || p === "opencode" ? p : "";
+};
+window.__bramProviderLabel = function (provider) {
+  var key = window.__bramProviderKey(provider);
+  return key === "codex" ? "Codex" : key === "opencode" ? "OpenCode" : "Claude";
+};
 window.__bramAgentSwitcherLabel = function (provider) {
-  return String(provider || "").toLowerCase() === "codex" ? "Codex" : "Claude";
+  return window.__bramProviderLabel(provider);
 };
 var __bramAgentSwitcherBusy = false;
 var __bramAgentSwitcherBusySubscribers = new Set();
@@ -927,7 +968,7 @@ window.__bramWithAgentCommandTimeout = function (promise, label) {
   return Promise.race([promise, timeout]);
 };
 window.__bramSwitchAgent = function (provider) {
-  var key = String(provider || "").toLowerCase() === "codex" ? "codex" : "claude";
+  var key = window.__bramProviderKey(provider) || "claude";
   var invoke = getTauriInvoke();
   if (!invoke) return Promise.reject(new Error("Tauri IPC unavailable"));
   window.__bramAgentSwitcherTrace("invoke", { provider: key });
@@ -959,7 +1000,7 @@ window.__bramSwitchAgent = function (provider) {
   var hooked = false;
   try { dismissedAt = Number(window.sessionStorage.getItem(DISMISS_KEY)) || 0; } catch (e) {}
 
-  var providerName = function (p) { return p === "codex" ? "Codex" : "Claude"; };
+  var providerName = function (p) { return window.__bramProviderLabel(p); };
   var derive = function () {
     var p = latest;
     if (!p || (p.outcome !== "exited" && p.outcome !== "timeout")) return null;
@@ -1058,6 +1099,86 @@ window.__bramSwitchAgent = function (provider) {
     });
   };
 })();
+// issue-448: with no `shell.agent` and both CLIs installed, the host holds the
+// autostart and asks which agent this project uses. Driven by the host's
+// replayable `startup-agent-choice`; a click saves the answer and starts that
+// agent, and a header switch or Start fresh clears the card. Dismiss is
+// focus (sessionStorage, keyed by the ask's time) and starts nothing.
+(function () {
+  var DISMISS_KEY = "bram.startupAgentChoiceDismissedAt";
+  var subscribers = new Set();
+  var latest = null;
+  var dismissedAt = 0;
+  var lastValue = null;
+  var hooked = false;
+  try { dismissedAt = Number(window.sessionStorage.getItem(DISMISS_KEY)) || 0; } catch (e) {}
+
+  var derive = function () {
+    var p = latest;
+    if (!p || !p.pending) return null;
+    if (Number(p.atMs) && Number(p.atMs) <= dismissedAt) return null;
+    // The host names the agents installed on this machine, so the card offers
+    // every one of them — three, since OpenCode joined Claude and Codex. An
+    // older host sends no list; the two-agent pair is then the honest answer.
+    var installed = Array.isArray(p.installed) && p.installed.length
+      ? p.installed.filter(function (key) { return window.__bramProviderKey(key); })
+      : ["claude", "codex"];
+    return { atMs: p.atMs, installed: installed };
+  };
+  var notify = function (reason) {
+    var next = derive();
+    var was = !!lastValue;
+    lastValue = next;
+    if (was !== !!next) {
+      try {
+        window.__bramIframeTrace("startup-agent-choice", { op: next ? "shown" : "cleared", reason: reason });
+      } catch (e) {}
+    }
+    subscribers.forEach(function (fn) {
+      try { fn(); } catch (e) { console.error("[bram] startup-agent-choice subscriber threw:", e); }
+    });
+  };
+  var ensureHooked = function () {
+    if (hooked) return;
+    hooked = true;
+    var source = window.bramSubscribeTauriEvent("startup-agent-choice");
+    source(function (snapshot) {
+      latest = (snapshot && snapshot.payload) || null;
+      notify(latest && latest.pending ? "ask" : "answered");
+    });
+  };
+
+  window.bramSubscribeStartupAgentChoice = (function () {
+    var factory;
+    return function () {
+      if (factory) return factory;
+      ensureHooked();
+      factory = function (emit) {
+        var fire = function () { emit(lastValue); };
+        subscribers.add(fire);
+        fire();
+        return function () { subscribers.delete(fire); };
+      };
+      return factory;
+    };
+  })();
+  window.__bramStartupAgentChoiceDismiss = function (value) {
+    if (!value) return;
+    dismissedAt = Number(value.atMs) || Date.now();
+    try { window.sessionStorage.setItem(DISMISS_KEY, String(dismissedAt)); } catch (e) {}
+    notify("dismiss-click");
+  };
+  window.__bramChooseStartupAgent = function (provider, toastApi) {
+    var invoke = getTauriInvoke();
+    if (!invoke) return;
+    window.__bramWithAgentCommandTimeout(invoke("choose_startup_agent", { provider: provider }), "agent choice")
+      .catch(function (e) {
+        if (toastApi && typeof toastApi.error === "function") {
+          toastApi.error(String((e && e.message) || e));
+        }
+      });
+  };
+})();
 // provider-session-pair-offer: after a header switch that found no partner
 // (the host resumed the target's pin or most recent session, and pairs only
 // on an explicit act), offer to keep the two sessions together or to start a
@@ -1078,7 +1199,7 @@ window.__bramSwitchAgent = function (provider) {
   var forCreate = null;
   try { dismissedAt = Number(window.sessionStorage.getItem(DISMISS_KEY)) || 0; } catch (e) {}
 
-  var name = function (p) { return p === "codex" ? "Codex" : "Claude"; };
+  var name = function (p) { return window.__bramProviderLabel(p); };
   // A session with no title is named by its short id, which the Sessions
   // tab can find, never "(untitled)".
   var quoted = function (t, id) { return t ? "'" + t + "'" : String(id || "").slice(0, 8); };
@@ -1086,6 +1207,19 @@ window.__bramSwitchAgent = function (provider) {
     var p = latest;
     if (!p || !p.active) return null;
     if (Number(p.atMs) && Number(p.atMs) <= dismissedAt) return null;
+    // session-groups (Jon, 2026-10-28): a switch never lands in another
+    // group's session, so the offer only ever joins two loose sessions; from
+    // inside a group the switch goes to the group's member or a new one.
+    var to = name(p.toProvider);
+    var toTitle = quoted(p.toTitle, p.toSessionId);
+    // Say what holds, not "no X session goes with": after a Leave the left
+    // session keeps its name, so a same-named session on the target agent made
+    // that read as false (2026-10-28 05:25Z).
+    var message = name(p.fromProvider) + " " + quoted(p.fromTitle, p.fromSessionId) +
+      " isn't in a group, so " + to + " resumed its most recent loose session, " + toTitle + ".";
+    var keepLabel = "Group these two";
+    var keepTooltip = "Then switching between " + name(p.fromProvider) + " and " + to +
+      " moves between them, and both take the name " + quoted(p.fromTitle, p.fromSessionId) + ".";
     return {
       atMs: p.atMs,
       fromProvider: p.fromProvider,
@@ -1093,13 +1227,12 @@ window.__bramSwitchAgent = function (provider) {
       fromTitle: p.fromTitle || "",
       toProvider: p.toProvider,
       toSessionId: p.toSessionId,
-      message: "No " + name(p.toProvider) + " session goes with " + name(p.fromProvider) + " session " +
-        quoted(p.fromTitle, p.fromSessionId) + ". " + name(p.toProvider) + " resumed its most recent, " +
-        quoted(p.toTitle, p.toSessionId) + ".",
-      keepTooltip: "Pair these two, so switching between Claude and Codex moves between them.",
-      actionLabel: "Start a new " + name(p.toProvider) + " session",
-      actionTooltip: "Opens New session to start a " + name(p.toProvider) + " session that goes with " +
-        quoted(p.fromTitle, p.fromSessionId) + "; switching back and forth will then move between those two.",
+      message: message,
+      keepLabel: keepLabel,
+      keepTooltip: keepTooltip,
+      actionLabel: "Start a new one",
+      actionTooltip: "Opens New session for a " + to + " session that goes with " +
+        quoted(p.fromTitle, p.fromSessionId) + ".",
     };
   };
   var notify = function (reason) {
@@ -1148,14 +1281,16 @@ window.__bramSwitchAgent = function (provider) {
     notify(reason);
   };
   window.__bramPairOfferDismiss = function (value) { dismiss(value, "dismiss-click"); };
+  // opencode-partner-handoff: the two sides as `<provider>=<id>`, any two of
+  // claude / codex / opencode.
   window.__bramPairOfferKeep = function (value, toastApi) {
     if (!value) return;
-    var claude = value.fromProvider === "claude" ? value.fromSessionId : value.toSessionId;
-    var codex = value.fromProvider === "codex" ? value.fromSessionId : value.toSessionId;
+    var from = window.__bramProviderKey(value.fromProvider);
+    var to = window.__bramProviderKey(value.toProvider);
     dismiss(value, "keep-click");
-    window.fetch("/__sessions/pair?claude=" + encodeURIComponent(claude || "") +
-      "&codex=" + encodeURIComponent(codex || "") +
-      "&from=" + encodeURIComponent(value.fromProvider || ""), { cache: "no-store" }).then(function (r) {
+    window.fetch("/__sessions/pair?" + from + "=" + encodeURIComponent(value.fromSessionId || "") +
+      "&" + to + "=" + encodeURIComponent(value.toSessionId || "") +
+      "&from=" + encodeURIComponent(from), { cache: "no-store" }).then(function (r) {
       if (!r.ok) throw new Error("HTTP " + r.status);
     }).catch(function (e) {
       if (toastApi && typeof toastApi.error === "function") {
@@ -1174,8 +1309,8 @@ window.__bramSwitchAgent = function (provider) {
     };
     dismiss(value, "start-click");
     window.__bramSessionSuggestIngest({
-      name: (value.fromTitle || (name(value.fromProvider) + " session " + String(value.fromSessionId || "").slice(0, 8))) +
-        " (" + name(value.toProvider) + ")",
+      // session-groups: the new session joins the group and takes its name.
+      name: value.fromTitle || (name(value.fromProvider) + " session " + String(value.fromSessionId || "").slice(0, 8)),
       whatsNext: "Pick up the work of the " + name(value.fromProvider) + " session " +
         quoted(value.fromTitle, value.fromSessionId) + " here in " + name(value.toProvider) + ".",
       atMs: Date.now(),
@@ -1192,44 +1327,88 @@ window.__bramSwitchAgent = function (provider) {
   window.__bramClearPairOfferForCreate = function () { forCreate = null; };
 })();
 
-// provider-session-pair-offer: the Sessions row's "paired with" label.
-window.__bramPairedWithLabel = function (partner) {
-  if (!partner) return "";
-  var who = partner.provider === "codex" ? "Codex" : "Claude";
-  return "Paired with " + who + " session " +
-    (partner.title ? "'" + partner.title + "'" : String(partner.id || "").slice(0, 8));
+// opencode-sessions-browser / opencode-session-rename: the Sessions row's
+// delete / rename buttons. Rename now works for OpenCode too — it writes the
+// title into OpenCode's own database — so only delete keeps the "do it inside
+// OpenCode" rule.
+window.__bramSessionEditEnabled = function (item, action, pendingDeletes, pendingRenames) {
+  if (!item || item.pending) return false;
+  // opencode-session-delete: OpenCode rows delete through its own CLI now.
+  // delete-live-session-leaves-stub: the host marks the session a CLI is
+  // running now; deleting it is refused, so don't offer the confirm at all.
+  if (action === "delete" && item.running) return false;
+  // session-groups: a group's sessions share its name; leave to rename.
+  if (action !== "delete" && item.group) return false;
+  return !((pendingDeletes || []).includes(item.id) || (pendingRenames || []).includes(item.id));
+};
+window.__bramSessionEditTooltip = function (item, action, pendingDeletes, pendingRenames) {
+  var del = action === "delete";
+  if (!item) return "";
+  if (item.pending) {
+    return del
+      ? "Available after the first message creates the Codex session"
+      : "Available after the next message creates the session";
+  }
+  if (del && item.running) return "This session is running. Switch away from it before deleting it.";
+  if (!del && item.group) return "This session takes its group's name. Leave the group to rename it.";
+  if (item.provider === "opencode") {
+    if (del) return "Delete session (OpenCode deletes it, with any child sessions)";
+    // opencode-session-rename: be honest about the mechanism and its residual.
+    return "Rename this session (writes the title into OpenCode's database; a session still open in OpenCode may keep showing the old one until it is reopened)";
+  }
+  if ((pendingDeletes || []).includes(item.id)) return "delete pending";
+  if ((pendingRenames || []).includes(item.id)) return "rename pending";
+  return del ? "Delete session" : "Rename session";
 };
 
-// provider-session-pair-offer: Match name. The name this row's session would
-// take to match its partner: "<partner title> (<this provider>)". Empty when
-// there's nothing to match (no partner title) or the names already match,
-// ignoring a trailing "(Claude)" / "(Codex)".
-window.__bramPairMatchTitle = function (item) {
-  var p = item && item.partner;
-  if (!p || !p.title) return "";
-  var mine = item.provider === "codex" ? "Codex" : "Claude";
-  var strip = function (t) { return String(t || "").replace(/ \((Claude|Codex)\)$/, ""); };
-  var base = strip(p.title);
-  // Already matching, suffix aside: nothing to offer on either row.
-  if (strip(item.title) === base) return "";
-  return base + " (" + mine + ")";
+// session-groups: the Sessions row's group line. Members share the group's
+// name (Jon, 2026-10-28), so only the agents are listed: "In a group with
+// Claude, Codex".
+window.__bramSessionGroupLabel = function (item) {
+  var g = item && item.group;
+  if (!g) return "";
+  var agents = (g.members || []).map(function (m) { return window.__bramProviderLabel(m.provider); });
+  return "In a group with " + agents.join(", ");
 };
-window.__bramPairMatchTooltip = function (item) {
-  var t = window.__bramPairMatchTitle(item);
-  return t ? "Rename this session to '" + t + "'" : "";
+window.__bramSessionLeaveTooltip = function (item) {
+  var g = item && item.group;
+  return g ? "Take this session out of its group; switching agents from the others no longer comes here" : "";
 };
-window.__bramPairMatchName = function (item, toastApi) {
-  var t = window.__bramPairMatchTitle(item);
-  if (!t) return;
-  var url = "/__sessions/rename?provider=" + encodeURIComponent(item.provider || "") +
-    "&id=" + encodeURIComponent(item.id || "") + "&title=" + encodeURIComponent(t);
-  try { window.__bramIframeTrace("pair-offer", { op: "match-name", provider: item.provider || "" }); } catch (e) {}
+
+// search-index-opencode-sessions: the Search page queries only once the
+// index has completed a cycle (lastCycleMs), which is when /__search stops
+// refusing with 503.
+window.__bramSearchReady = function (query, status) {
+  return !!query && String(query).trim().length >= 2 && !!(status && status.lastCycleMs);
+};
+
+// search-index-opencode-sessions (Jon, 2026-10-28): a session hit's badge
+// names its agent ("claude", "codex", "opencode") instead of "session"; the
+// colors still match the Sessions facet (blue).
+window.__bramSearchTypeLabel = function (h) {
+  if (!h) return "";
+  if (h.type === "worklist-history") return "history";
+  if (h.type === "session" && h.provider) return h.provider;
+  return h.type;
+};
+
+// session-groups: the Sessions row's Add to '<group>'. The group's member
+// anchors the join, so this session joins its group and takes its name. No
+// `from`: nothing is resumed, so no catch-up is offered.
+window.__bramSessionAddToGroupLabel = function (entry) {
+  return entry ? "Add to '" + entry.name + "'" : "";
+};
+window.__bramSessionAddToGroup = function (entry, toastApi) {
+  if (!entry) return;
+  var url = "/__sessions/pair?" + encodeURIComponent(entry.anchorProvider) + "=" +
+    encodeURIComponent(entry.anchorId) + "&" + encodeURIComponent(entry.provider) + "=" +
+    encodeURIComponent(entry.id);
   window.fetch(url, { cache: "no-store" }).then(function (r) {
     if (!r.ok) throw new Error("HTTP " + r.status);
-    if (typeof toastApi === "function") toastApi("Renamed to '" + t + "'");
+    if (typeof toastApi === "function") toastApi("Added to '" + entry.name + "'");
   }).catch(function (e) {
     if (toastApi && typeof toastApi.error === "function") {
-      toastApi.error("Could not rename: " + String((e && e.message) || e));
+      toastApi.error("Could not add to the group: " + String((e && e.message) || e));
     }
   });
 };
@@ -1243,7 +1422,7 @@ window.__bramUnpairSession = function (provider, id, toastApi) {
     if (!r.ok) throw new Error("HTTP " + r.status);
   }).catch(function (e) {
     if (toastApi && typeof toastApi.error === "function") {
-      toastApi.error("Could not unpair: " + String((e && e.message) || e));
+      toastApi.error("Could not leave the group: " + String((e && e.message) || e));
     }
   });
 };
@@ -1262,22 +1441,30 @@ window.__bramUnpairSession = function (provider, id, toastApi) {
   var dismissedAt = 0;
   var hooked = false;
   try { dismissedAt = Number(window.sessionStorage.getItem(DISMISS_KEY)) || 0; } catch (e) {}
-  var name = function (p) { return p === "codex" ? "Codex" : "Claude"; };
+  var name = function (p) { return window.__bramProviderLabel(p); };
   var label = function (title, id) { return title ? "'" + title + "'" : String(id || "").slice(0, 8); };
   var derive = function () {
     var p = latest;
     if (!p || !p.active || !p.path) return null;
     if (Number(p.atMs) && Number(p.atMs) <= dismissedAt) return null;
-    var n = Number(p.turns) || 0;
-    var from = name(p.fromProvider) + " session " + label(p.fromTitle, p.fromSessionId);
+    // session-groups: one source per group member with new turns.
+    var sources = (p.sources && p.sources.length) ? p.sources : [{
+      provider: p.fromProvider, id: p.fromSessionId, title: p.fromTitle, path: p.path, turns: p.turns,
+    }];
+    var parts = sources.map(function (s) {
+      var n = Number(s.turns) || 0;
+      return name(s.provider) + " session " + label(s.title, s.id) + " (" + n + " turn" + (n === 1 ? "" : "s") + ")";
+    });
+    var listed = parts.length > 1
+      ? parts.slice(0, -1).join(", ") + " and " + parts[parts.length - 1]
+      : parts[0];
     return {
       atMs: p.atMs,
       toProvider: p.toProvider,
-      message: name(p.toProvider) + " doesn't know what happened in " + from + " since it last ran (" +
-        n + " turn" + (n === 1 ? "" : "s") + ").",
+      message: name(p.toProvider) + " doesn't know what happened in " + listed + " since it last caught up.",
       actionLabel: "Catch " + name(p.toProvider) + " up",
-      actionTooltip: "Sends " + name(p.toProvider) + " one message asking it to read " + p.path +
-        " and say what changed.",
+      actionTooltip: "Sends " + name(p.toProvider) + " one message asking it to read " +
+        sources.map(function (s) { return s.path; }).join(", ") + " and say what changed.",
       // Written by the host (catch_up_turn_text), so a later digest can
       // recognise this exchange and leave it out.
       turn: p.turnText || "",
@@ -1333,8 +1520,8 @@ window.__bramUnpairSession = function (provider, id, toastApi) {
 })();
 
 window.__bramHandleAgentSwitcherChange = function (next, previous, select, toastApi) {
-  var key = String(next || "").toLowerCase() === "codex" ? "codex" : (String(next || "").toLowerCase() === "claude" ? "claude" : "");
-  var prev = String(previous || "").toLowerCase() === "codex" ? "codex" : "claude";
+  var key = window.__bramProviderKey(next);
+  var prev = window.__bramProviderKey(previous) || "claude";
   window.__bramAgentSwitcherTrace("change", { next: key, previous: prev, hasSelect: !!select });
   if (!key || key === prev) return;
   __bramPublishAgentSwitcherBusy(true);
@@ -1357,7 +1544,7 @@ window.__bramHandleAgentSwitcherChange = function (next, previous, select, toast
   });
 };
 window.__bramReloadAgentSession = function (provider, sessionId) {
-  var key = String(provider || "").toLowerCase() === "codex" ? "codex" : "claude";
+  var key = window.__bramProviderKey(provider) || "claude";
   var id = String(sessionId || "");
   var invoke = getTauriInvoke();
   if (!invoke) return Promise.reject(new Error("Tauri IPC unavailable"));
@@ -1396,7 +1583,7 @@ window.__bramReloadAgentSession = function (provider, sessionId) {
 // optionally naming it. The host kills+relaunches the agent without --continue
 // and applies the name when the new session's JSONL surfaces.
 window.__bramCreateNewSession = function (provider, title, pairWith) {
-  var key = String(provider || "").toLowerCase() === "codex" ? "codex" : "claude";
+  var key = window.__bramProviderKey(provider) || "claude";
   var invoke = getTauriInvoke();
   // dismiss-click-evidence-before-guard audit: __bramCreateNewSessionClick
   // (the only caller) has no trace of its own — unlike
@@ -1524,9 +1711,9 @@ window.__bramGateLastSessionLine = function (items, sel, sessions) {
   // name reads the same from both sides.
   var cur = Array.isArray(sessions) && sessions.length ? window.__bramCurrentSessionOf(sessions) : null;
   var prov = String(b.provider || "").toLowerCase();
-  var provName = prov === "codex" ? "Codex" : prov === "claude" ? "Claude" : String(b.provider || "");
+  var provName = window.__bramProviderKey(prov) ? window.__bramProviderLabel(prov) : String(b.provider || "");
   var otherAgent = !!(cur && cur.provider && String(cur.provider).toLowerCase() !== prov);
-  var title = String(b.title || "").replace(/\s*\((?:Codex|Claude)\)\s*$/i, "").trim();
+  var title = String(b.title || "").replace(/\s*\((?:Codex|Claude|OpenCode)\)\s*$/i, "").trim();
   if (otherAgent) {
     return title
       ? "Last worked on by " + provName + " in '" + title + "'."
@@ -1543,7 +1730,7 @@ window.__bramGateSwitchToLastSession = function (items, sel, sessions, toastApi)
   window.__bramReloadAgentSessionClick(b.provider, b.sessionId, toastApi);
 };
 window.__bramReloadAgentSessionClick = function (provider, sessionId, toastApi) {
-  var key = String(provider || "").toLowerCase() === "codex" ? "codex" : "claude";
+  var key = window.__bramProviderKey(provider) || "claude";
   var id = String(sessionId || "");
   try {
     window.__bramIframeTrace("agent-reload", {
@@ -2012,6 +2199,20 @@ window.__bramProjectScopedKey = function (base) {
   return projectKey ? base + ":" + projectKey : null;
 };
 
+// orient-me-stays-gone-once-used: Orient me hides once clicked in this
+// project, across pane reloads, tab switches and relaunches. A decision
+// ("I've oriented in this repo"), scoped to the project, so localStorage.
+window.__bramOrientSent = function () {
+  var key = window.__bramProjectScopedKey("bram.orientSent");
+  if (!key) return false;
+  try { return window.localStorage.getItem(key) === "1"; } catch (e) { return false; }
+};
+window.__bramMarkOrientSent = function () {
+  var key = window.__bramProjectScopedKey("bram.orientSent");
+  if (!key) return;
+  try { window.localStorage.setItem(key, "1"); } catch (e) {}
+};
+
 // message-box-on-draft-editor-pattern: the message box's unsent draft is
 // saved by the host, like the Queue. POST /__draft/save writes
 // resources/.bram-message-draft.json in this project, so it's per project by
@@ -2453,11 +2654,10 @@ window.__bramComposerEnterSubmit = function (box, toChat) {
   return window.__bramSubmitMessageAgentComposer(box, "");
 };
 // The addressee line's text. `provider` is the active agent ("claude" |
-// "codex"); `toChat` the per-message override.
+// "codex" | "opencode"); `toChat` the per-message override.
 window.__bramComposerAddressee = function (sel, toChat, provider) {
   var ids = Array.isArray(sel) ? sel : [];
-  var p = String(provider || "").toLowerCase();
-  var agent = p === "codex" ? "Codex" : "Claude";
+  var agent = window.__bramProviderLabel(provider);
   if (!ids.length || toChat) return "To: " + agent + " (chat)";
   return "To: " + (ids.length === 1 ? ids[0] : ids.length + " items") + " (feedback)";
 };
@@ -3186,7 +3386,7 @@ window.__bramSettingsFormData = function (settings, section) {
       policy = shell.continueLast === false ? "newSession" : "agentRecent";
     }
     return {
-      agent: shell.agent === "codex" ? "codex" : "claude",
+      agent: window.__bramProviderKey(shell.agent) || "claude",
       startupPolicy: policy,
       args: shell.args == null ? "" : String(shell.args),
       firstCommand: shell.firstCommand == null ? "" : String(shell.firstCommand),
@@ -3234,6 +3434,7 @@ window.providerDisplayName = function (mainAgentStatus, enhanceStatusValue) {
     (enhanceStatusValue && enhanceStatusValue.activeProvider) ||
     "";
   if (p === "claude") return "Claude Code";
+  if (p === "opencode") return "OpenCode";
   return p ? p.charAt(0).toUpperCase() + p.slice(1) : p;
 };
 
@@ -4851,18 +5052,21 @@ window.__bramClaimantCell = function (item, rowId) {
 // and baffling for a user looking at the file they just made.
 window.__bramIgnoredDeclaredPaths = function (item) {
   return ((item && item.changedFiles) || [])
-    .filter(function (f) { return f && f.status === "ignored"; })
+    .filter(function (f) { return f && f.status === "ignored" && !f.ignoredSummary; })
     .map(function (f) { return f.path; });
 };
 window.__bramIgnoredDeclaredPhrase = function (paths) {
   if (!paths || !paths.length) return "";
   var more = paths.length > 1 ? " and " + (paths.length - 1) + " more" : "";
-  return paths[0] + more + " exist" + (paths.length > 1 ? "" : "s") + ", but .gitignore hides " +
-    (paths.length > 1 ? "them" : "it") + " from git";
+  return paths[0] + more + " stay" + (paths.length > 1 ? "" : "s") + " local (ignored by git)";
 };
 
 window.__bramFileChangesCell = function (rec, rowBegun) {
-  if (rec && rec.status === "ignored") return "hidden by .gitignore";
+  if (rec && rec.ignoredSummary) {
+    if (rec.listingIncomplete) return rec.ignoredMore ? "+" + rec.ignoredMore + " or more (ignored)" : "more files not listed";
+    if (rec.ignoredMore) return "+" + rec.ignoredMore + " more (ignored)";
+  }
+  if (rec && rec.status === "ignored") return "stays local (ignored)";
   if (!rec || rec.status === "unchanged") return "";
   var suffix =
     rec.status === "new" ? " (new)" : rec.status === "deleted" ? " (deleted)" : "";
@@ -4995,8 +5199,7 @@ window.__bramFileChangesExplain = function (rec, item, items, claim) {
   var title = "Changes in " + path;
   var lines = [];
   if (rec && rec.status === "ignored") {
-    lines.push("**" + path + "** exists on disk, but `.gitignore` hides it from git, so git sees no change and there is nothing to commit.");
-    lines.push("To commit it, add a `!` exception to `.gitignore`, or force-stage it (`git add -f`).");
+    lines.push("**" + path + "** stays local because git ignores it. Its contents can be previewed, but it does not count toward planned changes or Commit.");
     return { title: title, body: lines.join("\n\n") };
   }
   if (!__bramNonzero(rec)) {
@@ -5072,6 +5275,7 @@ window.__bramFileSharedExplain = function (rec, item, items, claim) {
 };
 
 window.__bramSharedWithBegun = function (file, items, claim) {
+  if (file && file.ignored) return [];
   var sharers = (file && file.sharedWith) || [];
   // "done": a sharer that actually wrote lines here.
   var owners = file && window.__bramMembershipOwners(file.path);
@@ -5093,6 +5297,7 @@ window.__bramSharedWithBegun = function (file, items, claim) {
 // Start decision still needs them, and the row marks the tense (`· planned`)
 // so the credit lie d1798ca fixed cannot return through this door.
 window.__bramSharedWithPlanned = function (file, items, claim) {
+  if (file && file.ignored) return [];
   var sharers = (file && file.sharedWith) || [];
   // "planned": everyone who declares it but has written nothing here yet,
   // begun or not, so a begun-but-idle declarant appears in one column.
@@ -6611,6 +6816,19 @@ window.__bramProjectTint = function (key, alpha) {
 window.__bramProjectTooltip = function (info) {
   if (!info) return "";
   return info.repo ? info.project + " · " + info.repo : info.project || "";
+};
+
+// issue-448: /__enhance/status `projectFolder` says whether Bram was started
+// from a project folder (a git repo's root). Before status loads, or from an
+// older host without the field, treat the folder as fine so nothing flashes.
+window.__bramProjectFolderKind = function (status) {
+  return (status && status.projectFolder && status.projectFolder.kind) || "ok";
+};
+window.__bramProjectFolderIs = function (status, kind) {
+  return window.__bramProjectFolderKind(status) === kind;
+};
+window.__bramProjectFolderIsOk = function (status) {
+  return window.__bramProjectFolderKind(status) === "ok";
 };
 
 // Badge takes a dynamic background only through colorMap (value -> color),
@@ -9552,10 +9770,51 @@ window.__bramMakeTerminalVisibilityBridge = function (spec) {
   // terminal-attention-slash-panel (#423): the banner's words follow the
   // host's classified shape. The hooks prompt keeps the original line.
   window.__bramTerminalAttentionText = function (value) {
+    if (value && value.shape === "codex-permission") {
+      return "Codex is asking permission in the terminal. Open it to review and answer.";
+    }
     if (value && value.shape === "slash-panel") {
       return "Claude has a panel open in the terminal. Press Esc there to close it.";
     }
+    // terminal-attention-login-screen (#448).
+    if (value && value.shape === "claude-login") {
+      return "Claude isn't logged in. Open the terminal and run /login there.";
+    }
+    if (value && value.shape === "codex-login") {
+      return "Codex is asking you to sign in. Open the terminal to sign in.";
+    }
+    // v080-codex-session-lock: Bram never picks retry or fork for the user.
+    if (value && value.shape === "codex-session-lock") {
+      return "Codex says this conversation is open in another app. Open the terminal to retry, fork or exit.";
+    }
+    // opencode-terminal-prompts.
+    if (value && value.shape === "opencode-dialog") {
+      return "OpenCode has a dialog open in the terminal. Press Esc there to close it.";
+    }
+    if (value && value.shape === "opencode-permission") {
+      return "OpenCode is asking permission in the terminal. Answer it there.";
+    }
+    // opencode-question-card.
+    if (value && value.shape === "opencode-question") {
+      return "OpenCode is asking you a question in the terminal. Answer it there.";
+    }
     return "The terminal is waiting at a prompt Bram can't answer.";
+  };
+  // The host names the alternative only when its CLI is on PATH, and with
+  // three agents it is never simply "the other one" — so the label comes from
+  // the provider key, never a two-way ternary.
+  window.__bramTerminalAttentionSwitchLabel = function (value) {
+    var to = value && value.switchTo;
+    return to ? "Use " + window.__bramProviderLabel(to) + " instead" : "";
+  };
+  window.__bramTerminalAttentionSwitch = function (value, toastApi) {
+    var to = value && value.switchTo;
+    if (!to) return;
+    window.__bramSwitchAgent(to).catch(function (e) {
+      if (toastApi && typeof toastApi.error === "function") {
+        toastApi.error(String((e && e.message) || e));
+      }
+    });
   };
 })();
 
@@ -11205,6 +11464,24 @@ window.bramSubscribeTranscriptSplitHeight = (function () {
     return factory;
   };
 })();
+
+// transcript-worklist-expander-bar: the bar at the bottom of the transcript.
+// "▸ Worklist · 3 items · 1 ready to commit" (▾ when open). Ready to commit
+// uses the same predicate the Worklist's Commit button does, one item at a
+// time, so the bar never promises a commit the gate won't offer.
+window.__bramTranscriptWorklistBarLabel = function (open, board) {
+  var items = (board && board.items) || [];
+  var head = (open ? "▾" : "▸") + " Worklist";
+  if (!items.length) return head + " · empty";
+  var ready = 0;
+  items.forEach(function (it) {
+    try {
+      if (window.__bramSelectionAllCommittable(items, [it.id], null)) ready++;
+    } catch (e) {}
+  });
+  return head + " · " + items.length + " item" + (items.length === 1 ? "" : "s") +
+    (ready ? " · " + ready + " ready to commit" : "");
+};
 
 // #427: the Transcript's Worklist pane, open or closed. FOCUS (what the user
 // is looking at now), so sessionStorage: it survives a tab switch or pane
@@ -15284,8 +15561,17 @@ window.__bramApplySendRestore = function (snapshot, box, toastApi) {
   // pane-send-refuses-into-trust-prompt: an Enter would have answered the
   // prompt (its default trusts the folder), so the send came back.
   if (p && p.reason === "prompt-on-screen" && typeof toastApi === "function") {
-    var who = p.provider === "codex" ? "Codex" : (p.provider === "claude" ? "Claude" : "The agent");
-    toastApi(who + " is waiting on a trust prompt in the terminal, so your message wasn't sent. Answer the prompt there, then send again. Your message is back in the message box.");
+    var who = window.__bramProviderKey(p.provider) ? window.__bramProviderLabel(p.provider) : "The agent";
+    // opencode-terminal-prompts: the host names the shape it refused at.
+    if (p.shape === "opencode-dialog") {
+      toastApi("OpenCode has a dialog open in the terminal, so your message wasn't sent. Press Esc there to close it, then send again. Your message is back in the message box.");
+    } else if (p.shape === "opencode-permission") {
+      toastApi("OpenCode is asking permission in the terminal, so your message wasn't sent. Answer it there, then send again. Your message is back in the message box.");
+    } else if (p.shape === "opencode-question") {
+      toastApi("OpenCode is asking you a question in the terminal, so your message wasn't sent. Answer it there, then send again. Your message is back in the message box.");
+    } else {
+      toastApi(who + " is waiting on a trust prompt in the terminal, so your message wasn't sent. Answer the prompt there, then send again. Your message is back in the message box.");
+    }
   }
 };
 
@@ -15925,6 +16211,16 @@ window.__bramDiffForPath = function (item, path) {
   return null;
 };
 
+// Ignored files have no git diff. Build a new-file preview only after the
+// existing bounded local-file-preview route has read the expanded file.
+window.__bramIgnoredFilePatch = function (path, preview) {
+  if (!preview || !preview.ok || !preview.content) return "";
+  var text = String(preview.content).replace(/\r\n/g, "\n");
+  var lines = text.replace(/\n$/, "").split("\n");
+  return "diff --git a/" + path + " b/" + path + "\nnew file mode 100644\n--- /dev/null\n+++ b/" + path +
+    "\n@@ -0,0 +1," + lines.length + " @@\n" + lines.map(function (line) { return "+" + line; }).join("\n") + "\n";
+};
+
 // Expansion is keyed by "<itemId>::<path>", never by position. ExpandableItem's
 // own state is positional, so inside a loop whose membership changes -- and this
 // list changes as work proceeds -- an open row silently transfers to whatever
@@ -15990,7 +16286,13 @@ window.__bramLandedIds = function (board) {
 window.__bramGuardSelftestSummary = function (r) {
   if (!r) return "";
   if (!r.link) return "not installed: ~/.bram/bram-guard is missing";
-  if (r.ok) return "working: " + (r.cases || []).length + " cases as expected, registration current";
+  if (r.ok) {
+    // opencode-review-small-fixes: a user's own OpenCode plugin passes, but it
+    // isn't Bram's registration.
+    var custom = ((r.registration || {}).opencode || {}).custom;
+    return "working: " + (r.cases || []).length + " cases as expected, registration current" +
+      (custom ? " except OpenCode's (your own plugin)" : "");
+  }
   var failed = r.failed || [];
   return "failing: " + failed.length + " check" + (failed.length === 1 ? "" : "s") + " (" + failed.join(", ") + ")";
 };
@@ -16006,6 +16308,14 @@ window.__bramGuardRegistrationLine = function (r) {
     parts.push("Claude: " + (bits.join("; ") || "registration not current"));
   }
   parts.push("Codex: " + ((reg.codex || {}).ok ? "hook current" : "hook not current (run Setup)"));
+  // opencode-guard-selftest: only where OpenCode is wanted, the host's rule;
+  // an older host sends no opencode entry. opencode-review-small-fixes: a
+  // plugin without Setup's marker is the user's, which Setup keeps.
+  var o = reg.opencode;
+  if (o && o.wanted) {
+    parts.push("OpenCode: " + (o.custom ? "your own plugin, so Bram's checks are off"
+      : o.ok ? "plugin current" : "plugin missing or stale (run Setup)"));
+  }
   return parts.join(" · ");
 };
 
@@ -16125,7 +16435,10 @@ window.__bramDiffToggleTooltip = function (keys, itemId, path) {
   return window.__bramDiffExpanded(keys, itemId, path) ? "Hide this file's diff" : "Show this file's diff";
 };
 window.__bramDiffDisclosure = function (keys, itemId, path, begun, item) {
-  if (!begun || !window.__bramDiffForPath(item, path)) return "";
+  var ignored = ((item && item.changedFiles) || []).some(function (f) {
+    return f && f.path === path && f.ignored && !f.ignoredSummary;
+  });
+  if (!ignored && (!begun || !window.__bramDiffForPath(item, path))) return "";
   // Full-size ▼ / ▶, sized in markup to match the row's checkbox (the small
   // ▾ / ▸ read as specks: "They need to be as big as the checkbox").
   return window.__bramDiffExpanded(keys, itemId, path) ? "\u25BC" : "\u25B6";

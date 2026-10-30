@@ -226,20 +226,333 @@ pub fn record_item_session(
     Ok(true)
 }
 
-// --- session pairs (provider-session-counterparts) --------------------------
+// --- session groups (session-groups) ----------------------------------------
 //
-// A Claude session and a Codex session that go together: switching providers
-// from one resumes the other. Stored as `kind='pair'` transitions rows with
-// detail {"claude": <id>, "codex": <id>}; append-only, so the history stays
-// queryable. One partner per side: a session's partner is the other side of
-// the latest row naming it, and only while that partner's own latest row
-// names it back. An unpair is a row with the other side empty.
+// A group is a line of work: at most one session per agent, any number of
+// agents, and a session is in at most one group. Switching agents from a
+// group member resumes that agent's member. Groups replaced pairs on
+// 2026-10-28: with three agents a team was three pairs that could disagree
+// with each other (Codex and OpenCode "v0.8.0 burndown" both paired with
+// Claude "v0.8.0 burndown" but not with each other, and the offer had to
+// explain an Oct 23 pairing no screen showed).
+//
+// Stored as `kind='group'` transitions rows, append-only and replayed in
+// order:
+//   {"op":"join","group":<g>,"provider":<p>,"id":<id>}  moves (p, id) out of
+//       any other group into g, replacing g's current member for p
+//   {"op":"leave","provider":<p>,"id":<id>}
+//   {"op":"migrated"}  the old pair rows were converted (once)
+// A group left with fewer than two members dissolves.
+//
+// The old `kind='pair'` rows ({"claude": <id>, "codex": <id>}, an empty side
+// for an unpair) stay as history; `migrate_pairs_to_groups` converts the
+// pairs still holding when it first runs, and `session_never_paired` still
+// reads them.
 
+const PAIR_PROVIDERS: [&str; 3] = ["claude", "codex", "opencode"];
+
+fn is_pair_provider(p: &str) -> bool {
+    PAIR_PROVIDERS.contains(&p)
+}
+
+fn provider_rank(p: &str) -> usize {
+    PAIR_PROVIDERS
+        .iter()
+        .position(|q| *q == p)
+        .unwrap_or(usize::MAX)
+}
+
+type SessionKey = (String, String);
+
+/// A group as callers see it: its id, its members in PAIR_PROVIDERS order,
+/// and the member it started with (its name is that session's title).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionGroup {
+    pub id: String,
+    pub members: Vec<SessionKey>,
+    pub origin: SessionKey,
+}
+
+struct GroupRec {
+    members: std::collections::BTreeMap<usize, SessionKey>,
+    origin: SessionKey,
+}
+
+/// Every group, replayed once. Build it with `group_snapshot` when asking
+/// about many sessions (the Sessions list).
+#[derive(Default)]
+pub struct GroupSnapshot {
+    groups: std::collections::HashMap<String, GroupRec>,
+    of: std::collections::HashMap<SessionKey, String>,
+    // (provider, id, other provider): ever in one group with a session of
+    // the other provider. session_never_paired reads it.
+    ever: std::collections::HashSet<(String, String, String)>,
+}
+
+impl GroupSnapshot {
+    fn remove(&mut self, key: &SessionKey) {
+        let Some(gid) = self.of.remove(key) else {
+            return;
+        };
+        let dissolve = match self.groups.get_mut(&gid) {
+            Some(g) => {
+                g.members.retain(|_, k| k != key);
+                g.members.len() < 2
+            }
+            None => false,
+        };
+        if dissolve {
+            if let Some(g) = self.groups.remove(&gid) {
+                for k in g.members.values() {
+                    self.of.remove(k);
+                }
+            }
+        }
+    }
+
+    fn join(&mut self, gid: &str, key: SessionKey) {
+        if self.of.get(&key).map(|g| g.as_str()) == Some(gid) {
+            return;
+        }
+        self.remove(&key);
+        let rank = provider_rank(&key.0);
+        let g = self
+            .groups
+            .entry(gid.to_string())
+            .or_insert_with(|| GroupRec {
+                members: Default::default(),
+                origin: key.clone(),
+            });
+        if let Some(old) = g.members.insert(rank, key.clone()) {
+            self.of.remove(&old);
+        }
+        let others: Vec<SessionKey> = g.members.values().filter(|k| **k != key).cloned().collect();
+        self.of.insert(key.clone(), gid.to_string());
+        for (q, qid) in others {
+            self.ever.insert((key.0.clone(), key.1.clone(), q.clone()));
+            self.ever.insert((q, qid, key.0.clone()));
+        }
+    }
+
+    /// Every group of at least two.
+    pub fn groups(&self) -> Vec<SessionGroup> {
+        let mut ids: Vec<&String> = self.groups.keys().collect();
+        ids.sort();
+        ids.into_iter()
+            .filter_map(|gid| {
+                let g = &self.groups[gid];
+                (g.members.len() >= 2).then(|| SessionGroup {
+                    id: gid.clone(),
+                    members: g.members.values().cloned().collect(),
+                    origin: g.origin.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// The group (of at least two) that (`provider`, `id`) is in.
+    pub fn group_of(&self, provider: &str, id: &str) -> Option<SessionGroup> {
+        let gid = self.of.get(&(provider.to_string(), id.to_string()))?;
+        let g = self.groups.get(gid)?;
+        if g.members.len() < 2 {
+            return None;
+        }
+        Some(SessionGroup {
+            id: gid.clone(),
+            members: g.members.values().cloned().collect(),
+            origin: g.origin.clone(),
+        })
+    }
+}
+
+pub fn group_snapshot(conn: &Connection) -> Result<GroupSnapshot> {
+    let mut snap = GroupSnapshot::default();
+    let mut stmt = conn.prepare(
+        "SELECT detail FROM transitions WHERE kind = 'group' AND item_id IS NULL ORDER BY id ASC",
+    )?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    for detail in rows {
+        let detail = detail?;
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&detail) else {
+            continue;
+        };
+        let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+        match s("op").as_str() {
+            "join" => snap.join(&s("group"), (s("provider"), s("id"))),
+            "leave" => snap.remove(&(s("provider"), s("id"))),
+            _ => {}
+        }
+    }
+    Ok(snap)
+}
+
+/// The group (provider, sid) is in, if any.
+pub fn session_group(conn: &Connection, provider: &str, sid: &str) -> Result<Option<SessionGroup>> {
+    if !session_id_is_plain(sid) || !is_pair_provider(provider) {
+        return Ok(None);
+    }
+    Ok(group_snapshot(conn)?.group_of(provider, sid))
+}
+
+fn append_group_row(
+    conn: &Connection,
+    detail: serde_json::Value,
+    at_ms: i64,
+    source: &str,
+) -> Result<()> {
+    append_transition(conn, at_ms, None, "group", &detail.to_string(), source)
+}
+
+fn new_group_id(at_ms: i64, key: &SessionKey) -> String {
+    format!(
+        "g{}-{}-{}",
+        at_ms,
+        key.0,
+        key.1.chars().take(8).collect::<String>()
+    )
+}
+
+/// Put `joiner` in a group with `anchor`. When `anchor` is in a group,
+/// `joiner` moves into it (replacing that group's member on joiner's agent);
+/// otherwise, when `joiner` is in one, `anchor` joins that; otherwise the two
+/// start a group, named for `anchor`. Ok(false) when they already share a
+/// group, or a provider or id isn't plain.
+pub fn join_group(
+    conn: &Connection,
+    anchor: (&str, &str),
+    joiner: (&str, &str),
+    at_ms: i64,
+    source: &str,
+) -> Result<bool> {
+    if !is_pair_provider(anchor.0)
+        || !is_pair_provider(joiner.0)
+        || anchor.0 == joiner.0
+        || !session_id_is_plain(anchor.1)
+        || !session_id_is_plain(joiner.1)
+    {
+        return Ok(false);
+    }
+    let snap = group_snapshot(conn)?;
+    let ga = snap.group_of(anchor.0, anchor.1);
+    let gj = snap.group_of(joiner.0, joiner.1);
+    let row = |gid: &str, (p, id): (&str, &str)| serde_json::json!({ "op": "join", "group": gid, "provider": p, "id": id });
+    match (ga, gj) {
+        (Some(a), Some(j)) if a.id == j.id => Ok(false),
+        (Some(a), _) => {
+            append_group_row(conn, row(&a.id, joiner), at_ms, source)?;
+            Ok(true)
+        }
+        (None, Some(j)) => {
+            append_group_row(conn, row(&j.id, anchor), at_ms, source)?;
+            Ok(true)
+        }
+        (None, None) => {
+            let gid = new_group_id(at_ms, &(anchor.0.to_string(), anchor.1.to_string()));
+            append_group_row(conn, row(&gid, anchor), at_ms, source)?;
+            append_group_row(conn, row(&gid, joiner), at_ms, source)?;
+            Ok(true)
+        }
+    }
+}
+
+/// Take (provider, sid) out of its group. Ok(false) when it isn't in one.
+pub fn leave_group(
+    conn: &Connection,
+    provider: &str,
+    sid: &str,
+    at_ms: i64,
+    source: &str,
+) -> Result<bool> {
+    if session_group(conn, provider, sid)?.is_none() {
+        return Ok(false);
+    }
+    append_group_row(
+        conn,
+        serde_json::json!({ "op": "leave", "provider": provider, "id": sid }),
+        at_ms,
+        source,
+    )?;
+    Ok(true)
+}
+
+/// The `other`-provider member of (`provider`, `sid`)'s group.
+pub fn session_partner(
+    conn: &Connection,
+    provider: &str,
+    sid: &str,
+    other: &str,
+) -> Result<Option<String>> {
+    if provider == other || !is_pair_provider(other) {
+        return Ok(None);
+    }
+    Ok(session_group(conn, provider, sid)?.and_then(|g| {
+        g.members
+            .into_iter()
+            .find(|(p, _)| p == other)
+            .map(|(_, id)| id)
+    }))
+}
+
+/// Every other member (provider, id) of (`provider`, `sid`)'s group, in
+/// PAIR_PROVIDERS order.
+#[cfg(test)]
+pub fn session_partners(
+    conn: &Connection,
+    provider: &str,
+    sid: &str,
+) -> Result<Vec<(&'static str, String)>> {
+    let Some(g) = session_group(conn, provider, sid)? else {
+        return Ok(Vec::new());
+    };
+    Ok(g.members
+        .into_iter()
+        .filter(|(p, _)| p != provider)
+        .filter_map(|(p, id)| PAIR_PROVIDERS.iter().find(|q| **q == p).map(|q| (*q, id)))
+        .collect())
+}
+
+/// Pair-shaped entry point, kept for the switch paths that think in pairs.
+/// Both ids: `join_group` with `a` as the anchor. One id empty: the other
+/// agent's member of that session's group leaves it (the old per-pair
+/// unpair). Ok(false) when nothing changed.
+pub fn record_session_pair(
+    conn: &Connection,
+    a: &str,
+    a_id: &str,
+    b: &str,
+    b_id: &str,
+    at_ms: i64,
+    source: &str,
+) -> Result<bool> {
+    if !is_pair_provider(a) || !is_pair_provider(b) || a == b {
+        return Ok(false);
+    }
+    let plain_or_empty = |s: &str| s.is_empty() || session_id_is_plain(s);
+    if !plain_or_empty(a_id) || !plain_or_empty(b_id) || (a_id.is_empty() && b_id.is_empty()) {
+        return Ok(false);
+    }
+    if !a_id.is_empty() && !b_id.is_empty() {
+        return join_group(conn, (a, a_id), (b, b_id), at_ms, source);
+    }
+    let ((kept, kept_id), gone) = if b_id.is_empty() {
+        ((a, a_id), b)
+    } else {
+        ((b, b_id), a)
+    };
+    match session_partner(conn, kept, kept_id, gone)? {
+        Some(id) => leave_group(conn, gone, &id, at_ms, source),
+        None => Ok(false),
+    }
+}
+
+// The `other` side of the latest legacy pair row naming (`side`, `sid`)
+// together with `other`: Some("") for an unpair, None when no such row.
 fn latest_pair_row_for(
     conn: &Connection,
     side: &str,
     sid: &str,
-) -> Result<Option<(String, String)>> {
+    other: &str,
+) -> Result<Option<String>> {
     let mut stmt = conn.prepare(
         "SELECT detail FROM transitions WHERE kind = 'pair' AND item_id IS NULL ORDER BY id DESC",
     )?;
@@ -249,75 +562,204 @@ fn latest_pair_row_for(
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&detail) else {
             continue;
         };
-        let claude = v
-            .get("claude")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string();
-        let codex = v
-            .get("codex")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string();
-        let mine = if side == "claude" { &claude } else { &codex };
-        if mine == sid {
-            return Ok(Some((claude, codex)));
+        if v.get(side).and_then(|x| x.as_str()) != Some(sid) {
+            continue;
+        }
+        if let Some(theirs) = v.get(other) {
+            return Ok(Some(theirs.as_str().unwrap_or("").to_string()));
         }
     }
     Ok(None)
 }
 
-/// The session paired with (`provider`, `sid`), if the pairing still holds
-/// from both sides. `provider` is "claude" or "codex".
-pub fn session_partner(conn: &Connection, provider: &str, sid: &str) -> Result<Option<String>> {
-    if !session_id_is_plain(sid) || !matches!(provider, "claude" | "codex") {
-        return Ok(None);
-    }
-    let other_side = if provider == "claude" {
-        "codex"
-    } else {
-        "claude"
-    };
-    let Some((claude, codex)) = latest_pair_row_for(conn, provider, sid)? else {
-        return Ok(None);
-    };
-    let partner = if provider == "claude" { codex } else { claude };
-    if partner.is_empty() {
-        return Ok(None);
-    }
-    // The partner's own latest row must name this session back.
-    match latest_pair_row_for(conn, other_side, &partner)? {
-        Some((c, x)) if (if provider == "claude" { &c } else { &x }) == sid => Ok(Some(partner)),
-        _ => Ok(None),
+// A legacy pair that still held: the partner's own latest row names it back.
+fn legacy_pair_holds(conn: &Connection, a: &str, a_id: &str, b: &str, b_id: &str) -> Result<bool> {
+    Ok(
+        latest_pair_row_for(conn, a, a_id, b)?.as_deref() == Some(b_id)
+            && latest_pair_row_for(conn, b, b_id, a)?.as_deref() == Some(a_id),
+    )
+}
+
+/// Convert the legacy pairs still holding into groups, once (no group rows
+/// yet). Pairs that share a session merge into one group; when a merge would
+/// put two sessions of one agent in a group, the more recent pair wins and
+/// the older one is returned as dropped ("<p>=<id>+<q>=<id>").
+///
+/// group-migration-atomic (OpenCode's review of 116cded): the check and every
+/// write run in one IMMEDIATE transaction. A failure partway rolls back, so
+/// "any group row exists" means the migration finished and the next launch
+/// retries from scratch; a second Bram process on the same project blocks on
+/// the write lock, then sees the committed rows and skips (bounded by the
+/// connection's busy_timeout; on timeout it errors and retries next launch).
+pub fn migrate_pairs_to_groups(conn: &Connection, at_ms: i64) -> Result<Option<Vec<String>>> {
+    migrate_pairs_to_groups_tx(conn, at_ms, None)
+}
+
+fn migrate_pairs_to_groups_tx(
+    conn: &Connection,
+    at_ms: i64,
+    fail_after_rows: Option<usize>,
+) -> Result<Option<Vec<String>>> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    match migrate_pairs_to_groups_in_tx(conn, at_ms, fail_after_rows) {
+        Ok(out) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(out)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
     }
 }
 
-/// Pair a Claude session with a Codex session. Ok(false) when they are
-/// already paired (no row written) or an id isn't plain. Either id may be
-/// empty, which records an unpair of the other side.
-pub fn record_session_pair(
+// The migration body, run inside migrate_pairs_to_groups_tx's transaction.
+// `fail_after_rows` is a test hook: fail after writing that many rows.
+fn migrate_pairs_to_groups_in_tx(
     conn: &Connection,
-    claude: &str,
-    codex: &str,
     at_ms: i64,
-    source: &str,
-) -> Result<bool> {
-    let plain_or_empty = |s: &str| s.is_empty() || session_id_is_plain(s);
-    if !plain_or_empty(claude) || !plain_or_empty(codex) || (claude.is_empty() && codex.is_empty())
-    {
-        return Ok(false);
+    fail_after_rows: Option<usize>,
+) -> Result<Option<Vec<String>>> {
+    let mut written = 0usize;
+    let wrote = |written: &mut usize| -> Result<()> {
+        *written += 1;
+        if fail_after_rows.is_some_and(|n| *written >= n) {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+        Ok(())
+    };
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM transitions WHERE kind = 'group' AND item_id IS NULL",
+        [],
+        |r| r.get(0),
+    )?;
+    if n > 0 {
+        return Ok(None);
     }
-    if !claude.is_empty() && !codex.is_empty() {
-        if session_partner(conn, "claude", claude)?.as_deref() == Some(codex) {
-            return Ok(false);
+    let pairs: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT detail FROM transitions WHERE kind = 'pair' AND item_id IS NULL ORDER BY id DESC",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<Result<_>>()?
+    };
+    if pairs.is_empty() {
+        return Ok(None);
+    }
+    // Newest first, so a more recent pair claims its agent slots first.
+    let mut edges: Vec<(SessionKey, SessionKey)> = Vec::new();
+    for detail in &pairs {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(detail) else {
+            continue;
+        };
+        let sides: Vec<SessionKey> = PAIR_PROVIDERS
+            .iter()
+            .filter_map(|p| {
+                v.get(*p)
+                    .and_then(|x| x.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| (p.to_string(), s.to_string()))
+            })
+            .collect();
+        let [a, b] = sides.as_slice() else {
+            continue;
+        };
+        if edges
+            .iter()
+            .any(|(x, y)| (x == a && y == b) || (x == b && y == a))
+        {
+            continue;
+        }
+        if legacy_pair_holds(conn, &a.0, &a.1, &b.0, &b.1)? {
+            edges.push((a.clone(), b.clone()));
         }
     }
-    let detail = format!("{{\"claude\":\"{}\",\"codex\":\"{}\"}}", claude, codex);
-    // The row's `source` says how the pair came about (offer-keep,
-    // offer-create, explicit-resume, unpair, …), so the ledger alone can
-    // explain a pairing; it was hard-coded to "switch" before.
-    append_transition(conn, at_ms, None, "pair", &detail, source)?;
-    Ok(true)
+    // Components with at most one session per agent.
+    let mut comps: Vec<std::collections::BTreeMap<usize, SessionKey>> = Vec::new();
+    let mut comp_of: std::collections::HashMap<SessionKey, usize> = Default::default();
+    let mut dropped = Vec::new();
+    for (a, b) in edges {
+        let desc = format!("{}={}+{}={}", a.0, a.1, b.0, b.1);
+        match (comp_of.get(&a).copied(), comp_of.get(&b).copied()) {
+            (Some(x), Some(y)) if x == y => {}
+            (Some(x), Some(y)) => {
+                if comps[y].keys().any(|r| comps[x].contains_key(r)) {
+                    dropped.push(desc);
+                    continue;
+                }
+                let moved = std::mem::take(&mut comps[y]);
+                for (r, k) in moved {
+                    comp_of.insert(k.clone(), x);
+                    comps[x].insert(r, k);
+                }
+            }
+            (Some(i), None) | (None, Some(i)) => {
+                let k = if comp_of.contains_key(&a) { b } else { a };
+                let r = provider_rank(&k.0);
+                if comps[i].contains_key(&r) {
+                    dropped.push(desc);
+                    continue;
+                }
+                comps[i].insert(r, k.clone());
+                comp_of.insert(k, i);
+            }
+            (None, None) => {
+                let i = comps.len();
+                comps.push(Default::default());
+                comps[i].insert(provider_rank(&a.0), a.clone());
+                comps[i].insert(provider_rank(&b.0), b.clone());
+                comp_of.insert(a, i);
+                comp_of.insert(b, i);
+            }
+        }
+    }
+    for (n, comp) in comps.iter().enumerate() {
+        if comp.len() < 2 {
+            continue;
+        }
+        // Named for its Claude member when it has one (the first agent).
+        let origin = comp.values().next().cloned().unwrap_or_default();
+        let gid = format!("{}-m{}", new_group_id(at_ms, &origin), n);
+        for k in std::iter::once(&origin).chain(comp.values().filter(|k| **k != origin)) {
+            append_group_row(
+                conn,
+                serde_json::json!({ "op": "join", "group": gid, "provider": k.0, "id": k.1 }),
+                at_ms,
+                "migrate-pairs",
+            )?;
+            wrote(&mut written)?;
+        }
+    }
+    append_group_row(
+        conn,
+        serde_json::json!({ "op": "migrated", "dropped": dropped }),
+        at_ms,
+        "migrate-pairs",
+    )?;
+    wrote(&mut written)?;
+    Ok(Some(dropped))
+}
+
+/// Whether (`provider`, `sid`) was never grouped (or, before groups, paired)
+/// with a session of `other`, and so never left one either.
+/// first-switch-to-unused-provider-starts-named-partner gates its fresh
+/// partner on this alone.
+pub fn session_never_paired(
+    conn: &Connection,
+    provider: &str,
+    sid: &str,
+    other: &str,
+) -> Result<bool> {
+    if !session_id_is_plain(sid) || !is_pair_provider(provider) || !is_pair_provider(other) {
+        return Ok(false);
+    }
+    if latest_pair_row_for(conn, provider, sid, other)?.is_some() {
+        return Ok(false);
+    }
+    let snap = group_snapshot(conn)?;
+    Ok(!snap
+        .ever
+        .contains(&(provider.to_string(), sid.to_string(), other.to_string())))
 }
 
 // new-session-switch-starts-fresh-partner: a session started with New session
@@ -334,7 +776,7 @@ pub fn record_session_born(
     at_ms: i64,
     source: &str,
 ) -> Result<bool> {
-    if !session_id_is_plain(sid) || !matches!(provider, "claude" | "codex") {
+    if !session_id_is_plain(sid) || !is_pair_provider(provider) {
         return Ok(false);
     }
     if session_born_from_new_session(conn, provider, sid)? {
@@ -345,19 +787,9 @@ pub fn record_session_born(
     Ok(true)
 }
 
-/// Whether no pair row names (`provider`, `sid`): never paired, and so never
-/// unpaired either. first-switch-to-unused-provider-starts-named-partner
-/// gates its fresh partner on this alone.
-pub fn session_never_paired(conn: &Connection, provider: &str, sid: &str) -> Result<bool> {
-    if !session_id_is_plain(sid) || !matches!(provider, "claude" | "codex") {
-        return Ok(false);
-    }
-    Ok(latest_pair_row_for(conn, provider, sid)?.is_none())
-}
-
 /// Whether (`provider`, `sid`) was started with New session.
 pub fn session_born_from_new_session(conn: &Connection, provider: &str, sid: &str) -> Result<bool> {
-    if !session_id_is_plain(sid) || !matches!(provider, "claude" | "codex") {
+    if !session_id_is_plain(sid) || !is_pair_provider(provider) {
         return Ok(false);
     }
     let detail = format!("{{\"provider\":\"{}\",\"id\":\"{}\"}}", provider, sid);
@@ -1705,37 +2137,104 @@ mod tests {
     #[test]
     fn session_pairs_follow_the_latest_row_on_both_sides() {
         let conn = open_in_memory().unwrap();
-        assert_eq!(session_partner(&conn, "claude", "c1").unwrap(), None);
-        assert!(record_session_pair(&conn, "c1", "x1", 1, "test").unwrap());
+        let cx =
+            |c: &str, x: &str, at| record_session_pair(&conn, "claude", c, "codex", x, at, "test");
         assert_eq!(
-            session_partner(&conn, "claude", "c1").unwrap().as_deref(),
+            session_partner(&conn, "claude", "c1", "codex").unwrap(),
+            None
+        );
+        assert!(cx("c1", "x1", 1).unwrap());
+        assert_eq!(
+            session_partner(&conn, "claude", "c1", "codex")
+                .unwrap()
+                .as_deref(),
             Some("x1")
         );
         assert_eq!(
-            session_partner(&conn, "codex", "x1").unwrap().as_deref(),
+            session_partner(&conn, "codex", "x1", "claude")
+                .unwrap()
+                .as_deref(),
             Some("c1")
         );
         // Re-recording the same pair writes nothing.
-        assert!(!record_session_pair(&conn, "c1", "x1", 2, "test").unwrap());
+        assert!(!cx("c1", "x1", 2).unwrap());
         // x1 re-pairs with c2: c1 no longer has a partner (one per side).
-        assert!(record_session_pair(&conn, "c2", "x1", 3, "test").unwrap());
-        assert_eq!(session_partner(&conn, "claude", "c1").unwrap(), None);
+        assert!(cx("c2", "x1", 3).unwrap());
         assert_eq!(
-            session_partner(&conn, "codex", "x1").unwrap().as_deref(),
+            session_partner(&conn, "claude", "c1", "codex").unwrap(),
+            None
+        );
+        assert_eq!(
+            session_partner(&conn, "codex", "x1", "claude")
+                .unwrap()
+                .as_deref(),
             Some("c2")
         );
         // Unpair c2.
-        assert!(record_session_pair(&conn, "c2", "", 4, "test").unwrap());
-        assert_eq!(session_partner(&conn, "claude", "c2").unwrap(), None);
-        assert_eq!(session_partner(&conn, "codex", "x1").unwrap(), None);
+        assert!(cx("c2", "", 4).unwrap());
+        assert_eq!(
+            session_partner(&conn, "claude", "c2", "codex").unwrap(),
+            None
+        );
+        assert_eq!(
+            session_partner(&conn, "codex", "x1", "claude").unwrap(),
+            None
+        );
+    }
+
+    // opencode-partner-handoff
+    #[test]
+    fn a_session_keeps_one_partner_per_other_provider() {
+        let conn = open_in_memory().unwrap();
+        record_session_pair(&conn, "claude", "c1", "codex", "x1", 1, "test").unwrap();
+        // Argument order doesn't matter; the row is written claude-first.
+        assert!(
+            record_session_pair(&conn, "opencode", "ses_o1", "claude", "c1", 2, "test").unwrap()
+        );
+        assert_eq!(
+            session_partners(&conn, "claude", "c1").unwrap(),
+            vec![
+                ("codex", "x1".to_string()),
+                ("opencode", "ses_o1".to_string())
+            ]
+        );
+        assert_eq!(
+            session_partner(&conn, "opencode", "ses_o1", "claude")
+                .unwrap()
+                .as_deref(),
+            Some("c1")
+        );
+        // The OpenCode pair leaves Claude<->Codex alone, and vice versa.
+        assert_eq!(
+            session_partner(&conn, "codex", "x1", "claude")
+                .unwrap()
+                .as_deref(),
+            Some("c1")
+        );
+        record_session_pair(&conn, "claude", "c1", "opencode", "", 3, "test").unwrap();
+        assert_eq!(
+            session_partners(&conn, "claude", "c1").unwrap(),
+            vec![("codex", "x1".to_string())]
+        );
+        // Never paired is per side. session-groups: x1 shared a group with
+        // ses_o1, so it has been "paired" with OpenCode.
+        assert!(!session_never_paired(&conn, "claude", "c1", "codex").unwrap());
+        assert!(!session_never_paired(&conn, "codex", "x1", "opencode").unwrap());
+        assert!(session_never_paired(&conn, "codex", "x9", "opencode").unwrap());
+        // Same-provider and unknown-provider pairs are refused.
+        assert!(!record_session_pair(&conn, "claude", "c1", "claude", "c2", 4, "test").unwrap());
+        assert!(!record_session_pair(&conn, "claude", "c1", "other", "z", 4, "test").unwrap());
     }
 
     #[test]
     fn session_pairs_refuse_ids_they_would_have_to_escape() {
         let conn = open_in_memory().unwrap();
-        assert!(!record_session_pair(&conn, "a\"b", "x1", 1, "test").unwrap());
-        assert!(!record_session_pair(&conn, "", "", 1, "test").unwrap());
-        assert_eq!(session_partner(&conn, "claude", "a\"b").unwrap(), None);
+        assert!(!record_session_pair(&conn, "claude", "a\"b", "codex", "x1", 1, "test").unwrap());
+        assert!(!record_session_pair(&conn, "claude", "", "codex", "", 1, "test").unwrap());
+        assert_eq!(
+            session_partner(&conn, "claude", "a\"b", "codex").unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -1748,6 +2247,8 @@ mod tests {
         assert!(!session_born_from_new_session(&conn, "codex", "c1").unwrap());
         assert!(!record_session_born(&conn, "claude", "a\"b", 3, "test").unwrap());
         assert!(!record_session_born(&conn, "other", "c2", 3, "test").unwrap());
+        // opencode-partner-handoff: OpenCode sessions can be born too.
+        assert!(record_session_born(&conn, "opencode", "ses_o1", 4, "test").unwrap());
     }
 
     #[test]
@@ -1756,7 +2257,8 @@ mod tests {
         // What switch_agent requires for the new-session reason.
         let session_wants_fresh_partner = |conn: &Connection, p: &str, sid: &str| {
             Ok::<bool, rusqlite::Error>(
-                session_born_from_new_session(conn, p, sid)? && session_never_paired(conn, p, sid)?,
+                session_born_from_new_session(conn, p, sid)?
+                    && session_never_paired(conn, p, sid, "codex")?,
             )
         };
         // Not started with New session.
@@ -1765,17 +2267,149 @@ mod tests {
         record_session_born(&conn, "claude", "c1", 1, "test").unwrap();
         assert!(session_wants_fresh_partner(&conn, "claude", "c1").unwrap());
         // Paired, then unpaired: an Unpair must survive the next switch.
-        record_session_pair(&conn, "c1", "x1", 2, "test").unwrap();
+        record_session_pair(&conn, "claude", "c1", "codex", "x1", 2, "test").unwrap();
         assert!(!session_wants_fresh_partner(&conn, "claude", "c1").unwrap());
-        record_session_pair(&conn, "c1", "", 3, "test").unwrap();
+        record_session_pair(&conn, "claude", "c1", "codex", "", 3, "test").unwrap();
         assert!(!session_wants_fresh_partner(&conn, "claude", "c1").unwrap());
-        assert!(session_never_paired(&conn, "claude", "c0").unwrap());
-        assert!(!session_never_paired(&conn, "claude", "c1").unwrap());
+        assert!(session_never_paired(&conn, "claude", "c0", "codex").unwrap());
+        assert!(!session_never_paired(&conn, "claude", "c1", "codex").unwrap());
         // Unpaired from the other side leaves the earlier row naming it.
         record_session_born(&conn, "claude", "c2", 4, "test").unwrap();
-        record_session_pair(&conn, "c2", "x2", 5, "test").unwrap();
-        record_session_pair(&conn, "", "x2", 6, "test").unwrap();
+        record_session_pair(&conn, "claude", "c2", "codex", "x2", 5, "test").unwrap();
+        record_session_pair(&conn, "claude", "", "codex", "x2", 6, "test").unwrap();
         assert!(!session_wants_fresh_partner(&conn, "claude", "c2").unwrap());
+    }
+
+    // session-groups
+    #[test]
+    fn a_group_holds_one_session_per_agent_and_any_member_can_join() {
+        let conn = open_in_memory().unwrap();
+        // Claude c1 + OpenCode o1, then Codex x1 joins from either side.
+        assert!(join_group(&conn, ("claude", "c1"), ("opencode", "o1"), 1, "t").unwrap());
+        assert!(join_group(&conn, ("codex", "x1"), ("opencode", "o1"), 2, "t").unwrap());
+        let g = session_group(&conn, "codex", "x1").unwrap().unwrap();
+        assert_eq!(
+            g.members,
+            vec![
+                ("claude".to_string(), "c1".to_string()),
+                ("codex".to_string(), "x1".to_string()),
+                ("opencode".to_string(), "o1".to_string()),
+            ]
+        );
+        assert_eq!(g.origin, ("claude".to_string(), "c1".to_string()));
+        assert!(!join_group(&conn, ("claude", "c1"), ("codex", "x1"), 3, "t").unwrap());
+        // A second Codex session joining replaces x1, which leaves.
+        assert!(join_group(&conn, ("claude", "c1"), ("codex", "x2"), 4, "t").unwrap());
+        assert_eq!(session_group(&conn, "codex", "x1").unwrap(), None);
+        assert_eq!(
+            session_partner(&conn, "opencode", "o1", "codex")
+                .unwrap()
+                .as_deref(),
+            Some("x2")
+        );
+    }
+
+    #[test]
+    fn joining_moves_a_session_out_of_its_old_group_which_dissolves_below_two() {
+        let conn = open_in_memory().unwrap();
+        join_group(&conn, ("claude", "old"), ("codex", "x1"), 1, "t").unwrap();
+        join_group(&conn, ("claude", "new"), ("opencode", "o1"), 2, "t").unwrap();
+        // x1 moves to the new line of work; "old" is left alone, so its group goes.
+        assert!(join_group(&conn, ("claude", "new"), ("codex", "x1"), 3, "t").unwrap());
+        assert_eq!(session_group(&conn, "claude", "old").unwrap(), None);
+        assert_eq!(
+            session_group(&conn, "codex", "x1")
+                .unwrap()
+                .unwrap()
+                .members
+                .len(),
+            3
+        );
+        // Leave: the rest stay together.
+        assert!(leave_group(&conn, "codex", "x1", 4, "t").unwrap());
+        assert!(!leave_group(&conn, "codex", "x1", 5, "t").unwrap());
+        assert_eq!(
+            session_partners(&conn, "claude", "new").unwrap(),
+            vec![("opencode", "o1".to_string())]
+        );
+        // Leaving a group of two dissolves it.
+        leave_group(&conn, "opencode", "o1", 6, "t").unwrap();
+        assert_eq!(session_group(&conn, "claude", "new").unwrap(), None);
+        // Having been grouped still counts against a fresh partner.
+        assert!(!session_never_paired(&conn, "claude", "new", "codex").unwrap());
+    }
+
+    // group-migration-atomic: a migration that fails after its first row
+    // leaves nothing, and a rerun completes it; a rerun after success writes
+    // nothing.
+    #[test]
+    fn a_failed_migration_rolls_back_and_a_rerun_completes_it() {
+        let conn = open_in_memory().unwrap();
+        let pair = |a: &str, ai: &str, b: &str, bi: &str, at: i64| {
+            let detail = serde_json::json!({ a: ai, b: bi }).to_string();
+            append_transition(&conn, at, None, "pair", &detail, "test").unwrap();
+        };
+        pair("claude", "c1", "opencode", "o1", 1);
+        pair("claude", "c1", "codex", "x1", 2);
+        let groups = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM transitions WHERE kind = 'group'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(migrate_pairs_to_groups_tx(&conn, 10, Some(1)).is_err());
+        assert_eq!(
+            groups(&conn),
+            0,
+            "a failed migration must leave no group rows"
+        );
+        assert!(migrate_pairs_to_groups(&conn, 11).unwrap().is_some());
+        let after = groups(&conn);
+        assert_eq!(after, 4, "three joins and the migrated marker");
+        assert_eq!(
+            session_group(&conn, "codex", "x1")
+                .unwrap()
+                .unwrap()
+                .members
+                .len(),
+            3
+        );
+        assert_eq!(migrate_pairs_to_groups(&conn, 12).unwrap(), None);
+        assert_eq!(groups(&conn), after, "a second migration writes nothing");
+    }
+
+    #[test]
+    fn migration_merges_holding_pairs_and_the_newer_pair_wins_a_slot() {
+        let conn = open_in_memory().unwrap();
+        let pair = |a: &str, ai: &str, b: &str, bi: &str, at: i64| {
+            let detail = serde_json::json!({ a: ai, b: bi }).to_string();
+            append_transition(&conn, at, None, "pair", &detail, "test").unwrap();
+        };
+        // 2026-10-28's ledger, simplified: Claude c1 with OpenCode o1 and with
+        // Codex x1; OpenCode o1 also still with an old Codex x0 (older).
+        pair("codex", "x0", "opencode", "o1", 1);
+        pair("claude", "c1", "opencode", "o1", 2);
+        pair("claude", "c1", "codex", "x1", 3);
+        // A pair that was later unpaired doesn't migrate.
+        pair("claude", "c9", "codex", "x9", 4);
+        pair("claude", "c9", "codex", "", 5);
+        let dropped = migrate_pairs_to_groups(&conn, 10).unwrap().unwrap();
+        assert_eq!(dropped, vec!["codex=x0+opencode=o1".to_string()]);
+        let g = session_group(&conn, "opencode", "o1").unwrap().unwrap();
+        assert_eq!(
+            g.members,
+            vec![
+                ("claude".to_string(), "c1".to_string()),
+                ("codex".to_string(), "x1".to_string()),
+                ("opencode".to_string(), "o1".to_string()),
+            ]
+        );
+        assert_eq!(session_group(&conn, "codex", "x0").unwrap(), None);
+        assert_eq!(session_group(&conn, "claude", "c9").unwrap(), None);
+        // Once only.
+        assert_eq!(migrate_pairs_to_groups(&conn, 11).unwrap(), None);
     }
 
     #[test]

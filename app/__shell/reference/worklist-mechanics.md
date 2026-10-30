@@ -8,7 +8,7 @@ it applies; the core conventions stay authoritative for ordinary turns.
 ## Opt-out plumbing
 
 How the two direct-edit opt-outs ("just do it" and `skip-worklist:`)
-are honored. The user-facing contract is identical for both agents.
+are honored. The user-facing contract is identical for every agent.
 
 - **Claude, prose opt-out.** Claude's guard matches `_OPT_OUT_PATTERNS`
   against `transcript_path` on every `PreToolUse` and allows inline.
@@ -26,7 +26,13 @@ are honored. The user-facing contract is identical for both agents.
   `fresh_bypass()` (legacy records in `.worklist-authorization.json`
   stay honored for one release). The same `toTurn` path records a
   `direct-edit` line in the audit ledger.
-- **`skip-worklist:` prefix (both agents).** When the host's `toTurn`
+- **OpenCode, prose opt-out.** Same host-side record as Codex: OpenCode
+  writes no transcript a guard could read the phrase from. Its guard
+  (the `.opencode/plugins/bram.js` plugin, deciding through
+  `bram-guard guard opencode-worklist`) reads the record through the
+  same `fresh_bypass()` path. As with Codex, only a message sent through
+  Bram is seen; words typed straight into OpenCode's own prompt are not.
+- **`skip-worklist:` prefix (every agent).** When the host's `toTurn`
   write path sees the prefix it writes the same `direct-edit`
   record to `resources/.worklist-direct-edit.json`, then forwards the
   entire turn text including the prefix. The PreToolUse hook allows the
@@ -230,6 +236,14 @@ cross-checks the running process, `.bram-port`, and the
 `.bram-port.json` sidecar (port + pid + project root + startup
 timestamp). If `.bram-port` is missing entirely (agent launched outside
 Bram's PTY shell), fall back to `lsof -nP -iTCP -sTCP:LISTEN | grep bram`.
+
+**OpenCode** uses the same curl shapes; the flag rationale above holds
+unchanged. It has no Bram allowlist: whether it asks before running a
+shell command is OpenCode's own permission setting, and its shell runs
+without a sandbox, so it needs no filesystem channel like Codex's. Its
+instructions reach it through `.opencode/opencode.json`'s
+`instructions` list, which Setup keeps pointing at this file's core,
+`.claude/bram-conventions.md`.
 
 ## Codex transport: filesystem intent/result files
 
@@ -784,9 +798,15 @@ build?"; thread and model give evidential standing (an orchestrator
 held the design discussion, a subagent saw only its brief) and
 attribution; os and machine distinguish sessions of the same owner's
 same agent across machines. The hostname also makes the signature
-machine-readable provenance: Awaiting You classifies a same-account
+machine-readable provenance: Alerts classifies a same-account
 comment by it — unsigned means the human typed it, this host's name
 means this machine's agent, any other means your agent elsewhere moved.
+
+Bram's own issue comments sign too. With the worklist mirror on, state
+changes and relayed feedback open with `<owner>'s Bram (Bram <version>,
+worklist mirror, host, <os>, <machine>)`. Read one as Bram speaking, not
+an agent or the human. The guards don't accept `Bram` as an agent, so
+never sign your own writes that way.
 
 Old and missing signatures:
 
@@ -807,7 +827,7 @@ the session; the reminder carries it across.
   (`reminder-revendor-after-xmlui-release`); after the prefix the
   ordinary id rules apply. When the gate is a **date**, put it at the
   end of the id (`reminder-rerun-census-after-2026-09-19`). The rule is
-  mechanical on purpose: surfaces such as the Awaiting You inbox key on
+  mechanical on purpose: surfaces such as the Alerts inbox key on
   the prefix. Ids are immutable, so an older reminder keeps its name;
   the only conversion is the user Dropping it and you re-proposing it
   verbatim under a `reminder-` id. Don't push that, but say plainly

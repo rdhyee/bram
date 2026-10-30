@@ -4,18 +4,9 @@
 # the current provider host-side, so launching claude or codex by hand here
 # does NOT update Bram's UI -- use the header switcher to change providers.
 #
-# Exception: under "Do not start an agent" (shell.startupPolicy "none",
-# exported by the host as BRAM_STARTUP_POLICY) the agent is managed outside
-# Bram (e.g. by herdr), the header shows "Agent managed externally" instead of
-# a switcher, and the greeting says so.
-#
 # No shell functions wrap claude/codex any more: the host owns current-agent
 # state and types launch commands itself.
-if [ "$BRAM_STARTUP_POLICY" = "none" ]; then
-  echo "The agent here is managed outside Bram (e.g. herdr). Bram shows its work; change agents where it runs."
-else
-  echo "Bram manages the agent here - use the header switcher to change providers."
-fi
+echo "Bram manages the agent here - use the header switcher to change providers."
 
 # shell-reports-prompt-and-exit-status: report the shell's own foreground
 # edges to the host as private OSC 7779 sequences, which xterm.js ignores
@@ -35,17 +26,21 @@ __bram_preexec() {
   __bram_at_prompt=
   printf '\033]7779;bram;exec\007'
 }
-# A launcher may hand us its own PROMPT_COMMAND (bram_herdr.py does, to run
-# `herdr agent attach` before the first prompt). Assigning ours outright would
-# discard it, so keep it and run it once from __bram_prompt. Such a command
-# usually starts with `unset PROMPT_COMMAND`, which would also switch our
-# reporting off, so put ours back afterwards.
-__bram_inherited_pc="$PROMPT_COMMAND"
+# A launcher may hand us one command to run before the first prompt, in
+# BRAM_LAUNCHER_PROMPT_COMMAND (bram_herdr.py does, to run `herdr agent attach
+# <pane>`). It is opt-in on purpose: a PROMPT_COMMAND exported by the user's
+# own environment (e.g. `history -a`) is still replaced below, as it always
+# was, since running it would report a started command while autostart may be
+# typing a launch (judell/bram#442). Take the value and unset it at once, so
+# nested shells and the agent's subprocesses never inherit it. Run it once from
+# __bram_prompt; if it unsets PROMPT_COMMAND, ours is put back afterwards.
+__bram_launcher_pc="$BRAM_LAUNCHER_PROMPT_COMMAND"
+unset BRAM_LAUNCHER_PROMPT_COMMAND
 __bram_prompt() {
   local s=$?
-  if [ -n "$__bram_inherited_pc" ]; then
-    local pc="$__bram_inherited_pc"
-    __bram_inherited_pc=
+  if [ -n "$__bram_launcher_pc" ]; then
+    local pc="$__bram_launcher_pc"
+    __bram_launcher_pc=
     # The DEBUG trap does not fire for commands run inside a function, so say
     # a command started ourselves; otherwise the host keeps believing a bare
     # shell is in the foreground and refuses to type (reason=shell-foreground).

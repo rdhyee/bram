@@ -376,6 +376,48 @@ can't go (hard freezes, remote machines, semantic attribution) — but
 the ordering lesson stands: category attribution before semantic
 attribution.
 
+### Standing health check: `scripts/ui-health.py`
+
+Run it periodically, and whenever the window feels slow. It's read-only and
+needs no instance:
+
+```sh
+python3 -I scripts/ui-health.py                          # the live trace
+python3 -I scripts/ui-health.py --trend 2026-10-27 2026-10-28   # one row per day
+```
+
+It reports the trace's responsiveness gauges for a window:
+
+- the pane: heartbeat drift by focus state, long tasks, input latency by route
+- the parent: `xterm-liveness` stalls and slow `terminal-write-batch` writes
+- transcript projection times
+- the slowest host routes
+
+It also splits spikes by whether an agent turn was running. For each idle
+spike, it lists the host emits and routes in the 2.5 seconds before it. That
+correlation is the cheap first step: it names *what else was happening*.
+When it names nothing obvious, record a Timeline (above) to find out *where*
+the main thread's time went.
+
+The baseline on Jon's machine:
+
+- **After the 2026-07-22 fix** (`250503cf`): heartbeat avg 6–14 ms, max
+  81–141 ms, no spikes.
+- **July to October daily trend:** 0.3–3 focused spikes over 1 s per active
+  hour, input-latency p50 104–185 ms.
+
+A run well above that is a finding. Record the before and after with this
+script, so a fix's claim has numbers.
+
+The first standing run (2026-10-29) found 89 spikes in 23 minutes, against
+4 and 0 on either side. The idle-spike column named `subagents-changed` →
+`/__agents` for all 31 idle spikes. The writes came from another project's
+subagents: the watcher took any `subagents/` path under
+`~/.claude/projects/` as this project's (`foreign-subagent-writes-refetch-roster`).
+A real subagent run in this project still costs up to a second per roster
+refetch (the 2026-10-28 04:00 hour had 141 spikes). That's open, and it
+starts with a Timeline.
+
 ## Build vs. reload boundary
 
 **Settled 2026-08-26 (the helpers.js-needs-rebuild mantra was wrong,
@@ -438,6 +480,16 @@ either. And always launch the `./bram` symlink at the repo root, not
 an installed/older app — both for fresh code and because the symlink
 is what makes disk serving resolve at all.
 
+**Build through `scripts/build.sh`**, the same debug build with a
+record: output and exit status pass through, and each build appends a
+line to `resources/build-log.jsonl` (gitignored). The line has its
+duration, HEAD and whether it moved, `src-tauri/` lines changed since
+the last logged build, other `cargo`/`rustc` processes running, load,
+and the caller. `scripts/build-timings.sh` times synthetic edits on a
+quiet tree; this log catches the slow real builds it can't (#452:
+2m55s and 1m38s builds the same day the synthetic rows read 25–34 s).
+Read it by sorting on `seconds` and looking at the slow rows' context.
+
 ### Formatting is enforced, so run `cargo fmt`
 
 `src-tauri/` was normalized in `d94a3b9`, and `.github/workflows/fmt.yml`
@@ -495,6 +547,96 @@ id. That is what normalizing bought: the rule stopped depending on
 anyone remembering it. The cross-machine coordination that landing it
 required is on judell/bram#322.
 
+### Measuring build time, not guessing at it
+
+`scripts/build-timings.sh` prints the four numbers a build-time claim
+needs, as a markdown table:
+
+| measurement | what it isolates |
+|---|---|
+| no-op | cargo's freshness scan. If this already costs seconds, the complaint is not compilation |
+| incremental (one line appended to `lib.rs`) | the cheapest edit there is: nothing below it moves |
+| incremental, lines shifted (one line inserted at the top) | a mid-file edit, which moves every line below it. Full debuginfo records line numbers, so this may cost much more than the appended row; the gap between the two is the measurement (2026-10-27's mid-file edits built in 34 s to 2m55s) |
+| relink only | link time in isolation, which matters because the debug binary is ~70 MB |
+| check only (same one-line probe) | type-checking and metadata, with no codegen and no link |
+| clean (`--clean`) | everything, dependencies included — the only number comparable across machines and toolchains |
+
+**The rows do not add up, and the script does not pretend they do.** The
+obvious derived figure — `incremental − check − relink` as "codegen" — was
+tried and came out **negative**, twice: cold (`260.59s` of check against a
+`25.48s` build) and warm (`19.66s` check plus `9.91s` relink against a
+`23.95s` build). The legs share work: relink recompiles the bin's trivial
+`main.rs`, and check runs its own analysis pass. So read `check` and `relink`
+as independent scales for type-checking and for linking, and don't subtract
+one from another.
+
+The `check` leg needs warming to be a scale at all: `cargo check` keeps
+separate fingerprints, so a check issued right after a build type-checks the
+whole crate from nothing. The script warms that cache first, which is why the
+cold `260.59s` above is not the number it reports.
+
+**What these rows settle, and what they don't.** `check` is the row that
+decides whether crate size is worth attacking, because it is the cost that
+does **not** shrink when files are split *within* one crate: `lib.rs` →
+`lib/*.rs` stays a single compilation unit, and rustc type-checks and
+codegens the whole of it either way. A module split buys readability and
+nothing in build time. Only separate crates — a workspace — shrink the unit,
+which is a much larger change and should be taken on a number, not a hunch.
+The debug profile (`codegen-units`, `debug = "line-tables-only"`) is the other
+lever, and it wants the same treatment: measured, not guessed.
+
+Restoring a probe is itself an edit, so after each restore the script runs one
+untimed build before the next timed row. Before 2026-10-27 the relink row ran
+straight after the incremental probe's restore, so its number may include a
+recompile; compare it with earlier runs with that in mind.
+
+The incremental leg restores `lib.rs`'s exact bytes from a saved copy via
+a trap, so an interrupted run still leaves the tree as it found it, and a
+dirty tree's edits survive rather than being discarded. `--clean` builds
+into a scratch `CARGO_TARGET_DIR` and removes it afterward
+(`--keep-scratch` keeps it), so it cannot disturb the target dir you
+actually build into.
+
+**A before/after claim about build time is made with this script, not
+from memory.** That is the same rule §Perf diagnosis ordering states for
+the pane — the baseline is a commit, recorded with the instrument that
+will verify the "after" — applied to the one performance question that
+has no trace to read, because builds happen on the host before the app
+exists. Before this script, every slow-build report (#451) was a feeling.
+
+Run it on demand, not in CI: like `scripts/setup-harness.sh` and the
+membership starter check, it needs a machine that can build, which is
+not what the workflows have.
+
+### When builds get slow, check `target/debug/deps` first
+
+Cargo never deletes old build artifacts, and `rustc`, the linker and
+`cargo check` list `target/debug/deps` on every invocation. On
+2026-10-27 that directory held 982,330 files (119 GB), and it, not the
+code, was why builds had crept from seconds to half a minute (#452). The
+library rebuild used 4.3 s of CPU in 10.8 s of wall time. Neither
+`-Z time-passes` nor `-Z self-profile` sees that gap, because both time
+work, not waiting. macOS `sample` on the running `rustc` found it in
+`__getdirentries64` under `rustc_session::search_paths`.
+
+`cargo clean --manifest-path src-tauri/Cargo.toml --profile dev` fixed it.
+The full rebuild afterwards took 40 s, and then:
+
+| | before | after |
+|---|---|---|
+| library rebuild | 10.6–10.9 s | 2.4 s |
+| incremental (appended) | 24–34 s | 3–8 s |
+| relink only | 7–8.5 s | 0.5 s |
+| check only | 16–20 s | 1.5 s |
+
+The directory grows back by about 360 files per build. `scripts/build.sh`
+logs the count as `deps_files` and prints a warning past 100,000 files
+(set `BRAM_DEPS_WARN` to change that). It never cleans on its own,
+because a clean forces a full rebuild. Earlier build-time numbers in this
+section, and any profile or crate-split argument resting on them, were
+measured on the polluted directory: re-measure on a clean one before
+relying on them.
+
 ## Hand-testing the Worklist gate
 
 The gate's selection matrix — which buttons light for which combination of
@@ -536,6 +678,7 @@ instance binds its own loopback port and writes its own
 directory while your working session keeps going, untouched:
 
 ```sh
+git init /tmp/scratch-project   # issue-448: Bram starts only at a repo's root
 BRAM_TRACE=1 ./bram /tmp/scratch-project
 ```
 
@@ -598,9 +741,13 @@ BRAM_BIN=/path/to/bram scripts/setup-harness.sh
 
 Exit status is the number of failed assertions. Scenarios vary the
 *starting state* rather than the steps, because that is where the
-historical failures were: `pristine_nogit`, `pristine_git`,
+historical failures were: `pristine_nogit` (not a git repo, so refused:
+nothing written, autostart held, #448), `subfolder` (inside a repo but not
+its root, refused and named as such, #448), `pristine_git`,
 `already_setup` (the cross-machine re-run from #249), `legacy_hooks`
-(retired generic hook names, #173), and `nested` (a managed parent).
+(retired generic hook names, #173), and `nested` (a managed parent). The
+refused scenarios find the port from Bram's stderr (`[bram] loopback
+port=`), since a refused launch writes no port file.
 
 Every assertion traces to a bug the record actually caught, which is
 the standard for adding another one. Notably `already_setup` asserts
@@ -812,6 +959,36 @@ both facts and the exact git toplevel before acting. Transfer a scenario
 branch with ordinary Git plumbing (for example, a bundle), but never add
 an upstream to the disposable instance.
 
+### Switch matrix
+
+`scripts/switch-matrix.py` drives the session-switching matrix from
+[`decisions/2026-10-27-bram-chooses-the-session.md`](decisions/2026-10-27-bram-chooses-the-session.md)
+against a demo instance with the real agent CLIs, and checks the trace after
+each step. It launches the demo with `BRAM_TEST_DRIVE=1`, which turns on
+`POST /__test/{switch,reload,new-session,turn}`. These call the same functions
+the pane's clicks do, and are off otherwise (see `authorization.md`).
+
+```sh
+python3 -I scripts/switch-matrix.py --no-turns --agents claude,opencode   # no model turns
+python3 -I scripts/switch-matrix.py --agents claude,opencode              # adds New session, fresh partners, delete
+```
+
+The cases: a plain switch; New session (named on its reserved id, brief
+released when the composer is drawn); fresh partners (started, grouped with and
+named after the Claude session); resuming a group member by id, including
+Codex → OpenCode in a group of three; OpenCode marked current at launch;
+no-group fallback by id, with the offer up; a reload clearing the offer;
+deleting the running session refused; deleting a grouped one taking it out of
+its group; the offer's Add and the Sessions row's Leave. Across the whole run, no `launch-timeout`, `launch-exited`,
+`boot-held-restore` or `rebound` may appear.
+
+Exit status is the number of failed checks; on failure the demo stays up. Cases
+that deliver a brief or catch-up start a real model turn; `--no-turns` skips
+them. The script waits for each launch to settle before the next step, as a
+person would: driving faster produced failures that weren't Bram's. It needs a
+windowing session, so it runs on demand, not in CI. Record new failures in the
+decision note, not as new items, unless one blocks a release.
+
 ### Membership starter checks
 
 `scripts/membership-starter-check.py` turns the starters into a regression
@@ -861,6 +1038,61 @@ human driving against the full state range, for finding what you didn't
 know to script. The two feed each other — graduating a finding here
 into a `scenario/` branch or a harness assertion is how an exploratory
 discovery becomes a durable regression guard.
+
+## Capturing terminal specimens
+
+Bram reads agents' screens: terminal attention (`terminal_attention_prompt_shape`
+in `lib.rs`), the launch gate, the boot-prompt holds. Its markers must come
+from **captured specimens, never guesses** (the rule the trace vocabulary's
+`terminal-attention` row states). A specimen is what a CLI actually draws, at
+a known version, ANSI-stripped.
+
+There are two sources:
+
+- **The candidate inventory.** Unmatched idle screens are logged as
+  `[terminal-attention] op=candidate preview=…`. Grep every project's trace
+  archives for the screen you're after. Claude's "⚠ Your login expires in 3
+  days · run /login to renew" turned up this way (2.1.296).
+- **A deliberate capture.** `scripts/capture-terminal-specimen.py` runs a
+  command under a pseudo-terminal of fixed size (120×40 by default) and
+  writes the raw bytes and an ANSI-stripped `.txt`:
+
+  ```sh
+  python3 -I scripts/capture-terminal-specimen.py /tmp/spec/claude 15 -- claude
+  python3 -I scripts/capture-terminal-specimen.py --keys $'\r' --after 4 \
+      /tmp/spec/codex 12 -- codex
+  ```
+
+**Reach a state without touching a real account.** Point the CLI at a
+throwaway config directory and unset the API keys. Most states are a few
+fields of config away:
+
+| State | Setup |
+|---|---|
+| Claude logged out | `CLAUDE_CONFIG_DIR=$(mktemp -d)`, unset `ANTHROPIC_API_KEY`, and pre-set onboarding and folder trust in its `.claude.json` (`hasCompletedOnboarding`, `projects."<dir>".hasTrustDialogAccepted`). Otherwise the first-run theme picker and the folder-trust prompt come first. |
+| Codex logged out | `CODEX_HOME=$(mktemp -d)`, unset `OPENAI_API_KEY`, and pre-trust the folder in its `config.toml` (`[projects."<dir>"] trust_level = "trusted"`). |
+| A first-run prompt | the same throwaway directory with nothing pre-set |
+| An OpenCode dialog | At an idle composer, Ctrl+P opens the command palette, and Ctrl+X then `m`, `l` or `a` opens the model, session or agent list. Bram drains its tail on every keystroke, so capture what is drawn after the last key, not the whole stream. |
+| OpenCode logged out | No such screen in 2.1.4. With empty `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME` and `XDG_CACHE_HOME`, it prints a stack trace (`cli.server-connection.resolve`) and exits before drawing its composer. With a real config, it runs its free models without signing in. |
+
+Capture from an empty working directory, so the Bram repo's own trust state
+doesn't interfere. The same environment works for a demo instance:
+`env -u ANTHROPIC_API_KEY CLAUDE_CONFIG_DIR=<dir> scripts/demo-instance.sh launch`.
+Set `shell.startupPolicy` to `newSession` in its `.bram.json`, because Bram
+resumes from the real session history, which the throwaway config doesn't
+have ("No conversation found to continue").
+
+**What the specimens taught the first time** (terminal-attention-login-screen,
+#448): a logged-out Claude 2.1.310 draws **no** login screen. It opens its
+normal composer, and only the footer says "Not logged in · Run /login", which
+is why the launch check reported success. Codex 0.163.0 draws a full sign-in
+screen whose Enter starts the sign-in. Guessing would have got Claude wrong.
+
+**Then pin it.** Write the markers against the stripped text, anchored to the
+end of the screen where a live prompt puts its footer. Pin the specimen
+whole in a test, along with a near-miss: a reply that merely quotes the text,
+followed by the composer's chrome, must not match. Record the CLI version in
+the comment beside the markers.
 
 ## Moved from the seeded conventions
 

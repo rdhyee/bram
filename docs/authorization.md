@@ -50,6 +50,26 @@ chat approval or external clients.
 
 ## Action matrix
 
+Permission-menu callbacks use a separate per-Bram-instance credential,
+`BRAM_MENU_TOKEN`, inherited by the terminal child and echoed by its hook as
+`bram_token`. Missing or mismatched credentials receive HTTP 403; presenting a
+menu does not authorize the underlying tool or a Worklist operation. Bram
+feature-detects Codex's `--no-daemon` option and adds it to local launches so
+hooks run with this instance's environment rather than a shared server's.
+Explicit remote connections are preserved and may require the terminal
+fallback. Existing same-user-process limits still apply; no project-readable
+credential file or unauthenticated callback fallback is introduced. Regression
+coverage: `codex_instance_launch_tests` and `menu_credential_tests`; Windows
+live evidence is in #455. Successful validation removes the credential from
+the parsed payload before any menu tracing or claim handling.
+
+An existing conversation can remain owned by the shared server after its
+terminal closes. Moving it to standalone mode may show Codex's "conversation
+is open in another app" dialog. Do not shut down the shared server, which may
+own other work. The user must release the conversation there or choose a new
+session; holding Bram's queued sends at this dialog is tracked separately
+in the Windows release burndown (#455).
+
 The **policy** column governs agent behavior even where enforcement is
 coarser. The next column describes current checks, not permission to exploit
 their gaps. TTLs and the consumption distinction are explained below.
@@ -68,6 +88,7 @@ their gaps. TTLs and the consumption distinction are explained below.
 | Direct edit | Same-turn `just do it` or `skip-worklist:` opts out of proposal-first for the requested work. | Claude reads user-turn text; host writes a wildcard direct-edit sidecar for Codex / structured prefix. Guard checks its one-hour lifetime and paths. | Direct-edit audit breadcrumb. A matching phrase/sidecar is not a lifecycle grant. |
 | Plain git / forge work | Requires the user's request; issue-only work needs no Worklist item. | Separate guard rules, not `ensure_worklist_commit_authorized`; Bash coverage is coarse. Forge signatures and session-URL checks apply to inspectable writes. | Git / forge records. Worklist guarantees cannot be projected onto all shell commands. |
 | Push | User decides separately, normally with Push; agent pushes only when asked. | Host Push path and shell guard are different surfaces; the shell guard has a post-consumption push grace. | Remote reachability is separate from local commit success. Grace is not proof of push consent. |
+| Test-drive switch / reload / New session / turn | Only for `scripts/switch-matrix.py` on a disposable demo instance. | `POST /__test/{switch,reload,new-session,turn}` exist only when Bram starts with `BRAM_TEST_DRIVE=1` (else 404); they call the same command functions as the pane's IPC. `./bram` never sets it. | `[test-drive] op=enabled` at startup, `op=call route=…` per call. Any process in that instance's project can drive the agent while it's on, which is why it's confined to the demo. |
 | Queued issue close | User ticks the close choice; host queues against the new SHA and closes after push. | `enqueue_issue_closes_from_auth` and push-time processing; commit route rejects forge closing keywords that bypass the dialog. | `queuedCloses` / host close records. Direct forge issue actions follow the separate explicit-request policy. |
 
 ## Records, transport, and lifecycle
@@ -148,6 +169,16 @@ in #255. `invalidate_worklist_authorization` skips already-consumed records;
 that detail limits blanket claims that every interrupt revokes every later
 route call. An expired mutate refusal also releases the refused ids' claim
 so a dead approval cannot keep the board locked.
+
+What counts as an interrupt depends on the agent. For Claude and Codex a
+user Esc in the terminal or from the pane marks it at the keystroke
+(`pty_menu_clear`). OpenCode stops a running turn only on a second Esc
+within 5 s, so a single Esc interrupts nothing there. With Bram's OpenCode
+plugin in place, the mark (and the claim clear) wait for OpenCode's own
+`session.execution.interrupted` event (`opencode_turn_interrupted`), which
+covers any stop, Esc-caused or not. Without the plugin no such event
+arrives and the keystroke marks it, as for the other agents
+(opencode-esc-interrupt).
 
 ### Direct edits and provenance
 

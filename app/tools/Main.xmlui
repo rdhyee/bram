@@ -1,4 +1,4 @@
-<App layout="vertical-sticky" var.rightPaneSize="(measuring…)" var.updateBannerDismissedVersion="{window.__bramRestoreUpdateBannerDismissed ? window.__bramRestoreUpdateBannerDismissed() : ''}" var.toplevelBannerDismissed="{false}" var.strayScaffoldBannerDismissed="{false}" var.codexTrustBannerDismissed="{false}"var.setupCompleteProvider="{''}" var.lastSeenAgentVerb="{''}" var.transcriptAgentId="{''}" var.sendNoticeDismissed="{window.__bramRestoreSendNoticeDismissed()}" var.dismissedAgentIds="{window.__bramRestoreDismissedAgents()}"
+<App layout="vertical-sticky" persistTheme="true" var.rightPaneSize="(measuring…)" var.updateBannerDismissedVersion="{window.__bramRestoreUpdateBannerDismissed ? window.__bramRestoreUpdateBannerDismissed() : ''}" var.toplevelBannerDismissed="{false}" var.strayScaffoldBannerDismissed="{false}" var.codexTrustBannerDismissed="{false}"var.setupCompleteProvider="{''}" var.lastSeenAgentVerb="{''}" var.transcriptAgentId="{''}" var.sendNoticeDismissed="{window.__bramRestoreSendNoticeDismissed()}" var.dismissedAgentIds="{window.__bramRestoreDismissedAgents()}"
   onInit="startBramLatestJsonlPush(() => (enhanceStatus.value &amp;&amp; enhanceStatus.value.activeProvider) || '')">
   <PushSource
     id="mainAgentStatus"
@@ -589,7 +589,21 @@
           onDidChange="(next) => window.__bramHandleAgentSwitcherChange(next, (mainAgentStatus.value &amp;&amp; mainAgentStatus.value.provider) || (enhanceStatus.value &amp;&amp; enhanceStatus.value.activeProvider) || '', agentSwitcherSelect, toast)">
           <Option value="claude" label="Claude" />
           <Option value="codex" label="Codex" />
+          <Option value="opencode" label="OpenCode" />
         </RadioGroup>
+        <!-- agent-switcher-shows-stale-provider: RadioGroup's `initialValue`
+             only seeds the mount
+             (https://www.xmlui.org/docs/howto/present-choices-with-a-radiogroup),
+             and the seed above falls back to enhanceStatus before
+             mainAgentStatus reports the live provider — so the pane can mount
+             showing a provider the terminal is no longer running. Correct it
+             when the truth arrives. A sibling of the RadioGroup so the id
+             resolves in the same scope; ChangeListener does not fire on mount
+             (https://www.xmlui.org/docs/howto/debounce-with-changelistener),
+             which is what we want: the mount seed already ran. -->
+        <ChangeListener
+          listenTo="{((mainAgentStatus.value &amp;&amp; mainAgentStatus.value.provider) || (enhanceStatus.value &amp;&amp; enhanceStatus.value.activeProvider) || '') + '|' + (agentSwitcherBusy.value ? 'busy' : 'idle')}"
+          onDidChange="() => window.__bramSyncAgentSwitcher(agentSwitcherSelect, (mainAgentStatus.value &amp;&amp; mainAgentStatus.value.provider) || (enhanceStatus.value &amp;&amp; enhanceStatus.value.activeProvider) || '', agentSwitcherBusy.value)" />
         <!-- workflow-toggle-button-unwired: label only, no behaviour wired. -->
         <Button
           label="{workflowOn ? 'Workflow: on' : 'Workflow: off'}"
@@ -601,6 +615,30 @@
              message moved to the footer status line (Jon: it belongs there,
              not in the app header) — see the footer HStack below. -->
         <SpaceFiller />
+        <!-- dark-mode-tone-switch: XMLUI's own tone switch, beside the other
+             pane-level display controls. Tone rescales every $color-* scale,
+             so the pane needs no dark palette of its own; `persistTheme` on
+             App (the value at the top of this file) remembers the choice
+             across pane reloads and relaunches.
+             https://www.xmlui.org/docs/reference/components/ToneSwitch
+             tone-switch-smaller: ToneSwitch has no size prop, but its track,
+             thumb and padding all scale from --xmlui-fontSize (vendored CSS),
+             so a scoped fontSize shrinks it in proportion.
+             https://www.xmlui.org/docs/howto/override-a-components-theme-vars -->
+        <!-- header-toolbar-even-spacing (Jon, 2026-10-28: "poor spacing"):
+             one row with one gap. Ghost buttons carried their own
+             paddingHorizontal-Button-sm ($space-4) while the switch and the
+             Inspector had none, so the gaps depended on which two controls
+             were neighbours. Inside this row the padding hugs each label and
+             the gap does the spacing.
+             https://www.xmlui.org/docs/reference/components/Stack#gap
+             https://www.xmlui.org/docs/howto/override-a-components-theme-vars -->
+        <Theme paddingHorizontal-Button-sm="$space-1">
+        <HStack gap="$space-3" verticalAlignment="center">
+        <Theme fontSize="$fontSize-sm">
+          <ToneSwitch
+            tooltip="Switch between light and dark tone" />
+        </Theme>
         <!-- issue-414: opening the target app in a browser was three clicks
              deep (ⓘ, then Open in browser). The usual case, since the
              target pane is off by default. Tooltip shows the address. -->
@@ -629,6 +667,8 @@
           tooltip="Increase app font size"
           onClick="window.setAppFontSize(window.getAppFontSize() + 1)" />
         <Inspector src="{'/__vendor/xs-diff.html?v=' + window.APP_VERSION}" />
+        </HStack>
+        </Theme>
       </HStack>
     </Theme>
   </AppHeader>
@@ -649,17 +689,19 @@
     <NavLink label="Commits" to="/commits" tooltip="Recent commits, and pushing them" />
     <NavLink label="Queue" to="/queue" tooltip="Notes you&apos;re holding to send the agent when it&apos;s free" />
     <NavLink label="Search" to="/search" tooltip="Search the project&apos;s history: sessions, commits, issues, worklist" />
-    <NavLink label="Awaiting You" to="/needs-you" tooltip="Everything waiting on your decision, in one list" />
+    <NavLink label="Alerts" to="/needs-you" tooltip="Everything waiting on your decision, in one list" />
+    <NavLink label="History" to="/history" tooltip="Every worklist item that was committed or dropped, and why" />
+    <NavLink label="Files" to="/files" tooltip="Browse and search this repo&apos;s files" />
     <NavLink label="Settings" to="/settings" tooltip="Project and personal settings for Bram" />
     <!-- nav-primary-list-and-more-group: less-used pages, collapsed by
          default (initiallyExpanded unset;
          https://www.xmlui.org/docs/reference/components/NavGroup). The group
-         opens itself when one of its pages becomes the active route (the
-         Worklist tab's History button relies on this; NavGroupReact.tsx,
-         the pathname effect looking for .xmlui-navlink-active). -->
+         opens itself when one of its pages becomes the active route
+         (NavGroupReact.tsx, the pathname effect looking for
+         .xmlui-navlink-active). History and Files moved out to the main list
+         above Settings (nav-history-files-above-settings), so the Worklist
+         tab's History button no longer depends on that. -->
     <NavGroup label="More">
-      <NavLink label="History" to="/history" tooltip="Every worklist item that was committed or dropped, and why" />
-      <NavLink label="Files" to="/files" tooltip="Browse and search this repo&apos;s files" />
       <NavLink label="Tips" to="/tips" tooltip="All the footer tips, including ones you dismissed" />
       <NavLink label="Context" to="/context" tooltip="What the agent reads: CLAUDE.md, memory, hooks and settings" />
       <NavLink label="Status" to="/status" tooltip="Bram&apos;s health: guards, session size, state checks" />
@@ -695,7 +737,7 @@
   </VStack>
 
   <VStack
-    when="{enhanceStatus.value && enhanceStatus.value.firstRun && !enhanceStatus.value.nestedUnder}"
+    when="{enhanceStatus.value && enhanceStatus.value.firstRun && !enhanceStatus.value.nestedUnder && window.__bramProjectFolderIsOk(enhanceStatus.value)}"
     padding="$space-4"
     gap="$space-2"
     backgroundColor="$color-info-50"
@@ -748,6 +790,75 @@
       onClick="toplevelBannerDismissed = true" />
   </HStack>
 
+  <!-- issue-448: Bram wasn't started from a project folder, the root of a
+       local git repository (README prerequisite #1). A Bram's folder is fixed
+       at launch and the only way in is to cd to the repo's root and run bram,
+       so these say what's wrong, why, and exactly where to start from. The
+       host started nothing (no startup files, no Setup, no agent), and the
+       first-run and Setup blocks are hidden. Amber launched at $HOME, cd'd to
+       her project in Bram's terminal, and expected Bram to follow. -->
+  <VStack
+    when="{window.__bramProjectFolderIs(enhanceStatus.value, 'home')}"
+    backgroundColor="$color-warn-100"
+    padding="$space-3"
+    gap="$space-2">
+    <Text fontWeight="$fontWeight-bold" value="This isn't a project folder" />
+    <Text fontSize="$fontSize-sm">
+      Bram is running in your home directory. Bram works in a project folder:
+      the root of the local git repository for the app you want to work on,
+      such as
+      <Text inline="true" fontFamily="$fontFamily-monospace" value="~/code/my-app" />.
+      Your home directory can't be one, even if it's a git repository: every
+      other folder is inside it, so Bram would treat all of them as part of
+      this project.
+    </Text>
+    <Text fontSize="$fontSize-sm">
+      Quit Bram. Then, in your terminal,
+      <Text inline="true" fontFamily="$fontFamily-monospace" value="cd" /> to your
+      project folder and run
+      <Text inline="true" fontFamily="$fontFamily-monospace" value="bram" />.
+    </Text>
+  </VStack>
+  <VStack
+    when="{window.__bramProjectFolderIs(enhanceStatus.value, 'not-git')}"
+    backgroundColor="$color-warn-100"
+    padding="$space-3"
+    gap="$space-2">
+    <Text fontWeight="$fontWeight-bold" value="This isn't a project folder" />
+    <Text fontSize="$fontSize-sm">
+      Bram is running in
+      <Text inline="true" fontFamily="$fontFamily-monospace" value="{enhanceStatus.value.projectFolder.root}" />,
+      which isn't in a git repository. Bram works in a project folder: the
+      root of the local git repository for the app you want to work on, such as
+      <Text inline="true" fontFamily="$fontFamily-monospace" value="~/code/my-app" />.
+    </Text>
+    <Text fontSize="$fontSize-sm">
+      Quit Bram. Then, in your terminal,
+      <Text inline="true" fontFamily="$fontFamily-monospace" value="cd" /> to your
+      project folder and run
+      <Text inline="true" fontFamily="$fontFamily-monospace" value="bram" />.
+    </Text>
+  </VStack>
+  <VStack
+    when="{window.__bramProjectFolderIs(enhanceStatus.value, 'subfolder')}"
+    backgroundColor="$color-warn-100"
+    padding="$space-3"
+    gap="$space-2">
+    <Text fontWeight="$fontWeight-bold" value="Start Bram from the root of this repository" />
+    <Text fontSize="$fontSize-sm">
+      Bram is running in
+      <Text inline="true" fontFamily="$fontFamily-monospace" value="{enhanceStatus.value.projectFolder.root}" />,
+      a folder inside the git repository at
+      <Text inline="true" fontFamily="$fontFamily-monospace" value="{enhanceStatus.value.projectFolder.toplevel}" />.
+      Bram works from a repository's root folder.
+    </Text>
+    <Text fontSize="$fontSize-sm">
+      Quit Bram. Then, in your terminal, run
+      <Text inline="true" fontFamily="$fontFamily-monospace" value="{'cd ' + enhanceStatus.value.projectFolder.toplevel}" />
+      and then
+      <Text inline="true" fontFamily="$fontFamily-monospace" value="bram" />.
+    </Text>
+  </VStack>
   <!-- issue-353: a stray Setup scaffold in the home directory (from an
        earlier mis-launch at $HOME). The host computes strayHomeScaffold
        at startup but until now nothing in the pane used it — Walt's
@@ -813,7 +924,7 @@
        already provider-neutral; the codex-hook-refresh variant only appears
        when Codex is the active provider. -->
   <VStack
-    when="{enhanceStatus.value && enhanceStatus.value.providerNeedsSetup && !setupCompleteProvider}"
+    when="{enhanceStatus.value && enhanceStatus.value.providerNeedsSetup && !setupCompleteProvider && window.__bramProjectFolderIsOk(enhanceStatus.value)}"
     padding="$space-4"
     gap="$space-3"
     backgroundColor="$color-info-50"
@@ -1020,7 +1131,48 @@
            Worklist-dock mount (AgentMenuView is self-gating on menu and
            owns its preview modal, so the footer mount is drop-in). -->
       <AgentMenuView menu="{footerAgentMenuEvt.value}" surface="footer" />
-      <!-- agent-launch-failure-in-pane: a launch that failed (the agent
+      <!-- issue-448: two or more agent CLIs are installed and the project names
+           no agent, so the host held the autostart to ask instead of guessing
+           Claude. Driven by the host's replayable `startup-agent-choice`, which
+           names the agents installed on this machine; a click saves shell.agent
+           and starts that agent. Solid buttons for the answers, ghost for
+           Dismiss, per
+           https://www.xmlui.org/docs/reference/components/Button#variant . -->
+      <PushSource
+        id="startupAgentChoice"
+        initial="{null}"
+        subscribe="{window.bramSubscribeStartupAgentChoice()}" />
+      <VStack
+        when="{!!startupAgentChoice.value}"
+        gap="$space-1"
+        paddingHorizontal="$space-2"
+        paddingVertical="$space-1"
+        backgroundColor="$color-primary-50"
+        border="1px solid $color-primary-100"
+        borderRadius="$borderRadius">
+        <HStack width="100%" gap="$space-2" verticalAlignment="center">
+          <Text
+            width="*"
+            fontSize="$fontSize-sm"
+            value="Which agent do you use in this project?" />
+          <Items data="{startupAgentChoice.value ? startupAgentChoice.value.installed : []}">
+            <Button
+              label="{window.__bramProviderLabel($item)}"
+              size="xs"
+              onClick="window.__bramChooseStartupAgent($item, toast)" />
+          </Items>
+          <Button
+            label="Dismiss"
+            variant="ghost"
+            size="xs"
+            onClick="window.__bramStartupAgentChoiceDismiss(startupAgentChoice.value)" />
+        </HStack>
+        <Text
+          fontSize="$fontSize-sm"
+          color="$textColor-secondary"
+          value="These are the agents installed on this machine. Bram saves your answer for this project in .bram.json, and you can change it later in Settings." />
+      </VStack>
+      <!-- agent-launch-failure-in-pane:a launch that failed (the agent
            exited right after launch, or the terminal never came back to a
            prompt) is said here, above the message box, where the user is
            about to type into a terminal no agent is reading. Driven by the
@@ -1106,40 +1258,43 @@
         id="pairOffer"
         initial="{null}"
         subscribe="{window.bramSubscribePairOffer()}" />
-      <HStack
+      <!-- session-groups: message on its own full-width line, the buttons
+           below it, wrapping when the pane is narrow
+           (https://www.xmlui.org/docs/reference/components/Stack#wrapcontent).
+           On 2026-10-28 the offer squeezed its message into a narrow column. -->
+      <VStack
         when="{!!pairOffer.value}"
-        gap="$space-2"
-        verticalAlignment="center"
+        gap="$space-1"
         paddingHorizontal="$space-2"
         paddingVertical="$space-1"
         backgroundColor="$color-info-50"
         border="1px solid $color-info-200"
         borderRadius="$borderRadius">
         <Text
-          width="*"
           fontSize="$fontSize-sm"
           value="{pairOffer.value &amp;&amp; pairOffer.value.message}" />
-        <!-- new-session-switch-starts-fresh-partner: Start new leads; keeping
-             the old session is the less common intent (2026-10-08, a
-             fast Keep click paired a new session with last release's). -->
-        <Button
-          label="{pairOffer.value &amp;&amp; pairOffer.value.actionLabel}"
-          tooltip="{pairOffer.value &amp;&amp; pairOffer.value.actionTooltip}"
-          variant="outlined"
-          size="xs"
-          onClick="window.__bramPairOfferStart(pairOffer.value)" />
-        <Button
-          label="Keep these together"
-          tooltip="{pairOffer.value &amp;&amp; pairOffer.value.keepTooltip}"
-          variant="outlined"
-          size="xs"
-          onClick="window.__bramPairOfferKeep(pairOffer.value, toast)" />
-        <Button
-          label="Dismiss"
-          variant="ghost"
-          size="xs"
-          onClick="window.__bramPairOfferDismiss(pairOffer.value)" />
-      </HStack>
+        <HStack gap="$space-2" wrapContent="true" verticalAlignment="center">
+          <Button
+            label="{pairOffer.value &amp;&amp; pairOffer.value.keepLabel}"
+            tooltip="{pairOffer.value &amp;&amp; pairOffer.value.keepTooltip}"
+            size="xs"
+            onClick="window.__bramPairOfferKeep(pairOffer.value, toast)" />
+          <!-- new-session-switch-starts-fresh-partner: a fast Keep click once
+               paired a new session with last release's (2026-10-08). The
+               group's name now says what Add joins, so Add leads. -->
+          <Button
+            label="{pairOffer.value &amp;&amp; pairOffer.value.actionLabel}"
+            tooltip="{pairOffer.value &amp;&amp; pairOffer.value.actionTooltip}"
+            variant="outlined"
+            size="xs"
+            onClick="window.__bramPairOfferStart(pairOffer.value)" />
+          <Button
+            label="Dismiss"
+            variant="ghost"
+            size="xs"
+            onClick="window.__bramPairOfferDismiss(pairOffer.value)" />
+        </HStack>
+      </VStack>
       <!-- The hot TextArea is isolated from this App-scope footer. Props flow
            down only when provider state changes; the low-frequency Skills
            request flows up as a component event. -->
@@ -1374,6 +1529,14 @@
             width="*"
             color="$color-warn-700"
             value="{window.__bramTerminalAttentionText(terminalAttentionEvt.value)}" />
+          <!-- terminal-attention-login-screen (#448): a logged-out agent can
+               be traded for the other one, when the host found its CLI. -->
+          <Button
+            when="{!!(terminalAttentionEvt.value &amp;&amp; terminalAttentionEvt.value.switchTo)}"
+            label="{window.__bramTerminalAttentionSwitchLabel(terminalAttentionEvt.value)}"
+            variant="outlined"
+            size="xs"
+            onClick="window.__bramTerminalAttentionSwitch(terminalAttentionEvt.value, toast)" />
           <Button
             label="Open terminal"
             variant="outlined"
