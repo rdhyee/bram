@@ -220,6 +220,7 @@ window._xsLogs = window._xsLogs || [];
           describeInflight: window.__bramDescribeInflight || 0,
           lastLongTaskMs: lltFresh ? llt.ms : 0,
           lastLongTaskName: lltFresh ? llt.name : "",
+          lastLongTaskDuring: lltFresh ? (llt.during || "") : "",
           lastLongTaskAgoMs: lltFresh ? (Date.now() - llt.at) : -1,
         });
       }
@@ -365,6 +366,206 @@ window._xsLogs = window._xsLogs || [];
   }
 })();
 
+// Busy-slot API: names the work the pane was doing when the heartbeat
+// detects a stall. WebKit has no Long Tasks API, so a heartbeat stall alone
+// only says "something blocked the main thread". Hot paths bracket their sync
+// work with __bramBusyBegin/__bramBusyEnd; the heartbeat then attributes a
+// late tick to a span overlapping the stall window (preferring an active
+// span, else the most recent completed one that ended inside the window,
+// since the late tick usually runs after the work finished). Cheap and
+// no-throw by design; no tracing per call. Must stay above the heartbeat IIFE.
+var __bramBusyActive = {}; // token -> {name, startedAt}
+var __bramBusySeq = 0;
+var __bramBusyLast = null; // {name, startedAt, endedAt}
+window.__bramBusyBegin = function (name) {
+  try {
+    var tok = ++__bramBusySeq;
+    __bramBusyActive[tok] = { name: String(name), startedAt: Date.now() };
+    return tok;
+  } catch (e) { return 0; }
+};
+window.__bramBusyEnd = function (token) {
+  try {
+    var span = __bramBusyActive[token];
+    if (!span) return;
+    delete __bramBusyActive[token];
+    __bramBusyLast = { name: span.name, startedAt: span.startedAt, endedAt: Date.now() };
+  } catch (e) { /* ignore */ }
+};
+// Name of the busy span for stall window [windowStart, now] (Date.now() ms).
+window.__bramBusyDuring = function (windowStart) {
+  try {
+    var best = null, bestTok = -1;
+    for (var k in __bramBusyActive) {
+      var t = Number(k);
+      if (t > bestTok) { bestTok = t; best = __bramBusyActive[k]; }
+    }
+    if (best) return best.name;
+    if (__bramBusyLast && __bramBusyLast.endedAt >= windowStart) return __bramBusyLast.name;
+  } catch (e) { /* ignore */ }
+  return "";
+};
+
+// pane-idle-flush-when-degraded: WORKAROUND (judell/bram#482 for the
+// underlying leak). The agent pane's focused heartbeat-drift spikes climb
+// with age since last reload (~20 to ~121 per active hour over two hours) and
+// a reload clears them. Opt-in via ui.paneIdleFlush: once the pane has
+// measurably degraded AND nobody is using it, ask the host (POST
+// /__pane/flush) for the existing forced reload, which honors the turn-end
+// hold. Constants are tuned here.
+var PANE_FLUSH_WINDOW_MIN = 20; // rolling window for counting spikes
+var PANE_FLUSH_SPIKE_MS = 1000; // a focused drift over this is a spike
+var PANE_FLUSH_ARM_PER_HOUR = 30; // armed at >= this many, scaled per hour
+var PANE_FLUSH_UNFOCUSED_MIN = 3; // unfocused/hidden this long before firing
+var PANE_FLUSH_EVAL_MS = 5000; // guard re-check cadence (DOM queries)
+var PANE_FLUSH_COOLDOWN_MS = 10 * 60 * 1000; // after a fire, before another
+var PANE_FLUSH_KEY = "bram.paneFlushAtMs"; // sessionStorage (focus, not decision)
+
+// Pure decision. state: { enabled, spikes (count in window), windowMin,
+// unfocusedMs (null when focused/visible), turn, dialog, composer, queued }.
+// Returns { action: "none"|"held"|"fire", reason, armed }.
+window.__bramPaneFlushDecision = function (state) {
+  var st = state || {};
+  var windowMin = st.windowMin || PANE_FLUSH_WINDOW_MIN;
+  var perHour = ((st.spikes || 0) * 60) / windowMin;
+  var armed = !!st.enabled && perHour >= PANE_FLUSH_ARM_PER_HOUR;
+  if (!armed) return { action: "none", reason: "", armed: false };
+  if (st.unfocusedMs == null || st.unfocusedMs < PANE_FLUSH_UNFOCUSED_MIN * 60000) {
+    return { action: "held", reason: "focused", armed: true };
+  }
+  if (st.turn) return { action: "held", reason: "turn", armed: true };
+  if (st.dialog) return { action: "held", reason: "dialog", armed: true };
+  if (st.composer) return { action: "held", reason: "composer", armed: true };
+  if (st.queued) return { action: "held", reason: "queued", armed: true };
+  return { action: "fire", reason: "", armed: true };
+};
+
+(function paneIdleFlush() {
+  if (typeof window === "undefined" || typeof document === "undefined") return;
+  if (window.location.pathname.indexOf("/tools/") === -1) return;
+  var enabled = false;
+  var spikes = []; // Date.now() of focused drift spikes
+  var unfocusedSince = null;
+  var lastEval = 0;
+  var lastHeldReason = "";
+  var wasArmed = false;
+  var firedAt = 0;
+  var loadedAt = Date.now();
+
+  function loadSetting() {
+    if (typeof window.fetch !== "function") return;
+    window
+      .fetch("/__settings", { cache: "no-store" })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (s) { enabled = !!(s && s.ui && s.ui.paneIdleFlush === true); })
+      .catch(function () {});
+  }
+  loadSetting();
+  setTimeout(function () {
+    try {
+      window.subscribeTauriEvent("__bramPaneIdleFlushSettingsUnsub", "settings-changed", function () { loadSetting(); });
+    } catch (e) {}
+  }, 1500);
+
+  // Report a reload we asked for.
+  setTimeout(function () {
+    try {
+      var raw = window.sessionStorage.getItem(PANE_FLUSH_KEY);
+      if (!raw) return;
+      window.sessionStorage.removeItem(PANE_FLUSH_KEY);
+      var at = Number(raw);
+      if (at > 0) window.__bramIframeTrace("pane-flush", { op: "reloaded", cold_ms: Date.now() - at });
+    } catch (e) {}
+  }, 2000);
+
+  function unfocusedNow() {
+    var hidden = document.hidden === true;
+    var focused = typeof document.hasFocus === "function" ? document.hasFocus() : true;
+    return hidden || !focused;
+  }
+  function markFocus() {
+    if (unfocusedNow()) { if (unfocusedSince == null) unfocusedSince = Date.now(); }
+    else unfocusedSince = null;
+  }
+  try {
+    window.addEventListener("focus", markFocus);
+    window.addEventListener("blur", markFocus);
+    document.addEventListener("visibilitychange", markFocus);
+  } catch (e) {}
+  markFocus();
+
+  function dialogOpen() {
+    try {
+      var els = document.querySelectorAll('[role="dialog"]');
+      for (var i = 0; i < els.length; i++) {
+        if (els[i].offsetParent !== null || (els[i].getClientRects && els[i].getClientRects().length)) return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+  function composerFocused() {
+    try {
+      var a = document.activeElement;
+      if (!a) return false;
+      var tag = (a.tagName || "").toLowerCase();
+      return tag === "textarea" || tag === "input" || a.isContentEditable === true;
+    } catch (e) { return false; }
+  }
+
+  // Called from the heartbeat tick with this tick's drift and focus.
+  window.__bramPaneFlushTick = function (drift, focusedNow) {
+    try {
+      var now = Date.now();
+      markFocus();
+      if (focusedNow && drift > PANE_FLUSH_SPIKE_MS) spikes.push(now);
+      var cutoff = now - PANE_FLUSH_WINDOW_MIN * 60000;
+      while (spikes.length && spikes[0] < cutoff) spikes.shift();
+      if (!enabled || now - lastEval < PANE_FLUSH_EVAL_MS) return;
+      lastEval = now;
+      if (firedAt && now - firedAt < PANE_FLUSH_COOLDOWN_MS) return;
+      var dec = window.__bramPaneFlushDecision({
+        enabled: enabled,
+        spikes: spikes.length,
+        windowMin: PANE_FLUSH_WINDOW_MIN,
+        unfocusedMs: unfocusedSince == null ? null : now - unfocusedSince,
+        turn: typeof window.__bramAgentTurnInFlight === "function" && window.__bramAgentTurnInFlight() === true,
+        dialog: dialogOpen(),
+        composer: composerFocused(),
+        queued: typeof window.__bramGateQueued === "function" && window.__bramGateQueued() === true,
+      });
+      if (dec.armed && !wasArmed) {
+        window.__bramIframeTrace("pane-flush", { op: "armed", spikes: spikes.length, window_min: PANE_FLUSH_WINDOW_MIN });
+      }
+      wasArmed = dec.armed;
+      if (dec.action === "held") {
+        if (dec.reason !== lastHeldReason) {
+          lastHeldReason = dec.reason;
+          window.__bramIframeTrace("pane-flush", { op: "held", reason: dec.reason });
+        }
+      } else {
+        lastHeldReason = "";
+      }
+      if (dec.action !== "fire") return;
+      firedAt = now;
+      window.__bramIframeTrace("pane-flush", {
+        op: "fired",
+        pane_age_min: Math.round((now - loadedAt) / 60000),
+        spikes: spikes.length,
+      });
+      try { window.sessionStorage.setItem(PANE_FLUSH_KEY, String(now)); } catch (e) {}
+      window
+        .fetch("/__pane/flush", { method: "POST" })
+        .then(function (r) {
+          if (!r.ok) throw new Error("status " + r.status);
+        })
+        .catch(function () {
+          firedAt = 0; // not delivered: allow a retry on a later heartbeat
+          try { window.sessionStorage.removeItem(PANE_FLUSH_KEY); } catch (e) {}
+        });
+    } catch (e) {}
+  };
+})();
+
 // Main-thread heartbeat for the drawer iframe. setInterval scheduled
 // every 200ms; if the actual gap exceeds the threshold the main thread
 // was blocked (typically by heavy Markdown re-renders during JSONL
@@ -448,6 +649,8 @@ window._xsLogs = window._xsLogs || [];
         : document.hasFocus();
     var bg = hidden || !focused;
     batchTick(drift, bg);
+    // pane-idle-flush-when-degraded: feed the workaround's spike window.
+    if (window.__bramPaneFlushTick) window.__bramPaneFlushTick(drift, !bg);
     if (drift >= DRIFT_THRESHOLD_MS && !window.__bramMenuPending) {
       try {
         window.logToHost({
@@ -470,11 +673,15 @@ window._xsLogs = window._xsLogs || [];
     if (drift >= 200 && !bg && !window.__bramMenuPending) {
       // describe-backfill-observability: remember the latest long task so
       // input-latency can attribute a slow keystroke to it at emit time.
-      window.__bramLastLongTask = { ms: Math.round(drift), name: "heartbeat", at: Date.now() };
+      // Name the work (WebKit has no Long Tasks API): stall window starts
+      // where the tick was expected, i.e. drift ms ago.
+      var during = window.__bramBusyDuring(Date.now() - drift - 20);
+      window.__bramLastLongTask = { ms: Math.round(drift), name: "heartbeat", during: during, at: Date.now() };
       window.__bramIframeTrace("long-task", {
         ms: Math.round(drift),
         name: "heartbeat",
         source: "heartbeat",
+        during: during,
       });
     }
   }, TICK_MS);
@@ -885,7 +1092,8 @@ window.__bramAgentSwitcherTrace = function (stage, fields) {
 // which lands in __bramHandleAgentSwitcherChange(next, previous, ...) with
 // previous === next (both are the live provider), and that returns early.
 // `busy` skips the correction while a switch is in flight, so a status push
-// cannot yank the user's click back to the provider it is leaving.
+// cannot yank the user's click back to the provider it is leaving; it lasts
+// until the status reports the request (__bramAgentSwitcherHoldUntilReported).
 window.__bramSyncAgentSwitcher = function (select, provider, busy) {
   if (!select || busy) return;
   var key = window.__bramProviderKey(provider);
@@ -914,23 +1122,38 @@ window.__bramStartupPolicyIsNone = function (pushedEvt, fetchedSettings) {
   return shell.startupPolicy === "none";
 };
 // PR #394 review: the header switcher's `when`, kept as a single call per
-// docs/developing-bram.md. Shown only when Bram is launching agents itself
-// (policy is not "none") AND a provider is known.
-window.__bramShowAgentSwitcher = function (pushedEvt, fetchedSettings, mainStatus, enhance) {
-  if (window.__bramStartupPolicyIsNone(pushedEvt, fetchedSettings)) return false;
-  var provider = (mainStatus && mainStatus.provider) || (enhance && enhance.activeProvider);
-  return !!provider;
+// docs/developing-bram.md. Shown whenever Bram is launching agents itself
+// (policy is not "none"). top-banner-wraps: no longer waits for a known
+// provider, since __bramShownProvider always has an answer.
+window.__bramShowAgentSwitcher = function (pushedEvt, fetchedSettings) {
+  return !window.__bramStartupPolicyIsNone(pushedEvt, fetchedSettings);
+};
+// top-banner-wraps: the provider the header dropdown shows: the live one, else
+// the active one, else the configured default (shell.agent), else claude, the
+// same fallback as the host's configured_agent_provider.
+window.__bramShownProvider = function (pushedEvt, fetchedSettings, mainStatus, enhance) {
+  var settings = (pushedEvt && pushedEvt.payload) || fetchedSettings || {};
+  return window.__bramProviderKey(mainStatus && mainStatus.provider) ||
+    window.__bramProviderKey(enhance && enhance.activeProvider) ||
+    window.__bramProviderKey((settings.shell || {}).agent) ||
+    "claude";
 };
 // opencode-provider-switch: the one place a provider string is recognized.
 // Key is "" for anything unknown, so each caller picks its own default;
 // the label defaults to Claude, as the binary checks it replaces did.
+// antigravity-provider-switch adds Antigravity: its wire string is
+// `antigravity`, and its CLI (`agy`) never appears here — that name lives in
+// the host's provider_cli_name.
 window.__bramProviderKey = function (provider) {
   var p = String(provider || "").toLowerCase();
-  return p === "claude" || p === "codex" || p === "opencode" ? p : "";
+  return p === "claude" || p === "codex" || p === "opencode" || p === "antigravity" ? p : "";
 };
 window.__bramProviderLabel = function (provider) {
   var key = window.__bramProviderKey(provider);
-  return key === "codex" ? "Codex" : key === "opencode" ? "OpenCode" : "Claude";
+  return key === "codex" ? "Codex"
+    : key === "opencode" ? "OpenCode"
+    : key === "antigravity" ? "Antigravity"
+    : "Claude";
 };
 window.__bramAgentSwitcherLabel = function (provider) {
   return window.__bramProviderLabel(provider);
@@ -1006,6 +1229,20 @@ window.__bramSwitchAgent = function (provider) {
     if (!p || (p.outcome !== "exited" && p.outcome !== "timeout")) return null;
     if (Number(p.atMs) && Number(p.atMs) <= dismissedAt) return null;
     var name = providerName(p.provider);
+    if (p.outcome === "exited" && p.notFound) {
+      // windows-pty-path-from-registry: the host recognized the shell's
+      // "command not found" for the launched command; say that, not the shell.
+      return {
+        kind: "exited",
+        provider: p.provider,
+        atMs: p.atMs,
+        message: name + " didn't start: \"" + p.notFound + "\" isn't on this terminal's PATH. " +
+          "Install " + name + "'s CLI, or if you just installed it, relaunch Bram so its terminal picks up the new PATH.",
+        tail: "",
+        actionLabel: "Start " + name + " fresh",
+        actionTooltip: "Starts " + p.provider + " as a new session, without resuming and without extra arguments.",
+      };
+    }
     if (p.outcome === "exited") {
       var hasStatus = p.status !== null && p.status !== undefined;
       return {
@@ -1118,7 +1355,7 @@ window.__bramSwitchAgent = function (provider) {
     if (!p || !p.pending) return null;
     if (Number(p.atMs) && Number(p.atMs) <= dismissedAt) return null;
     // The host names the agents installed on this machine, so the card offers
-    // every one of them — three, since OpenCode joined Claude and Codex. An
+    // every one of them — now including Antigravity. An
     // older host sends no list; the two-agent pair is then the honest answer.
     var installed = Array.isArray(p.installed) && p.installed.length
       ? p.installed.filter(function (key) { return window.__bramProviderKey(key); })
@@ -1281,8 +1518,8 @@ window.__bramSwitchAgent = function (provider) {
     notify(reason);
   };
   window.__bramPairOfferDismiss = function (value) { dismiss(value, "dismiss-click"); };
-  // opencode-partner-handoff: the two sides as `<provider>=<id>`, any two of
-  // claude / codex / opencode.
+  // opencode-partner-handoff, antigravity-partner-handoff: the two sides as
+  // `<provider>=<id>`, any two of the session providers.
   window.__bramPairOfferKeep = function (value, toastApi) {
     if (!value) return;
     var from = window.__bramProviderKey(value.fromProvider);
@@ -1291,7 +1528,7 @@ window.__bramSwitchAgent = function (provider) {
     window.fetch("/__sessions/pair?" + from + "=" + encodeURIComponent(value.fromSessionId || "") +
       "&" + to + "=" + encodeURIComponent(value.toSessionId || "") +
       "&from=" + encodeURIComponent(from), { cache: "no-store" }).then(function (r) {
-      if (!r.ok) throw new Error("HTTP " + r.status);
+      if (!r.ok) return window.__bramHttpError(r);
     }).catch(function (e) {
       if (toastApi && typeof toastApi.error === "function") {
         toastApi.error("Could not pair: " + String((e && e.message) || e));
@@ -1363,7 +1600,7 @@ window.__bramSessionEditTooltip = function (item, action, pendingDeletes, pendin
 
 // session-groups: the Sessions row's group line. Members share the group's
 // name (Jon, 2026-10-28), so only the agents are listed: "In a group with
-// Claude, Codex".
+// Claude, Antigravity".
 window.__bramSessionGroupLabel = function (item) {
   var g = item && item.group;
   if (!g) return "";
@@ -1392,6 +1629,15 @@ window.__bramSearchTypeLabel = function (h) {
   return h.type;
 };
 
+// issue-461-refuse-placeholder-pair: throw the host's refusal text, so the
+// toast says why instead of "HTTP 409". Falls back to the status when the
+// body is empty.
+window.__bramHttpError = function (r) {
+  return r.text().then(function (t) {
+    throw new Error((t || "").trim() || "HTTP " + r.status);
+  });
+};
+
 // session-groups: the Sessions row's Add to '<group>'. The group's member
 // anchors the join, so this session joins its group and takes its name. No
 // `from`: nothing is resumed, so no catch-up is offered.
@@ -1404,7 +1650,7 @@ window.__bramSessionAddToGroup = function (entry, toastApi) {
     encodeURIComponent(entry.anchorId) + "&" + encodeURIComponent(entry.provider) + "=" +
     encodeURIComponent(entry.id);
   window.fetch(url, { cache: "no-store" }).then(function (r) {
-    if (!r.ok) throw new Error("HTTP " + r.status);
+    if (!r.ok) return window.__bramHttpError(r);
     if (typeof toastApi === "function") toastApi("Added to '" + entry.name + "'");
   }).catch(function (e) {
     if (toastApi && typeof toastApi.error === "function") {
@@ -1519,6 +1765,34 @@ window.__bramUnpairSession = function (provider, id, toastApi) {
   };
 })();
 
+// provider-switch-flashes-back: switch_agent returns when the launch is sent,
+// not when the agent runs, so the status still names the old provider for up
+// to a few seconds. Clearing busy then let __bramSyncAgentSwitcher set the
+// control back to the agent being left, and forward again when the status
+// caught up. Stay busy until the status reports the request. The short delay
+// lets mainAgentStatus reach the pane first, so the sync that busy-to-idle
+// fires compares against the new provider. The limit keeps a launch that never
+// reports from leaving the control disabled; the sync then shows what the
+// status says.
+function __bramAgentSwitcherHoldUntilReported(key) {
+  var startedAt = Date.now();
+  var done = false;
+  var unsub = null;
+  var limit = null;
+  var finish = function (stage) {
+    if (done) return;
+    done = true;
+    clearTimeout(limit);
+    if (unsub) unsub();
+    window.__bramAgentSwitcherTrace(stage, { provider: key, waitedMs: Date.now() - startedAt });
+    setTimeout(function () { __bramPublishAgentSwitcherBusy(false); }, stage === "settled" ? 200 : 0);
+  };
+  limit = setTimeout(function () { finish("settle-timeout"); }, 15000);
+  unsub = window.bramSubscribeAgentStatus()(function (status) {
+    if (window.__bramProviderKey(status && status.provider) === key) finish("settled");
+  });
+  if (done) unsub();
+}
 window.__bramHandleAgentSwitcherChange = function (next, previous, select, toastApi) {
   var key = window.__bramProviderKey(next);
   var prev = window.__bramProviderKey(previous) || "claude";
@@ -1527,7 +1801,7 @@ window.__bramHandleAgentSwitcherChange = function (next, previous, select, toast
   __bramPublishAgentSwitcherBusy(true);
   window.__bramSwitchAgent(key).then(function () {
     window.__bramAgentSwitcherTrace("complete", { provider: key });
-    __bramPublishAgentSwitcherBusy(false);
+    __bramAgentSwitcherHoldUntilReported(key);
   }).catch(function (e) {
     window.__bramAgentSwitcherTrace("revert", {
       provider: key,
@@ -1622,14 +1896,14 @@ window.__bramNewSessionBrief = function (words, predecessor) {
   // so name the digest Bram wrote; its header names the full transcript.
   if (predecessor && predecessor.digest) {
     prev += ", whose latest turns Bram wrote to `" + predecessor.digest +
-      "` (its header names the full transcript if you need more)";
+      "` in its state folder (`.bram/` if it exists, else `resources/`; the header names the full transcript if you need more)";
   }
   return [
     "You're starting a new session for this line of work, in my words:",
     "",
     String(words || "").trim(),
     "",
-    "Before anything else, build your context for it. Search the project history (/__search; the port is in resources/.bram-port) for what bears on it, and read " + prev + " where it's relevant.",
+    "Before anything else, build your context for it. Search the project history (/__search; the port is in .bram-port in Bram's state folder: .bram/ if it exists, else resources/) for what bears on it, and read " + prev + " where it's relevant.",
     "",
     "Then tell me what you found, with citations; what you looked for and didn't find; and what you think should frame this work. Don't change files or propose worklist items yet. We'll settle the framing together first.",
   ].join("\n");
@@ -1645,7 +1919,7 @@ window.__bramCreateNewSessionClick = function (provider, name, toastApi, words, 
       id: offer.id,
       title: offer.title,
       // provider-session-digest-for-codex: the host writes this before launch.
-      digest: "resources/session-digests/" + offer.provider + "-" + offer.id + ".md",
+      digest: "session-digests/" + offer.provider + "-" + offer.id + ".md",
     };
   }
   if (typeof toastApi === "function") toastApi("Starting a new session…");
@@ -1678,7 +1952,9 @@ window.__bramCreateNewSessionClick = function (provider, name, toastApi, words, 
 // nothing. "Current" comes from the live /__sessions/list (refetched on
 // sessions-list-changed), so a switch updates the line without refetching
 // the board; the host's isCurrent is the fallback until that list loads.
-window.__bramGateLastSession = function (items, sel, sessions) {
+// gate-last-session-line-dismissable: the trailing `tick` is the gate bar's
+// reactive var, passed only so bindings re-evaluate after a dismissal.
+window.__bramGateLastSession = function (items, sel, sessions, tick) {
   var ids = Array.isArray(sel) ? sel : [];
   if (!ids.length) return null;
   var byId = {};
@@ -1693,11 +1969,37 @@ window.__bramGateLastSession = function (items, sel, sessions) {
   }
   var cur = Array.isArray(sessions) && sessions.length ? window.__bramCurrentSessionOf(sessions) : null;
   if (cur ? shared.sessionId === cur.id : shared.isCurrent) return null;
-  return { id: ids.join(","), provider: shared.provider, sessionId: shared.sessionId, atMs: shared.atMs, title: shared.title };
+  var b = { id: ids.join(","), provider: shared.provider, sessionId: shared.sessionId, atMs: shared.atMs, title: shared.title };
+  if (window.__bramGateLastSessionDismissedMap()[b.id + ":" + b.sessionId]) return null;
+  return b;
+};
+// Dismissals are focus (what is ticked right now), so sessionStorage, keyed
+// per project; null key means neither read nor write.
+window.__bramGateLastSessionDismissedMap = function () {
+  try {
+    var k = window.__bramProjectScopedKey("bram.gateLastSessionDismissed");
+    if (!k) return {};
+    var m = JSON.parse(window.sessionStorage.getItem(k) || "{}");
+    return m && typeof m === "object" ? m : {};
+  } catch (e) { return {}; }
+};
+window.__bramGateLastSessionDismissClick = function (items, sel, sessions, tick) {
+  var b = window.__bramGateLastSession(items, sel, sessions);
+  if (!b) return tick || 0;
+  window.__bramIframeTrace("worklist-last-session", { op: "dismiss", id: b.id, session: b.sessionId, provider: b.provider });
+  try {
+    var k = window.__bramProjectScopedKey("bram.gateLastSessionDismissed");
+    if (k) {
+      var m = window.__bramGateLastSessionDismissedMap();
+      m[b.id + ":" + b.sessionId] = 1;
+      window.sessionStorage.setItem(k, JSON.stringify(m));
+    }
+  } catch (e) {}
+  return (tick || 0) + 1;
 };
 var __bramGateLastSessionShown = {};
-window.__bramGateLastSessionLine = function (items, sel, sessions) {
-  var b = window.__bramGateLastSession(items, sel, sessions);
+window.__bramGateLastSessionLine = function (items, sel, sessions, tick) {
+  var b = window.__bramGateLastSession(items, sel, sessions, tick);
   if (!b) return "";
   var key = b.id + ":" + b.sessionId;
   if (!__bramGateLastSessionShown[key]) {
@@ -2100,9 +2402,9 @@ window.__bramTraceHelperTiming = function (name, t0, extra) {
 // name, remaining segments are a property path inside the parsed JSON
 // object. Used by the __bram-prefixed localStorage shim helpers below
 // so they can run in plain JS without re-entering XMLUI's statement
-// queue. `bram.worklistSubmittedMessage` reads
-// `JSON.parse(localStorage.bram).worklistSubmittedMessage`. Splitter keys
-// like `bram.splitter.worklist` are two-level.
+// queue. `bram.turnCompleteBeep` reads
+// `JSON.parse(localStorage.bram).turnCompleteBeep`. Splitter keys like
+// `bram.splitter.worklist` are two-level.
 function __bramSplitKey(key) {
   var s = String(key);
   var dot = s.indexOf(".");
@@ -2659,6 +2961,8 @@ window.__bramSubmitFeedbackForSelection = function (box) {
 // sent with an item ticked, the sender unsure where it went — are why the
 // destination is shown before sending instead of inferred silently.
 window.__bramComposerEnterSubmit = function (box, toChat) {
+  // misaddressed-feedback-resends-as-chat: a new send answers the offer.
+  window.__bramMisaddressedDismiss();
   // composer-cmd-enter-just-do-it: ⌘Enter / Ctrl+Enter (noted by the keydown
   // listener below) sends a direct request, whatever is ticked.
   if (window.__bramComposerTakeDirectEnter()) {
@@ -2799,6 +3103,105 @@ window.__bramDismissForgeItem = function (ds, id, marker) {
       if (ds && typeof ds.refetch === "function") ds.refetch();
     })
     .catch(function () {});
+};
+
+// misaddressed-feedback-resends-as-chat: when the agent flags the feedback
+// it's answering as not about its item (POST /__worklist/misaddressed
+// op=flag), the composer shows "Not about <item>? Resend as chat". One click
+// unticks, sends the same text as chat through the composer's own chat path,
+// and the host notes on the feedback record that it was resent. Ignoring the
+// offer is fine: the next Enter send dismisses it.
+window.__bramMisaddressedPending = null;
+// The DataSource's transformResult: keeps a mirror for the Enter path.
+window.__bramMisaddressedAccept = function (d) {
+  window.__bramMisaddressedPending = (d && d.pending) || null;
+  return { pending: window.__bramMisaddressedPending };
+};
+// Takes the DataSource's value ({pending}); "" when nothing is flagged.
+// misaddressed-chat-resends-as-feedback: a flag now carries its direction.
+// kind "chat" is a message sent as chat that was feedback on an item; the
+// offer reads "About <item>?" and resends it as feedback to that item.
+window.__bramMisaddressedLabel = function (v) {
+  var p = v && v.pending;
+  if (!p || !p.itemId) return "";
+  return p.kind === "chat" ? "About " + p.itemId + "?" : "Not about " + p.itemId + "?";
+};
+window.__bramMisaddressedButton = function (v) {
+  var p = v && v.pending;
+  return p && p.kind === "chat" ? "Resend as feedback" : "Resend as chat";
+};
+window.__bramMisaddressedTooltip = function (v) {
+  var p = v && v.pending;
+  return p && p.kind === "chat"
+    ? "Tick the item, send the same message and its images to it as feedback, and note that it was first sent as chat"
+    : "Untick the item, send the same message as chat, and note on the item's feedback record that it was resent";
+};
+function __bramMisaddressedPost(body) {
+  if (typeof window.fetch !== "function") return Promise.resolve(null);
+  return window
+    .fetch("/__worklist/misaddressed", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    })
+    .then(function (r) { return r.json().catch(function () { return null; }); })
+    .catch(function () { return null; });
+}
+window.__bramMisaddressedResend = function (ds) {
+  var pending = ds && ds.value && ds.value.pending;
+  if (pending && pending.kind === "chat") return window.__bramMisaddressedResendAsFeedback(ds, pending);
+  if (!pending || !pending.feedbackRef) return;
+  window.__bramIframeTrace("click", { target: "resend-as-chat", op: "act", item: String(pending.itemId || "") });
+  __bramMisaddressedPost({ op: "resend", feedbackRef: pending.feedbackRef }).then(function (res) {
+    window.__bramMisaddressedPending = null;
+    if (ds && typeof ds.refetch === "function") ds.refetch();
+    if (!res || !res.ok || !res.text) {
+      window.__bramIframeTrace("click", { target: "resend-as-chat", op: "refused", reason: String((res && res.error) || "no-response") });
+      return;
+    }
+    var sel = (window.__bramW2Selection || []).filter(function (id) { return id !== res.itemId; });
+    if (typeof window.__bramW2SetSelection === "function") window.__bramW2SetSelection(sel);
+    window.__bramPrepareWorklistMessageSubmission({ text: res.text, mode: "", voiceTarget: "message-agent" });
+  });
+};
+// The chat direction: the host returns the chat turn's text, its images and
+// a note; the pane ticks the item, alone, and sends them through the same
+// feedback path Enter uses (images as the composer's own screenshot markers,
+// so the agent reads them as it would a pasted one). The selection survives,
+// as after any feedback send.
+window.__bramMisaddressedResendAsFeedback = function (ds, pending) {
+  if (!pending || !pending.turnRef) return;
+  window.__bramIframeTrace("click", { target: "resend-as-feedback", op: "act", item: String(pending.itemId || "") });
+  __bramMisaddressedPost({ op: "resend-as-feedback", turnRef: pending.turnRef }).then(function (res) {
+    window.__bramMisaddressedPending = null;
+    if (ds && typeof ds.refetch === "function") ds.refetch();
+    if (!res || !res.ok || !res.itemId || (!res.text && !(res.images || []).length)) {
+      window.__bramIframeTrace("click", { target: "resend-as-feedback", op: "refused", reason: String((res && res.error) || "no-response") });
+      return;
+    }
+    var markers = (res.images || []).map(function (p) { return "Read this screenshot: @" + p + "\n[Image: source: " + p + "]"; }).join("\n");
+    var body = (markers ? markers + "\n\n" : "") + (res.text || "") + (res.note || "");
+    if (typeof window.__bramW2SetSelection === "function") window.__bramW2SetSelection([res.itemId]);
+    window.__bramWorklist2BatchIterate([res.itemId], body);
+    if (typeof window.__bramGateGoTranscript === "function") window.__bramGateGoTranscript();
+  });
+};
+window.__bramMisaddressedDismiss = function () {
+  if (!window.__bramMisaddressedPending) return;
+  window.__bramMisaddressedPending = null;
+  __bramMisaddressedPost({ op: "dismiss" });
+};
+// misaddressed-offer-dismissable (Jon, 2026-11-08: "should be dismissable"):
+// the offer's ×. Declines the resend and nothing else; the flag stays on
+// the feedback record. Refetches once the host has dropped the offer, so the
+// line goes at once instead of at the next push.
+window.__bramMisaddressedDismissClick = function (ds) {
+  var pending = ds && ds.value && ds.value.pending;
+  window.__bramIframeTrace("click", { target: "misaddressed-dismiss", item: String((pending && pending.itemId) || "") });
+  window.__bramMisaddressedPending = null;
+  __bramMisaddressedPost({ op: "dismiss" }).then(function () {
+    if (ds && typeof ds.refetch === "function") ds.refetch();
+  });
 };
 
 window.__bramGateCloseComment = function (itemId, issueNumber, text, closesIssues) {
@@ -2953,7 +3356,8 @@ window.__bramPlanLine = function (board) {
   var parts = steps.map(function (s) {
     var ids = (s.ids || []).join(", ");
     if (s.verb === "feedback") return "Send feedback to " + ids;
-    var verb = s.verb === "drop" ? "Drop" : s.verb === "commit" ? "Commit" : String(s.verb || "");
+    var verb = s.verb === "drop" ? "Drop" : s.verb === "commit" ? "Commit"
+      : s.verb === "start" ? "Start" : String(s.verb || "");
     return verb + " " + ids;
   });
   if (parts.length) {
@@ -2972,25 +3376,70 @@ window.__bramPlanLine = function (board) {
 // decide, and are not part of the message, so they sit under a rule in
 // italics, one short line per sentence. XMLUI's Tooltip has no width limit, so a long
 // paragraph would run off the edge instead of wrapping (8045e8f).
+// whats-my-sequence-button (Jon, 2026-11-08, on the summary + feedback +
+// decide-lines hover: "This is total overkill"): the hover says only what one
+// click would send that the line can't show, a feedback step's text. The
+// reasoning is Why?'s; "" means no hover.
 window.__bramPlanTooltip = function (board) {
-  var plan = board && board.plan;
-  var summary = String((plan && plan.summary) || "").trim();
-  var steps = __bramPlanSteps(board);
-  var feedback = steps
+  return __bramPlanSteps(board)
     .filter(function (s) { return s.verb === "feedback"; })
     .map(function (s) {
       return "**Feedback to " + (s.ids || []).join(", ") + ":**\n\n> " + String(s.text || "").split("\n").join("\n> ");
-    });
-  // What helps decide (Jon, 2026-10-04): it's all or nothing, and the
-  // feedback goes as written. Not the mechanics of each step.
-  var decide = ["*One click does all of it.*", "*Skip it if you disagree with any step" +
-    (feedback.length ? " or would word the feedback differently" : "") + "; × dismisses it.*"];
-  var parts = [];
-  if (summary) parts.push(summary);
-  parts = parts.concat(feedback);
-  parts.push("---");
-  parts.push(decide.join("  \n"));
-  return parts.join("\n\n");
+    })
+    .join("\n\n");
+};
+// whats-my-sequence-button (Jon, 2026-11-08: "there should be no
+// recommendation when there is only one or zero items selected ... That's
+// when the sequence matters"): the plan line shows only while two or more
+// items are ticked.
+window.__bramPlanVisible = function (board, sel) {
+  return (sel || []).length > 1 && !!window.__bramPlanLine(board);
+};
+// whats-my-sequence-button: what the plan line's Why? button opens: why this
+// order, nothing else. The agent's `why` (Markdown, posted with the plan),
+// else its one-line summary, so a plan from an agent that predates `why`
+// still explains itself.
+window.__bramPlanWhy = function (board) {
+  var plan = board && board.plan;
+  var why = String((plan && plan.why) || "").trim();
+  if (why) return why;
+  var summary = String((plan && plan.summary) || "").trim();
+  return summary || "No explanation was posted with this plan.";
+};
+// whats-my-sequence-button (Jon, 2026-11-08: "What's my sequence here? ...
+// we should put that on the surface of the app"). The gate bar's button
+// sends this fixed question, naming the ticked items, as an ordinary chat
+// turn (not feedback to them); the seeded conventions tell every agent to
+// answer it with the order and a posted plan. Straight to toTurn, not
+// through the composer's send, which would clear a half-typed draft and
+// take any staged images with it.
+// Renamed from "What's my sequence here?" (Jon, 2026-11-08: "change what's
+// my sequence to what's my next move").
+window.__bramSequenceQuestion = "What's my next move?";
+// The button sits in the plan line's slot: shown when two or more items are
+// ticked (Jon, 2026-11-08: a sequence only matters then) and no plan is
+// showing (a posted plan is the answer, with its own Why?).
+window.__bramShowSequenceButton = function (board, sel) {
+  return (sel || []).length > 1 && !window.__bramPlanVisible(board, sel);
+};
+// next-move-button-inline-and-quiet (Jon, 2026-11-08: "at the end of the
+// line above it"): which row carries the button. The gate's consequence
+// line if it's showing, else the take line if that's showing, else a row of
+// its own; "" when the button isn't shown at all. Each row's `when` asks for
+// its own slot, so exactly one draws it.
+window.__bramNextMoveSlot = function (board, sel, claim, pred) {
+  if (!window.__bramShowSequenceButton(board, sel)) return "";
+  if (window.__bramStartConsequence(board && board.items, sel, claim)) return "consequence";
+  if (window.__bramSelectionTakeLine(pred, sel, board)) return "take";
+  return "own";
+};
+window.__bramAskSequence = function (sel) {
+  var ids = (sel || []).slice();
+  window.__bramIframeTrace("click", { target: "gatebar-sequence", selected: ids.length });
+  if (typeof window.toTurn === "function") {
+    window.toTurn(window.__bramSequenceQuestion + (ids.length ? " (" + ids.join(", ") + ")" : ""));
+  }
+  window.__bramGateGoTranscript();
 };
 // Runs the plan through the gate buttons' own paths, for exactly the named
 // ids: feedback-less drops host-direct (POST /__worklist/drop, as Drop does),
@@ -3005,23 +3454,50 @@ window.__bramDoRecommended = function (board, claim) {
   var steps = __bramPlanSteps(board);
   var dropIds = [];
   var commitIds = [];
+  var startIds = [];
   var feedbackSteps = [];
   steps.forEach(function (s) {
     var ids = s.ids || [];
     if (s.verb === "drop") dropIds = dropIds.concat(ids);
     else if (s.verb === "commit") commitIds = commitIds.concat(ids);
+    else if (s.verb === "start") startIds = startIds.concat(ids);
     else if (s.verb === "feedback" && ids.length && s.text) feedbackSteps.push(s);
   });
   window.__bramIframeTrace("click", {
     target: "gatebar-do-recommended",
     drop: dropIds.length,
     commit: commitIds.length,
+    start: startIds.length,
     feedback: feedbackSteps.length,
   });
   var items = (board && board.items) || [];
   // After any drops, like commits. The host refuses a plan that mixes
-  // feedback with commit, so at most one of the two runs.
+  // feedback with commit or start, so at most one kind of turn runs.
   var commit = function () {
+    // whats-my-sequence-button: commits and starts go as ONE approval, so
+    // one agent turn commits and then starts (the authorization record holds
+    // one approval at a time; a second click would replace the first). Each
+    // item keeps its own gate: the host accepts a start beside commits only
+    // when every commit id is applied, so that's "to commit", and a start
+    // id is "to apply". Commit's own path can't carry it: it would make
+    // every item apply-and-commit as soon as one isn't applied.
+    if (startIds.length && commitIds.length) {
+      var ids = commitIds.concat(startIds);
+      var body = window.__bramWithShareMode("", "together", items, commitIds, null);
+      var r = window.__bramPrepareBatchWorklistActionSubmission({
+        items: items,
+        selectedIds: ids,
+        feedbackDraftsById: window.__bramFanFeedback(ids, body),
+        kind: "approved",
+        oneShot: false,
+        closeMap: window.__bramW2CloseMap,
+      });
+      window.__bramW2SetSelection(startIds);
+      window.__bramWorklistActApply(r);
+      window.__bramGateGoTranscript();
+      return;
+    }
+    if (startIds.length) window.__bramGateAct("start", items, startIds, null, claim);
     if (commitIds.length) window.__bramGateAct("commit", items, commitIds, "together", claim);
     feedbackSteps.forEach(function (s) {
       window.__bramWorklist2BatchIterate(s.ids, String(s.text));
@@ -3056,7 +3532,13 @@ window.__bramDismissPlan = function () {
     .catch(function () {});
 };
 
-window.__bramGateAct = function (kind, items, sel, shareMode, claim) {
+window.__bramGateAct = function (kind, items, sel, shareMode, claim, opt) {
+  // gate-click-queues-behind-running-turn: `opt.now` delivers a queued click
+  // (at turn end, or Commit now) with the composer text it was made with
+  // (`opt.text`); `opt.delivery` keeps that delivery from clearing the
+  // composer, changing the selection or switching tabs, since the user may
+  // have moved on.
+  opt = opt || {};
   // Selection is literal user intent. Shared-file handling may change how the
   // agent prepares the commit, but never which ids this action authorizes.
   var ids0 = sel || [];
@@ -3072,14 +3554,20 @@ window.__bramGateAct = function (kind, items, sel, shareMode, claim) {
   // consult the live turn state before acting. `cautioned` rides the click
   // trace (computed before it, per the trace-comes-first rule above) so the
   // soak can count how often the guard fired and what the user chose.
-  var cautioned;
-  if (kind === "commit" || kind === "start-commit") {
-    if (!window.__bramAgentTurnActive()) {
-      cautioned = "not-needed";
-    } else if (window.__bramGateCautionArmed(kind)) {
-      cautioned = "bypassed";
-    } else {
-      cautioned = "shown";
+  // gate-click-queues-behind-running-turn: a Start, Start & commit or Commit
+  // click taken while the agent's turn is in flight is queued, not executed:
+  // nothing is recorded and nothing is typed until the turn ends, so the
+  // approval's TTL starts at delivery and the commit is taken after the agent
+  // stops editing (#368's torn-commit window). This replaces #368's
+  // ask-twice caution for these kinds. The queued button is disabled; the
+  // queue row's Cancel clears it, and stopping the turn delivers it sooner.
+  var queueable = kind === "start" || kind === "start-commit" || kind === "commit";
+  var queueOp = "";
+  if (queueable && !opt.now && ids0.length) {
+    if (window.__bramGateQueued(kind)) {
+      queueOp = "cancel";
+    } else if (window.__bramAgentTurnInFlight()) {
+      queueOp = "queue";
     }
   }
   window.__bramIframeTrace("click", {
@@ -3087,17 +3575,29 @@ window.__bramGateAct = function (kind, items, sel, shareMode, claim) {
     count: ids0.length,
     op: ids0.length ? "act" : "empty-selection",
     store: (window.__bramW2Selection || []).length,
-    cautioned: cautioned,
+    queue: queueOp || (opt.delivery ? "delivered" : (queueable ? "not-needed" : undefined)),
   });
   if (!ids0.length) return;
-  if (cautioned === "shown") {
-    window.__bramGateCautionSet(kind, ids0.length);
+  if (queueOp === "cancel") {
+    window.__bramGateQueueClear("cancelled");
     return;
   }
-  if (cautioned === "bypassed") {
-    window.__bramGateCautionClear("bypassed");
+  if (queueOp === "queue") {
+    // Plain copies, not the binding's values: XMLUI hands bindings out as
+    // reactive proxies, and reading a stale one after the board refreshes
+    // throws ("Proxy handler's 'get' result…", the 2026-11-04 02:51:38 demo
+    // run, where delivery died before recording anything).
+    window.__bramGateQueueSet({
+      kind: kind,
+      items: window.__bramPlainCopy(items),
+      sel: ids0.slice(),
+      shareMode: shareMode,
+      text: String(window.__bramMessageAgentText || ""),
+    });
+    window.__bramClearComposer();
+    return;
   }
-  var text = String(window.__bramMessageAgentText || "");
+  var text = opt.now && opt.text != null ? String(opt.text) : String(window.__bramMessageAgentText || "");
   // issue-345: this trace is the soak evidence that the user SAW the
   // don't-close warning and submitted the commit anyway -- fires only when
   // the detector still returns a contradiction for THIS submission (i.e.
@@ -3125,7 +3625,15 @@ window.__bramGateAct = function (kind, items, sel, shareMode, claim) {
 
   if (kind === "iterate") {
     window.__bramWorklist2BatchIterate(ids, body);
-    window.__bramW2SetSelection([]);
+    // feedback-send-keeps-selection: the items the feedback went to stay
+    // ticked, as after Start (16d5540f), so a run of feedback stays addressed
+    // to them. Clearing here sent every second follow-up out as chat
+    // (2026-11-05, three times running). Untick, Send as chat instead, or a
+    // clearing gate verb ends the run.
+    window.__bramW2SetSelection(ids);
+    window.__bramIframeTrace("click", {
+      target: "gatebar-iterate", op: "selection-after", keptSelection: ids,
+    });
     window.__bramClearComposer();
     window.__bramGateGoTranscript();
     return;
@@ -3143,6 +3651,12 @@ window.__bramGateAct = function (kind, items, sel, shareMode, claim) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ids: ids }),
+      })
+      .then(function (r) {
+        // delegated-work-action-gates: the host refuses a bound id
+        // (409 refuse-delegated-live). The button is disabled for it, so this
+        // only fires on a stale pane; record it rather than fail silently.
+        if (r && r.status === 409) window.__bramIframeTrace("gate-click", { op: "drop-refused", status: r.status, ids: ids });
       })
       .catch(function () {});
     window.__bramW2SetSelection([]);
@@ -3175,6 +3689,13 @@ window.__bramGateAct = function (kind, items, sel, shareMode, claim) {
   // was ticked is released, so the addressee line names exactly what is being
   // worked on. Every other kind clears: Start & commit, Commit and Drop rows
   // leave the board.
+  if (opt.delivery) {
+    // A queued click delivered at turn end: the user may have typed or
+    // ticked something else meanwhile, so leave the composer, selection and
+    // tab alone.
+    window.__bramWorklistActApply(r);
+    return;
+  }
   var keep = (kind === "start") ? ids : [];
   window.__bramW2SetSelection(keep);
   window.__bramIframeTrace("click", {
@@ -3327,10 +3848,6 @@ window.__bramClearWorklistUiState = function () {
   try { sessionStorage.removeItem("bram.worklistUiState"); } catch (e) {}
 };
 
-window.__bramRestoreWorklistSubmittedMessage = function () {
-  return __bramReadLS("bram.worklistSubmittedMessage", "");
-};
-
 window.__bramRestoreWorklistSessionSubmittedMessage = function () {
   return __bramReadSS("bram.worklistSessionSubmittedMessage", "");
 };
@@ -3343,17 +3860,7 @@ window.__bramShouldDimAgentDockOnMount = function () {
   return true;
 };
 
-window.__bramRestoreWorklistSubmittedKind = function () {
-  var kind = __bramReadLS("bram.worklistSubmittedKind", "");
-  return kind === "message" || kind === "action" ? kind : null;
-};
-
 window.__bramSetWorklistSubmittedKind = function (kind) {
-  if (kind === "message" || kind === "action") {
-    __bramWriteLS("bram.worklistSubmittedKind", kind);
-  } else {
-    __bramWriteLS("bram.worklistSubmittedKind", "");
-  }
   return kind || null;
 };
 
@@ -3404,25 +3911,45 @@ window.settingsInfoBodies = {
   sessions:
     "The agent can offer to continue a new line of work in a fresh session. It always asks first, in one line, and at most once per topic; saying no keeps the work here.\n\n## When the agent is about to propose a new worklist item\n\n*Project setting, saved in `.bram.json` as `sessions.suggestOnNewItem` and shared with everyone who works in this repo. Default: on.*\n\n## When the agent is about to file a new issue\n\n*Project setting, saved in `.bram.json` as `sessions.suggestOnNewIssue` and shared with everyone who works in this repo. Default: on.*\n\n## When the conversation shifts to a significantly different topic\n\nThe agent judges when a topic has shifted, so this one asks more often than the other two.\n\n*Project setting, saved in `.bram.json` as `sessions.suggestOnTopicShift` and shared with everyone who works in this repo. Default: off.*\n\n## Pair new sessions across providers\n\nWhen you switch between Claude and Codex and the session you're leaving has no partner on the other side, the other agent resumes its most recent session and Bram asks what you want: **Keep these together** pairs the two, so switching back and forth moves between them; **Start a new … session** starts one for the session you left. Bram never pairs sessions on its own. Turning this off stops the question; pairs you already made keep working, and **Unpair** on the Sessions tab ends one.\n\n*Project setting, saved in `.bram.json` as `sessions.pairAcrossProviders` and shared with everyone who works in this repo. Default: on.*",
   batchCommitActions:
-    "## Mirror Worklist lifecycle to GitHub issues\n\nPost Worklist lifecycle comments to linked GitHub issues.\n\n*Project setting, saved in `.bram.json` as `mirrorWorklistLifecycleToIssue` and shared with everyone who works in this repo. Default: off.*",
+    "## Mirror Worklist lifecycle to GitHub issues\n\nPost Worklist lifecycle comments to linked GitHub issues.\n\n*Project setting, saved in `.bram.json` as `mirrorWorklistLifecycleToIssue` and shared with everyone who works in this repo. Default: off.*" +
+    "\n\n## Pause Worklist enforcement for Claude\n\nAn advanced, experimental setting. While it is on, Bram's guard stops denying Claude's edits that no Worklist item covers, and Claude is told the Worklist is paused, so it edits directly and proposes no items. You define the work and manage commits yourself. The guard's other checks (session URLs, forge signatures) still apply. Codex, OpenCode and Antigravity stay enforced. Edits made while paused belong to no item: before turning enforcement back on, commit or stash them, or the next whole-file commit of a begun item may take them.\n\n*Project setting, saved in `.bram.json` as `worklist.enforcement` (`paused` or `on`) and shared with everyone who works in this repo. Default: on.*",
   ui:
-    "## Show target app\n\nShow the embedded target-app preview pane. Usually off.\n\n*Project setting, saved in `.bram.json` as `ui.showTargetApp` and shared with everyone who works in this repo. Default: off.*\n\n## Terminal open at startup\n\nOpen the terminal pane when Bram launches. The agent pane's Worklist and Transcript are the main surface; the toolbar's terminal button still opens and closes it for the current session.\n\n*Your setting, saved on this machine for every Bram window, not in the repo. Default: off.*\n\n## Agent-pane hot-reload\n\nAuto-reload the agent pane as you edit Bram's own source. For developing Bram.\n\n*Project setting, saved in `.bram.json` as `ui.toolsPaneHotReload` and shared with everyone who works in this repo. Default: off.*\n\n## Show tips in the footer\n\nShow rotating tips in the footer.\n\n*Your setting, saved on this machine for every Bram window, not in the repo. Default: on.*\n\n## Soft beep on menus and turn completion\n\nPlay a soft beep when a permission menu appears or a turn finishes.\n\n*Your setting, saved on this machine for every Bram window, not in the repo. Default: on.*\n\n## Dismissed tips return after\n\nHow long a dismissed tip stays hidden before showing again.\n\n*Your setting, saved on this machine for every Bram window, not in the repo. Default: 1 week.*\n\n## Search badges start all on\n\nWhether the Search tab opens with all facet badges selected, or none.\n\n*Your setting, saved on this machine for every Bram window, not in the repo. Default: on.*",
+    "## Show target app\n\nShow the embedded target-app preview pane. Usually off.\n\n*Project setting, saved in `.bram.json` as `ui.showTargetApp` and shared with everyone who works in this repo. Default: off.*\n\n## Terminal open at startup\n\nOpen the terminal pane when Bram launches. The agent pane's Worklist and Transcript are the main surface; the toolbar's terminal button still opens and closes it for the current session.\n\n*Your setting, saved on this machine for every Bram window, not in the repo. Default: off.*\n\n## Agent-pane hot-reload\n\nAuto-reload the agent pane as you edit Bram's own source. For developing Bram.\n\n*Project setting, saved in `.bram.json` as `ui.toolsPaneHotReload` and shared with everyone who works in this repo. Default: off.*\n\n## Reload a slowed pane when idle\n\nA workaround for an unexplained slowdown: the agent pane gets sluggish the longer it stays loaded, and a reload clears it. With this on, the pane reloads itself once it has measurably slowed down and you are not using it. It never reloads while you are using the pane: not while the window is focused, a turn is running, a dialog is open, the message box has focus, or a Worklist click is queued.\n\n*Project setting, saved in `.bram.json` as `ui.paneIdleFlush` and shared with everyone who works in this repo. Default: off.*\n\n## Show tips in the footer\n\nShow rotating tips in the footer.\n\n*Your setting, saved on this machine for every Bram window, not in the repo. Default: on.*\n\n## Soft beep on menus and turn completion\n\nPlay a soft beep when a permission menu appears or a turn finishes.\n\n*Your setting, saved on this machine for every Bram window, not in the repo. Default: on.*\n\n## Dismissed tips return after\n\nHow long a dismissed tip stays hidden before showing again.\n\n*Your setting, saved on this machine for every Bram window, not in the repo. Default: 1 week.*\n\n## Search badges start all on\n\nWhether the Search tab opens with all facet badges selected, or none.\n\n*Your setting, saved on this machine for every Bram window, not in the repo. Default: on.*",
+  // tool-descriptions-prompt-names-the-agent (Jon, 2026-11-05: "i can
+  // barely understand this, peggy never would"). Facts and sources are in
+  // that item's draft: per-agent behaviour measured on real sessions; cost
+  // from claude-haiku-4-5 at $1/$5 per MTok and ~430 in / 16 out tokens per
+  // call; key-vs-subscription from code.claude.com/docs/en/authentication.
   ai:
     "## Tool Descriptions\n\n" +
-    "The one-line intent header on Transcript tool rows.\n\n" +
-    "**For Claude** — rows already lead with Claude's own words: Bash tool " +
-    "descriptions, and the narration preceding other calls. No key, nothing " +
-    "to turn on. When the toggle is on, Bram uses Haiku to enhance them.\n\n" +
-    "**For Codex** — no native descriptions; rows show the raw command. " +
-    "When the toggle is on, Bram uses Haiku to create descriptions.\n\n" +
-    "Flipping the toggle off hides existing Haiku descriptions; flipping it " +
-    "back on restores them from cache at no cost — flip freely to compare.\n\n" +
-    "On sends tool material (command, diff, context, result excerpt) to the " +
-    "Anthropic API — needs `ANTHROPIC_API_KEY`, billed per-token. " +
-    "Credentials are redacted heuristically, not guaranteed. If Claude Code " +
-    "also accepts the key, run `/config` → turn off \"Use custom API key\" " +
-    "to keep it Bram-only.\n\n" +
-    "*Project setting, saved in `.bram.json` as `ai.describeCommands` and shared with everyone who works in this repo. Default: off.*",
+    "Each step the agent takes (running a command, reading or editing a file) " +
+    "shows as a row in the Transcript. A short description at the start of the " +
+    "row says what the step was for.\n\n" +
+    "**With this off**, rows use the agent's own words where there are any:\n\n" +
+    "| Agent | Commands | File reads and edits |\n" +
+    "|---|---|---|\n" +
+    "| Claude | its own description | the sentence Claude wrote just before |\n" +
+    "| Codex | the raw command | the file name |\n" +
+    "| OpenCode | the raw command | the file name |\n" +
+    "| Antigravity | its own description | the file name |\n\n" +
+    "**With this on**, Bram asks Claude Haiku to write a description for every " +
+    "row, for every agent, using the command and the agent's own lead-in " +
+    "sentence. Descriptions are kept: turning this off hides them, and turning " +
+    "it back on shows them again at no cost.\n\n" +
+    "**It needs an Anthropic API key, and a Claude subscription doesn't cover " +
+    "it.** Set `ANTHROPIC_API_KEY` in the environment you start Bram from. " +
+    "Calls are billed per token to that key's account, separately from any " +
+    "Claude Pro or Max plan. A description costs about $0.0005; a long working " +
+    "session comes to around 10 cents.\n\n" +
+    "**One catch for Claude users:** if Claude Code also sees that key, it asks " +
+    "whether to use it. If you say yes, your Claude Code usage moves from your " +
+    "subscription to the key and is billed per token. To keep the key for Bram " +
+    "only, say no, or in Claude Code run `/config` and turn off \"Use custom " +
+    "API key\".\n\n" +
+    "**What leaves your machine:** commands, file changes and short excerpts of " +
+    "results go to Anthropic. Bram masks things that look like passwords and " +
+    "keys, but can't promise to catch every one.\n\n" +
+    "*Project setting, saved as `ai.describeCommands` and shared with everyone who works in this repo. Default: off.*",
   search:
     "## Commit depth\n\nHow many of the newest commits the search index covers, messages and diffs (100\u201320,000); deeper indexing lengthens the next cold rebuild proportionally.\n\n*Project setting, saved in `.bram.json` as `search.commitDepth` and shared with everyone who works in this repo. Default: 2,000.*\n\n## Issue limit\n\nHow many forge issues the Issues tab and search index fetch (50\u20132,000).\n\n*Project setting, saved in `.bram.json` as `search.issueLimit` and shared with everyone who works in this repo. Default: 500.*",
   traces:
@@ -3629,9 +4156,7 @@ window.__bramSubmitWorklistMessageFast = function (text, voiceTarget) {
   window.__bramIframeTrace("message-agent-submit", { stage: "after-toTurn", chars: toSend.length, sentAt: sentAt });
   var baseline = 0;
   __bramWriteMessageDraft("", "submit");
-  __bramWriteLS("bram.worklistSubmittedMessage", userTyped);
   __bramWriteSS("bram.worklistSessionSubmittedMessage", userTyped);
-  window.__bramSetWorklistSubmittedKind("message");
   return { message: userTyped, images: __bramExtractImagePaths(toSend), baseline: baseline, sentAtText: new Date().toLocaleTimeString() };
 };
 
@@ -3785,7 +4310,88 @@ window.__bramAlertsKey = function (item) {
   if (!item) return "";
   return (item.id || "") + "|" + (item.activityMarker || item.activityAt || "");
 };
+// alerts-show-whats-new-and-what-was-said: arriving at Alerts snapshots which
+// rows (ALL lanes) are unseen BEFORE marking them seen, and keeps the snapshot
+// until you leave the page, so the rows can wear a New badge. Both the nav
+// pulse binding (Main.xmlui) and the Inbox page call __bramAlertsSnapshot, in
+// whatever order the engine evaluates them: on the page it unions newly
+// unseen keys into the snapshot, then marks them seen, so whichever runs
+// first captures and the other sees them already seen but still in the
+// snapshot. Off the page it clears the snapshot. The pulse itself stays on
+// Needs you now only.
+window.__bramAlertsSeenRead = function (storeKey) {
+  try {
+    return JSON.parse(sessionStorage.getItem(storeKey) || "{}") || {};
+  } catch (e) {
+    return {};
+  }
+};
+window.__bramAlertsAllItems = function (needsYou) {
+  var lanes = (needsYou && needsYou.lanes) || {};
+  var out = [];
+  var names = ["needsYouNow", "yourDecision", "othersHands", "looseEnds"];
+  for (var n = 0; n < names.length; n++) {
+    var arr = lanes[names[n]];
+    if (Array.isArray(arr)) out = out.concat(arr);
+  }
+  return out;
+};
+window.__bramAlertsSnapshotMap = {};
+window.__bramAlertsSnapshot = function (needsYou, pathname) {
+  if (pathname !== "/needs-you") {
+    window.__bramAlertsSnapshotMap = {};
+    return window.__bramAlertsSnapshotMap;
+  }
+  var storeKey = window.__bramProjectScopedKey
+    ? window.__bramProjectScopedKey("bram.alertsSeen")
+    : null;
+  if (!storeKey) return window.__bramAlertsSnapshotMap;
+  var items = window.__bramAlertsAllItems(needsYou);
+  var seen = window.__bramAlertsSeenRead(storeKey);
+  var snap = window.__bramAlertsSnapshotMap;
+  var added = 0;
+  var changed = false;
+  for (var i = 0; i < items.length; i++) {
+    var k = window.__bramAlertsKey(items[i]);
+    if (k && !seen[k]) {
+      seen[k] = 1;
+      changed = true;
+      if (!snap[k]) {
+        snap[k] = 1;
+        added++;
+      }
+    }
+  }
+  if (changed) {
+    try {
+      sessionStorage.setItem(storeKey, JSON.stringify(seen));
+    } catch (e) {}
+  }
+  if (added) {
+    window.__bramIframeTrace("alerts-new-snapshot", { added: added, total: Object.keys(snap).length });
+  }
+  return snap;
+};
+window.__bramAlertsIsNew = function (snap, item) {
+  return !!(snap && snap[window.__bramAlertsKey(item)]);
+};
+window.__bramAlertsAccent = function (snap, item) {
+  return window.__bramAlertsIsNew(snap, item)
+    ? "3px solid var(--xmlui-color-primary-500)"
+    : "";
+};
+// The row's detail line. With an excerpt the comment's own words replace the
+// "GitHub notification (reason)." tail, keeping the replier's name ("Asish's
+// Claude replied"); without one the host's detail stands.
+window.__bramAlertsDetail = function (item) {
+  var d = (item && item.detail) || "";
+  if (!item || !item.excerpt) return d;
+  var cut = d.indexOf(" \u00b7 GitHub notification");
+  return cut > 0 ? d.slice(0, cut) : d;
+};
 window.__bramAlertsShouldPulse = function (needsYou, pathname) {
+  var snap = window.__bramAlertsSnapshot(needsYou, pathname);
+  if (pathname === "/needs-you") return false;
   var items =
     needsYou && needsYou.lanes && Array.isArray(needsYou.lanes.needsYouNow)
       ? needsYou.lanes.needsYouNow
@@ -3793,31 +4399,7 @@ window.__bramAlertsShouldPulse = function (needsYou, pathname) {
   var storeKey = window.__bramProjectScopedKey
     ? window.__bramProjectScopedKey("bram.alertsSeen")
     : null;
-  var seen = {};
-  if (storeKey) {
-    try {
-      seen = JSON.parse(sessionStorage.getItem(storeKey) || "{}") || {};
-    } catch (e) {
-      seen = {};
-    }
-  }
-  if (pathname === "/needs-you") {
-    if (!storeKey) return false;
-    var changed = false;
-    for (var i = 0; i < items.length; i++) {
-      var k = window.__bramAlertsKey(items[i]);
-      if (k && !seen[k]) {
-        seen[k] = 1;
-        changed = true;
-      }
-    }
-    if (changed) {
-      try {
-        sessionStorage.setItem(storeKey, JSON.stringify(seen));
-      } catch (e) {}
-    }
-    return false;
-  }
+  var seen = storeKey ? window.__bramAlertsSeenRead(storeKey) : {};
   for (var j = 0; j < items.length; j++) {
     if (!seen[window.__bramAlertsKey(items[j])]) return true;
   }
@@ -3887,7 +4469,9 @@ var BRAM_ECHO_MAX_TICKS = 15; // ~30 s at the 2 s tick
 window.__bramItemInflightKind = function (claim, itemId, echoItemId, echoKind, echoTick) {
   if (!itemId) return "";
   var ids = (claim && claim.ids) || [];
-  if (ids.indexOf(itemId) !== -1) return claim.kind || "";
+  // delegated-work-action-gates: a delegation-only claim is not an agent
+  // working on the item in the main turn; the strip names the subagent.
+  if (ids.indexOf(itemId) !== -1 && !(claim && claim.heldByDelegation)) return claim.kind || "";
   if (!echoItemId || echoItemId !== itemId || !echoKind) return "";
   if ((echoTick || 0) >= BRAM_ECHO_MAX_TICKS) {
     // Host never claimed this item. Stop asserting it is in flight; the row
@@ -3903,8 +4487,102 @@ window.__bramItemInflightKind = function (claim, itemId, echoItemId, echoKind, e
 // ids, not a boolean: when parallel agent work later brings multi-claim
 // host state, the evolution happens here and call sites stay put.
 window.__bramInflightBlocker = function (claim) {
+  // delegated-work-action-gates: a claim held ONLY by bound subagents (no main
+  // turn running) is not "a turn is running": no global dim, no gate-click
+  // queue, no frozen checkboxes. Those rows are handled by the
+  // selection-scoped __bramDelegatedBlocker below instead.
+  if (claim && claim.heldByDelegation) return "";
   var ids = (claim && claim.ids) || [];
   return ids.length ? ids[0] : "";
+};
+
+// delegated-work-action-gates: the host's live subagent bindings, served on
+// /__inflight as `delegated: [{agentId, ids, agentType, description,
+// boundAtMs}]`. Plain-array copy so callers can loop without proxy surprises.
+window.__bramDelegatedBindings = function (claim) {
+  var d = (claim && claim.delegated) || [];
+  var out = [];
+  for (var i = 0; i < d.length; i++) {
+    if (d[i] && d[i].agentId) out.push(d[i]);
+  }
+  return out;
+};
+
+// The bindings whose ids intersect `sel` (an array of item ids).
+window.__bramDelegatedBindingsFor = function (claim, sel) {
+  var chosen = sel || [];
+  var out = [];
+  window.__bramDelegatedBindings(claim).forEach(function (b) {
+    var ids = b.ids || [];
+    for (var i = 0; i < ids.length; i++) {
+      if (chosen.indexOf(ids[i]) !== -1) { out.push(b); return; }
+    }
+  });
+  return out;
+};
+
+// The selection-scoped blocker: the first selected id that a live binding
+// covers, else "". Unrelated selections return "" and act normally.
+window.__bramDelegatedBlocker = function (claim, sel) {
+  var chosen = sel || [];
+  var bs = window.__bramDelegatedBindings(claim);
+  for (var i = 0; i < bs.length; i++) {
+    var ids = bs[i].ids || [];
+    for (var j = 0; j < ids.length; j++) {
+      if (chosen.indexOf(ids[j]) !== -1) return ids[j];
+    }
+  }
+  return "";
+};
+
+window.__bramDelegatedLabel = function (b) {
+  if (!b) return "";
+  return String(b.description || b.agentType || b.agentId || "subagent");
+};
+
+// "A subagent (<label>) is still working on <id>" for the tooltips and the
+// gate-bar line. Empty when the selection touches no binding.
+window.__bramDelegatedWhy = function (claim, sel) {
+  var id = window.__bramDelegatedBlocker(claim, sel);
+  if (!id) return "";
+  var bs = window.__bramDelegatedBindingsFor(claim, [id]);
+  var label = bs.length ? window.__bramDelegatedLabel(bs[0]) : "subagent";
+  var more = bs.length > 1 ? " (+" + (bs.length - 1) + " more)" : "";
+  return "A subagent (" + label + ")" + more + " is still working on " + id +
+    "; it unlocks when the subagent stops.";
+};
+
+// The binding that covers one item (for the row strip), or null.
+window.__bramDelegatedForItem = function (claim, itemId) {
+  var bs = window.__bramDelegatedBindingsFor(claim, [itemId]);
+  return bs.length ? bs[0] : null;
+};
+
+// Release every binding covering the selection (the user knows the subagent
+// is gone, or its stop never arrived), in ONE request: the host releases them
+// and reconciles the claim as one transaction. The host emits
+// inflight-claim-changed and worklist-changed on the change, which refetch
+// the gate bar and rows.
+window.__bramDelegatedRelease = function (claim, sel) {
+  var bs = window.__bramDelegatedBindingsFor(claim, sel);
+  var agentIds = [];
+  bs.forEach(function (b) {
+    if (agentIds.indexOf(b.agentId) === -1) agentIds.push(b.agentId);
+  });
+  window.__bramIframeTrace("delegated-release", { op: "click", agentIds: agentIds, ids: (sel || []).slice() });
+  if (!agentIds.length) return;
+  window
+    .fetch("/__agent/subagent/release", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agentIds: agentIds }),
+    })
+    .then(function (r) {
+      window.__bramIframeTrace("delegated-release", { op: "done", agentIds: agentIds, status: r.status });
+    })
+    .catch(function (e) {
+      window.__bramIframeTrace("delegated-release", { op: "failed", agentIds: agentIds, error: String(e) });
+    });
 };
 
 // strip-label-tense-for-applied-items: the Worklist2 summary strip's
@@ -4098,16 +4776,29 @@ window.__bramWorklist2StripTooltip = function (item, claim, items) {
   // strip-proposed-says-files-changed: the not-yet-started row whose files
   // have changed explains itself, since nothing on the board credits them.
   if (item && !window.__bramWorklist2Begun(item, claim)) {
-    var moved = window.__bramUnbegunMovedFiles(item);
-    if (moved) {
+    var uncreditedPaths = window.__bramUncreditedDeclaredPaths(item);
+    if (uncreditedPaths.length) {
+      // strip-says-when-declared-file-has-uncredited-changes: the strip's
+      // sentence, with the file in code and the disclosure clause.
       return (
-        moved + " of its files " + (moved === 1 ? "has" : "have") +
-        " changed on disk, but nothing on the board started this row, so " +
-        "those changes aren't credited to it yet.\n\n" +
-        "**Start & commit** lands them under this item. **Drop** removes " +
-        "the row and leaves the changes on disk, belonging to no item."
+        window.__bramUncreditedPhrase(uncreditedPaths, true, true) + "\n\n" +
+        "Nothing on the board started this row, so those changes aren't " +
+        "credited to it yet. **Start** begins work under this item and " +
+        "leaves them on disk until its commit takes the file. **Start & " +
+        "commit** lands them under this item now. **Drop** removes the row " +
+        "and leaves the changes on disk, belonging to no item."
       );
     }
+    // strip-uncredited-checks-membership: changes another item owns.
+    var ownedPaths = window.__bramOwnedDeclaredPaths(item);
+    if (ownedPaths.length) {
+      return window.__bramOwnedPhrase(ownedPaths, true, true);
+    }
+  }
+  // gate-names-the-outside-commit-that-strands-an-item: the strip's
+  // "Stranded by" expands to what happened and the way out.
+  if (item && (item.commitStrandedBy || []).length) {
+    return window.__bramStrandedSentence(item.commitStrandedBy, item.commitDependsOn, true, false);
   }
   var split = window.__bramItemChangedSplit(item, items, claim);
   // For a committable row, the terse label dropped the on-disk total, the
@@ -4306,6 +4997,8 @@ window.__bramGateCommitWhyNot = function (items, sel, claim, ctx) {
   if (!chosen.length) return "";
   var blocker = window.__bramInflightBlocker(claim);
   if (blocker) return "Unavailable while Bram is working on " + blocker + "; it unlocks when that turn ends.";
+  var delegatedWhy = window.__bramDelegatedWhy(claim, chosen);
+  if (delegatedWhy) return delegatedWhy;
   var addressed = window.__bramAddressedBlockMessage ? window.__bramAddressedBlockMessage(chosen, ctx) : "";
   if (addressed) return addressed;
   if (window.__bramSelectionAllCommittable(items, chosen, claim)) return "";
@@ -4316,6 +5009,9 @@ window.__bramGateCommitWhyNot = function (items, sel, claim, ctx) {
     var it = list.filter(function (x) { return x.id === chosen[i]; })[0];
     if (!it) continue;
     if (!window.__bramWorklist2Begun(it, claim)) return it.id + " hasn't been started; use Start first.";
+    if ((it.commitStrandedBy || []).length) {
+      return window.__bramStrandedSentence(it.commitStrandedBy, it.commitDependsOn, true, false);
+    }
     if ((it.commitCheckFailedPaths || []).length) {
       return it.id + "'s change doesn't apply to HEAD on its own (" + it.commitCheckFailedPaths.join(", ") + ").";
     }
@@ -4337,7 +5033,13 @@ window.__bramGateCommitWhyNot = function (items, sel, claim, ctx) {
 window.__bramGateCommitTooltip = function (sel, branch, items, claim, ctx) {
   var scope = window.__bramGateScopeTooltip(sel, "commit", branch) || "";
   var why = window.__bramGateCommitWhyNot(items, sel, claim, ctx);
-  return why ? scope + (scope ? "\n\n" : "") + "**Why it's off:** " + why : scope;
+  if (why) return scope + (scope ? "\n\n" : "") + "**Why it's off:** " + why;
+  // gate-one-way-to-continue-one-to-finish: Commit on a `proposed` item sends
+  // apply-and-commit, which lets the agent make remaining edits first.
+  if (window.__bramSelectionNeedsProposedCommit(items, sel)) {
+    return "The agent may finish remaining edits before it commits." + (scope ? "\n\n" + scope : "");
+  }
+  return scope;
 };
 
 window.__bramSelectionAllCommittable = function (items, sel, claim) {
@@ -4397,6 +5099,39 @@ window.__bramSelectionAllCommittable = function (items, sel, claim) {
     }
   }
   return true;
+};
+
+// gate-names-the-outside-commit-that-strands-an-item: the sentence for an
+// item whose patch no longer applies because a commit outside the Worklist
+// changed its file after it began (host: commitStrandedBy, strandedBy). It
+// names the file and the commit, then the way out: together with the file's
+// other owners when there are any, or a re-anchor by the agent. `code` wraps
+// names for Markdown; `plural` phrases it for a selection.
+window.__bramStrandedSentence = function (stranded, others, code, plural) {
+  var list = stranded || [];
+  if (!list.length) return "";
+  var c = list[0];
+  var path = (c.paths || [])[0] || "a declared file";
+  var q = function (s) { return code ? "`" + s + "`" : s; };
+  var more = list.length > 1
+    ? " and " + (list.length - 1) + " more commit" + (list.length > 2 ? "s" : "")
+    : "";
+  var subj = plural ? "these items" : "this item";
+  var obj = plural ? "them" : "it";
+  var fix = (others || []).length
+    ? "Commit " + obj + " together with " + window.__bramNameList(others) +
+      ", or ask the agent to re-anchor " + obj + "."
+    : "Ask the agent to re-anchor " + obj + ".";
+  // One sentence, no hand breaks: the tooltips that show it are Tooltip
+  // templates with a width-bound Markdown, so they wrap on their own
+  // (strip-tooltip-wraps-via-template; the 2026-11-07 "need to wrap the
+  // tooltip" fix was three hand-broken lines).
+  return (
+    q(path) + " was changed by " + q(c.short || c.sha) + ", a commit outside the Worklist" + more +
+    ", after " + subj + " began, so " +
+    (plural ? "their patches no longer apply." : "its patch no longer applies on its own.") +
+    " " + fix
+  );
 };
 
 // #336: the begun items this one shares CHANGED paths with -- the claimants
@@ -4902,7 +5637,12 @@ window.__bramSelectionPredictionKey = function (board, sel) {
   // already carry the final key, marked stale. The ready signal refetches the
   // board, which flips it to fresh under the same key; this makes that flip
   // change the request, so the prediction refetches instead of staying hidden.
-  return k ? ids.join(",") + "|" + k + "|" + (board.membershipStale ? "stale" : "fresh") : "";
+  return k ? window.__bramSelectionIdsParam(ids) + "|" + k + "|" + (board.membershipStale ? "stale" : "fresh") : "";
+};
+// The will-commit request's ids, sorted: one selection is one request
+// whatever order it was ticked in (next-move-button-inline-and-quiet).
+window.__bramSelectionIdsParam = function (sel) {
+  return (sel || []).slice().sort().join(",");
 };
 
 window.__bramSelectionTakeLine = function (pred, sel, board) {
@@ -4911,6 +5651,10 @@ window.__bramSelectionTakeLine = function (pred, sel, board) {
   if ((pred.ids || []).slice().sort().join(",") !== sel.slice().sort().join(",")) return "";
   if (!board || !board.membershipStateKey || pred.stateKey !== board.membershipStateKey) return "";
   if ((pred.dependentPaths || []).length) {
+    if ((pred.strandedBy || []).length) {
+      return "Together these can't commit: " +
+        window.__bramStrandedSentence(pred.strandedBy, [], false, true);
+    }
     return "Together these can't commit: their changes depend on work by " +
       window.__bramNameList(pred.entangledWith || []) + ".";
   }
@@ -4919,11 +5663,18 @@ window.__bramSelectionTakeLine = function (pred, sel, board) {
     var un = pred.unowned || [];
     var ua = 0, ur = 0;
     for (var i = 0; i < un.length; i++) { ua += un[i].added || 0; ur += un[i].removed || 0; }
+    // next-move-button-inline-and-quiet (Jon, 2026-11-08: "There should only
+    // be one top line in this situation"): a bare whole-file count repeats
+    // the one-commit line above it. It speaks only to warn, when the take
+    // includes lines no item wrote.
+    if (!un.length) return "";
     return "Together, Commit takes these files whole: " + take +
-      (un.length ? ", including +" + ua + " \u2212" + ur + " no item wrote" : "") + ".";
+      ", including +" + ua + " \u2212" + ur + " no item wrote.";
   }
-  return "Together, Commit takes only these items' own lines: " + take +
-    " (shared with " + window.__bramNameList(pred.entangledWith || []) + ").";
+  // Taking only the items' own lines is the ordinary case, and says nothing
+  // (Jon, 2026-11-08: "we can lose this verbiage now"). The two lines above
+  // stay: each warns of something a click would otherwise do unseen.
+  return "";
 };
 
 // Removed-line ownership for one path ({startLine, endLine, itemId | itemIds},
@@ -5180,9 +5931,12 @@ window.__bramFileChangesCell = function (rec, rowBegun) {
   // beside that claim (Jon, 2026-10-07). Show the disk change, marked as not
   // yet credited to the item, since nothing on the board started it.
   if (!rowBegun) {
-    return (rec.added || 0) > 0 || (rec.removed || 0) > 0
-      ? total + suffix + " · not credited"
-      : "";
+    if (!window.__bramFileRecMoved(rec)) return "";
+    // strip-uncredited-checks-membership: name the owner when another item
+    // owns the change; "not credited" only for lines no item owns.
+    var o = rec.path ? window.__bramPathOwners(rec.path, null) : null;
+    if (o && o.owners.length && !o.unowned) return total + suffix + " · owned by " + o.owners.join(", ");
+    return total + suffix + " · not credited";
   }
   var hasTake = typeof rec.takeAdded === "number";
   if (hasTake && (rec.takeAdded !== rec.added || rec.takeRemoved !== rec.removed)) {
@@ -5490,6 +6244,12 @@ window.__bramWorklist2Strip = function (item, claim, items, attribution, agentSt
     return base + " · " + (asClaim ? "closes " : "for ") + closesList;
   };
   var kind = window.__bramItemInflightKind(claim, item.id, "", "", 0);
+  // delegated-work-action-gates: a live subagent binding names who is working
+  // and replaces "Start again, or Drop" / any "stopped" reading.
+  if (!kind) {
+    var delegatedTo = window.__bramDelegatedForItem(claim, item.id);
+    if (delegatedTo) return withCloses("Subagent working: " + window.__bramDelegatedLabel(delegatedTo), true);
+  }
   // issue-430-dependent-commit-offer: a refused commit used to reach only the
   // agent's HTTP response, and the row kept offering it ("bram does not tell
   // me that!"). The host keeps the last refusal until HEAD moves.
@@ -5644,7 +6404,35 @@ window.__bramWorklist2Strip = function (item, claim, items, attribution, agentSt
     if (ownLines === 0 || !window.__bramOwnClause(item, attribution)) {
       return withCloses("No changes of its own yet");
     }
+    // gate-names-the-outside-commit-that-strands-an-item: name the commit
+    // that stranded it, never the neighbour the host would otherwise blame.
+    var strandedBy = item.commitStrandedBy || [];
+    if (strandedBy.length) {
+      return withCloses(
+        "Stranded by " + (strandedBy[0].short || strandedBy[0].sha) + " · " +
+          ((strandedBy[0].paths || [])[0] || "its file") +
+          " changed outside the Worklist after it began",
+      );
+    }
     var blockers = window.__bramItemShareBlockers(item, items, claim);
+    // gate-names-the-outside-commit-that-strands-an-item: two items whose
+    // patches each depend on the other's lines can't be ordered. "Commit that
+    // first" on both rows was the loop Jon hit on 2026-11-02; say what's true.
+    var mutual = blockers.length > 0 && blockers.every(function (b) {
+      var o = (items || []).filter(function (x) { return x && x.id === b; })[0];
+      return !!o && (o.commitDependsOn || []).indexOf(item.id) !== -1;
+    });
+    // whats-my-sequence-button: a still-begun JOINT partner (lines written
+    // while both items' claims were open) can't commit first either: the
+    // host refuses either one alone (op=refuse-joint-interval), so "commit
+    // that first" on both rows was the same loop (Jon, 2026-11-08, on
+    // log-tells-session-switches and whats-my-sequence-button). Say what's
+    // true: they commit together.
+    var joint = (item.jointWith || []).filter(function (j) {
+      var o = (items || []).filter(function (x) { return x && x.id === j; })[0];
+      return !!o && window.__bramWorklist2Begun(o, claim);
+    });
+    if (joint.length) return withCloses("Commits only together with " + joint.join(", "));
     // issue-419-header-from-membership: superseded. The item did work in its
     // windows (ownLines > 0 above), but membership credits it no line in any
     // of its changed files: another item rewrote them. "Shares its changed
@@ -5655,6 +6443,8 @@ window.__bramWorklist2Strip = function (item, claim, items, attribution, agentSt
       rewritten
         ? "Its lines here were rewritten by " + blockers.join(", ") + " · commit " +
             (blockers.length === 1 ? "that" : "those") + " first"
+        : mutual
+        ? "Commits only together with " + blockers.join(", ")
         : blockers.length
         ? "Shares its changed files with " + blockers.join(", ") + " · commit " +
             (blockers.length === 1 ? "that" : "those") + " first"
@@ -5674,8 +6464,21 @@ window.__bramWorklist2Strip = function (item, claim, items, attribution, agentSt
     // moved. This retired the __bramWorklistStripAnomaly tripwire (removed),
     // whose `no-changes-yet-with-changed-files` line flagged exactly this
     // label hiding real changes.
+    // strip-says-when-declared-file-has-uncredited-changes: name the file and
+    // what Start & commit does with it. Jon, 2026-11-02, on
+    // orientation-diagrams-first after a direct edit to site/index.html: "if
+    // I can plainly see that there's been a change, then I've already
+    // started by definition". The verbs don't change (Resume means begun
+    // under THIS item, and nothing has), so the line says why Start sits
+    // beside visible changes. Same predicate as the table's `not credited`.
+    var uncredited = window.__bramUncreditedDeclaredPaths(item);
+    var owned = uncredited.length ? [] : window.__bramOwnedDeclaredPaths(item);
     return withCloses(
-      window.__bramUnbegunMovedFiles(item) ? "Proposed · its files have changed" : "Proposed",
+      uncredited.length
+        ? "Proposed · " + window.__bramUncreditedPhrase(uncredited, false, false)
+        : owned.length
+          ? "Proposed · " + window.__bramOwnedPhrase(owned, false, false)
+          : "Proposed",
     );
   }
   // issue-406: its work was committed outside the Worklist (a plain git
@@ -5750,14 +6553,131 @@ window.__bramWorklist2Strip = function (item, claim, items, attribution, agentSt
 // strip-proposed-says-files-changed: how many of an item's changed files have
 // lines added or removed -- the test the strip uses to say a not-yet-started
 // row's files have changed.
+// strip-says-when-declared-file-has-uncredited-changes: ONE test for "this
+// declared file moved on disk" (lines added or removed), shared by the files
+// table's `not credited` cell, the strip, its tooltip and the Start / Start &
+// commit tooltips, so no two of them can disagree about which files those are.
+window.__bramFileRecMoved = function (rec) {
+  return !!rec && ((rec.added || 0) > 0 || (rec.removed || 0) > 0);
+};
+// A NOT-BEGUN row's declared files that already moved: nothing on the board
+// started the row, so nobody is credited with those lines. Meaningful only
+// where the caller has checked begun-ness; on a begun row the same records
+// are the item's own work.
+// strip-uncredited-checks-membership: who owns a changed path's lines, from
+// the board's membership. null when membership has no fresh answer (the
+// callers then keep the plain "moved on disk" rule). `owners` excludes
+// `exceptId`; `unowned` is whether any line belongs to no item. A changed
+// path membership doesn't list belongs to no begun item at all.
+window.__bramPathOwners = function (path, exceptId) {
+  var m = window.__bramBoardMembership();
+  if (!m || m.stale) return null;
+  var e = m.byPath[path];
+  if (!e) return { owners: [], unowned: true };
+  var u = e.unowned || {};
+  return {
+    owners: (e.owners || []).filter(function (id) { return id !== exceptId; }),
+    unowned: ((u.added || 0) + (u.removed || 0)) > 0,
+  };
+};
+// Since strip-uncredited-checks-membership, "uncredited" means what it
+// says: lines no item owns. Before it, any moved declared file counted, so
+// a row whose files held another begun item's work read "changes nobody
+// credits" (2026-11-07: log-reads-across-trace-rotation beside the applied
+// log-shows-start-commit-push-search, whose lines membership credited).
+window.__bramUncreditedDeclaredPaths = function (item) {
+  var id = item && item.id;
+  return ((item && item.changedFiles) || [])
+    .filter(window.__bramFileRecMoved)
+    .filter(function (f) {
+      var o = window.__bramPathOwners(f.path, id);
+      return !o || o.unowned || !o.owners.length;
+    })
+    .map(function (f) { return f.path; });
+};
+// A not-begun row's declared files whose changes another item owns, with
+// those owners: [{path, owners}].
+window.__bramOwnedDeclaredPaths = function (item) {
+  var id = item && item.id;
+  var out = [];
+  ((item && item.changedFiles) || []).filter(window.__bramFileRecMoved).forEach(function (f) {
+    var o = window.__bramPathOwners(f.path, id);
+    if (o && o.owners.length) out.push({ path: f.path, owners: o.owners });
+  });
+  return out;
+};
+// The sentence for those: one file named, "and N more" past the first, and
+// the owners. `full` adds the way out, for the tooltips.
+window.__bramOwnedPhrase = function (list, code, full) {
+  var l = list || [];
+  if (!l.length) return "";
+  var owners = [];
+  l.forEach(function (x) { x.owners.forEach(function (o) { if (owners.indexOf(o) < 0) owners.push(o); }); });
+  var q = function (t) { return code ? "`" + t + "`" : t; };
+  var who = owners.map(q).join(" and ");
+  var name = q(l[0].path);
+  var more = l.length > 1 ? " and " + (l.length - 1) + " more" : "";
+  var verb = l.length > 1 ? " already have " : " already has ";
+  return (
+    name + more + verb + "changes owned by " + who +
+    "; starting this item mixes its edits into them" +
+    (full ? ". Commit " + who + " first, or start this one and commit them together." : "")
+  );
+};
 window.__bramUnbegunMovedFiles = function (item) {
-  var files = (item && item.changedFiles) || [];
-  var moved = 0;
-  for (var i = 0; i < files.length; i++) {
-    var f = files[i];
-    if (f && ((f.added || 0) > 0 || (f.removed || 0) > 0)) moved++;
+  return window.__bramUncreditedDeclaredPaths(item).length;
+};
+// The sentence those surfaces share. One file named, "and N more" past the
+// first. `code` wraps the path for Markdown (tooltips); the strip is plain
+// text. `full` adds the disclosure clause, which the terse strip leaves to
+// the tooltips (worklist2-strip-terse).
+window.__bramUncreditedPhrase = function (paths, code, full) {
+  var p = paths || [];
+  if (!p.length) return "";
+  var name = code ? "`" + p[0] + "`" : p[0];
+  var more = p.length > 1 ? " and " + (p.length - 1) + " more" : "";
+  var verb = p.length > 1 ? " already have" : " already has";
+  return (
+    name + more + verb + " changes nobody credits; Start & commit takes them with this item" +
+    (full ? " (they're disclosed as taken at the commit)." : "")
+  );
+};
+// The gate tooltips' input: the selection's uncredited paths, but only when
+// EVERY selected item is not begun -- the strip's own branch -- so a begun
+// row's credited changes are never called uncredited. Mixed selections get
+// their own explainer (__bramStartConsequence).
+window.__bramSelectionUncreditedPaths = function (items, sel, claim) {
+  var chosen = sel || [];
+  var list = items || [];
+  var out = [];
+  var seen = {};
+  for (var s = 0; s < chosen.length; s++) {
+    var it = null;
+    for (var i = 0; i < list.length; i++) if (list[i] && list[i].id === chosen[s]) it = list[i];
+    if (!it || window.__bramWorklist2Begun(it, claim)) return [];
+    var paths = window.__bramUncreditedDeclaredPaths(it);
+    for (var p = 0; p < paths.length; p++) {
+      if (!seen[paths[p]]) { seen[paths[p]] = true; out.push(paths[p]); }
+    }
   }
-  return moved;
+  return out;
+};
+// strip-uncredited-checks-membership: the same, for changes another item
+// owns, with the same not-begun-only rule.
+window.__bramSelectionOwnedPaths = function (items, sel, claim) {
+  var chosen = sel || [];
+  var list = items || [];
+  var out = [];
+  var seen = {};
+  for (var s = 0; s < chosen.length; s++) {
+    var it = null;
+    for (var i = 0; i < list.length; i++) if (list[i] && list[i].id === chosen[s]) it = list[i];
+    if (!it || window.__bramWorklist2Begun(it, claim)) return [];
+    window.__bramOwnedDeclaredPaths(it).forEach(function (x) {
+      if (!seen[x.path]) { seen[x.path] = true; out.push(x); }
+    });
+  }
+  return out;
 };
 // worklist2-checkbox-during-action: the row checkbox stays ticked and
 // disabled while a live claim covers the item — the tick is part of the
@@ -5861,6 +6781,17 @@ window.__bramBasename = function (path) {
 // "issue-269-drop-not-blocked-by-unrelated-claim issue-278-semantic-colour"
 // reads as one malformed token. A middot cannot be confused with anything
 // inside an id, which is hyphen-and-alphanumeric only.
+// shared-with-one-line: the files table's cell. Items with lines here entangle
+// a commit; items that only list the file don't. Names are in the ⓘ dialog.
+window.__bramSharedWithSummary = function (file, items, claim) {
+  var withLines = window.__bramSharedWithBegun(file, items, claim).length;
+  var listed = window.__bramSharedWithPlanned(file, items, claim).length;
+  var parts = [];
+  if (withLines) parts.push(withLines + " with lines");
+  if (listed) parts.push(listed + " listed");
+  return parts.join(" \u00b7 ");
+};
+
 window.__bramJoinIds = function (ids) {
   return (ids || []).join(" \u00b7 ");
 };
@@ -6072,6 +7003,7 @@ window.__bramW2ResetStartMode = function () {
   // selection's commit. Folded here (rather than a second statement in the
   // gate bar's ChangeListener) so the markup handler stays a single call.
   if (window.__bramGateCautionClear) window.__bramGateCautionClear("selection-changed");
+  if (window.__bramGateQueueClear) window.__bramGateQueueClear("selection-changed");
   return "together";
 };
 
@@ -6159,7 +7091,7 @@ window.__bramPushWithheldNote = function (status) {
   return "These commits ride " + b + "; they reach " + (status.pushWithheld.defaultBranch || "main") + " through its PR.";
 };
 
-window.__bramGateScopeTooltip = function (sel, kind, branch) {
+window.__bramGateScopeTooltip = function (sel, kind, branch, claim, items) {
   // gate-tooltips-multiline: Markdown lines, joined like the Worklist strip
   // tooltip (__bramWorklist2StripTooltip) -- one long single-line tooltip ran
   // past its edge. Rendered via tooltipMarkdown on the gate buttons.
@@ -6181,6 +7113,23 @@ window.__bramGateScopeTooltip = function (sel, kind, branch) {
   // the commit decision is made.
   if ((kind === "commit" || kind === "start-commit") && branch) {
     lines.push("→ `" + branch + "`");
+  }
+  // delegated-work-action-gates: why the button is off, when a subagent holds
+  // a selected item.
+  var delegatedWhy = window.__bramDelegatedWhy(claim, ids);
+  if (delegatedWhy) lines.push("**Why it's off:** " + delegatedWhy);
+  // strip-says-when-declared-file-has-uncredited-changes: the strip's
+  // sentence, on the two buttons that act on it. Only for a selection of
+  // not-begun items (__bramSelectionUncreditedPaths returns [] otherwise).
+  if (kind === "start" || kind === "start-commit") {
+    var uncredited = window.__bramSelectionUncreditedPaths(items, ids, claim);
+    if (uncredited.length) {
+      lines.push("**Already on disk:** " + window.__bramUncreditedPhrase(uncredited, true, true));
+    }
+    var ownedSel = window.__bramSelectionOwnedPaths(items, ids, claim);
+    if (ownedSel.length) {
+      lines.push("**Already on disk:** " + window.__bramOwnedPhrase(ownedSel, true, true));
+    }
   }
   return lines.join("\n\n");
 };
@@ -6233,24 +7182,13 @@ window.__bramStartConsequence = function (items, sel, claim) {
   }
   var n = window.__bramSelectionSharedFileCount(items, sel, claim);
 
-  // Mixed begun + unbegun: Start is foreclosed by the begun items, Commit by
-  // the unbegun ones, so no joint Start or Commit exists for this selection.
-  // Direct the selection change that unlocks each half. Names appear once, in
-  // the first half; the guidance half refers back ("the started item") rather
-  // than repeating long kebab-case ids.
-  if (begun.length && unbegun.length) {
-    return (
-      window.__bramNameList(begun) +
-      (begun.length === 1 ? " already has" : " already have") +
-      " changes and " + window.__bramNameList(unbegun) +
-      (unbegun.length === 1 ? " has" : " have") +
-      " not started, so this selection has no joint Start or Commit. Select " +
-      (begun.length === 1 ? "the started item alone" : "only the started items") +
-      " to commit, or " +
-      (unbegun.length === 1 ? "the proposed one to start it" : "one or more proposed ones to start them") +
-      (n ? " (their edits would then mix)" : "") + "."
-    );
-  }
+  // Mixed begun + unbegun: no joint Start or Commit exists for this
+  // selection, and nothing is said here. This branch used to spell out which
+  // half to tick for each button; the gate bar's What's my next move? and
+  // its plan now answer that for a multi-item selection (Jon, 2026-11-08:
+  // "we tell the story more clearly now and better without it";
+  // whats-my-sequence-button).
+  if (begun.length && unbegun.length) return "";
 
   // All unbegun: Start is lit, and the consequence of clicking it is the
   // one thing worth saying -- and only when the items share files.
@@ -6933,6 +7871,119 @@ window.__bramProjectFolderIs = function (status, kind) {
 };
 window.__bramProjectFolderIsOk = function (status) {
   return window.__bramProjectFolderKind(status) === "ok";
+};
+
+// issue-465: the Setup banner's heading, text, button label, tooltip and
+// whether Run Setup is offered, all from one place so the markup stays a
+// single call per attribute. `status` is /__enhance/status; `field` is one of
+// heading | text | button | tooltip | runnable. Three variants: first install,
+// already set up (names what was found; never says "install"), and a process
+// older than its checkout (Setup is not the remedy, so no button).
+window.__bramSetupReasonText = function (code) {
+  var m = {
+    "claude-instructions-stale": "This project's Bram instructions are out of date",
+    "claude-hook-missing": "The worklist guard hook isn't registered",
+    "claude-menu-hook-missing": "The permission hook isn't registered",
+    "codex-hook-missing": "Codex's Bram hooks are missing or out of date",
+    "codex-developer-instructions-missing": "Codex's Bram developer instructions are missing or out of date",
+    "codex-instructions-stale": "This project's AGENTS.md instructions for Codex are out of date",
+    "opencode-plugin-missing": "The OpenCode guard plugin is missing or out of date",
+    "opencode-instructions-missing": "OpenCode isn't configured to load the Bram instructions",
+    "antigravity-hook-missing": "Antigravity's Bram hooks are missing or out of date",
+    "antigravity-rules-stale": "Antigravity's Bram rule files are missing or out of date",
+  };
+  return m[code] || code;
+};
+// What skipping Setup costs until it runs, so the banner answers "do I have to
+// press this?" The guard hook is the only one that changes what agents can do.
+window.__bramSetupReasonCost = function (code) {
+  var m = {
+    "claude-instructions-stale": "Until then the agent works from older instructions.",
+    "claude-hook-missing": "Until then the Worklist isn't enforced: the agent can edit files no item covers.",
+    "claude-menu-hook-missing": "Until then permission prompts appear only in the terminal.",
+    "codex-hook-missing": "Until then the Worklist may not be enforced for Codex.",
+    "codex-developer-instructions-missing": "Until then Codex works from older instructions.",
+    "codex-instructions-stale": "Until then Codex works from older instructions.",
+    "opencode-plugin-missing": "Until then the Worklist isn't enforced for OpenCode.",
+    "opencode-instructions-missing": "Until then OpenCode works without Bram's instructions.",
+    "antigravity-hook-missing": "Until then the Worklist isn't enforced for Antigravity.",
+    "antigravity-rules-stale": "Until then Antigravity works without current Bram instructions.",
+  };
+  return m[code] || "";
+};
+// issue-465: the banner's ⓘ dialog. Markdown, because Text prints backticks
+// literally. It lists every situation the banner can report, so keep it in
+// step with __bramSetupReasonText and __bramSetupReasonCost.
+window.__bramSetupInfoMarkdown = function () {
+  return [
+    "Bram sets up this repo so AI agents share the Worklist: agents propose changes, and you approve them. Setup installs a small set of files, and running it again is safe.",
+    "",
+    "**Why this banner appears**",
+    "",
+    "- **New project:** nothing is installed yet. Bram normally does this itself before the agent starts, so you'll see it only if that didn't happen.",
+    "- **Instructions out of date:** Bram's instructions for an agent are older than this Bram. An upgrade usually causes this. The agent works from the older instructions until it's fixed.",
+    "- **Worklist guard missing:** the hook or plugin that enforces the Worklist isn't in place. **This is the serious one:** an agent can edit files no item covers.",
+    "- **Permission hook missing (Claude):** permission prompts appear only in the terminal, not here. If the terminal is hidden, a prompt can go unseen.",
+    "- **Bram older than its checkout:** the code on disk is newer than the running Bram. Setup isn't the fix, so the banner offers no button. Restart Bram, after rebuilding if you haven't. Running Setup from an older Bram would stamp new instructions with the old version.",
+    "",
+    "**If you don't press the button**",
+    "",
+    "Nothing stops working right away, and Bram runs Setup itself at its next launch. Until then, the costs above apply.",
+    "",
+    "**What Setup writes**",
+    "",
+    "- `.worklist-authorization.json` in Bram's state folder (`.bram/`, or `resources/` before 0.8.4), the approval record every agent's guard reads.",
+    "- The conventions file, `.claude/bram-conventions.md`, and its reference files.",
+    "- **Claude:** an import in `CLAUDE.md`, and the worklist-guard and permission hooks.",
+    "- **Codex:** a block in `AGENTS.md`, plus `developer_instructions` and hooks in `~/.codex/config.toml`.",
+    "- **OpenCode, where installed:** the guard plugin in `.opencode/plugins/`, and the conventions entry in `.opencode/opencode.json`.",
+    "- **Antigravity, where installed:** the guard group in `.agents/hooks.json`, and the conventions rules in `.agents/rules/`.",
+    "",
+    "**After Setup runs**",
+    "",
+    "Restart the agent, because it reads hooks and instructions when it starts. The banner won't return until something Setup wrote goes missing or falls out of date.",
+  ].join("\n");
+};
+window.__bramSetupBanner = function (status, field) {
+  var s = status || {};
+  var reasons = s.setupReasons || [];
+  var kind = s.providerSetupKind;
+  var refresh = kind === "codex-hook-refresh";
+  var older = kind === "restart-older-process";
+  var firstInstall = reasons.indexOf("not-installed") >= 0 || !reasons.length;
+  var found = reasons
+    .filter(function (c) { return c !== "not-installed"; })
+    .map(function (c) {
+      return (window.__bramSetupReasonText(c) + ". " + window.__bramSetupReasonCost(c)).trim();
+    });
+  if (older) {
+    if (field === "heading") return "Restart Bram";
+    if (field === "text")
+      return "This Bram is " + s.runningVersion + " and its checkout is " + s.checkoutVersion + ". Restart it, after rebuilding if you haven't.";
+    if (field === "button") return "";
+    if (field === "tooltip") return "About restarting Bram";
+    return false;
+  }
+  if (field === "runnable") return true;
+  if (refresh) {
+    if (field === "heading") return "Refresh Agent Coordination";
+    if (field === "text")
+      return "Bram was upgraded. Refresh the coordination files so Claude and Codex use the current conventions and hooks.";
+    if (field === "button") return "Refresh Coordination";
+    return "About agent coordination refresh";
+  }
+  if (firstInstall) {
+    if (field === "heading") return "Set Up Agent Coordination";
+    if (field === "text")
+      return "Install Bram's worklist coordination files and agent adapters for this repo.";
+    if (field === "button") return "Run Setup";
+    return "About agent coordination setup";
+  }
+  if (field === "heading") return "Agent Coordination Needs Attention";
+  if (field === "text")
+    return found.join(" ") + " Run Setup to fix this now, or Bram will at its next launch; it is safe to run again. Restart the agent afterwards.";
+  if (field === "button") return "Run Setup";
+  return "About agent coordination setup";
 };
 
 // Badge takes a dynamic background only through colorMap (value -> color),
@@ -7950,9 +9001,7 @@ window.__bramRecordWorklistFeedbackConversation = function (text) {
   if (!text || !text.trim()) return false;
   var message = text.trim();
   var baseline = 0;
-  __bramWriteLS("bram.worklistSubmittedMessage", message);
   __bramWriteSS("bram.worklistSessionSubmittedMessage", message);
-  window.__bramSetWorklistSubmittedKind("action");
   return { message: message, images: __bramExtractImagePaths(message), baseline: baseline, sentAtText: new Date().toLocaleTimeString() };
 };
 
@@ -9512,7 +10561,11 @@ window.subscribeTauriEvent("__bramNativeToolbarPtyMenuUnsub",
   var lastValue = null;
   var lastSig = null;
   var sigOf = function (v) {
-    return v ? [v.state, v.verb, v.provider, v.substate, v.source].join("|") : "";
+    if (!v) return "";
+    // antigravity-error-state-surfaced: agy's error rides the status payload
+    // as agentError {text, atMs}; a new one must reach the deduped consumers.
+    var err = v.agentError && v.agentError.atMs ? String(v.agentError.atMs) : "";
+    return [v.state, v.verb, v.provider, v.substate, v.source, err].join("|");
   };
   var notify = function (set) {
     set.forEach(function (fn) {
@@ -9570,6 +10623,21 @@ window.subscribeTauriEvent("__bramNativeToolbarPtyMenuUnsub",
   window.__bramAgentTurnActive = function () {
     ensureSubscribed();
     return !!(lastValue && lastValue.state === "working");
+  };
+  // gate-click-queues-behind-running-turn: a turn is still in flight while
+  // the agent waits at a permission menu, so the gate queue counts both.
+  window.__bramAgentTurnInFlight = function () {
+    ensureSubscribed();
+    var st = lastValue && lastValue.state;
+    return st === "working" || st === "waiting-for-permission";
+  };
+  // log-queue-entry-opens-message: the agent the status names right now, as
+  // a provider key ("" when none has reported yet). Queue entries record it
+  // when written and sent, so the Log shows who it was then, not who is
+  // selected while reading.
+  window.__bramCurrentAgent = function () {
+    ensureSubscribed();
+    return window.__bramProviderKey(lastValue && lastValue.provider);
   };
 })();
 
@@ -9891,6 +10959,18 @@ window.__bramMakeTerminalVisibilityBridge = function (spec) {
     if (value && value.shape === "codex-login") {
       return "Codex is asking you to sign in. Open the terminal to sign in.";
     }
+    if (value && value.shape === "antigravity-login") {
+      return "Antigravity is asking you to sign in. Open the terminal to sign in.";
+    }
+    if (value && value.shape === "antigravity-folder-trust") {
+      return "Antigravity is asking you to trust this folder. Open the terminal to review it.";
+    }
+    if (value && value.shape === "antigravity-resume-picker") {
+      return "Antigravity has its conversation picker open. Open the terminal to choose a conversation.";
+    }
+    if (value && value.shape === "antigravity-permission") {
+      return "Antigravity is asking permission in the terminal. Answer it there.";
+    }
     // v080-codex-session-lock: Bram never picks retry or fork for the user.
     if (value && value.shape === "codex-session-lock") {
       return "Codex says this conversation is open in another app. Open the terminal to retry, fork or exit.";
@@ -9909,7 +10989,7 @@ window.__bramMakeTerminalVisibilityBridge = function (spec) {
     return "The terminal is waiting at a prompt Bram can't answer.";
   };
   // The host names the alternative only when its CLI is on PATH, and with
-  // three agents it is never simply "the other one" — so the label comes from
+  // several agents it is never simply "the other one" — so the label comes from
   // the provider key, never a two-way ternary.
   window.__bramTerminalAttentionSwitchLabel = function (value) {
     var to = value && value.switchTo;
@@ -10498,6 +11578,26 @@ window.__bramToastWhisperNotice = function (notice, toastApi) {
   );
 };
 
+// agy-session-rename: one toast for a failed group name. The host replays the
+// latest event on every pane reload, and a changed format would fail once per
+// member at startup, so `at` is remembered for this session and a burst shows
+// once. Dismissing this is focus, not a decision.
+window.__bramToastGroupNameFailed = function (evt, toastApi) {
+  var p = evt && evt.payload;
+  if (!p || !toastApi || typeof toastApi.error !== "function") return;
+  var key = "bram.groupNameFailedAt";
+  var at = Number(p.at) || 0;
+  var shown = 0;
+  try { shown = Number(window.sessionStorage.getItem(key)) || 0; } catch (e) {}
+  if (at <= shown + 60000) return;
+  try { window.sessionStorage.setItem(key, String(at)); } catch (e) {}
+  toastApi.error(
+    window.__bramProviderLabel(p.provider) + " session couldn't take the name '" +
+    String(p.group || "") + "': " + String(p.detail || "unknown error") +
+    ". It's still in the group."
+  );
+};
+
 // voice-setup-dialog: when a 🎤 click finds whisper-server, the model or
 // ffmpeg missing, main.js posts { type: "bram-voice-setup", missing,
 // blocking, report } (report is whisper_preflight's). This replaces the
@@ -10918,7 +12018,7 @@ window.__bramLocalLinkRequestFromHref = function (href) {
   // opens a "File unavailable" preview instead of the page (the /queue
   // launch bug, 2026-07-23).
   var routeMatch = raw.match(
-    /^\/(needs-you|worklist2?|transcript|search|issues|commits|queue|history|files|sessions|tips|settings|status|context)(\/.*)?$/
+    /^\/(needs-you|worklist2?|transcript|search|issues|commits|queue|history|files|sessions|tips|settings|status|context|log)(\/.*)?$/
   );
   if (routeMatch) {
     var rest = routeMatch[2] ? routeMatch[2].slice(1) : "";
@@ -11332,8 +12432,26 @@ window.__bramShapePrecedingIntent = function (prose) {
   if (!prose) return "";
   var flat = String(prose).replace(/\s+/g, " ").trim();
   if (!flat) return "";
-  var m = flat.match(/[^.!?]*[.!?:]?\s*$/);
-  var tail = ((m && m[0]) || flat).trim();
+  // row-intent-splits-at-a-filename-dot: a sentence ends at . ! or ? only
+  // when whitespace follows, so `lib.rs`, 0.8.2 and URLs stay whole, and
+  // never inside a closed inline code span. An unpaired backtick opens no
+  // span. A colon still doesn't end a sentence, as before.
+  var ticks = [];
+  for (var t = 0; t < flat.length; t++) if (flat.charAt(t) === "`") ticks.push(t);
+  var inCode = function (i) {
+    for (var p = 0; p + 1 < ticks.length; p += 2) {
+      if (i > ticks[p] && i < ticks[p + 1]) return true;
+    }
+    return false;
+  };
+  var start = 0;
+  for (var i = 0; i < flat.length - 1; i++) {
+    var c = flat.charAt(i);
+    if ((c === "." || c === "!" || c === "?") && flat.charAt(i + 1) === " " && !inCode(i)) {
+      start = i + 1;
+    }
+  }
+  var tail = flat.slice(start).trim();
   if (!tail) tail = flat;
   if (tail.length > 90) tail = tail.slice(0, 89).trim() + "…";
   if (tail.length < 12) return "";
@@ -11352,21 +12470,35 @@ window.__bramShapePrecedingIntent = function (prose) {
 // - first row of a consecutive same-narration group only — three Reads
 //   under one sentence each captioned identically read as noise;
 // - sentence shaping via __bramShapePrecedingIntent above.
+// row-intent-reads-claude-narration-again (Peggy, 2026-11-05: Claude rows
+// bare until Haiku was switched on). Two later changes had silenced this
+// pass. Claude Code 2.1.280 writes its short notes as `thinking` entries
+// (see Transcript.xmlui's transcript-thinking-inline), and the projection
+// gives each JSONL record its own turn, so a note and the calls it
+// introduces sit in different turns. So: `thinking` counts as narration,
+// and narration carries across consecutive assistant turns, reset only by
+// a user turn (the first guard above, unchanged). Measured on this session
+// with Haiku stripped: 51 of 123 tool rows bare before.
 // Runs once per broadcast, before reference preservation; the field is
-// derived deterministically from turn content, so a reused prior turn
+// derived deterministically from turn content (turns are append-only, so a
+// turn's carried-in narration never changes), so a reused prior turn
 // reference already carries it.
 window.__bramAnnotatePrecedingIntent = function (turns) {
   var list = turns || [];
+  var lastProse = "";
+  var lastApplied = "";
   for (var i = 0; i < list.length; i++) {
     var t = list[i] || {};
-    if (t.role !== "assistant") continue;
-    var lastProse = "";
-    var lastApplied = "";
+    if (t.role !== "assistant") {
+      lastProse = "";
+      lastApplied = "";
+      continue;
+    }
     var es = t.entries || [];
     for (var k = 0; k < es.length; k++) {
       var e = es[k];
       if (!e) continue;
-      if (e.kind === "text" && e.text) {
+      if ((e.kind === "text" || e.kind === "thinking") && e.text) {
         lastProse = e.text;
         lastApplied = "";
         continue;
@@ -11397,11 +12529,23 @@ window.__bramBroadcastProjectedTurns = function (payload, reason) {
   }
   payload.revision = ++__projectedTurnsRevision;
   __projectedTurnsValue = payload;
+  // Busy span (issue-473-readable-launch-log): opens at the subscriber
+  // fan-out and closes at the double-rAF settle below, because React renders
+  // the new projection in a later task, not inside this loop. A stall while
+  // the span is open is the Transcript render (or its fan-out). If the settle
+  // can't be scheduled, the catch below closes the span at once.
+  var __busyTok = window.__bramBusyBegin("transcript-render");
+  var __busyClosed = false;
+  var __busyClose = function () {
+    if (__busyClosed) return;
+    __busyClosed = true;
+    window.__bramBusyEnd(__busyTok);
+  };
   var n = __projectedTurnsSubscribers.length;
   for (var j = 0; j < n; j++) {
     try { __projectedTurnsSubscribers[j](payload); } catch (e) {}
   }
-  __bramEagerDescribe(payload);
+  try { __bramEagerDescribe(payload); } catch (eD) { __busyClose(); throw eD; }
   // projection-broadcast-attribution (round 2 of the boot-latency work):
   // every broadcast names its trigger, the active route, and its cost —
   // sync ms here, render settle via double-rAF. The 2026-07-30 finding
@@ -11424,6 +12568,7 @@ window.__bramBroadcastProjectedTurns = function (payload, reason) {
     var __bcastSettleT0 = Date.now();
     requestAnimationFrame(function () {
       requestAnimationFrame(function () {
+        __busyClose();
         try {
           window.__bramIframeTrace("projection-broadcast", {
             stage: "settle",
@@ -11435,7 +12580,7 @@ window.__bramBroadcastProjectedTurns = function (payload, reason) {
         } catch (eS) { /* ignore */ }
       });
     });
-  } catch (eB) { /* ignore */ }
+  } catch (eB) { __busyClose(); }
 };
 
 // promote-tool-descriptions-to-row (eager): request descriptions only as
@@ -11506,8 +12651,23 @@ function __bramWidestOverflow(page) {
     var txt = (el.textContent || "").trim().slice(0, 40);
     return el.tagName.toLowerCase() + (cls ? "." + cls : "") + (tid ? " [" + tid + "]" : "") +
       " " + Math.round(r.width) + "w right=" + Math.round(r.right) + " limit=" + Math.round(limit) +
-      (txt ? " \"" + txt + "\"" : "");
+      (txt ? " \"" + txt + "\"" : "") + __bramOverflowCause(el);
   });
+}
+
+// What pushed an overflowing element right: for it and three ancestors, its
+// left edge and each earlier sibling that takes up width, as
+// " <left=L sib=Wx'text'...". Part of the same flip diagnostic.
+function __bramOverflowCause(el) {
+  var out = "";
+  for (var n = el, depth = 0; n && depth < 4; n = n.parentElement, depth++) {
+    out += " <left=" + Math.round(n.getBoundingClientRect().left);
+    for (var s = n.previousElementSibling; s; s = s.previousElementSibling) {
+      var w = Math.round(s.getBoundingClientRect().width);
+      if (w > 0) out += " sib=" + w + "w'" + (s.textContent || "").trim().slice(0, 24) + "'";
+    }
+  }
+  return out;
 }
 
 window.bramSubscribeTranscriptSplitHeight = (function () {
@@ -11600,6 +12760,91 @@ window.bramSubscribeTranscriptSplitHeight = (function () {
       return function () { subscribers.delete(fire); };
     };
     return factory;
+  };
+})();
+
+// top-banner-wraps: the header's two groups sit on one row until they no
+// longer fit, then stack (level 1), then the left group stacks too (level 2).
+// Main.xmlui binds `orientation` to this level. The groups are fit-content,
+// so their widths don't depend on the row's orientation and the choice can't
+// oscillate. The left group's width does change at level 2, so that level
+// compares against the width last read below it.
+//
+// The AppHeader's height is a fixed theme value, and the pinned StickySections
+// sit at the same value, so a stacked header must raise it or its second row
+// spills over the content. Writes --xmlui-height-AppHeader inline on <html>,
+// where XMLUI puts the root theme class. Level 0 removes the override, leaving
+// a wide window exactly as themed.
+(function () {
+  var level = 0;
+  var subscribers = new Set();
+  window.bramSubscribeHeaderRows = function () {
+    return function (emit) {
+      var fire = function () { emit(level); };
+      subscribers.add(fire);
+      fire();
+      return function () { subscribers.delete(fire); };
+    };
+  };
+  window.__bramWatchHeaderRows = function () {
+    var row = document.querySelector('[data-testid="app-header-row"]');
+    var left = document.querySelector('[data-testid="app-header-left"]');
+    var right = document.querySelector('[data-testid="app-header-right"]');
+    if (!row || !left || !right || row.__bramHeaderRowsWatched) return;
+    row.__bramHeaderRowsWatched = true;
+    var root = document.documentElement;
+    var prop = "--xmlui-height-AppHeader";
+    // Read before any override, and kept as the theme's own expression so it
+    // still scales with the A− / A+ font size.
+    var base = getComputedStyle(root).getPropertyValue(prop).trim() || "3.5rem";
+    var extra = 0;
+    var leftW = 0;
+    var pending = false;
+    function schedule() {
+      if (pending) return;
+      pending = true;
+      requestAnimationFrame(measure);
+    }
+    function measure() {
+      pending = false;
+      var rowW = row.getBoundingClientRect().width;
+      var l = left.getBoundingClientRect();
+      var r = right.getBoundingClientRect();
+      if (!rowW) return;
+      if (level < 2) leftW = l.width;
+      var next = leftW > rowW ? 2 : leftW + r.width + 4 > rowW ? 1 : 0;
+      if (next !== level) {
+        window.__bramIframeTrace("header-rows", {
+          level: next, prev: level, rowW: Math.round(rowW),
+          leftW: Math.round(leftW), rightW: Math.round(r.width),
+        });
+        level = next;
+        subscribers.forEach(function (fn) {
+          try { fn(); } catch (e) { console.error("[bramSubscribeHeaderRows] subscriber threw:", e); }
+        });
+        schedule(); // heights are read once the new orientation has laid out
+        return;
+      }
+      var nextExtra = level ? Math.max(0, Math.round(Math.max(l.bottom, r.bottom) -
+        Math.min(l.top, r.top) - Math.max(l.height, r.height))) : 0;
+      if (level === 2) nextExtra += Math.max(0, Math.round(l.height - r.height));
+      if (nextExtra === extra) return;
+      extra = nextExtra;
+      window.__bramIframeTrace("header-rows", { op: "height", extraPx: extra, level: level });
+      if (extra) root.style.setProperty(prop, "calc(" + base + " + " + extra + "px)");
+      else root.style.removeProperty(prop);
+    }
+    // Deferred to a frame: resizing from inside the callback is what makes
+    // the browser report a ResizeObserver loop.
+    if (typeof ResizeObserver !== "undefined") {
+      var ro = new ResizeObserver(schedule);
+      [row, left, right].forEach(function (el) { ro.observe(el); });
+    }
+    window.addEventListener("resize", schedule);
+    window.__bramIframeTrace("header-rows", {
+      op: "watch", base: base, rowW: Math.round(row.getBoundingClientRect().width),
+    });
+    schedule();
   };
 })();
 
@@ -11720,6 +12965,9 @@ function __bramVisibleToolIds() {
   try {
     var evs = window.__bramLastTranscriptEvents || [];
     var r = window.__bramVisibleRange;
+    // transcript-show-only-you-messages: the range indexes the filtered
+    // list then, not this snapshot, and no tool rows are on screen.
+    if (window.__bramYouOnlyActive && r && r.startIndex >= 0) return ids;
     if (r && r.startIndex >= 0) {
       for (var j = r.startIndex; j <= r.endIndex && j < evs.length; j++) {
         var ev = evs[j];
@@ -12273,7 +13521,92 @@ window.bramSubscribeProjectedLastExchange = (function () {
 //
 // Same factory shape as bramSubscribeProjectedLastExchange: `emit` is called
 // once on subscribe and on every change; the return value unsubscribes.
-window.__bramW2Selection = [];
+// keep-selection-reload (#479): a tools-pane reload started the selection
+// empty, so the next message went out as chat instead of feedback (after
+// 74e5984 kept items ticked across a feedback send, a reload silently ended
+// the run). The selection is focus state, what the user is working on now
+// (developing-bram.md §Client storage), so sessionStorage: it survives a
+// reload, dies with the session, and is project-scoped so another Bram
+// window never sees it. On a null project key, neither read nor write.
+// Restored here, at load, before Worklist.xmlui's var reads it; ids that
+// left the board drop out through the Worklist's existing prune.
+var __BRAM_W2_SELECTION_KEY = "bram.w2Selection";
+window.__bramW2RestorePending = null;
+window.__bramW2Selection = (function () {
+  var key = window.__bramProjectScopedKey(__BRAM_W2_SELECTION_KEY);
+  if (!key) return [];
+  var ids = [];
+  try {
+    var parsed = JSON.parse(window.sessionStorage.getItem(key) || "[]");
+    if (Array.isArray(parsed)) ids = parsed.filter(function (x) { return typeof x === "string" && x; });
+  } catch (e) { return []; }
+  if (ids.length) {
+    window.__bramW2RestorePending = { ids: ids.slice(), at: Date.now() };
+    window.__bramIframeTrace("w2-selection-restore", { op: "restore", count: ids.length, ids: ids });
+  }
+  return ids;
+})();
+function __bramW2PersistSelection(ids) {
+  var key = window.__bramProjectScopedKey(__BRAM_W2_SELECTION_KEY);
+  if (!key) return;
+  try {
+    if (ids.length) window.sessionStorage.setItem(key, JSON.stringify(ids));
+    else window.sessionStorage.removeItem(key);
+  } catch (e) { /* storage is optional */ }
+}
+// The first selection change after a restore, once a board is known: name
+// the restored ids the board no longer has (the prune let them go). Ids
+// still on the board are never reported, so unticking a row isn't mistaken
+// for a drop. Stale after a minute: a later change isn't the reload's doing.
+function __bramW2ReportRestoreDrops(next) {
+  var pending = window.__bramW2RestorePending;
+  if (!pending) return;
+  if (Date.now() - pending.at > 60000) { window.__bramW2RestorePending = null; return; }
+  var board = (__bramWlAccepted && Array.isArray(__bramWlAccepted.items)) ? __bramWlAccepted.items : null;
+  if (!board) return;
+  window.__bramW2RestorePending = null;
+  var onBoard = {};
+  board.forEach(function (i) { if (i && i.id) onBoard[i.id] = true; });
+  var dropped = pending.ids.filter(function (id) { return !onBoard[id] && next.indexOf(id) < 0; });
+  if (dropped.length) {
+    window.__bramIframeTrace("w2-selection-restore", { op: "dropped", count: dropped.length, ids: dropped });
+  }
+}
+// next-move-button-inline-and-quiet (Jon, 2026-11-08: "And if it does
+// happen, we'll capture the evidence?"): the selection store's writers.
+// The 2026-11-08 jitter could be counted (will-commit requests, publish and
+// receive lines) but not attributed: nothing said which code wrote each
+// selection, so the second writer was never named. Each real change now
+// traces its ids and caller, and a churn alarm (more than 20 changes in 10 s)
+// traces once per 30 s with the writers behind it.
+var __bramW2SelEvidence = { reorders: 0, recent: [], churnAt: 0 };
+function __bramW2Caller() {
+  try {
+    var lines = String(new Error().stack || "").split("\n").map(function (l) { return l.trim(); });
+    // Skip this helper and the store's own frames; the first other frame is
+    // the writer.
+    for (var i = 1; i < lines.length; i++) {
+      var l = lines[i];
+      if (!l || /__bramW2Caller|__bramW2SetSelection|__bramW2NoteSelectionChange/.test(l)) continue;
+      return l.slice(0, 160);
+    }
+  } catch (e) {}
+  return "";
+}
+function __bramW2NoteSelectionChange(next, prev) {
+  var now = Date.now();
+  var from = __bramW2Caller();
+  window.__bramIframeTrace("w2-selection-store", { op: "set", ids: next, prev: prev, from: from });
+  var ev = __bramW2SelEvidence;
+  ev.recent.push({ t: now, from: from });
+  ev.recent = ev.recent.filter(function (r) { return now - r.t <= 10000; });
+  if (ev.recent.length > 20 && now - ev.churnAt > 30000) {
+    ev.churnAt = now;
+    var writers = {};
+    ev.recent.forEach(function (r) { writers[r.from] = (writers[r.from] || 0) + 1; });
+    window.__bramIframeTrace("w2-selection-store", { op: "churn", changes: ev.recent.length, windowMs: 10000, writers: writers });
+  }
+}
 window.bramSubscribeW2Selection = (function () {
   var factory;
   return function () {
@@ -12282,10 +13615,30 @@ window.bramSubscribeW2Selection = (function () {
     window.__bramW2SetSelection = function (ids) {
       var next = (ids || []).slice();
       var prev = window.__bramW2Selection || [];
-      if (next.length === prev.length && next.every(function (v, i) { return v === prev[i]; })) {
+      // next-move-button-inline-and-quiet: the same items in another order
+      // are the same selection. The Worklist's prune rewrites it in board
+      // order on every board refresh while other writers keep tick order
+      // (a restored selection, for one), and an order-sensitive check let
+      // the two ping-pong: 531 alternating /__worklist/will-commit requests
+      // in 23 s after the 07:32:03 restore on 2026-11-08, felt as jitter.
+      var sameSet = next.length === prev.length && next.every(function (v) { return prev.indexOf(v) !== -1; });
+      var sameOrder = sameSet && next.every(function (v, i) { return v === prev[i]; });
+      if (sameSet) {
+        // Evidence if the fight recurs underneath: who wrote the other order.
+        // The first ignored reorder and every 50th after it, so a live
+        // ping-pong names both writers without flooding the trace.
+        if (!sameOrder && (__bramW2SelEvidence.reorders++ % 50) === 0) {
+          window.__bramIframeTrace("w2-selection-store", {
+            op: "reorder-ignored", ids: next, prev: prev,
+            from: __bramW2Caller(), n: __bramW2SelEvidence.reorders,
+          });
+        }
         return;
       }
+      __bramW2NoteSelectionChange(next, prev);
       window.__bramW2Selection = next;
+      __bramW2PersistSelection(next);
+      __bramW2ReportRestoreDrops(next);
       subscribers.forEach(function (fn) {
         try { fn(); } catch (e) { console.error("[bramSubscribeW2Selection] subscriber threw:", e); }
       });
@@ -12362,6 +13715,138 @@ window.bramSubscribeW2Selection = (function () {
     };
     return factory;
   };
+})();
+
+// gate-click-queues-behind-running-turn: one queued gate click (Start,
+// Start & commit or Commit) taken while the agent's turn was in flight. It is
+// delivered through __bramGateAct when the agent's status leaves "working",
+// so the approval is recorded at delivery. Focus state: it lives in memory,
+// with a project-scoped sessionStorage marker only so that a pane reload
+// can say the queued click was dropped rather than losing it silently.
+(function () {
+  var subscribers = new Set();
+  var factory = null;
+  var watching = false;
+  var notify = function () {
+    subscribers.forEach(function (fn) {
+      try { fn(); } catch (e) { console.error("[bramSubscribeGateQueue] subscriber threw:", e); }
+    });
+  };
+  var markerKey = function () {
+    return window.__bramProjectScopedKey ? window.__bramProjectScopedKey("bram.gateQueueMarker") : null;
+  };
+  var setMarker = function (q) {
+    var k = markerKey();
+    if (!k) return;
+    try {
+      if (q) window.sessionStorage.setItem(k, JSON.stringify({ kind: q.kind, ids: q.sel, atMs: q.atMs }));
+      else window.sessionStorage.removeItem(k);
+    } catch (e) {}
+  };
+  window.__bramW2GateQueue = null;
+  window.__bramPlainCopy = function (v) {
+    try { return v == null ? v : JSON.parse(JSON.stringify(v)); } catch (e) { return null; }
+  };
+  // Delivery reads the board as it is now (the latest accepted /__worklist
+  // payload, plain JSON), falling back to the copy saved at click time. No
+  // claim: the turn the click waited for has ended, and the host checks the
+  // real record at commit.
+  var deliveryItems = function (q) {
+    var b = typeof __bramWlAccepted !== "undefined" ? __bramWlAccepted : null;
+    return (b && Array.isArray(b.items)) ? b.items : (q.items || []);
+  };
+  var deliver = function () {
+    var q = window.__bramW2GateQueue;
+    if (!q) return;
+    window.__bramW2GateQueue = null;
+    setMarker(null);
+    window.__bramIframeTrace("gate-click", {
+      op: "delivered", kind: q.kind, ids: q.sel, queued_ms: Date.now() - q.atMs,
+    });
+    notify();
+    try {
+      window.__bramGateAct(q.kind, deliveryItems(q), q.sel, q.shareMode, null,
+        { now: true, delivery: true, text: q.text });
+    } catch (e) {
+      window.__bramIframeTrace("gate-click", {
+        op: "delivery-failed", kind: q.kind, ids: q.sel, error: String((e && e.message) || e),
+      });
+    }
+  };
+  var watchTurnEnd = function () {
+    if (watching) return;
+    watching = true;
+    window.bramSubscribeAgentStatus()(function (status) {
+      // Only a turn that is over delivers: "waiting-for-permission" is a
+      // menu mid-turn, not the end of it.
+      var st = status && status.state;
+      if (window.__bramW2GateQueue && (st === "finished" || st === "idle")) deliver();
+    });
+  };
+  window.__bramGateQueueSet = function (q) {
+    q.atMs = Date.now();
+    window.__bramW2GateQueue = q;
+    setMarker(q);
+    window.__bramIframeTrace("gate-click", { op: "queued", kind: q.kind, ids: q.sel });
+    watchTurnEnd();
+    notify();
+    return q;
+  };
+  window.__bramGateQueueClear = function (reason) {
+    var q = window.__bramW2GateQueue;
+    if (!q) return null;
+    window.__bramW2GateQueue = null;
+    setMarker(null);
+    window.__bramIframeTrace("gate-click", { op: reason || "cancelled", kind: q.kind, ids: q.sel });
+    notify();
+    return reason || null;
+  };
+  window.__bramGateQueued = function (kind) {
+    var q = window.__bramW2GateQueue;
+    return !!(q && (!kind || q.kind === kind));
+  };
+  // For bindings: takes the pushed queue value (gateQueue.value) so XMLUI
+  // re-evaluates the binding when the queue changes; a bare window read
+  // would never refresh.
+  window.__bramGateQueuedAs = function (q, kind) {
+    return !!(q && q.kind === kind);
+  };
+  window.__bramGateQueuedLabel = function (kind, base, q) {
+    return q && q.kind === kind ? base + " queued" : base;
+  };
+  // One line, one control: the queued button is disabled and says
+  // "… queued"; the row says when it runs and offers Cancel. To have it run
+  // sooner, stop the agent's turn: the turn ending is what delivers it.
+  window.__bramGateQueueMessage = function (q) {
+    return q ? "Runs when the agent finishes its current turn." : "";
+  };
+  window.__bramGateQueueCancel = function () {
+    window.__bramGateQueueClear("cancelled");
+  };
+  window.bramSubscribeGateQueue = function () {
+    if (factory) return factory;
+    factory = function (emit) {
+      var fire = function () { emit(window.__bramW2GateQueue || null); };
+      subscribers.add(fire);
+      fire();
+      return function () { subscribers.delete(fire); };
+    };
+    return factory;
+  };
+  // A marker left by a previous load means a queued click was lost to a
+  // reload: say so, then forget it. Deferred so the project key is set.
+  setTimeout(function () {
+    var k = markerKey();
+    if (!k) return;
+    try {
+      var raw = window.sessionStorage.getItem(k);
+      if (raw) {
+        var m = JSON.parse(raw);
+        window.sessionStorage.removeItem(k);
+        window.__bramIframeTrace("gate-click", { op: "dropped", reason: "reload", kind: m.kind, ids: m.ids });
+      }
+    } catch (e) {}
+  }, 0);
 })();
 
 // issue-368-addressed-turn-context: the active turn's addressed worklist ids,
@@ -12956,6 +14441,25 @@ function __bramLastRowProbe(total) {
 // No fixed offset correction: the two misses differed by an order of
 // magnitude, which points at content settling after the scroll rather than a
 // constant error, so a fudge factor would fix one and miss the other.
+// transcript-worklist-open-keeps-reading: opening the Worklist pane lands
+// the newest turn only for a reader who was following. The old listener
+// set follow to true unconditionally before the (yielding) jump, so a
+// scrolled-up reader was pinned to the bottom by the next turn's repin
+// (since 14fe5bb3, #427). Reads the synchronous follow truth, like
+// __bramFollowRepinOk. Returns the Transcript's next atBottom: unchanged
+// when the pane closes or the reader is reading.
+window.__bramWorklistOpenLand = function (open, atBottom, listRef, agentId, total) {
+  if (!open) return atBottom;
+  if (window.__bramFollowAtBottom === false) {
+    window.__bramIframeTrace("follow-state", {
+      op: "worklist-open-yielded", agentId: agentId || "main",
+    });
+    return false;
+  }
+  var next = window.__bramFollowTransition(true, "worklist-open", agentId);
+  window.__bramBottomJumpRetry(listRef, "worklist-open", agentId, total);
+  return next;
+};
 window.__bramBottomJumpRetry = function (listRef, cause, agentId, total) {
   window.__bramJumpListRef = listRef;
   // #427: one live retry loop at a time. The Transcript's Worklist split
@@ -13193,8 +14697,8 @@ window.__xmluiEvalTraceSink = function (op, d) {
   try { window.__bramIframeTrace("xmlui-probe", { op: op, d: d }); } catch (e) { /* ignore */ }
 };
 
-window.__bramRegisterTranscriptScroll = function (goTop, goBottom) {
-  window.__bramTranscriptScrollActions = { top: goTop, bottom: goBottom };
+window.__bramRegisterTranscriptScroll = function (goTop, goBottom, youStep) {
+  window.__bramTranscriptScrollActions = { top: goTop, bottom: goBottom, you: youStep || null };
 };
 window.__bramTranscriptScroll = function (dir) {
   var a = window.__bramTranscriptScrollActions;
@@ -13210,7 +14714,7 @@ window.__bramTranscriptScroll = function (dir) {
 // two closures stay in markup because they assign the Transcript's xs vars;
 // everything else runs here, and the enter line times the mount against the
 // render (tau-hub 2026-10-08: onMount ran ~18 s after the Transcript drew).
-window.__bramTranscriptOnMount = function (goTop, goBottom) {
+window.__bramTranscriptOnMount = function (goTop, goBottom, youStep) {
   try {
     window.__bramIframeTrace("follow-state", {
       op: "transcript-onmount-enter",
@@ -13218,7 +14722,7 @@ window.__bramTranscriptOnMount = function (goTop, goBottom) {
     });
   } catch (e) { /* ignore */ }
   window.__bramChipJumpPending = 0;
-  window.__bramRegisterTranscriptScroll(goTop, goBottom);
+  window.__bramRegisterTranscriptScroll(goTop, goBottom, youStep);
   window.__bramTranscriptMount();
 };
 
@@ -13649,14 +15153,18 @@ window.__bramToolResultIsStructuredJson = function (result) {
 // which read as a scrolling monospace blob. Parse the "Q"="A" pairs into
 // question/answer prose; null on parse miss so the caller self-declines to
 // the generic fence.
+// askuserquestion-quoted-answer-truncated: quotes inside a question or an
+// answer are expected (a typed "Other" answer often quotes something). So
+// split on the separators, not on every quote: a question ends at `"="`, an
+// answer at `", "` (the next pair) or the closing `".` / final `"`. The
+// result string has no escaping, so an answer containing the literal `", "`
+// stays ambiguous.
 window.__bramAskUserQuestionQA = function (text) {
-  var pairs = String(text || "").match(/"[^"]+"="[^"]*"/g);
-  if (!pairs || !pairs.length) return null;
+  var re = /"((?:[^"]|"(?!="))+)"="((?:[^"]|"(?!, "|\.(?:\s|$)|$))*)"/g;
+  var s = String(text || "");
   var out = [];
-  for (var i = 0; i < pairs.length; i++) {
-    var mm = /"([^"]+)"="([^"]*)"/.exec(pairs[i]);
-    if (mm) out.push("**" + mm[1] + "**\n\n✔ " + mm[2]);
-  }
+  var mm;
+  while ((mm = re.exec(s))) out.push("**" + mm[1] + "**\n\n✔ " + mm[2]);
   return out.length ? out.join("\n\n") : null;
 };
 
@@ -13894,7 +15402,18 @@ window.__bramTranscriptEventsFromTurns = function (payload, menu) {
         });
       } else if (t.role === "user") {
         if (t.text && String(t.text).trim()) {
-          slice.push({ id: baseId + "-u", kind: "user", text: t.text });
+          var uev = { id: baseId + "-u", kind: "user", text: t.text };
+          // issue-470: the host flags a Claude compaction summary and carries
+          // its boundary metadata. Plain extra fields on a kind:"user" event,
+          // so SessionDetail/SubagentPeek (which render only "user") still
+          // show it; only the live Transcript reclassifies it.
+          if (t.compactSummary === true) {
+            uev.compactSummary = true;
+            if (t.compactTrigger) uev.compactTrigger = t.compactTrigger;
+            if (t.compactPreTokens) uev.compactPreTokens = t.compactPreTokens;
+            if (t.compactPostTokens) uev.compactPostTokens = t.compactPostTokens;
+          }
+          slice.push(uev);
         }
       } else {
         var entries = t.entries || [];
@@ -13944,12 +15463,344 @@ window.__bramTranscriptEventsFromTurns = function (payload, menu) {
       if (t.images && t.images.length) {
         slice.push({ id: baseId + "-images", kind: "images", role: t.role || "", images: t.images });
       }
+      // log-rows-baseline-and-spacing: the turn's time (the host's `ts`) on
+      // its first event, so a Log entry's link can find the turn at its
+      // moment (__bramTranscriptIndexAt).
+      if (t.ts && slice.length) slice[0].turnTs = Date.parse(t.ts) || 0;
       if (window.__bramProjectedEventCache) window.__bramProjectedEventCache.set(t, slice);
     }
     for (var si = 0; si < slice.length; si++) events.push(slice[si]);
   window.__bramLastTranscriptEvents = events;
   }
   return window.__bramAppendMenuEvents(events, menu);
+};
+
+// issue-470-compaction-summary-collapsed: when Claude Code auto-compacts, it
+// writes the hand-off summary as a `user` record ("This session is being
+// continued from a previous conversation…", isCompactSummary:true), which the
+// host projects as an ordinary user turn, so the live Transcript showed a
+// screen of summary as a "You" turn. The host projection keeps only
+// The host projection (st_parse_lines_to_turns) now flags such turns
+// `compactSummary: true` and copies the preceding compact_boundary's
+// trigger/preTokens/postTokens as compactTrigger/compactPreTokens/
+// compactPostTokens; the shared adapter passes them onto the user event.
+// The flag is authoritative. Claude Code's fixed opening sentence (stable
+// since the 2026-06-02 prior art, 9f8a61f) remains the fallback for an older
+// host that sends no flag; the label then omits the metadata. Codex/other
+// providers never write this sentence, so they're unchanged.
+var __BRAM_COMPACT_SUMMARY_PREFIX = "This session is being continued from a previous conversation";
+window.__bramIsCompactSummaryText = function (text) {
+  return String(text || "").replace(/^\s+/, "").indexOf(__BRAM_COMPACT_SUMMARY_PREFIX) === 0;
+};
+
+// Content-derived id (djb2 over the summary text). The row's expand state is
+// keyed by this id, never by position: a sliding transcript window renumbers
+// the host turn indices that the adapter's "pt<N>" ids are built from.
+function __bramCompactSummaryId(text) {
+  var s = String(text || "");
+  var h = 5381;
+  for (var i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
+  return "compact-" + h.toString(36) + "-" + s.length.toString(36);
+}
+
+// Turn a "user" event that is a compaction summary into a "compaction" event:
+// { id, kind:"compaction", text, lines, trigger, preTokens, postTokens }.
+// trigger/preTokens/postTokens come from the host's compact* fields, and are
+// "" / 0 when the host sent none (older host, or no boundary record).
+window.__bramCompactionEvent = function (ev) {
+  var text = String((ev && ev.text) || "");
+  var lines = text.replace(/\s+$/, "").split(/\r?\n/).length;
+  return {
+    id: __bramCompactSummaryId(text),
+    kind: "compaction",
+    text: text,
+    lines: lines,
+    trigger: String((ev && ev.compactTrigger) || ""),
+    preTokens: Number((ev && ev.compactPreTokens) || 0),
+    postTokens: Number((ev && ev.compactPostTokens) || 0),
+  };
+};
+
+// The live Transcript's event stream: the shared adapter's output with
+// compaction summaries reclassified. Kept out of __bramTranscriptEventsFromTurns
+// itself because SessionDetail and SubagentPeek share that adapter (and its
+// per-turn cache) and render only kind "user"; a new kind there would make the
+// summary vanish from those views. Replaced in place, so the adapter's
+// __bramLastTranscriptEvents snapshot (index-aligned for the describe pump)
+// stays aligned. Converted events are cached by source-event identity so an
+// unchanged row keeps an identical object across refetches.
+window.__bramCompactionEventCache = (typeof WeakMap === "function") ? new WeakMap() : null;
+
+// transcript-host-notes-render-as-bram: the host prepends `[bram: <text>]`
+// lines (then a blank line) to the user's next message so the agent sees
+// them; the Transcript showed them at the same weight as what the user
+// typed. Display only: the agent still receives them inline. Only LEADING
+// `[bram: …]` notes count, each ending at the first `]` followed by
+// whitespace or the end; the whitespace between notes and before the user's
+// text is dropped. The host joins them with newlines, but the turn arrives
+// flattened: Claude Code records "[bram: …] hello" with a single space
+// (demo instance, 2026-11-07), so both shapes must match. A `[bram:`
+// mid-message or after the user's text is left alone.
+window.__bramSplitHostNotes = function (text) {
+  var src = String(text == null ? "" : text);
+  if (src.indexOf("[bram: ") !== 0) return { notes: [], text: src };
+  var notes = [];
+  var rest = src;
+  var re = /^\[bram: ([\s\S]*?)\](?=\s|$)\s*/;
+  var m;
+  while ((m = re.exec(rest))) {
+    notes.push(m[1]);
+    rest = rest.slice(m[0].length);
+  }
+  if (!notes.length) return { notes: [], text: src };
+  return { notes: notes, text: rest };
+};
+window.__bramHostNotesEventCache = (typeof WeakMap === "function") ? new WeakMap() : null;
+window.__bramLiveTranscriptEvents = function (payload, menu) {
+  var events = window.__bramTranscriptEventsFromTurns(payload, menu);
+  for (var i = 0; i < events.length; i++) {
+    var ev = events[i];
+    if (!ev || ev.kind !== "user") continue;
+    // transcript-host-notes-render-as-bram: split leading host notes off the
+    // user text (cached by source event so unchanged rows keep identity).
+    if (ev.compactSummary !== true && !window.__bramIsCompactSummaryText(ev.text)) {
+      var ncache = window.__bramHostNotesEventCache;
+      var split = ncache && ncache.get(ev);
+      if (split === undefined || split === null) {
+        var sp = window.__bramSplitHostNotes(ev.text);
+        split = sp.notes.length ? Object.assign({}, ev, { text: sp.text, hostNotes: sp.notes }) : false;
+        if (ncache) ncache.set(ev, split);
+      }
+      if (split) events[i] = split;
+      continue;
+    }
+    if (ev.compactSummary !== true && !window.__bramIsCompactSummaryText(ev.text)) continue;
+    var cache = window.__bramCompactionEventCache;
+    var conv = cache && cache.get(ev);
+    if (!conv) {
+      conv = window.__bramCompactionEvent(ev);
+      if (cache) cache.set(ev, conv);
+    }
+    events[i] = conv;
+  }
+  return events;
+};
+
+// transcript-show-only-you-messages: the Transcript's `events` is what the
+// List shows, either every projected row or only the user's own turns
+// (kind "user"; compaction summaries were reclassified above, so they drop
+// out). Find, follow-bottom and the You nav all run on this array, so they
+// act on what is shown with no logic of their own. Cached by source identity
+// so an unchanged projection keeps an identical filtered array.
+// The toggle is focus state (where you're looking), so sessionStorage:
+// it survives the remount a tab switch causes, not a relaunch
+// (developing-bram.md §Client storage).
+var __BRAM_YOU_ONLY_KEY = "bram.transcriptYouOnly";
+var __bramYouRowsCache = { src: null, out: null };
+window.__bramYouOnlyInitial = function () {
+  try { return window.sessionStorage.getItem(__BRAM_YOU_ONLY_KEY) === "1"; } catch (e) { return false; }
+};
+window.__bramShownTranscriptEvents = function (all, youOnly) {
+  window.__bramYouOnlyActive = !!youOnly;
+  var src = all || [];
+  if (!youOnly) return src;
+  if (__bramYouRowsCache.src === src) return __bramYouRowsCache.out;
+  var out = [];
+  for (var i = 0; i < src.length; i++) {
+    if (src[i] && src[i].kind === "user") out.push(src[i]);
+  }
+  __bramYouRowsCache = { src: src, out: out };
+  return out;
+};
+// "340 events", or "12 of 340 events" while only your messages show.
+window.__bramTranscriptCountLabel = function (shown, all, youOnly) {
+  var n = (all || []).length;
+  return youOnly ? ((shown || []).length + " of " + n + " events") : (n + " events");
+};
+// The toggle's click. Records where the reader was (as an index into ALL
+// events) so the post-toggle listener can land them on the same spot;
+// -1 while following, where the content-change repin lands at the bottom.
+window.__bramYouOnlySet = function (on, shown, all, agentId) {
+  on = !!on;
+  try { window.sessionStorage.setItem(__BRAM_YOU_ONLY_KEY, on ? "1" : "0"); } catch (e) { /* ignore */ }
+  var anchor = -1;
+  try {
+    var r = window.__bramVisibleRange;
+    var following = window.__bramFollowAtBottom !== false;
+    if (!following && r && r.startIndex >= 0 && shown && shown[r.startIndex]) {
+      anchor = (all || []).indexOf(shown[r.startIndex]);
+    }
+  } catch (e2) { /* ignore */ }
+  window.__bramYouAnchor = anchor;
+  window.__bramYouRef = null;
+  var mine = 0;
+  for (var i = 0; i < (all || []).length; i++) if (all[i] && all[i].kind === "user") mine++;
+  window.__bramIframeTrace("transcript-you", {
+    op: "only-mine", on: on, mine: mine, total: (all || []).length,
+    anchor: anchor, agentId: agentId || "main",
+  });
+  return on;
+};
+// After the toggle re-renders the List: scroll to the recorded spot. Turning
+// on lands on your last message at or above it; turning off lands on the row
+// itself.
+window.__bramYouOnlyRestore = function (shown, all, list, agentId) {
+  var a = window.__bramYouAnchor;
+  window.__bramYouAnchor = -1;
+  if (typeof a !== "number" || a < 0 || !list) return;
+  var target = a;
+  if (shown !== all) {
+    var count = 0;
+    for (var i = 0; i <= a && i < all.length; i++) if (all[i] && all[i].kind === "user") count++;
+    target = Math.max(0, count - 1);
+  }
+  try { list.scrollToIndex(target); } catch (e) { /* ignore */ }
+  window.__bramIframeTrace("transcript-you", {
+    op: "restore", anchor: a, to: target, agentId: agentId || "main",
+  });
+};
+
+// transcript-you-message-nav: ⤒ ▲ ▼ ⤓ for your messages. The reference row
+// is the last one a step landed on while it is still in view (so ▼ keeps
+// advancing near the end, where scrollToIndex can't move the view), else the
+// first visible row (so the buttons follow a hand scroll).
+function __bramYouRefIndex(shown) {
+  var r = window.__bramVisibleRange;
+  var start = (r && r.startIndex >= 0) ? r.startIndex : 0;
+  var end = (r && r.endIndex >= 0) ? r.endIndex : start;
+  var ref = window.__bramYouRef;
+  if (ref) {
+    for (var i = start; i <= end && i < shown.length; i++) {
+      if (shown[i] && shown[i].id === ref) return i;
+    }
+  }
+  return start;
+}
+function __bramYouTarget(dir, shown, ref) {
+  var i;
+  if (dir === "first") { for (i = 0; i < shown.length; i++) if (shown[i] && shown[i].kind === "user") return i; return -1; }
+  if (dir === "last") { for (i = shown.length - 1; i >= 0; i--) if (shown[i] && shown[i].kind === "user") return i; return -1; }
+  if (dir === "prev") { for (i = Math.min(ref, shown.length) - 1; i >= 0; i--) if (shown[i] && shown[i].kind === "user") return i; return -1; }
+  for (i = ref + 1; i < shown.length; i++) if (shown[i] && shown[i].kind === "user") return i;
+  return -1;
+}
+// Button enablement, derived from (shown, tick). Cached by a value key so an
+// unchanged state keeps an identical object and doesn't re-render the pane.
+var __bramYouNavCache = { key: "", val: null };
+window.__bramYouNavState = function (shown /*, tick */) {
+  shown = shown || [];
+  var ref = __bramYouRefIndex(shown);
+  var total = 0, before = 0, after = 0, atRef = false;
+  for (var i = 0; i < shown.length; i++) {
+    if (!shown[i] || shown[i].kind !== "user") continue;
+    total++;
+    if (i < ref) before++;
+    else if (i > ref) after++;
+    else atRef = true;
+  }
+  var key = total + "|" + before + "|" + after + "|" + atRef;
+  if (__bramYouNavCache.key === key) return __bramYouNavCache.val;
+  __bramYouNavPublishSoon();
+  // No wraparound (findbar-no-wraparound): ⤒ is off only when the reference
+  // row is already your first message, ⤓ only when it is your last.
+  var val = {
+    any: total > 0, canPrev: before > 0, canNext: after > 0,
+    canFirst: total > 0 && !(atRef && before === 0),
+    canLast: total > 0 && !(atRef && after === 0),
+  };
+  __bramYouNavCache = { key: key, val: val };
+  return val;
+};
+// The nav buttons live in the composer (MessageAgentComposer.xmlui), not the
+// Transcript, so their enablement travels by PushSource: the Transcript's
+// youNav binding computes the state, a changed key publishes it here. The
+// publish is deferred a tick so the composer's state update never lands
+// inside the Transcript's render.
+var __bramYouNavSubscribers = new Set();
+var __bramYouNavPublishPending = false;
+function __bramYouNavPublishSoon() {
+  if (__bramYouNavPublishPending) return;
+  __bramYouNavPublishPending = true;
+  setTimeout(function () {
+    __bramYouNavPublishPending = false;
+    var val = __bramYouNavCache.val;
+    __bramYouNavSubscribers.forEach(function (fn) {
+      try { fn(val); } catch (e) { console.error("[bramSubscribeYouNav] subscriber threw:", e); }
+    });
+  }, 0);
+}
+window.bramSubscribeYouNav = (function () {
+  var factory = function (emit) {
+    __bramYouNavSubscribers.add(emit);
+    emit(__bramYouNavCache.val);
+    return function () { __bramYouNavSubscribers.delete(emit); };
+  };
+  return function () { return factory; };
+})();
+// The composer's ▲/▼: ride the closure the mounted Transcript registered
+// (__bramTranscriptOnMount), like the top/bottom arrows do.
+window.__bramTranscriptYouStep = function (dir) {
+  var a = window.__bramTranscriptScrollActions;
+  if (!a || !a.you) return;
+  try { a.you(dir); } catch (e) { /* ignore */ }
+};
+
+// The List's onVisibleRangeDidChange: the existing bookkeeping, plus a tick
+// that changes only when the You nav's state does.
+window.__bramSetVisibleRangeYou = function (range, listRef, agentId, shown) {
+  window.__bramSetVisibleRange(range, listRef, agentId);
+  window.__bramYouNavState(shown);
+  return __bramYouNavCache.key;
+};
+// A button click. Scrolls, remembers the landing row, opens the follow echo
+// window and returns an increasing step number; the markup's listener on
+// that number sets atBottom=false (the find-step contract).
+var __bramYouStepSeq = 0;
+window.__bramYouStep = function (dir, shown, list, agentId) {
+  shown = shown || [];
+  var ref = __bramYouRefIndex(shown);
+  var target = __bramYouTarget(dir, shown, ref);
+  window.__bramFollowTransition(false, "you-step", agentId);
+  if (target >= 0) {
+    window.__bramYouRef = shown[target].id;
+    try { list.scrollToIndex(target); } catch (e) { /* ignore */ }
+  }
+  window.__bramIframeTrace("transcript-you", {
+    op: "step", dir: dir, from: ref, to: target, agentId: agentId || "main",
+  });
+  __bramYouStepSeq += 1;
+  return __bramYouStepSeq;
+};
+
+// Token counts as "969k" / "7k" / "1.2M".
+function __bramCompactTokens(n) {
+  n = Number(n) || 0;
+  if (n >= 1e6) return (Math.round(n / 1e5) / 10) + "M";
+  if (n >= 1e3) return Math.round(n / 1e3) + "k";
+  return String(n);
+}
+
+// "Context compacted (auto, 969k → 7k tokens) · 42 lines" — the parenthetical
+// only when the boundary metadata is present.
+window.__bramCompactionLabel = function (item) {
+  var it = item || {};
+  var meta = [];
+  if (it.trigger) meta.push(String(it.trigger));
+  if (it.preTokens && it.postTokens) {
+    meta.push(__bramCompactTokens(it.preTokens) + " → " + __bramCompactTokens(it.postTokens) + " tokens");
+  }
+  var n = Number(it.lines) || 0;
+  return "Context compacted" + (meta.length ? " (" + meta.join(", ") + ")" : "") +
+    " · " + n + (n === 1 ? " line" : " lines");
+};
+
+// Whether a compaction row is open. `toggled` is the Transcript's id-keyed
+// list of rows the user flipped away from the default; the default is the
+// per-user "Show compaction summaries in full" setting. XOR keeps both the
+// setting and each row's own click meaningful.
+window.__bramCompactionOpen = function (toggled, item) {
+  var flipped = (toggled || []).indexOf(item && item.id) >= 0;
+  return window.__bramCompactSummaryExpanded() ? !flipped : flipped;
 };
 
 // Pure consumer shim for the Sessions tab: unwrap the /__turns envelope.
@@ -14937,12 +16788,59 @@ window.__bramRestoreAllAgents = function () {
 // top-3 Items, and the "+N more" dropdown so a dismissal promotes the next
 // agent up from overflow. Returns the raw agents array untouched when
 // nothing is dismissed.
+// footer-subagents-hidden-while-session-pending: until a new session's first
+// turn confirms it, /__agents falls back to the PREVIOUS session's transcript,
+// so its subagents (and "N hidden") leaked into the new session's footer. While
+// the current /__sessions/list row is `pending`, the chip strip gets no roster.
+// Keyed on the pending flag, not a sid comparison: a Codex roster's sid is the
+// rollout file stem, not the session id.
+window.__bramRosterForSession = function (roster, sessions) {
+  var current = window.__bramCurrentSessionOf(sessions);
+  return current && current.pending ? null : roster;
+};
+
 window.__bramVisibleFooterAgents = function (roster, dismissed) {
   var agents = (roster && roster.agents) || [];
   if (!dismissed || !dismissed.length) return agents;
   return agents.filter(function (a) {
     return dismissed.indexOf(a && a.agentId) === -1;
   });
+};
+
+// subagent-chips-show-selection: the footer chips, newest first, capped at 3.
+// A selected agent is always among them, taking the last slot if it would
+// otherwise be in "+N more": selection is the chip's fill, so a selection
+// needs a chip.
+window.__bramFooterChipAgents = function (roster, dismissed, selectedId) {
+  var visible = window.__bramVisibleFooterAgents(roster, dismissed);
+  var chips = visible.slice(-3).reverse();
+  var selected = visible.slice(0, -3).filter(function (a) { return a.agentId === selectedId; });
+  return selected.length ? chips.slice(0, 2).concat(selected) : chips;
+};
+
+// The rest of the visible agents for the "+N more" menu, newest first.
+window.__bramFooterOverflowAgents = function (roster, dismissed, selectedId) {
+  var chips = window.__bramFooterChipAgents(roster, dismissed, selectedId);
+  return window.__bramVisibleFooterAgents(roster, dismissed).filter(function (a) {
+    return chips.indexOf(a) === -1;
+  }).reverse();
+};
+
+// The transcript selection that still has a chip: the agent id, or "" (Main)
+// once the agent is dismissed or leaves the roster. One chip is always
+// selected, and the Transcript doesn't stay on a stream with none. A roster
+// that hasn't loaded keeps the selection.
+window.__bramLiveTranscriptAgent = function (agentId, roster, dismissed) {
+  if (!agentId || !roster) return agentId;
+  var live = window.__bramVisibleFooterAgents(roster, dismissed).some(function (a) {
+    return a.agentId === agentId;
+  });
+  return live ? agentId : "";
+};
+
+// Main's chip takes the same running glyph as a subagent's.
+window.__bramMainChipLabel = function (status) {
+  return status && status.state === "working" ? "Main ●" : "Main";
 };
 
 // The dismissed agents still present in the current roster — drives the
@@ -14972,69 +16870,52 @@ window.__bramRunningSubagentCount = function (roster) {
   return n;
 };
 
-// Footer session-info line with the transcript viewport spliced in after
-// the provider token: "CLAUDE · Main · july5 · id …" or
-// "CLAUDE · subagent: <description> · july5 · id …". The viewport lives
-// HERE rather than in chip styling so dropdown-overflow agents get the
-// same selection indicator as chip agents.
-//
-// Returned as {pre, bold, post} segments so the viewport NAME — "Main" or
-// the subagent's description — renders bold while everything around it
-// (provider, "subagent:" label, model, session meta) stays regular. The
-// name is the tie between the chip strip and the stream being viewed; the
-// chrome around it is not. The "subagent: " label and " (Model)" suffix
-// deliberately sit outside the bold segment. Main.xmlui renders the three
-// segments as adjacent Texts; __bramFooterSessionLine joins them, so the
-// string and segmented forms can never disagree.
-window.__bramFooterSessionLineParts = function (session, agentId, roster) {
+// Footer session-info line: "CLAUDE (Opus 5.5) · Session: july5 · id …". It
+// describes the session only, and doesn't change with the transcript viewed:
+// the chips carry selection (subagent-chips-show-selection). "Session:" types
+// the title, which is otherwise a freeform phrase beside the freeform chips.
+// footer-model-follows-requested-provider (Windows, 2026-11-02): after
+// switching to a new Antigravity session the footer read "ANTIGRAVITY (Fable
+// 5.1) · … requested — session not yet confirmed". The provider name came from
+// the requested session; the model came from the roster, which still described
+// the Claude session just left. The model shows only when it belongs to the
+// session the line names: none while that session is pending (the same check
+// as __bramRosterForSession), and none when the roster's session is another
+// provider's (`mainProvider`, host-labelled from the roster's session path). A
+// roster without `mainProvider` (an older host) is taken as matching.
+window.__bramFooterModelLabel = function (session, roster) {
+  if (session && session.pending) return "";
+  var m = roster && roster.mainModel;
+  if (!m) return "";
+  var rp = String(roster.mainProvider || "").toLowerCase();
+  var sp = String((session && session.provider) || "").toLowerCase();
+  if (rp && sp && rp !== sp) return "";
+  return window.__bramPrettyModel(m);
+};
+
+window.__bramFooterSessionLine = function (session, roster) {
   var meta = window.__bramSessionMetaLine(session) || "";
-  var agents = (roster && roster.agents) || [];
-  var mainModel = roster && roster.mainModel;
-  // Zero-subagent sessions still get the plain meta line unless we have
-  // the main model to report; a bare "Main" is footer noise.
-  if (!agentId && agents.length === 0 && !mainModel) return { pre: meta, bold: "", post: "" };
-  var viewPre = "";
-  var viewBold = "Main";
-  var viewPost = "";
-  if (agentId) {
-    var match = null;
-    for (var i = 0; i < agents.length; i++) {
-      if (agents[i].agentId === agentId) { match = agents[i]; break; }
-    }
-    viewPre = "subagent: ";
-    viewBold = (match && (match.description || match.agentType)) || agentId;
-    if (match && match.model) viewPost = " (" + window.__bramPrettyModel(match.model) + ")";
-  } else if (mainModel) {
-    viewPost = " (" + window.__bramPrettyModel(mainModel) + ")";
-  }
-  if (!meta) return { pre: viewPre, bold: viewBold, post: viewPost };
+  var label = window.__bramFooterModelLabel(session, roster);
+  var model = label ? " (" + label + ")" : "";
+  if (!meta) return model.trim();
+  if (!session.provider) return "Session: " + meta;
   var sp = meta.indexOf(" ");
-  if (sp < 0) return { pre: meta + " · " + viewPre, bold: viewBold, post: viewPost };
-  return {
-    pre: meta.slice(0, sp) + " · " + viewPre,
-    bold: viewBold,
-    post: viewPost + " ·" + meta.slice(sp),
-  };
+  return meta.slice(0, sp) + model + " · Session:" + meta.slice(sp);
 };
 // composer-addressee-hugs-box (Jon): the footer status as ONE Markdown
 // paragraph, so a narrow pane wraps it at word boundaries like a sentence.
 // As separate Text items under HStack wrapContent it broke per item
 // ("CLAUDE ·Main" alone, then the rest, then "· Indexed" on its own line).
-// Only the viewport name is bold; every join is the same " · ". Session and
-// agent names are data, so Markdown punctuation is escaped.
-window.__bramFooterStatusMarkdown = function (parts, indexStatus) {
+// Every join is the same " · ". Session names are data, so Markdown
+// punctuation is escaped.
+window.__bramFooterStatusMarkdown = function (line, indexStatus) {
   var indexLabel = indexStatus ? window.__bramFooterIndexLabel(indexStatus) : "";
   var esc = function (t) {
     return String(t || "").replace(/([\\`*_{}\[\]()#+\-.!|<>~])/g, "\\$1");
   };
-  var p = parts || {};
-  var line = esc(p.pre) + (p.bold ? "**" + esc(p.bold) + "**" : "") + esc(p.post);
-  if (indexLabel) line += (line ? " · " : "") + esc(indexLabel);
-  return line;
-};
-window.__bramFooterSessionLine = function (session, agentId, roster) {
-  var p = window.__bramFooterSessionLineParts(session, agentId, roster);
-  return p.pre + p.bold + p.post;
+  var out = esc(line);
+  if (indexLabel) out += (out ? " · " : "") + esc(indexLabel);
+  return out;
 };
 
 // One-line header for a subagent view (Transcript header + inline peek),
@@ -15068,10 +16949,45 @@ function __bramLatestResolvedLedgerEntry(payload) {
   return latest;
 }
 
+// antigravity-error-state-surfaced: the agent error the footer notice shows,
+// or null. The host puts agy's latest `state=error` message on /__send-ledger
+// (and on the agent-status payload) as agentError {text, atMs}, cleared when
+// the next turn starts. It outranks a resolved ledger entry when it is newer
+// than that entry's verdict, or when the entry's own verdict is that error
+// (landed, cause agent-error: the ledger's sweep resolves AFTER the marker).
+// The user moving on (a send injected after the error) retires it, as it
+// retires the ledger notices.
+function __bramAgentErrorToShow(payload) {
+  var err = payload && payload.agentError;
+  if (!err || !err.text || !err.atMs) return null;
+  var entries = (payload && payload.entries) || [];
+  for (var i = 0; i < entries.length; i++) {
+    var n = entries[i];
+    if (n && n.injectedAtMs > err.atMs) return null;
+  }
+  var latest = __bramLatestResolvedLedgerEntry(payload);
+  if (latest && latest.resolvedAtMs > err.atMs && latest.cause !== "agent-error") return null;
+  return err;
+}
+
+// The notice's words for agy's error. A quota refusal gets its own line,
+// since the remedy is outside Bram; anything else is reported as agy said it.
+window.__bramAgentErrorNotice = function (err) {
+  var text = String((err && err.text) || "").replace(/\s+/g, " ").trim();
+  if (!text) return "";
+  if (/quota/i.test(text)) {
+    return "Antigravity reports its quota is used up; its reply didn’t start: " + text;
+  }
+  return "Antigravity reported an error: " + text;
+};
+
 // Key identifying the current notice for dismissal: the producing
-// ledger entry's id. A dismissed key hides THAT notice only; a new
-// resolved entry (new id) notices normally.
+// ledger entry's id, or the agent error's time when that is the notice.
+// A dismissed key hides THAT notice only; a new resolved entry (new id)
+// or a new error (new atMs) notices normally.
 window.__bramSendLedgerNoticeKey = function (payload) {
+  var err = __bramAgentErrorToShow(payload);
+  if (err) return "agent-error:" + err.atMs;
   var latest = __bramLatestResolvedLedgerEntry(payload);
   return (latest && latest.id) || "";
 };
@@ -15551,6 +17467,15 @@ window.__bramSendLedgerNotice = function (payload, dismissedKey) {
   var entries = (payload && payload.entries) || [];
   var nowMs = (payload && payload.nowMs) || Date.now();
   var staleTerminalInput = !!(payload && payload.staleTerminalInput);
+  // antigravity-error-state-surfaced: agy took the send and refused it. Said
+  // here, in the footer notice, where the ledger used to call the same send
+  // "did not reach the agent" (2026-11-03). No age cutoff: the host clears
+  // the error when the next turn starts.
+  var agentError = __bramAgentErrorToShow(payload);
+  if (agentError) {
+    if (dismissedKey === "agent-error:" + agentError.atMs) return "";
+    return window.__bramAgentErrorNotice(agentError);
+  }
   var latest = __bramLatestResolvedLedgerEntry(payload);
   if (!latest) return "";
   if (dismissedKey && latest.id === dismissedKey) return "";
@@ -15587,6 +17512,9 @@ window.__bramSendLedgerNotice = function (payload, dismissedKey) {
     // in the TERMINAL input, unanswered — and the copy there prepends
     // onto the next terminal-submitted send if not cleared.
     return "Response interrupted — your message" + label + " is back in the terminal input, unanswered. Press Enter there to resend it, or clear it before sending anything new.";
+  }
+  if (latest.state === "landed" && latest.cause === "agent-error") {
+    return "Antigravity took your message" + label + " but reported an error instead of replying.";
   }
   if (latest.state === "landed" && latest.retried) {
     return "A lost send" + label + " was redelivered automatically.";
@@ -15733,6 +17661,91 @@ window.__bramSetTranscriptMounted = function (mounted) {
 // Immutable toggle of an id in an array (proven per-item expand pattern,
 // matching Workspace's expandedItemIds — avoids object-literal var inits
 // that XMLUI's expression engine mishandles).
+// log-rows-baseline-and-spacing: a Log entry links into the Transcript at
+// its moment (/transcript?at=<ms>). The index is the first event of the
+// first turn that began at or after the moment (turnTs, from the host's
+// per-turn `ts`), or the last event when every turn began earlier; -1
+// when no event carries a time (a provider without timestamps).
+window.__bramTranscriptIndexAt = function (events, atMs) {
+  var list = events || [], seen = false;
+  for (var i = 0; i < list.length; i++) {
+    var ts = list[i] && list[i].turnTs;
+    if (!ts) continue;
+    seen = true;
+    if (ts >= atMs) return i;
+  }
+  return seen ? list.length - 1 : -1;
+};
+// One step of the link's landing, run by a Timer until it returns 0. It
+// waits for the events (up to 20 ticks), scrolls to the moment's turn, and
+// scrolls again on the next tick, since a virtualized List measures rows
+// as it reaches them. Traced as transcript-link.
+var __bramTranscriptLinkTicks = {};
+window.__bramTranscriptLinkStep = function (list, events, atMs, agentId) {
+  var key = String(atMs);
+  var n = (__bramTranscriptLinkTicks[key] = (__bramTranscriptLinkTicks[key] || 0) + 1);
+  var idx = window.__bramTranscriptIndexAt(events, atMs);
+  if (idx < 0) {
+    if (n < 20) return atMs;
+    window.__bramIframeTrace("transcript-link", { op: "gave-up", at: atMs, events: (events || []).length });
+    delete __bramTranscriptLinkTicks[key];
+    return 0;
+  }
+  try { list.scrollToIndex(idx); } catch (e) { /* the List not yet mounted: retry */ }
+  if (n === 1 || !window.__bramTranscriptLinkLanded || window.__bramTranscriptLinkLanded !== key) {
+    window.__bramTranscriptLinkLanded = key;
+    window.__bramFollowTransition(false, "log-link", agentId);
+    window.__bramIframeTrace("transcript-link", { op: "land", at: atMs, index: idx, events: events.length });
+    return atMs;
+  }
+  delete __bramTranscriptLinkTicks[key];
+  return 0;
+};
+// The Transcript link for a Log entry, or null. The Transcript shows the
+// current session, so only an entry that happened in it links.
+window.__bramStoryTranscriptHref = function (item, story) {
+  var cur = story && story.currentSession && story.currentSession.sessionId;
+  if (!item || !item.t || !cur || item.sessionId !== cur) return null;
+  return "/transcript?at=" + item.t;
+};
+// Carry expansion in the List's data so cached rows receive fresh bindings
+// and handlers. Parent state alone changed without updating visible rows in
+// the vendored XMLUI bundle; reproduced with both plain and arrow handlers.
+// https://www.xmlui.org/docs/howto/keep-per-item-state-in-a-loop
+window.__bramLogRows = function (entries, expanded) {
+  var open = new Set(expanded || []);
+  return (entries || []).map(function (entry) {
+    return Object.assign({}, entry, { isExpanded: open.has(entry.id) });
+  });
+};
+// A sentence click toggles its entry. The current plain handler passes no
+// event, so embedded links navigate and also toggle. Event-aware callers
+// skip in-row links/buttons and stop the ancestor walk at the row marker.
+window.__bramLogRowToggle = function (e, expanded, id) {
+  var t = e && e.target;
+  while (t && t.tagName) {
+    var tid = (t.getAttribute && t.getAttribute("data-testid")) || "";
+    if (tid === "log-row") break;
+    if (t.tagName === "A" || t.tagName === "BUTTON") {
+      window.__bramIframeTrace("log-row-toggle", { op: "link", id: String(id), tag: t.tagName });
+      return expanded;
+    }
+    t = t.parentElement;
+  }
+  var next = window.__bramToggleInArray(expanded, id);
+  window.__bramIframeTrace("log-row-toggle", {
+    op: "toggle", id: String(id), open: next.indexOf(id) >= 0, reachedRow: !!(t && t.tagName),
+  });
+  return next;
+};
+// log-demo-restart-and-expanders: the Log's open-entries state changed.
+window.__bramLogExpandedTrace = function (expanded) {
+  window.__bramIframeTrace("log-row-expanded", { open: (expanded || []).length, ids: (expanded || []).slice(-3) });
+};
+// The expanded detail's line for a demo entry: which saved demo board it ran.
+window.__bramStoryScenarioLine = function (item) {
+  return item && item.scenario ? "Scenario: " + item.scenario + " (a saved demo board)" : "";
+};
 window.__bramToggleInArray = function (arr, id) {
   arr = arr || [];
   if (arr.indexOf(id) >= 0) return arr.filter(function (x) { return x !== id; });
@@ -15845,7 +17858,11 @@ window.__bramDescribeContextForTool = function (toolId) {
         var es = (turns[ti] && turns[ti].entries) || [];
         for (var p = ei; p >= 0; p--) {
           var t = es[p];
-          if (t && t.kind === "text" && t.text) { prose = t.text; break; }
+          // row-intent-reads-claude-narration-again: Claude's notes are
+          // `thinking` entries now (Claude Code 2.1.280), so without this
+          // Haiku got the user's message as context for Claude rows while
+          // other agents' text notes reached it.
+          if (t && (t.kind === "text" || t.kind === "thinking") && t.text) { prose = t.text; break; }
         }
         if (!prose && ti > 0) {
           // Fall back to the turn's own text (user turns carry their
@@ -16180,6 +18197,8 @@ var __BRAM_QUEUE_RECOVERY_KEY = "bram.agent-message-queue.unsaved";
 // it — the populated queue cannot be clobbered by a click-before-hydrate.
 window.__bramQueueVersion = null;
 var __bramQueueSaveTimer = null;
+var __bramQueueSaveChain = Promise.resolve();
+var __bramQueueRetained = Object.create(null);
 // queue-persist-pasted-images: the staged-image store
 // (bramPendingPastedImages, keyed by target) stays the one source of truth
 // for a note's screenshots. Each save writes a copy of the note's paths into
@@ -16243,11 +18262,16 @@ function __bramQueueDropImages(id) {
   bramTracePasteImage("queue-delete", { target: target, dropped: before.length - kept.length, retained: bramPendingPastedImageSummary() });
   bramNotifyPasteState();
 }
-function __bramQueueScheduleSave(entries) {
+function __bramQueueScheduleSave(entries, removed) {
+  // Keep the final editor value when Send/Delete beats the debounce timer.
+  // It travels with the next versioned save, not through the trace.
+  if (removed && removed.id) __bramQueueRetained[removed.id] = removed;
   __bramQueueLastEntries = entries || [];
   var snapshot = __bramQueueWithImages(entries);
+  var retained = Object.values(__bramQueueRetained);
   var payload = JSON.stringify({
     entries: snapshot,
+    retainedEntries: retained,
     version: window.__bramQueueVersion,
   });
   try {
@@ -16256,12 +18280,15 @@ function __bramQueueScheduleSave(entries) {
   if (__bramQueueSaveTimer) clearTimeout(__bramQueueSaveTimer);
   __bramQueueSaveTimer = setTimeout(function () {
     __bramQueueSaveTimer = null;
-    fetch("/__queue/save", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: payload,
-    })
-      .then(function (response) {
+    // A later edit can arrive while a save is in flight. Dispatch in order
+    // with the acknowledged version, so removing a message cannot race its
+    // last edit and lose the final saved draft to a stale-version refusal.
+    __bramQueueSaveChain = __bramQueueSaveChain.then(function () {
+      return fetch("/__queue/save", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ entries: snapshot, retainedEntries: retained, version: window.__bramQueueVersion }),
+      }).then(function (response) {
         if (response.status === 409) {
           // A concurrent writer (or a stale base) moved the version. Do not
           // retry blind — that is the overwrite this guard exists to prevent.
@@ -16269,12 +18296,6 @@ function __bramQueueScheduleSave(entries) {
           throw new Error("queue save refused: stale-version");
         }
         if (!response.ok) throw new Error("queue save returned " + response.status);
-        response
-          .json()
-          .then(function (r) {
-            if (r && typeof r.version === "number") window.__bramQueueVersion = r.version;
-          })
-          .catch(function () {});
         // queue-remount-stale-hydration: do NOT clear the snapshot on save.
         // It is the session-scoped source of truth (overwritten on every
         // mutation); clearing it handed remount back to the /__queue
@@ -16282,7 +18303,14 @@ function __bramQueueScheduleSave(entries) {
         // (item gone) and deletes (item back). The snapshot is cleared only
         // by the browser session ending; the host /__queue is the
         // cross-restart backstop, read when the snapshot is absent.
-      })
+        return response.json().then(function (r) {
+          if (r && typeof r.version === "number") window.__bramQueueVersion = r.version;
+          retained.forEach(function (entry) {
+            if (__bramQueueRetained[entry.id] === entry) delete __bramQueueRetained[entry.id];
+          });
+        });
+      });
+    })
       .catch(function (e) {
         window.logToHost({ kind: "queue-save", phase: "err", error: String(e) });
       });
@@ -16429,6 +18457,15 @@ window.__bramGuardRegistrationLine = function (r) {
     parts.push("OpenCode: " + (o.custom ? "your own plugin, so Bram's checks are off"
       : o.ok ? "plugin current" : "plugin missing or stale (run Setup)"));
   }
+  // antigravity-worklist-guard: Bram's group in .agents/hooks.json, only
+  // where agy is wanted; an older host sends no antigravity entry. Setup
+  // leaves a file that isn't JSON alone, so that case asks for a hand fix.
+  var a = reg.antigravity;
+  if (a && a.wanted) {
+    parts.push("Antigravity: " + (a.ok ? "hook current"
+      : a.state === "unparseable" ? ".agents/hooks.json isn't valid JSON, so agy runs without the guard (fix it by hand)"
+      : "hook missing or stale (run Setup)"));
+  }
   return parts.join(" · ");
 };
 
@@ -16440,6 +18477,276 @@ window.__bramGuardRoutingLine = function (r) {
   if (!g.projectGuard) return "This project hasn't recorded its guard yet (it does within a minute of launch).";
   if (!g.linkTarget || g.linkTarget === g.projectGuard) return "Hooks run this project's own guard: " + g.projectGuard;
   return "The shared link points at " + g.linkTarget + " (another Bram); hooks here are routed to this project's guard: " + g.projectGuard;
+};
+
+// issue-469-status-dry-run: the Status tab's "State folder" section
+// (GET /__state-dir/plan). Nothing moves; these only format the plan.
+// status-reports-a-completed-move: after a move, Status says what happened
+// instead of listing the new folder as "would move". Parts: show, line, left.
+window.__bramStateDirPlanMoved = function (p, part) {
+  var m = p && p.migrated;
+  if (part === "show") return !!m;
+  if (!m) return "";
+  if (part === "settings") {
+    // tracked-bram-json-cleanup-offered
+    var rs = p.rootSettings || {};
+    return rs.tracked && rs.dirty
+      ? "The tracked .bram.json differs from HEAD (personal settings an earlier Bram wrote). The agent has been asked to propose moving them to .bram/settings.json."
+      : "";
+  }
+  if (part === "left") {
+    var left = p.leftBehind || [];
+    return left.length ? "Left in resources/: " + left.join(", ") + "." : "";
+  }
+  var when = String(m.at || "").replace("T", " ").replace(/:\d\d(\.\d+)?Z$/, " UTC");
+  var how = m.selective ? " (selective)" : (m.how === "demo-hydrate" ? " (demo hydrate)" : "");
+  var from = String(m.from || "").replace(/^.*\//, "") || "resources";
+  return "Moved from " + from + "/ on " + when + how + ".";
+};
+
+window.__bramStateDirPlanFolderLine = function (p) {
+  if (!p) return "";
+  return "State folder: " + p.stateDir + (p.stateDirExists ? " (exists)" : " (not created yet)");
+};
+window.__bramStateDirPlanHeading = function (p, key) {
+  if (!p) return "";
+  var labels = { wouldMove: "Would move", foreign: "Foreign", tracked: "Tracked", nested: "Nested" };
+  var n = key === "tracked" ? ((p.tracked || {}).count || 0) : (p[key] || []).length;
+  var more = key === "tracked" && (p.tracked || {}).truncated ? " (first 200 shown)" : "";
+  return (labels[key] || key) + " " + n + more;
+};
+window.__bramStateDirPlanTrackedPaths = function (p) {
+  return ((p && p.tracked) || {}).paths || [];
+};
+window.__bramStateDirPlanRow = function (item) {
+  if (item == null) return "";
+  if (typeof item === "string") return item;
+  if (item.stateDir) return item.path + " (own " + item.stateDir + "/, migrates itself)";
+  if (item.kind) return item.path + " (" + item.kind + ")";
+  return item.name + (item.isDir ? "/" : "");
+};
+window.__bramStateDirPlanLiveClaimLine = function (p) {
+  if (!p) return "";
+  if (!p.liveClaim) return "Live claim: no";
+  var d = p.liveClaimDetail || {};
+  var bits = [];
+  if ((d.claimIds || []).length) bits.push("claim on " + d.claimIds.join(", "));
+  if (d.authorization) bits.push(d.authorization + " authorization open");
+  return "Live claim: yes" + (bits.length ? " (" + bits.join("; ") + ")" : "");
+};
+
+// issue-469-mixed-folder-dialog: the mixed-folder banner (Main.xmlui) and the
+// Status tab's "Move at next launch", from the plan's `pending` / `decision`.
+// Parts: show (banner visible), chosen (Move already chosen), text, stays
+// (tooltip naming what stays), offer (Status button visible), pending.
+// `last` is the decision call's lastResult ({choice, atMs}): the newer of it
+// and the plan's recorded decision wins, so a click changes the banner when
+// its POST returns instead of after the plan refetch, which took 30 s on
+// Windows (issue-469-state-move-pane-fixes; APICall lastResult:
+// https://www.xmlui.org/docs/reference/components/APICall#lastresult).
+window.__bramStateMoveBanner = function (p, part, last) {
+  if (part === "pending") return !!(p && p.pending);
+  if (!p || !p.pending) return part === "text" || part === "stays" ? "" : false;
+  var recorded = p.decision || {};
+  var latest = last && last.choice && (last.atMs || 0) >= (recorded.atMs || 0) ? last : recorded;
+  var choice = latest.choice || "";
+  if (part === "show") return choice !== "not-now";
+  if (part === "chosen") return choice === "move";
+  if (part === "offer") {
+    var offer = choice !== "move";
+    window.__bramStateMoveTraceOffer(offer, choice);
+    return offer;
+  }
+  if (part === "stays") {
+    var names = (p.foreign || []).map(function (f) { return f.name + (f.isDir ? "/" : ""); });
+    return "Stays in " + p.stateDir + "/: " + (names.join(", ") || "tracked files") + ".";
+  }
+  // state-move-banner-says-why: lead with the reason (Jon, 2026-11-04: "this
+  // release is migrating the resources folder").
+  var why = "Bram 0.8.4 moves its working folder from " + p.stateDir + "/ to .bram/";
+  if (choice === "move") {
+    return why + ". It moves its own files at the next launch; the files that aren't Bram's stay in " +
+      p.stateDir + "/.";
+  }
+  return why + ", which keeps itself out of git. This project's " + p.stateDir +
+    "/ also holds files that aren't Bram's" +
+    (p.pending === "tracked" ? " (or that git tracks)" : "") +
+    ", so Bram will move only its own files, at the next launch. Yours stay where they are.";
+};
+
+// pane-buttons-acknowledge-clicks: time an APICall from its beforeRequest to
+// its success / error, so the ~30 s completion lag seen on the state-move
+// controls can be measured on the APICalls that remain. Wire it as
+// onBeforeRequest="window.__bramApiTiming('<id>', 'before')" and the same
+// with 'success' / 'error'. Returns undefined, so it never cancels a request
+// or suppresses invalidation. Traced as iframe `api-timing`.
+window.__bramApiTimingStarts = window.__bramApiTimingStarts || {};
+window.__bramApiTiming = function (id, op) {
+  try {
+    var now = Date.now();
+    if (op === "before") window.__bramApiTimingStarts[id] = now;
+    var started = window.__bramApiTimingStarts[id];
+    if (typeof window.logToHost !== "function") return;
+    window.logToHost({
+      kind: "iframe-trace",
+      subkind: "api-timing",
+      at: new Date(now).toISOString(),
+      id: id,
+      op: op,
+      ms: op === "before" || !started ? 0 : now - started,
+    });
+  } catch (e) {}
+};
+
+// pane-buttons-acknowledge-clicks: a pane action as a plain fetch, in place of
+// an APICall whose onSuccess (and post-success invalidation) reached the pane
+// ~30 s after the host answered (measured 2026-11-04: api:complete 11 ms,
+// onSuccess +29.96 s, four of four runs; cause inside XMLUI, handed off).
+// __bramPaneAction(name, url, init) fetches; init.query becomes the query
+// string, init.body is sent as JSON. Subscribers of
+// __bramSubscribePaneAction(name) (a PushSource factory, the shape of
+// bramSubscribeTauriEvent) get { tick, name, busy: true } at the click and
+// { tick, name, busy: false, ok, status, data, error } when it lands, so a
+// button can disable at once and a ChangeListener can run what onSuccess /
+// onError ran. Traced as iframe `pane-action` op=click|done|failed with ms.
+window.__bramPaneActionBus = window.__bramPaneActionBus || Object.create(null);
+window.__bramPaneActionChannel = function (name) {
+  var bus = window.__bramPaneActionBus;
+  if (!bus[name]) bus[name] = { subscribers: new Set(), tick: 0, last: null };
+  return bus[name];
+};
+window.__bramSubscribePaneAction = function (name) {
+  var ch = window.__bramPaneActionChannel(name);
+  if (ch.factory) return ch.factory;
+  ch.factory = function (emit) {
+    ch.subscribers.add(emit);
+    if (ch.last) emit(ch.last);
+    return function () { ch.subscribers.delete(emit); };
+  };
+  return ch.factory;
+};
+window.__bramPaneAction = function (name, url, init) {
+  var ch = window.__bramPaneActionChannel(name);
+  var opts = init || {};
+  var started = Date.now();
+  var trace = function (op, extra) {
+    try {
+      if (typeof window.logToHost !== "function") return;
+      var payload = {
+        kind: "iframe-trace",
+        subkind: "pane-action",
+        at: new Date().toISOString(),
+        name: name,
+        op: op,
+        ms: Date.now() - started,
+      };
+      if (extra) Object.assign(payload, extra);
+      window.logToHost(payload);
+    } catch (e) {}
+  };
+  var publish = function (fields) {
+    ch.tick += 1;
+    var snap = Object.assign({ tick: ch.tick, name: name }, fields);
+    ch.last = snap;
+    ch.subscribers.forEach(function (fn) {
+      try { fn(snap); } catch (e) { console.error("[__bramPaneAction] subscriber threw:", e); }
+    });
+    return snap;
+  };
+  var full = url;
+  if (opts.query) {
+    var qs = Object.keys(opts.query)
+      .filter(function (k) { return opts.query[k] !== undefined && opts.query[k] !== null; })
+      .map(function (k) { return encodeURIComponent(k) + "=" + encodeURIComponent(String(opts.query[k])); })
+      .join("&");
+    if (qs) full += (url.indexOf("?") < 0 ? "?" : "&") + qs;
+  }
+  var req = { method: opts.method || "GET", cache: "no-store" };
+  if (opts.body !== undefined) {
+    req.method = opts.method || "POST";
+    req.headers = { "Content-Type": "application/json" };
+    req.body = JSON.stringify(opts.body);
+  }
+  trace("click");
+  publish({ busy: true });
+  return window
+    .fetch(full, req)
+    .then(function (r) {
+      return r.text().then(function (text) {
+        var data = null;
+        try { data = text ? JSON.parse(text) : null; } catch (e) { data = text; }
+        var error = null;
+        if (!r.ok) {
+          error = (data && typeof data === "object" && (data.error || data.message)) ||
+            (typeof data === "string" && data) || ("error " + r.status);
+        }
+        trace("done", { status: r.status });
+        return publish({ busy: false, ok: r.ok, status: r.status, data: data, error: error });
+      });
+    })
+    .catch(function (e) {
+      trace("failed", { error: String(e) });
+      return publish({ busy: false, ok: false, status: 0, data: null, error: String(e) });
+    });
+};
+
+// The banner's and Status's Move / Not now: a plain fetch, like the subagent
+// Release, instead of an APICall. The host answers in under 1 ms and pushes
+// `state-dir-changed`, on which both surfaces refetch the plan; the APICall
+// path completed ~30 s late in the pane on macOS and Windows
+// (issue-469-state-move-pane-fixes). Traced click and done, with elapsed ms.
+window.__bramStateMoveDecide = function (choice) {
+  var started = Date.now();
+  var trace = function (op, extra) {
+    try {
+      if (typeof window.logToHost !== "function") return;
+      var payload = {
+        kind: "iframe-trace",
+        subkind: "state-move-decide",
+        at: new Date().toISOString(),
+        op: op,
+        choice: choice,
+        ms: Date.now() - started,
+      };
+      if (extra) Object.assign(payload, extra);
+      window.logToHost(payload);
+    } catch (e) {}
+  };
+  trace("click");
+  return window
+    .fetch("/__state-dir/decision", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ choice: choice }),
+    })
+    .then(function (r) { trace("done", { status: r.status }); })
+    .catch(function (e) { trace("failed", { error: String(e) }); });
+};
+
+// Status's plan, kept across a refetch: a value that is briefly empty while a
+// refetch is in flight (or slow to render) must not hide the Move row, the
+// only way back from Not now (Windows check, 2026-11-04 21:28:36).
+window.__bramStateDirPlanKept = function (value) {
+  if (value && value.stateDir) window.__bramStateDirPlanLast = value;
+  return window.__bramStateDirPlanLast || value || null;
+};
+
+// One pane trace line each time Status's Move button flips, so a
+// disappearance leaves evidence of what the helper saw.
+window.__bramStateMoveTraceOffer = function (offer, choice) {
+  if (window.__bramStateMoveOfferLast === offer) return;
+  window.__bramStateMoveOfferLast = offer;
+  try {
+    if (typeof window.logToHost === "function") {
+      window.logToHost({
+        kind: "iframe-trace",
+        subkind: "state-move-offer",
+        at: new Date().toISOString(),
+        offer: offer,
+        choice: choice || null,
+      });
+    }
+  } catch (e) {}
 };
 
 window.__bramLandedNote = function (board) {
@@ -16620,6 +18927,12 @@ window.__bramQueueRestore = function (hostEntries, hostVersion) {
   // carries it as its precondition base. Before this runs, __bramQueueVersion
   // stays null and no save can land (host refuses a version-less write).
   window.__bramQueueVersion = typeof hostVersion === "number" ? hostVersion : 0;
+  try {
+    var recovery = JSON.parse(sessionStorage.getItem(__BRAM_QUEUE_RECOVERY_KEY) || "null");
+    ((recovery && recovery.retainedEntries) || []).forEach(function (entry) {
+      if (entry && entry.id) __bramQueueRetained[entry.id] = entry;
+    });
+  } catch (e) { /* entries recovery below handles malformed storage */ }
   var restored = __bramQueueRestoreEntries(hostEntries);
   __bramQueueLastEntries = restored.entries;
   // queue-persist-pasted-images: images = screenshots re-staged by this
@@ -16627,7 +18940,7 @@ window.__bramQueueRestore = function (hostEntries, hostVersion) {
   // any save, which stamps entries from the staged store.
   var images = __bramQueueRestageImages(restored.entries);
   window.__bramIframeTrace("queue", { op: "hydrate", version: window.__bramQueueVersion, images: images });
-  if (restored.ahead) __bramQueueScheduleSave(restored.entries);
+  if (restored.ahead || Object.keys(__bramQueueRetained).length) __bramQueueScheduleSave(restored.entries);
   return restored.entries;
 };
 // Returns { entries, ahead }: ahead means the sessionStorage snapshot won and
@@ -16712,6 +19025,7 @@ window.__bramQueueAdd = function (entries) {
     sendMode: "message",
     targetItemId: "",
     updatedAtMs: now,
+    agent: window.__bramCurrentAgent ? window.__bramCurrentAgent() : "",
   });
   window.__bramIframeTrace("queue", { op: "add", id: next[0].id, chars: 0 });
   __bramQueueScheduleSave(next);
@@ -16723,6 +19037,10 @@ window.__bramQueueAdd = function (entries) {
 window.__bramQueueRemove = function (entries, idx, suppressTrace) {
   var next = (entries || []).slice();
   var removed = next[idx];
+  // Snapshot attachments before Delete clears their staging area. Send has
+  // already consumed staging, so retain any paths carried by the entry.
+  var retained = removed && Object.assign({}, removed, __bramQueueWithImages([removed])[0]);
+  if (retained && !suppressTrace) retained.deletedAtMs = Date.now();
   // Send and Delete both end here; the note's editor goes away, so a mic
   // still recording into it would have nowhere to deliver.
   if (removed && removed.id) window.__bramVoiceStopOnSend("queue-item:" + removed.id);
@@ -16732,7 +19050,7 @@ window.__bramQueueRemove = function (entries, idx, suppressTrace) {
     if (removed && removed.id) __bramQueueDropImages(removed.id);
   }
   next.splice(idx, 1);
-  __bramQueueScheduleSave(next);
+  __bramQueueScheduleSave(next, retained);
   return next;
 };
 // __bramQueueReorder: persist a drag-reordered entries array. newOrder comes
@@ -16767,6 +19085,9 @@ window.__bramQueueSend = function (entries, idx, worklistItems) {
   var mode = window.__bramQueueSendMode(entry);
   var imageTarget = "queue-item:" + (entry.id || "");
   var images = window.bramPendingPastedImageCountForTarget(imageTarget);
+  // The send below consumes the staged screenshots, so take their paths
+  // first: the retained draft records them and the Log shows them.
+  var imagePaths = window.bramPendingPastedImagePathsForTarget(imageTarget) || [];
   if (mode === "iterate") {
     var targetItemId = String(entry.targetItemId || "");
     var items = worklistItems || [];
@@ -16782,7 +19103,15 @@ window.__bramQueueSend = function (entries, idx, worklistItems) {
     toTurn(window.__bramWithStagedImageMarkers(text, imageTarget));
   }
   window.__bramIframeTrace("queue", { op: "send", id: entry.id || "", mode: mode, chars: text.length, images: images });
-  return window.__bramQueueRemove(entries, idx, true);
+  // Record where it went: the retained draft keeps the agent and time of the
+  // send, which is what the Log's context footer reports.
+  var sent = (entries || []).slice();
+  sent[idx] = Object.assign({}, entry, {
+    sentAtMs: Date.now(),
+    sentToAgent: window.__bramCurrentAgent ? window.__bramCurrentAgent() : "",
+  });
+  if (imagePaths.length) sent[idx].images = imagePaths.slice();
+  return window.__bramQueueRemove(sent, idx, true);
 };
 // Ready = no open turn (agent-status not "working") and no pending menu.
 // Advisory dimming only — the host send-gate remains the enforcement layer
@@ -17093,6 +19422,17 @@ document.addEventListener("click", function (e) {
       tagName: String((e.target && e.target.tagName) || ""),
     });
   } catch (traceErr) {}
+  // log-shows-start-commit-push-search: on the Log tab a Markdown link to
+  // the forge (a commit's URL) opens in the system browser, the way every
+  // forge link in the pane does (openExternal), instead of navigating the
+  // pane away. Scoped to the Log's route; other tabs keep their own rules.
+  if (/^https?:\/\//.test(href) && String(window.location.hash || "").indexOf("#/log") === 0 &&
+      typeof window.openExternal === "function") {
+    e.preventDefault();
+    e.stopPropagation();
+    try { window.openExternal(href); } catch (oe) {}
+    return;
+  }
   if (href.indexOf("://") === -1 && /\.md(?:[?#].*)?$/i.test(href)) {
     if (typeof __contextMemorySelector === "function") {
       e.preventDefault();
@@ -17533,7 +19873,7 @@ window.__bramHighlightSetting = function (key) {
 window.__bramTipsRegistry = [
   { id: 'tool-descriptions', priority: 10,
     url: 'https://blog.jonudell.net/2026/07/23/agents-that-narrate-their-work-are-the-best-team-players/',
-    text: 'Tip: Turn on Tool Descriptions (Settings) to have Haiku enhance the intent headers on tool rows — and add them where Codex leaves none.' },
+    text: 'Tip: Turn on Tool Descriptions (Settings) to have Claude Haiku describe every step in the Transcript. It needs an Anthropic API key, billed separately from any subscription.' },
   { id: 'terminal-toggle', priority: 15,
     text: 'Tip: Use the terminal button in the top toolbar to show or hide the terminal.' },
   { id: 'batch-actions', priority: 20, route: '/worklist2',
@@ -17651,6 +19991,17 @@ window.__bramSetSearchBadgesInitialAllOn = function (on) {
   return !!on;
 };
 
+// issue-470-compaction-summary-collapsed: whether the Transcript's compaction
+// rows start expanded. Default OFF (collapsed to one line). DECISION, per-user
+// and unscoped: a reading preference that holds in any project.
+window.__bramCompactSummaryExpanded = function () {
+  return __bramReadLS('bram.compactSummaryExpanded', '0') === '1';
+};
+window.__bramSetCompactSummaryExpanded = function (on) {
+  __bramWriteLS('bram.compactSummaryExpanded', on ? '1' : '0');
+  return !!on;
+};
+
 // terminal-open-at-startup-setting: whether the terminal pane is open when Bram
 // launches. Default OFF (the agent pane is the primary surface). DECISION,
 // per-user and unscoped: a layout preference, not about any one project. The
@@ -17737,9 +20088,31 @@ window.__bramPickTip = function (settings, sessions, tick) {
     if (__bramTipDismissed(t.id)) continue;
     if (window.__bramTipSkips[t.id]) continue;
     if (!__bramTipEligible(t, settings)) continue;
+    if (t.id === 'tool-descriptions') return Object.assign({}, t, { text: window.__bramToolDescriptionsTipText() });
     return t;
   }
   return null;
+};
+
+// tool-descriptions-prompt-names-the-agent: the footer's Tool Descriptions
+// tip says what the agent you're running leaves undescribed (measured on
+// real sessions; see the item's draft). Same tip id, so a dismissal holds;
+// the registry text stays agent-neutral for the Tips page.
+window.__bramToolDescriptionsTipText = function () {
+  var agent = window.__bramCurrentAgent ? window.__bramCurrentAgent() : "";
+  var cost = " It needs an Anthropic API key, billed separately from any subscription.";
+  if (agent === "codex" || agent === "opencode") {
+    return "Tip: " + window.__bramProviderLabel(agent) + " doesn't describe its steps, so Transcript rows show raw commands. Turn on Tool Descriptions (Settings) to have Claude Haiku write them." + cost;
+  }
+  if (agent === "antigravity") {
+    return "Tip: Antigravity describes its commands but not its file reads and edits. Turn on Tool Descriptions (Settings) to have Claude Haiku describe every step." + cost;
+  }
+  if (agent === "claude") {
+    return "Tip: Claude describes its own commands. Turn on Tool Descriptions (Settings) to have Claude Haiku describe every step, file reads and edits included." + cost;
+  }
+  return window.__bramTipsRegistry[0] && window.__bramTipsRegistry[0].id === 'tool-descriptions'
+    ? window.__bramTipsRegistry[0].text
+    : "Tip: Turn on Tool Descriptions (Settings) to have Claude Haiku describe every step in the Transcript." + cost;
 };
 
 window.__bramDismissTip = function (id, tick) {
@@ -17761,6 +20134,21 @@ window.__bramSuggestSetting = function (settings, key) {
   var s = settings && settings.sessions;
   if (s && typeof s[key] === "boolean") return s[key];
   return key !== "suggestOnTopicShift";
+};
+
+// issue-466-pause-install-uninstall (v1): worklist.enforcement, Claude only.
+// "paused" pauses the guard's coverage denials and Claude's instructions;
+// anything else, or absent, is today's enforcement. Default on.
+window.__bramEnforcementPaused = function (settings) {
+  return !!(settings && settings.worklist && settings.worklist.enforcement === "paused");
+};
+// Prefers the pushed snapshot, falls back to the initial /__settings fetch.
+window.__bramEnforcementPausedFrom = function (pushed, fetched) {
+  var payload = pushed && pushed.payload;
+  return window.__bramEnforcementPaused(payload || fetched);
+};
+window.__bramEnforcementUpdate = function (paused) {
+  return { worklist: { enforcement: paused ? "paused" : "on" } };
 };
 
 // suggest-fresh-session: the agent's session-suggest event (POST
@@ -18189,3 +20577,956 @@ window.__bramInstallCodeBlockTools();
 // calls must follow what they call). Capture phase, so it runs before the
 // TextArea's own keydown submits the Form.
 try { document.addEventListener("keydown", window.__bramComposerDirectEnterKeydown, true); } catch (e) {}
+
+// ---- Bram's story (issue-473-readable-launch-log, iteration 2) -------------
+// The Log's narrator. Pure and synchronous: takes the payload of
+// GET /__story/lines and returns first-person episodes, newest first. Only
+// definitions run at load time. The one outside read is the Transcript
+// projection (window.getProjectedTurns), used for the research summary.
+// BEGIN bram-story
+// The window's start is computed once per `key` (the Log's refresh ticks).
+// It sits in a DataSource URL, so a value that changed on every evaluation
+// made a new URL on every render: a refetch loop (1,513 fetches in minutes,
+// 2026-11-05). It moves only when the key does.
+var __bramStorySinceCache = { key: null, value: "" };
+// A fresh key each time the Log tab mounts, so reopening it starts a new
+// window instead of reusing the first visit's URL (and its cached result).
+var __bramStoryMounts = 0;
+window.__bramStoryMountKey = function () { return ++__bramStoryMounts; };
+window.__bramStorySince = function (minutes, key) {
+  var k = String(minutes) + "|" + String(key);
+  if (__bramStorySinceCache.key !== k) {
+    __bramStorySinceCache = {
+      key: k,
+      value: new Date(Date.now() - (Number(minutes) || 60) * 60000).toISOString(),
+    };
+  }
+  return __bramStorySinceCache.value;
+};
+
+// log-shows-start-commit-push-search: a Log entry's expanded context, from
+// the fields the teller attached (agent and session in force when the
+// episode began). "unknown" means the trace tail didn't name it.
+window.__bramStoryEntryContext = function (item) {
+  if (!item) return "";
+  // log-tells-session-switches: a switch reads from → to, each side with its
+  // short id; the single context line would name only one of the two.
+  if (item.kind === "switch" && (item.fromSessionId || item.fromAgent)) {
+    var side = function (a, sid, title) {
+      return (a ? window.__bramProviderLabel(a) : "an agent the trace doesn't name") + " · " +
+        (title ? "'" + title + "' (" + String(sid).slice(0, 8) + "…)"
+          : sid ? "session " + String(sid).slice(0, 8) + "…" : "a session the trace doesn't name");
+    };
+    return "From " + side(item.fromAgent, item.fromSessionId, item.fromSessionTitle) +
+      " → to " + side(item.agent, item.sessionId, item.sessionTitle);
+  }
+  var agent = item.agent ? window.__bramProviderLabel(item.agent) : "an agent the trace doesn't name";
+  var session = item.sessionTitle ? "'" + item.sessionTitle + "'"
+    : item.sessionId ? "session " + String(item.sessionId).slice(0, 8) + "…"
+    : "a session the trace doesn't name";
+  return agent + " · " + session;
+};
+// The board as it stood when the entry happened (/__worklist-history/at):
+// each item with its state, in the board's own order.
+window.__bramStoryBoardLine = function (board, loaded) {
+  if (!loaded && !board) return "Board then: fetching…";
+  var items = (board && Array.isArray(board.items)) ? board.items : [];
+  if (!items.length) return "Board then: empty.";
+  // log-rows-baseline-and-spacing: the items themselves are listed below
+  // this line, one per row, linked to History (__bramStoryBoardItems).
+  return "Board then: " + (items.length === 1 ? "1 item" : items.length + " items") + ":";
+};
+// The board's items, each with its state and its History link, for the
+// expanded entry's vertical list.
+// log-push-lists-its-commits: the commits a push carried, from the Commits
+// tab's list (/__commits: newest first along the branch, each with its
+// Worklist itemIds). The slice runs from the push's newer sha back to, not
+// including, its older one. Each row is one Markdown line: the sha linked
+// to the forge (pushed, so html_url) or the local view, the subject, and
+// its items linked to History, or "no Worklist item". null when either end
+// isn't in the list.
+window.__bramStoryPushCommits = function (commits, from, to) {
+  var list = Array.isArray(commits) ? commits : [];
+  if (!from || !to) return null;
+  var at = function (prefix) {
+    for (var i = 0; i < list.length; i++) if (String(list[i].sha || "").indexOf(prefix) === 0) return i;
+    return -1;
+  };
+  var i = at(to), j = at(from);
+  if (i < 0 || j < 0 || j <= i) return null;
+  return list.slice(i, j).map(function (c) {
+    var sha = String(c.sha || "").slice(0, 7);
+    var url = c.html_url || ("/commits?sha=" + sha);
+    var subject = String((c.commit && c.commit.message) || "").split("\n")[0];
+    var items = (c.itemIds || []).map(function (id) {
+      return "[" + id + "](/history?entry=" + encodeURIComponent(id) + ")";
+    });
+    return {
+      sha: sha,
+      md: "[" + sha + "](" + url + ") " + subject.replace(/([\[\]])/g, "\\$1") +
+        " · " + (items.length ? items.join(", ") : "no Worklist item"),
+    };
+  });
+};
+// A commit's changed files (/__commit?sha=), one row each: the path and
+// its added and removed line counts. The heading names the totals.
+window.__bramStoryCommitFiles = function (commit) {
+  var files = (commit && Array.isArray(commit.files)) ? commit.files : [];
+  return files.map(function (f) {
+    return { path: f.filename || "", added: "+" + (f.additions || 0), removed: (f.deletions || 0) > 0 ? "\u2212" + f.deletions : "" };
+  });
+};
+window.__bramStoryCommitFilesHeading = function (commit, loaded) {
+  if (!loaded && !commit) return "Files: fetching…";
+  var files = (commit && Array.isArray(commit.files)) ? commit.files : [];
+  if (!files.length) return "No changed files.";
+  var st = (commit && commit.stats) || {};
+  return "Changed " + (files.length === 1 ? "1 file" : files.length + " files") +
+    " (+" + (st.additions || 0) + " \u2212" + (st.deletions || 0) + "):";
+};
+// The heading over that list, or what to say when it can't be listed.
+window.__bramStoryPushHeading = function (rows, loaded) {
+  if (!loaded) return "Pushed commits: fetching…";
+  if (!rows) return "The pushed commits are older than the Commits list holds; the range link shows them.";
+  return rows.length === 1 ? "Pushed 1 commit:" : "Pushed " + rows.length + " commits:";
+};
+window.__bramStoryBoardItems = function (board) {
+  var items = (board && Array.isArray(board.items)) ? board.items : [];
+  return items.map(function (it) {
+    return {
+      id: it.id,
+      state: it.status === "applied" ? "applied" : it.begun ? "begun" : "proposed",
+      href: "/history?entry=" + encodeURIComponent(it.id),
+    };
+  });
+};
+
+// log-shows-start-commit-push-search: the Search tab reports each bucket's
+// results, so the Log can tell what you searched for. Traced from the pane,
+// not the /__search route, which also serves the agent's searches and can't
+// tell them apart. One line per bucket per query; the narrator sums them.
+window.__bramSearchQueryTrace = function (bucket, q, mode, data) {
+  var query = String(q || "").trim();
+  if (!query) return;
+  window.__bramIframeTrace("search-query", {
+    op: "results", bucket: bucket, q: query.slice(0, 200), mode: mode || "and",
+    hits: Array.isArray(data) ? data.length : 0,
+  });
+};
+
+// log-queue-entry-opens-message: the small-print context under an expanded
+// queue message, from what its saved draft recorded at the time. Older
+// drafts have no agent field and say so rather than guessing.
+window.__bramQueueDraftContext = function (draft) {
+  if (!draft) return "";
+  var agentKey = draft.sentToAgent || draft.agent || "";
+  var agent = agentKey
+    ? (draft.sentToAgent ? "Sent to " : "Agent: ") + window.__bramProviderLabel(agentKey)
+    : "Agent: not recorded";
+  var item = window.__bramQueueSendMode(draft) === "iterate" && draft.targetItemId
+    ? "Worklist item: " + draft.targetItemId
+    : "Worklist item: none";
+  return agent + " · " + item;
+};
+// What happened to a message that is no longer queued, for Queue's
+// read-only view. Missing times (older drafts) give the plain sentence.
+window.__bramQueueDraftFate = function (draft) {
+  if (!draft) return "No saved draft is available for this older message.";
+  var at = function (ms) {
+    var d = new Date(Number(ms) || 0);
+    return isNaN(d.getTime()) || !ms ? "" : " at " + String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+  };
+  if (draft.sentAtMs) return "No longer queued: sent" + at(draft.sentAtMs) + ".";
+  if (draft.deletedAtMs) return "No longer queued: deleted" + at(draft.deletedAtMs) + ".";
+  return "No longer queued.";
+};
+// The read-only card's first line: the message's quoted leading sentence,
+// the same quote the Log uses; "" when there's no text to quote.
+window.__bramQueueFocusTitle = function (draft) {
+  var q = draft ? window.__bramStoryLeadingSentence(draft.text) : "";
+  return q ? "“" + q + "”" : "";
+};
+// Bring Queue's row for `id` into view once it renders. DndItems has no
+// scrollToId (List does), so find the row by its testId marker.
+window.__bramQueueRevealFocus = function (id) {
+  if (!id) return;
+  var tries = 0;
+  var tick = function () {
+    var el = document.querySelector('[data-testid="queue-entry-' + String(id).replace(/"/g, "") + '"]');
+    if (el) { el.scrollIntoView({ block: "center" }); return; }
+    if (++tries < 20) requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+};
+
+window.__bramStoryLeadingSentence = function (text) {
+  var s = String(text || "").trim().replace(/\s+/g, " ");
+  var first = /^[\s\S]*?[.!?](?=\s|$)/.exec(s);
+  s = first ? first[0] : s;
+  return s.length > 180 ? s.slice(0, 177) + "…" : s;
+};
+
+window.__bramStoryTell = (function () {
+  var WANT_STALL_GAP = 30000, LATENCY_MS = 200, LONGTASK_MS = 1000, START_COMMIT_MS = 10 * 60000;
+  // Set just before the final flush; Infinity while the trace is still
+  // being read, so a deadline reached inside the window reads as passed.
+  var flushNow = Infinity;
+  var DURING = { "transcript-render": "rendering the Transcript",
+    "worklist-refetch": "refetching the Worklist", "worklist-render": "rendering the Worklist" };
+
+  function kv(rest, key) {
+    var m = new RegExp("(?:^|\\s)" + key + "=(\\S+)").exec(rest);
+    return m ? m[1] : null;
+  }
+  function idsOf(rest) {
+    var m = /ids=(\[[^\]]*\])/.exec(rest);
+    try { return m ? JSON.parse(m[1]) : []; } catch (e) { return []; }
+  }
+  function jsonTail(rest) {
+    var i = rest.indexOf("{");
+    try { return i >= 0 ? JSON.parse(rest.slice(i)) : {}; } catch (e) { return {}; }
+  }
+  function plural(n, w) { return n + " " + w + (n === 1 ? "" : "s"); }
+  function dur(s) {
+    s = Math.round(s);
+    if (s < 60) return s + "s";
+    if (s < 3600) return Math.floor(s / 60) + "m" + ("0" + (s % 60)).slice(-2) + "s";
+    return Math.floor(s / 3600) + "h" + ("0" + Math.floor((s % 3600) / 60)).slice(-2) + "m";
+  }
+  function hhmm(t) {
+    var d = new Date(t);
+    return ("0" + d.getHours()).slice(-2) + ":" + ("0" + d.getMinutes()).slice(-2);
+  }
+  function names(ids) {
+    if (!ids || !ids.length) return "no item";
+    if (ids.length <= 2) return ids.join(" and ");
+    return ids[0] + ", " + ids[1] + " and " + (ids.length - 2) + " more";
+  }
+  // log-shows-start-commit-push-search (Jon, 2026-11-07: "link to the item
+  // in History"): the same list with each id a Markdown link to the item's
+  // History entry (/history?entry=<id>, issue-67's deep link, which groups
+  // the snapshots per item whether or not it has landed). Log.xmlui renders
+  // the sentence as Markdown; the id sits in backticks so its hyphens and
+  // underscores can't be read as emphasis.
+  function itemLink(id) { return "[`" + id + "`](/history?entry=" + encodeURIComponent(id) + ")"; }
+  function linked(ids) {
+    if (!ids || !ids.length) return "no item";
+    var l = ids.map(itemLink);
+    if (l.length <= 2) return l.join(" and ");
+    return l[0] + ", " + l[1] + " and " + (l.length - 2) + " more";
+  }
+  // head="..." from [turn-send]: unescape, drop the host's own "..." cut,
+  // keep ~60 chars. Returns null for machine-made heads.
+  function quoteOf(rest) {
+    var m = /head="((?:[^"\\]|\\.)*)"/.exec(rest);
+    if (!m) return null;
+    var h = m[1].replace(/\\"/g, '"').replace(/\\n/g, " ").replace(/\\\\/g, "\\");
+    if (/^(approved|drop|iterate|skip-worklist|voice):/.test(h) || /^Read and follow this Bram turn/.test(h)) return null;
+    var cut = /\.\.\.$/.test(h);
+    h = h.replace(/\.\.\.$/, "").replace(/\s+/g, " ").trim();
+    if (!h) return null;
+    if (h.length > 60) { h = h.slice(0, 60).replace(/\s+\S*$/, ""); cut = true; }
+    return h + (cut ? "…" : "");
+  }
+
+  // ---- research summary from the Transcript projection ----------------------
+  // Projection entries carry no timestamps, so turns are matched by order:
+  // the projection is split into groups, each opened by a user ("u") or
+  // system ("s") turn; groups map newest-first onto the trace's turn episodes.
+  function toolGroups() {
+    try {
+      var pv = typeof window.getProjectedTurns === "function" ? window.getProjectedTurns() : null;
+      if (!pv || !pv.turns) return null;
+      var groups = [], cur = null;
+      pv.turns.forEach(function (t) {
+        if (t.role === "assistant") {
+          if (!cur) { cur = { user: null, calls: [], open: true }; groups.push(cur); }
+          (t.entries || []).forEach(function (e) { if (e && e.kind === "tool") cur.calls.push(e); });
+        } else {
+          cur = { user: t.text || "", calls: [], open: false };
+          groups.push(cur);
+        }
+      });
+      return { groups: groups, truncatedHead: !!(pv.windowStart > 0) };
+    } catch (e) { return null; }
+  }
+  function summarize(calls) {
+    var c = { search: 0, hist: 0, read: 0, edit: 0, cmd: 0, agent: 0, web: 0 };
+    calls.forEach(function (e) {
+      var n = e.name || "";
+      if (n === "Bash") {
+        if (/\/__search\b/.test(e.commandDisplay || "")) c.hist++; else c.cmd++;
+      } else if (n === "Read") c.read++;
+      else if (n === "Grep" || n === "Glob" || /search|find/i.test(n.replace(/^mcp__/, "")) && n !== "ToolSearch") c.search++;
+      else if (n === "Edit" || n === "Write" || n === "MultiEdit" || n === "NotebookEdit") c.edit++;
+      else if (n === "Agent" || n === "Task") c.agent++;
+      else if (n === "WebSearch" || n === "WebFetch") c.web++;
+    });
+    var p = [];
+    if (c.hist) p.push("searched the history " + plural(c.hist, "time"));
+    if (c.search) p.push("ran " + plural(c.search, "search") );
+    if (c.read) p.push("read " + plural(c.read, "file"));
+    if (c.edit) p.push("made " + plural(c.edit, "edit"));
+    if (c.cmd) p.push("ran " + plural(c.cmd, "command"));
+    if (c.agent) p.push("started " + plural(c.agent, "subagent"));
+    if (c.web) p.push("made " + plural(c.web, "web request"));
+    if (!p.length) return "";
+    var last = p.pop();
+    return "It " + (p.length ? p.join(", ") + " and " + last : last) + ".";
+  }
+
+  function tell(payload) {
+    var out = [];
+    var lines = (payload && payload.lines) || [];
+    var open = [], turn = null;
+    var recent = [], sends = [], qsends = [], allTurns = [];
+    // queue-add: one sentence per item added to the queue; its length comes
+    // from the item's later update lines (the trace has no text).
+    var qadds = {};
+    function onQueueAdd(t, j) {
+      if (!j.id || qadds[j.id]) return;
+      var rec = { chars: j.chars || 0 };
+      qadds[j.id] = rec;
+      out.push({ t: t, at: hhmm(t), kind: "queue-add", queueId: j.id, surprising: false, _qadd: rec, _t: t });
+    }
+    // queue-delete: names the add it undoes when that add is in the window.
+    function onQueueDelete(t, j) {
+      var a = j.id && qadds[j.id];
+      var addedAt = a ? (out.filter(function (o) { return o._qadd === a; })[0] || {}).at : "";
+      out.push({
+        t: t, at: hhmm(t), kind: "queue-delete", queueId: j.id, surprising: false,
+        text: "Deleted queue message" +
+          (j.chars ? " (" + j.chars + " characters)" : "") +
+          (addedAt ? ", added at " + addedAt + "." : "."),
+      });
+    }
+    var drift = { t: 0, focused: null };
+
+    // Context for an entry's expanded detail: the agent and session in force
+    // when its episode began. The agent comes from turn-state lines (and a
+    // session set); the session from [agent-switch] op=live-session-set.
+    // Before the window's first set the tail can't name the session, unless
+    // the window has no set at all, in which case the current session held
+    // throughout (the host sends it as currentSession).
+    var cur = payload && payload.currentSession;
+    // Only a session set changes the session; the category's other ops
+    // (log-tells-session-switches) say why it changed.
+    var anySet = lines.some(function (l) { return l.cat === "agent-switch" && /^op=live-session-set /.test(l.text || ""); });
+    var curProvider = anySet ? null : (cur && cur.provider) || null;
+    var curSessionId = anySet ? null : (cur && cur.sessionId) || null;
+    function sessionTitle(sid) {
+      if (!sid) return null;
+      if (cur && cur.sessionId === sid && cur.title) return cur.title;
+      var titles = (payload && payload.sessionTitles) || {};
+      return titles[sid] || null;
+    }
+    function ctxNow() { return { agent: curProvider, sessionId: curSessionId, sessionTitle: sessionTitle(curSessionId) }; }
+    function Ep(kind, t) { return { kind: kind, t: t, deadline: t + 5000, d: {}, ctx: ctxNow() }; }
+    function say(ep, kind, text, surprising) {
+      var c = ep.ctx || ctxNow();
+      out.push({ t: ep.t, at: hhmm(ep.t), text: text, kind: kind, surprising: !!surprising, _ep: ep,
+        agent: c.agent, sessionId: c.sessionId, sessionTitle: c.sessionTitle });
+    }
+    // A commit sha as a Markdown link: to the forge once it's pushed (the
+    // host knows the repo's web address, commitUrlBase, and the pane opens
+    // it externally), and to the Commits tab's local view while no remote
+    // has it (unpushedShas; the forge would 404), as it is without a remote.
+    function shaLink(sha) {
+      if (!sha) return sha;
+      var base = payload && payload.commitUrlBase;
+      var unpushed = (payload && payload.unpushedShas) || [];
+      var local = !base || unpushed.some(function (u) { return u.indexOf(sha) === 0; });
+      return local ? "[" + sha + "](/commits?sha=" + sha + ")" : "[" + sha + "](" + base + sha + ")";
+    }
+    // A pushed range as a link to the forge's compare view, when the host
+    // knows the repo's web address; plain text otherwise.
+    function rangeLink(a, b) {
+      var base = payload && payload.commitUrlBase;
+      var text = a + ".." + b;
+      if (!base || !/\/commit\/$/.test(base)) return text;
+      return "[" + text + "](" + base.replace(/\/commit\/$/, "/compare/") + a + "..." + b + ")";
+    }
+    function find(kind) {
+      for (var i = open.length - 1; i >= 0; i--) if (open[i].kind === kind) return open[i];
+      return null;
+    }
+    function simple(t, kind, text, surprising) {
+      var ep = Ep("simple", t); ep.deadline = t; ep.d = { text: text, k: kind, s: surprising };
+      open.push(ep);
+      return ep;
+    }
+    function tick(now) {
+      var due = open.filter(function (e) { return e.deadline <= now; });
+      due.forEach(function (ep) {
+        open.splice(open.indexOf(ep), 1);
+        ENDERS[ep.kind](ep);
+      });
+    }
+
+    // -- turn
+    function onSentinel(t, rest) {
+      var op = kv(rest, "op");
+      if (op === "write" && kv(rest, "kind")) {
+        recent.push({ t: t, w: "claim", kind: kv(rest, "kind"), ids: idsOf(rest) });
+        var g = find("gate");
+        if (g && idsOf(rest).length) g.d.claimed = true;
+      }
+      if (turn && (op === "clear-at-turn-end" || op === "clear")) {
+        turn.d.released = idsOf(rest).length ? idsOf(rest) : (turn.d.released || true);
+      }
+    }
+    function onTurnState(t, rest) {
+      var frm = kv(rest, "from"), to = kv(rest, "to"), menu = kv(rest, "menu");
+      if (to === "working" && frm !== "working" && !turn) {
+        turn = Ep("turn", t); turn.deadline = Infinity; turn.d.pauses = [];
+      } else if (turn) {
+        if (to === "waiting-for-permission" && frm !== to) {
+          turn.d.pauses.push(menu || "a prompt");
+        } else if ((frm === "working" || frm === "waiting-for-permission") && (to === "finished" || to === "idle")) {
+          turn.d.end = t; turn.deadline = t + 3000;
+          open.push(turn); turn = null;
+        }
+      }
+    }
+    function endTurn(ep) {
+      var t0 = ep.t, t1 = ep.d.end;
+      var near = recent.filter(function (r) { return t0 - 15000 <= r.t && r.t <= t0 + 5000; });
+      var ctx = near.filter(function (r) { return r.w === "ctx" && r.kind !== "turn-end"; });
+      var claims = near.filter(function (r) { return r.w === "claim"; });
+      var kind = ctx.length ? ctx[ctx.length - 1].kind : (claims.length ? claims[claims.length - 1].kind : null);
+      var ids = claims.length ? claims[claims.length - 1].ids : [];
+      var n = ctx.length ? ctx[ctx.length - 1].ids : null;
+      var rec = { ep: ep, shown: false };
+      allTurns.push(rec);
+      if ((t1 - t0) / 1000 < 2 && !ids.length) return;
+      var snd = null;
+      sends.forEach(function (s) { if (s.q && t0 - 15000 <= s.t && s.t <= t0 + 5000) snd = s; });
+      var queued = !!snd;
+      if (!snd) sends.forEach(function (s) { if (s.q !== null && s.quote && t0 - 15000 <= s.t && s.t <= t0 + 5000) snd = s; });
+      var quote = kind === "general" && snd && snd.quote ? ' ("' + snd.quote + '")' : "";
+      if (!queued) queued = kind === "general" && snd && qsends.some(function (q) { return Math.abs(q - snd.t) < 2000; });
+      var why;
+      if (kind === "general") why = "for your " + (queued ? "queued" : "chat") + " message" + quote;
+      else if (kind === "approved") why = "for your approval";
+      else if (kind === "iterate") why = "for your feedback";
+      else why = "I can't trace back to a message (often a background task waking it)";
+      var on = ids.length ? " on " + names(ids) : (n && n !== "0" ? " on " + n + " item(s)" : "");
+      var verb = (t1 - t0) / 1000 > 900 ? "took a long turn" : "took a turn";
+      var s = "Claude " + verb + " " + why + on + " and finished in " + dur((t1 - t0) / 1000) + ".";
+      if (ep.d.pauses.length) {
+        var k = ep.d.pauses.length, seen = {};
+        ep.d.pauses.forEach(function (p) { seen[p] = 1; });
+        s += " It stopped " + plural(k, "time") + " to wait for you (" + Object.keys(seen).sort().join(", ") + ").";
+      }
+      var surprising = false;
+      if (ep.d.released) s += " I released the claim.";
+      else if (ids.length) { s += " I did not see the claim released, so the item may still read as running."; surprising = true; }
+      rec.shown = true; rec.queued = queued; rec.quote = snd && snd.quote;
+      rec.text = s; rec.surprising = surprising;
+      say(ep, "turn", s, surprising);
+      out[out.length - 1]._rec = rec;
+    }
+
+    // -- gate
+    function onClick(t, rest) {
+      var j = jsonTail(rest), tg = j.target || "";
+      if (j.op !== "act" || tg.indexOf("gatebar-") !== 0) return;
+      var g = Ep("gate", t);
+      g.d.target = tg.slice(8); g.d.count = j.count || 0;
+      // A Commit lands within a minute; a Start & commit first does the
+      // work, so its commit can be many minutes away (2026-11-07 21:00Z:
+      // 76 s, and the Log said no commit had landed).
+      g.deadline = t + (tg === "gatebar-start-commit" ? START_COMMIT_MS : tg === "gatebar-commit" ? 60000 : 8000);
+      open.push(g);
+    }
+    function gateNow(t) { var g = find("gate"); return g && t - g.t < 60000 ? g : null; }
+    function onAuth(t, rest) {
+      var op = kv(rest, "op"), kind = kv(rest, "kind");
+      if (op === "write" && kind === "approved") {
+        var g = gateNow(t);
+        if (!g || g.d.ids) { g = Ep("gate", t); g.d.target = null; g.d.count = 0; g.deadline = t + 8000; open.push(g); }
+        g.d.ids = idsOf(rest); g.d.recorded = true; g.deadline = Math.max(g.deadline, t + 8000);
+      } else if (op === "write" && kind === "direct-edit") {
+        simple(t, "gate", "You sent a turn that skips the Worklist (skip-worklist: prefix), so I allowed direct edits with no item.");
+      } else if (op === "refuse") {
+        var m = /expired \((\d+) ms old, TTL (\d+) ms\)/.exec(rest);
+        var what = kv(rest, "mutate_op") || "request", ids = idsOf(rest);
+        if (m) {
+          simple(t, "refusal", "I refused to " + what + " " + names(ids) + ": the approval was " + dur(+m[1] / 1000) +
+            " old and they expire after " + dur(+m[2] / 1000) + ". That's the rule working; it needs a fresh Start.");
+        } else {
+          var dm = /detail=(.*?) ids=/.exec(rest);
+          simple(t, "refusal", "I refused to " + what + " " + names(ids) + " and gave this reason: " +
+            (dm ? dm[1] : "none given") + ". I have no standard sentence for that, so it may be new.", true);
+        }
+      }
+    }
+    function onSend(t, rest) {
+      var rec = { t: t, quote: quoteOf(rest), q: false };
+      sends.push(rec);
+      if (sends.length > 60) sends.shift();
+      var g = gateNow(t);
+      if (g && /head="(approved|drop):/.test(rest) && t - g.t < 30000) g.d.handed = true;
+    }
+    function onCommit(t, rest) {
+      var op = kv(rest, "op"), g = find("gate");
+      if (op === "committed") {
+        if (g && (g.d.target === "commit" || g.d.target === "start-commit" || g.d.target === null)) {
+          g.d.sha = kv(rest, "sha"); g.deadline = t + 4000;
+        } else {
+          simple(t, "gate", "A commit landed (" + shaLink(kv(rest, "sha")) + "), but I saw no gate click for it.");
+        }
+      } else if (op === "staging" && g) {
+        g.d.files = kv(rest, "files");
+      } else if (op === "commit-took-unowned" && g && g.d.sha) {
+        (g.d.unowned = g.d.unowned || []).push([kv(rest, "path"), kv(rest, "added"), kv(rest, "removed")]);
+      }
+    }
+    // The gate line names the click and, for a commit, what landed. It no
+    // longer recites the approval, the claim and the hand-off (Jon,
+    // 2026-11-07: "remove that sentence"); those are what a click always
+    // does, and the row's spinner shows them live.
+    function endGate(ep) {
+      var d = ep.d, tg = d.target, ids = d.ids || [], s, surprising = false;
+      var who = ids.length ? linked(ids) : (d.count ? plural(d.count, "item") : "an item");
+      if (tg === null) {
+        if (!d.recorded) return;
+        s = "An approval for " + who + " was recorded, but I saw no click on the gate bar for it" +
+          (d.handed ? "; the turn was handed to Claude" : "") + ".";
+      } else if (tg === "drop") {
+        s = "You clicked Drop on " + who + ". Feedback-less drops finish in the host, so there's no turn to tell about.";
+      } else {
+        var label = { start: "Start", commit: "Commit", "start-commit": "Start & commit" }[tg] || tg;
+        s = "You clicked " + label + " on " + who + ".";
+        if (tg === "commit" || tg === "start-commit") {
+          if (d.sha) {
+            s += d.files ? " I staged " + plural(+d.files, "file") + " and committed " + shaLink(d.sha) + "." : " I committed " + shaLink(d.sha) + ".";
+            (d.unowned || []).forEach(function (u) {
+              s += " That commit also took lines no item owned in " + u[0] + " (+" + u[1] + "/-" + u[2] +
+                "); that's disclosed, not hidden, but worth a look.";
+              surprising = true;
+            });
+          } else if (flushNow < ep.deadline) {
+            // Told before its deadline, by the flush at the end of the
+            // window: the commit may still be on its way.
+            s += " The commit hasn't landed yet.";
+          } else if (tg === "commit") {
+            s += " I did not see a commit land within a minute."; surprising = true;
+          } else {
+            s += " No commit had landed " + dur(START_COMMIT_MS / 1000) + " later.";
+          }
+        }
+      }
+      say(ep, "gate", s, surprising);
+    }
+
+    // -- push (log-shows-start-commit-push-search): one [git-push]
+    // op=push-result line per `git push` the host runs, on success and
+    // failure (issue-383). The range comes from git's own stderr
+    // ("   a1b2c3d..e4f5a6b  main -> main"); its rebase and lock-retry ops
+    // are left to the push-result line that follows them.
+    function onPush(t, rest) {
+      if (kv(rest, "op") !== "push-result") return;
+      var branch = kv(rest, "branch") || "the branch", stage = kv(rest, "stage") || "initial";
+      var ok = kv(rest, "ok") === "true";
+      var em = /stderr="((?:[^"\\]|\\.)*)"/.exec(rest);
+      var err = em ? em[1].replace(/\\n/g, "\n").replace(/\\"/g, '"') : "";
+      var rm = /([0-9a-f]{7,40})\.\.([0-9a-f]{7,40})/.exec(err);
+      if (ok) {
+        var s = "You pushed " + branch;
+        if (rm) s += " (" + rangeLink(rm[1].slice(0, 8), rm[2].slice(0, 8)) + ")";
+        else if (/up-to-date/i.test(err)) s += "; there was nothing new to send";
+        s += stage === "rebase" ? ", after a rebase onto what had been pushed meanwhile." : ".";
+        var pep = simple(t, "push", s);
+        // log-push-lists-its-commits: the range's two ends, so an expanded
+        // push can list what it carried (__bramStoryPushCommits).
+        if (rm) { pep.d.from = rm[1]; pep.d.to = rm[2]; }
+      } else {
+        var lines = err.split("\n").map(function (l) { return l.trim(); }).filter(Boolean);
+        var why = lines.filter(function (l) { return /^(error|fatal):/.test(l); })[0] || lines[lines.length - 1] || "git gave no error text";
+        simple(t, "push", "Your push of " + branch + " failed at the " + stage + " stage: " + why, true);
+      }
+    }
+
+    // -- search: the Search tab's [iframe] subkind=search-query, one line per
+    // bucket per query (window.__bramSearchQueryTrace). The buckets of one
+    // query land within a second, and a query typed in stages replaces the
+    // last within 4 s, so the Log tells the query you settled on and its
+    // total, not every keystroke.
+    function onSearch(t, j) {
+      if (!j || j.op !== "results" || !j.q) return;
+      var ep = find("search");
+      if (ep && t - ep.t > 4000) ep = null;
+      if (!ep) { ep = Ep("search", t); ep.d = { q: j.q, mode: j.mode, hits: {} }; open.push(ep); }
+      else if (ep.d.q !== j.q) { ep.d.q = j.q; ep.d.mode = j.mode; ep.d.hits = {}; ep.t = t; }
+      ep.d.hits[j.bucket || "?"] = Number(j.hits) || 0;
+      ep.deadline = t + 4000;
+    }
+    function endSearch(ep) {
+      var d = ep.d, total = 0, parts = [];
+      var LABEL = { session: "sessions", commit: "commits", issue: "issues", "worklist-history": "history" };
+      Object.keys(d.hits).forEach(function (b) {
+        total += d.hits[b];
+        if (d.hits[b]) parts.push(d.hits[b] + " " + (LABEL[b] || b));
+      });
+      var s = "You searched for “" + window.__bramStoryLeadingSentence(d.q) + "”" +
+        (d.mode && d.mode !== "and" ? " (" + d.mode + " mode)" : "");
+      s += total
+        ? " and got " + plural(total, "hit") + (parts.length > 1 ? " (" + parts.join(", ") + ")" : "") + "."
+        : " and found nothing.";
+      say(ep, "search", s);
+    }
+
+    // -- stall
+    function onStall(t, sub, j) {
+      if (sub === "input-latency") {
+        if ((j.latencyMs || 0) < LATENCY_MS || !j.hadFocus) return;
+      } else {
+        var focused = t - drift.t < 3000 ? drift.focused : null;
+        if ((j.ms || 0) < LONGTASK_MS || focused !== true) return;
+      }
+      var ep = find("stall");
+      if (!ep) { ep = Ep("stall", t); ep.d.ev = []; open.push(ep); }
+      ep.d.ev.push([t, sub, j]); ep.deadline = t + WANT_STALL_GAP;
+    }
+    function endStall(ep) {
+      var ev = ep.d.ev, s;
+      var lt = ev.filter(function (e) { return e[1] === "long-task"; }).map(function (e) { return e[2]; });
+      var il = ev.filter(function (e) { return e[1] === "input-latency"; }).map(function (e) { return e[2]; });
+      var span = (ev[ev.length - 1][0] - ev[0][0]) / 1000;
+      var during = {};
+      ev.forEach(function (e) {
+        // A slow input names its blocker as lastLongTaskDuring.
+        var w = e[2].during || e[2].lastLongTaskDuring; if (w) { var k = DURING[w] || w; during[k] = (during[k] || 0) + 1; }
+      });
+      var top = Object.keys(during).sort(function (a, b) { return during[b] - during[a]; })[0];
+      if (ev.length === 1) {
+        var j = ev[0][2];
+        s = il.length ? "A " + (j.event || "keystroke") + " took " + j.latencyMs + "ms to land on " + (j.route || "the pane")
+                      : "The pane froze for " + (j.ms / 1000).toFixed(1) + "s while you had it focused";
+      } else {
+        var parts = [];
+        if (lt.length) parts.push("froze " + plural(lt.length, "time") + ", worst " +
+          (Math.max.apply(null, lt.map(function (x) { return x.ms; })) / 1000).toFixed(1) + "s");
+        if (il.length) {
+          var routes = {};
+          il.forEach(function (x) { var r = x.route || "the pane"; routes[r] = (routes[r] || 0) + 1; });
+          var rt = Object.keys(routes).sort(function (a, b) { return routes[b] - routes[a]; })[0];
+          parts.push(plural(il.length, "slow input") + ", worst " +
+            Math.max.apply(null, il.map(function (x) { return x.latencyMs; })) + "ms, mostly on " + rt);
+        }
+        s = "The pane had trouble over " + (span >= 1 ? dur(span) : "a moment") + ": " + parts.join(" and ");
+      }
+      s += top ? ", while I was " + top + "." : ". I can't say what I was busy with; the trace doesn't name the work.";
+      say(ep, "stall", s, true);
+    }
+
+    // -- refusal (guard)
+    function onHook(t, rest) {
+      var reason = kv(rest, "reason") || "?", tool = kv(rest, "tool"), target = kv(rest, "target");
+      var key = reason + "\u0001" + tool + "\u0001" + target;
+      var ep = find("refusal");
+      if (ep && ep.d.key === key) { ep.d.n++; ep.deadline = t + 20000; return; }
+      ep = Ep("refusal", t); ep.d = { key: key, reason: reason, tool: tool, target: target, n: 1 };
+      ep.deadline = t + 20000; open.push(ep);
+    }
+    function endRefusal(ep) {
+      var d = ep.d, at = d.target && d.target !== "-" ? " " + d.target : "";
+      var i = d.reason.indexOf(":"), base = i < 0 ? d.reason : d.reason.slice(0, i), arg = i < 0 ? "" : d.reason.slice(i + 1);
+      var works = " That's the rule working.", s, surprising = false;
+      if (base === "stale-worklist-version") s = "I refused Claude's " + d.tool + " of" + at + ": it was written against an old worklist version. It has to re-read and retry." + works;
+      else if (base === "no-coverage-no-opt-out") s = "I refused Claude's " + d.tool + at + ": no approved item covers it and you hadn't said 'just do it'." + works;
+      else if (base === "crossboundary-unsigned") s = "I refused a forge post because it lacked the agent signature line." + works;
+      else if (base === "crossboundary-stale-version") s = "I refused a forge post: its signature named Bram " + arg + ", which isn't the running version." + works;
+      else if (base === "crossboundary-unparsed") s = "I refused a forge post because I couldn't check it (" + (arg || "unparsed") + ")." + works;
+      else if (base === "subagent-lifecycle-call") s = "I refused a worklist lifecycle call that came from a subagent." + works;
+      else { s = "I refused Claude's " + d.tool + at + " with reason '" + d.reason + "'. I have no standard sentence for that one, so it may be new."; surprising = true; }
+      if (d.n > 1) s += " (It happened " + d.n + " times in a row.)";
+      say(ep, "refusal", s, surprising);
+    }
+
+    // -- queue
+    function onQueueSend(t, rest) {
+      var j = jsonTail(rest);
+      qsends.push(t);
+      var ep = Ep("queue", t); ep.deadline = t + 2500; ep.d.mode = j.mode;
+      open.push(ep);
+    }
+    function endQueue(ep) {
+      var snd = null, best = 1e12;
+      sends.forEach(function (s) { if (Math.abs(s.t - ep.t) <= 2000 && Math.abs(s.t - ep.t) < best) { snd = s; best = Math.abs(s.t - ep.t); } });
+      if (snd) snd.q = true;
+      var what = ep.d.mode && ep.d.mode !== "message" ? "a queued " + ep.d.mode : "a queued message";
+      var q = snd && snd.quote ? ' ("' + snd.quote + '")' : "";
+      say(ep, "queue", "You sent " + what + q + ", and I handed it to Claude.", false);
+    }
+
+    // -- switch (log-tells-session-switches): told when the session actually
+    // changes, at an [agent-switch] op=live-session-set naming a session
+    // other than the one before it. The ops just before a set say why: a
+    // switch to another agent (op=start, with its resume_reason), a fresh
+    // partner (op=fresh-partner), the resume at launch (op=autostart), or
+    // the New session dialog ([session-new] op=create). A set with none of
+    // those came from the Sessions tab (source=explicit-resume) or from the
+    // agent itself (source=agent-event), and is told as that, without
+    // guessing a cause. A launch that times out or exits is told on its own.
+    var lastSet = null, pendingSwitch = null, PENDING_SWITCH_MS = 120000;
+    function agentName(p) { return p ? window.__bramProviderLabel(p) : "the agent"; }
+    // "session ‘title’" (Jon, 2026-11-08: "I resumed ‘Bava…’ -> session
+    // ‘Bava…’"), or "session 01a1b891…" untitled. bareName is the title alone,
+    // for sentences that already say "a new session" or "its most recent
+    // session".
+    function bareName(sid) {
+      var title = sessionTitle(sid);
+      return title ? "‘" + title + "’" : String(sid).slice(0, 8) + "…";
+    }
+    function sessName(sid) { return "session " + bareName(sid); }
+    // "Claude's ‘x’" when the agents differ, so each side says whose it is.
+    function sideName(p, sid, withAgent) { return (withAgent ? agentName(p) + "'s " : "") + sessName(sid); }
+    function pushSwitch(t, text, surprising, to, from) {
+      var c = to || ctxNow();
+      out.push({ t: t, at: hhmm(t), text: text, kind: "switch", surprising: !!surprising, _ep: { d: {} },
+        agent: c.agent, sessionId: c.sessionId, sessionTitle: c.sessionTitle,
+        fromAgent: from ? from.agent : null, fromSessionId: from ? from.sessionId : null,
+        fromSessionTitle: from ? from.sessionTitle : null });
+    }
+    function onSessionNew(t, rest) {
+      if (kv(rest, "op") === "create") pendingSwitch = { t: t, why: "new", provider: kv(rest, "provider") };
+    }
+    function onAgentSwitch(t, rest) {
+      var op = kv(rest, "op"), prov = kv(rest, "provider");
+      if (pendingSwitch && t - pendingSwitch.t > PENDING_SWITCH_MS) pendingSwitch = null;
+      if (op === "start") {
+        pendingSwitch = { t: t, why: "start", provider: prov, reason: kv(rest, "resume_reason") };
+      } else if (op === "fresh-partner") {
+        if (!pendingSwitch || pendingSwitch.provider !== prov) pendingSwitch = { t: t, why: "start", provider: prov, reason: "fresh" };
+        pendingSwitch.partnerOf = kv(rest, "from");
+      } else if (op === "autostart") {
+        pendingSwitch = { t: t, why: "launch", provider: prov };
+      } else if (op === "launch-superseded") {
+        if (pendingSwitch && pendingSwitch.provider === prov) pendingSwitch = null;
+      } else if (op === "launch-timeout" || op === "launch-exited") {
+        if (pendingSwitch && pendingSwitch.provider === prov && pendingSwitch.why !== "launch") {
+          var how = op === "launch-timeout" ? "the launch timed out" : "it exited as it launched";
+          var away = lastSet && lastSet.provider !== prov ? " from " + agentName(lastSet.provider) : "";
+          pushSwitch(t, "You switched" + away + " to " + agentName(prov) + ", but it didn't start (" + how + ").", true);
+          pendingSwitch = null;
+        }
+      } else if (op === "live-session-set") {
+        onSessionSet(t, rest, prov);
+      }
+    }
+    function onSessionSet(t, rest, prov) {
+      var sid = kv(rest, "session"), src = kv(rest, "source"), prev = kv(rest, "previous");
+      if (!sid) return;
+      var from = lastSet || (prev ? { provider: prov, id: prev } : null);
+      var p = pendingSwitch && pendingSwitch.provider === prov ? pendingSwitch : null;
+      if (p) pendingSwitch = null;
+      lastSet = { provider: prov, id: sid };
+      curSessionId = sid;
+      if (prov) curProvider = prov;
+      var isNew = src === "reserved-id" || !!(p && (p.why === "new" || p.reason === "fresh-for-new-session" || p.reason === "fresh"));
+      if (from ? from.id === sid : !isNew) return;
+      var other = !!(from && from.provider !== prov);
+      var A = from ? agentName(from.provider) : "", B = agentName(prov), to = sessName(sid);
+      var was = from ? sideName(from.provider, from.id, other) : "";
+      var s;
+      if (isNew) {
+        // A new session is named only when its title says something: a fresh
+        // partner takes the title of the session it's grouped with, and an
+        // untitled one would read as "a new session, session 01a1…".
+        var newTitle = sessionTitle(sid);
+        var partnerTitle = p && p.partnerOf ? sessionTitle(p.partnerOf) : null;
+        var named = newTitle && newTitle !== partnerTitle ? ", ‘" + newTitle + "’" : "";
+        if (p && p.partnerOf) s = "You switched" + (other ? " from " + A : "") + " to " + B + " in a new session" + named + ", grouped with " + sessName(p.partnerOf) + ".";
+        else if (other) s = "You switched from " + A + " to " + B + ", in a new session" + named + ".";
+        else s = "You started a new " + B + " session" + named + (from ? ", leaving " + was : "") + ".";
+      } else if (p && p.why === "launch") {
+        s = "At launch I resumed " + sideName(prov, sid, other) + "; before the relaunch you were in " + was + ".";
+      } else if (p && p.why === "start" && other) {
+        s = "You switched from " + A + " to " + B + ", resuming " +
+          (p.reason === "partner" ? to + ", the session grouped with " + was
+            : p.reason === "latest" ? "its most recent session, " + bareName(sid)
+            : to) + ".";
+      } else if (src === "agent-event" && !p) {
+        s = other
+          ? "The session changed from " + was + " to " + sideName(prov, sid, true) + ". " + B + " reported it; I saw no switch that explains it."
+          : B + " moved to a new session, " + bareName(sid) + ", from " + was + ". I didn't start that; " + B + " reported it.";
+      } else {
+        s = other ? "You switched from " + was + " to " + sideName(prov, sid, true) + "."
+          : "You switched to " + to + ", from " + was + ".";
+      }
+      pushSwitch(t, s, false,
+        { agent: prov, sessionId: sid, sessionTitle: sessionTitle(sid) },
+        from ? { agent: from.provider, sessionId: from.id, sessionTitle: sessionTitle(from.id) } : null);
+    }
+
+    var ENDERS = {
+      simple: function (ep) { say(ep, ep.d.k, ep.d.text, ep.d.s); },
+      turn: endTurn, gate: endGate, stall: endStall, refusal: endRefusal, queue: endQueue, search: endSearch
+    };
+
+    var demoStop = null;
+    lines.forEach(function (ln) {
+      var t = Date.parse(ln.ts);
+      if (isNaN(t)) return;
+      var cat = ln.cat, rest = ln.text || "";
+      tick(t);
+      var sub = cat === "iframe" ? kv(rest, "subkind") : null;
+      if (cat === "turn-state" && kv(rest, "provider")) curProvider = kv(rest, "provider");
+      // A session set moves the session every later entry happened in; the
+      // other ops only explain the next set (log-tells-session-switches).
+      if (cat === "agent-switch") onAgentSwitch(t, rest);
+      else if (cat === "session-new") onSessionNew(t, rest);
+      else if (cat === "turn-state") onTurnState(t, rest);
+      else if (cat === "turn-context" && rest.indexOf("op=set") >= 0) recent.push({ t: t, w: "ctx", kind: kv(rest, "kind"), ids: kv(rest, "ids") });
+      else if (cat === "inflight-sentinel") onSentinel(t, rest);
+      else if (cat === "iframe" && sub === "click") onClick(t, rest);
+      else if (cat === "iframe" && sub === "queue") {
+        var qj = jsonTail(rest);
+        if (qj.op === "send") onQueueSend(t, rest);
+        else if (qj.op === "add") onQueueAdd(t, qj);
+        else if (qj.op === "update" && qadds[qj.id]) qadds[qj.id].chars = qj.chars;
+        else if (qj.op === "delete") onQueueDelete(t, qj);
+      }
+      // keep-selection-reload (#479): the moment the addressee could have
+      // changed under the user, told in the Log.
+      else if (cat === "iframe" && sub === "w2-selection-restore") {
+        var sj = jsonTail(rest);
+        var sids = Array.isArray(sj.ids) ? sj.ids : [];
+        // Nothing ticked before the reload means nothing could change under
+        // the user, so there is nothing to tell (the empty case read "I kept
+        // your selection: no item", 2026-11-07).
+        if (sj.op === "restore" && sids.length) simple(t, "selection", "The pane reloaded; I kept your selection: " + linked(sids) + ".", false);
+        else if (sj.op === "dropped") simple(t, "selection", "After the reload, " + linked(sids) + (sids.length === 1 ? " was" : " were") + " no longer on the Worklist, so I unticked " + (sids.length === 1 ? "it" : "them") + ".", true);
+      }
+      else if (cat === "iframe" && sub === "heartbeat-drift") drift = { t: t, focused: jsonTail(rest).focused };
+      else if (cat === "iframe" && (sub === "long-task" || sub === "input-latency")) onStall(t, sub, jsonTail(rest));
+      else if (cat === "iframe" && sub === "search-query") onSearch(t, jsonTail(rest));
+      else if (cat === "auth-record") onAuth(t, rest);
+      else if (cat === "turn-send") onSend(t, rest);
+      else if (cat === "worklist-commit") onCommit(t, rest);
+      else if (cat === "git-push") onPush(t, rest);
+      // log-records-demo-instances: scripts/demo_instance.py's launch and
+      // stop, appended to this trace.
+      // log-demo-restart-and-expanders: a stop is held 10 s, and a launch
+      // inside that window turns it into one restart line (Jon: the two
+      // lines read backward, newest first). The scenario name stays off
+      // the sentence and goes to the entry's detail.
+      else if (cat === "demo-instance") {
+        var dop = kv(rest, "op"), dsc = kv(rest, "scenario"), dpid = kv(rest, "pid");
+        var pidTxt = dpid ? " (PID " + dpid + ")" : "";
+        if (dop === "stop") {
+          var sep = simple(t, "demo", "The demo instance stopped" + pidTxt + ".");
+          sep.deadline = t + 10000;
+          sep.d.scenario = dsc;
+          demoStop = { t: t, pid: dpid, ep: sep };
+        } else if (dop === "launch") {
+          if (demoStop && t - demoStop.t <= 10000 && open.indexOf(demoStop.ep) >= 0) {
+            demoStop.ep.d.text = "The demo instance restarted" +
+              (demoStop.pid && dpid ? " (PID " + demoStop.pid + " \u2192 " + dpid + ")" : pidTxt) + ".";
+            demoStop.ep.d.scenario = dsc || demoStop.ep.d.scenario;
+            demoStop = null;
+          } else {
+            var lep = simple(t, "demo", "A demo instance started" + pidTxt + ".");
+            lep.d.scenario = dsc;
+          }
+        }
+      }
+      else if (cat === "hook-deny") {
+        var hm = /^(\S+) (\S+) (\S+) (.*)$/.exec(rest);
+        if (hm && hm[4].indexOf("decided=deny") >= 0) onHook(t, "tool=" + hm[3] + " " + hm[4]);
+      }
+      else if (cat === "queue" && rest.indexOf("op=save-refused") >= 0) {
+        var bm = /base=Some\((\d+)/.exec(rest);
+        simple(t, "queue", "I refused a queue save: it was written against version " + (bm ? bm[1] : "?") +
+          " but the file was at " + kv(rest, "on_disk") + ". The writer has to re-read and try again.", true);
+      }
+      else if (cat === "bram-trace" && rest.indexOf("event=session-start") >= 0) {
+        simple(t, "launch", "I started up (pid " + kv(rest, "pid") + ").");
+      }
+    });
+    // Episodes still open at the end of the window are told now; their
+    // enders read flushNow to tell "not yet" from "never did".
+    flushNow = Date.now();
+    tick(Infinity);
+
+    // Research summary: map projection groups onto turn episodes by order.
+    try {
+      var pg = toolGroups();
+      if (pg && allTurns.length) {
+        var groups = pg.groups.filter(function (g) { return g.user !== null || !g.open || g.calls.length; });
+        // groups opened by a user/system turn are complete at the front; the
+        // first group may be cut off by the projection window.
+        var gi = groups.length - 1;
+        for (var ti = allTurns.length - 1; ti >= 0 && gi >= 0; ti--, gi--) {
+          var rec = allTurns[ti], g = groups[gi];
+          if (g.user === null && pg.truncatedHead && gi === 0) break;
+          if (rec.quote && g.user && g.user.slice(0, 15) !== rec.quote.replace(/…$/, "").slice(0, 15)) break;
+          if (rec.shown && g.calls.length) {
+            var sum = summarize(g.calls);
+            if (sum) {
+              out.forEach(function (o) { if (o._rec === rec) o.text += " " + sum; });
+            }
+          }
+        }
+      }
+    } catch (e) { /* summary is optional */ }
+
+    out.forEach(function (o) {
+      if (o._qadd) {
+        o.text = "New queue message" +
+          (o._qadd.chars ? " (" + o._qadd.chars + " characters)." : ".");
+      }
+    });
+    out.sort(function (a, b) { return b.t - a.t; });
+    return out
+      .filter(function (o) { return STORY_SHOW.indexOf(o.kind) >= 0; })
+      .map(function (o) {
+        var draft = o.queueId && payload.queueDrafts && payload.queueDrafts[o.queueId];
+        var message = draft && typeof draft.text === "string" ? draft.text : null;
+        var quote = window.__bramStoryLeadingSentence(message);
+        var text = o.text;
+        if (quote) text = (o.kind === "queue-delete" ? "Deleted queue message: “" : "New queue message: “") + quote + "”";
+        return {
+          id: o.kind + ":" + (o.queueId || o.t),
+          at: o.at, text: text, kind: o.kind, surprising: o.surprising, queueId: o.queueId || null,
+          // For the expanded detail: when it happened (the board-then fetch
+          // keys on it) and the agent and session in force at the time.
+          t: o.t, agent: o.agent || null, sessionId: o.sessionId || null, sessionTitle: o.sessionTitle || null,
+          // log-tells-session-switches: a switch's other side, for its
+          // from → to detail line.
+          fromAgent: o.fromAgent || null, fromSessionId: o.fromSessionId || null, fromSessionTitle: o.fromSessionTitle || null,
+          pushFrom: (o._ep && o._ep.d && o._ep.d.from) || null, pushTo: (o._ep && o._ep.d && o._ep.d.to) || null,
+          // log-push-lists-its-commits: a gate entry's commit, so an
+          // expanded commit can list the files it changed.
+          commitSha: (o.kind === "gate" && o._ep && o._ep.d && o._ep.d.sha) || null,
+          scenario: (o.kind === "demo" && o._ep && o._ep.d && o._ep.d.scenario) || null,
+          message: message === null ? "No saved draft is available for this older message." : (message || "This queued message is empty."),
+          context: window.__bramQueueDraftContext(draft || null),
+          images: (draft && Array.isArray(draft.images)) ? draft.images : [],
+        };
+      });
+  }
+
+  // What the Log shows, opt-in (Jon, 2026-11-05: "show nothing until I ask
+  // for it"). Every kind is still told; only these reach the Log. Add a kind
+  // here when it's asked for. Known kinds: queue-add, queue, turn, gate,
+  // stall, refusal, launch, queue-delete, selection, push, search, demo,
+  // switch. switch: asked for 2026-11-07 (log-tells-session-switches).
+  // gate, push and search were asked for on 2026-11-07
+  // (log-shows-start-commit-push-search: "Start, Commit, Push, Search").
+  // demo: asked for 2026-11-07 (log-records-demo-instances, "log when we
+  // run a demo instance").
+  var STORY_SHOW = ["queue-add", "queue-delete", "selection", "gate", "push", "search", "demo", "switch"];
+  // log-reads-across-trace-rotation: the Log's URL names these kinds, and the
+  // host sends only the lines they're told from (story_kind_wants in lib.rs),
+  // so held-back kinds cost nothing until they're shown.
+  window.__bramStoryShownKinds = function () { return STORY_SHOW.join(","); };
+
+  return function (payload) {
+    flushNow = Infinity;
+    try { return tell(payload); } catch (e) { return []; }
+  };
+})();
+// END bram-story

@@ -39,6 +39,12 @@ const GUARD = join(
   process.platform === "win32" ? "bram-guard.exe" : "bram-guard",
 );
 const GUARD_TIMEOUT_MS = 15000;
+// Bram's per-project state folder: `.bram/` when it exists, else the older
+// `resources/` (issue #469). A path in `.bram/` wins only if that file is there.
+function statePath(name) {
+  const moved = join(ROOT, ".bram", name);
+  return existsSync(moved) ? moved : join(ROOT, "resources", name);
+}
 // Built-in tools that can't change the project. Everything else goes to the
 // guard, which allows what it has no rule for; MCP calls go as MCP calls
 // (mcpIdentity below), so its MCP rule applies.
@@ -65,7 +71,7 @@ function deny(message) {
 // guard itself does in an unmanaged repo. With the marker present a missing
 // guard is a broken install, and that denies.
 function bramManagedHere() {
-  return existsSync(join(ROOT, "resources", ".worklist-authorization.json"));
+  return existsSync(statePath(".worklist-authorization.json"));
 }
 
 // opencode-mcp-guard: OpenCode 2.1.4 runs MCP tools through code mode, and
@@ -211,7 +217,7 @@ const FORWARDED = new Set([
 // Read per event: Bram writes a new port each time it starts.
 function bramPort() {
   try {
-    return Number(readFileSync(join(ROOT, "resources", ".bram-port"), "utf8").trim()) || 0;
+    return Number(readFileSync(statePath(".bram-port"), "utf8").trim()) || 0;
   } catch {
     return 0;
   }
@@ -257,6 +263,13 @@ async function forwardTurns(api) {
     // Chained so the host sees boundaries in order; never awaited here, so
     // a slow or absent Bram can't hold up OpenCode's event stream.
     const body = { type: evt.type, sessionID: sid, at: evt.created };
+    // opencode-session-own-terminal: Bram launches OpenCode --standalone, so
+    // this plugin inherits its terminal's token, and another OpenCode has
+    // none. The shared service (ppid 1) can hold a token too, from whichever
+    // terminal started it, while serving every OpenCode, so it never sends one.
+    if (process.env.BRAM_MENU_TOKEN && process.ppid !== 1) {
+      body.bram_token = process.env.BRAM_MENU_TOKEN;
+    }
     if (evt.type.startsWith("permission.")) body.permission = data;
     if (evt.type.startsWith("form.")) body.form = data;
     chain = chain.then(() => postEvent(body));

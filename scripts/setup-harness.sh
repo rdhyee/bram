@@ -21,6 +21,10 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$REPO_ROOT/scripts/bram-state.sh"
+# The state folder's name under a project (.bram or resources), re-resolved on
+# each call because Setup may create it mid-scenario.
+state_rel() { basename "$(bram_state_dir "$1")"; }
 BRAM_BIN="${BRAM_BIN:-$REPO_ROOT/src-tauri/target/debug/bram}"
 WORK_ROOT="${HARNESS_TMP:-$(mktemp -d -t bram-setup-harness)}"
 KEEP_ON_FAIL="${KEEP_ON_FAIL:-1}"
@@ -63,8 +67,8 @@ launch() {
   BRAM_PID=$!
   local i
   for i in $(seq 1 80); do
-    if [ -f "$dir/resources/.bram-port" ]; then
-      BRAM_PORT="$(cat "$dir/resources/.bram-port" 2>/dev/null)"
+    if [ -f "$(bram_state_dir "$dir")/.bram-port" ]; then
+      BRAM_PORT="$(cat "$(bram_state_dir "$dir")/.bram-port" 2>/dev/null)"
       [ -n "$BRAM_PORT" ] && sleep 1 && return 0
     fi
     kill -0 "$BRAM_PID" 2>/dev/null || { bad "launch" "process exited; see $WORK_ROOT/$SCENARIO.log"; return 1; }
@@ -110,7 +114,7 @@ assert_refused() {
   else
     bad "autostart held ($kind)" "no op=autostart-held line in $WORK_ROOT/$SCENARIO.log"
   fi
-  for p in resources .claude AGENTS.md CLAUDE.md .bram.json; do
+  for p in resources .bram .claude AGENTS.md CLAUDE.md .bram.json; do
     [ -e "$dir/$p" ] && written="$written $p"
   done
   if [ -z "$written" ]; then
@@ -144,12 +148,13 @@ assert_file() {
   if [ -e "$dir/$rel" ]; then ok "seeded $rel"; else bad "seeded $rel" "missing"; fi
 }
 
-# Fingerprint everything Setup owns. resources/ is excluded: the port file,
-# port sidecar and traces legitimately change between runs.
+# Fingerprint everything Setup owns. The state folder (.bram/ or resources/)
+# is excluded: the port file, port sidecar and traces legitimately change
+# between runs.
 fingerprint() {
   local dir="$1"
   (cd "$dir" && find . -type f \
-      -not -path './resources/*' -not -path './.git/*' \
+      -not -path './resources/*' -not -path './.bram/*' -not -path './.git/*' \
       -print0 2>/dev/null | sort -z | xargs -0 shasum 2>/dev/null)
 }
 
@@ -162,7 +167,7 @@ assert_trace() {
   local dir="$1" pattern="$2" name="$3"
   local i
   for i in $(seq 1 20); do
-    if grep -q "$pattern" "$dir/resources/bram-traces/bram-trace.log" 2>/dev/null; then
+    if grep -q "$pattern" "$(bram_state_dir "$dir")/bram-traces/bram-trace.log" 2>/dev/null; then
       ok "$name"
       return 0
     fi
@@ -180,7 +185,7 @@ assert_setup_landed() {
   local dir="$1"
 
   # core_installed keys on this file (lib.rs:33509).
-  assert_file "$dir" "resources/.worklist-authorization.json"
+  assert_file "$dir" "$(state_rel "$dir")/.worklist-authorization.json"
   assert_file "$dir" ".claude/bram-conventions.md"
   assert_file "$dir" ".claude/settings.json"
   assert_file "$dir" "AGENTS.md"
@@ -237,6 +242,60 @@ assert_setup_landed() {
     bad "no .opencode/ without OpenCode" "Setup created it with no opencode on PATH"
   else
     ok "no .opencode/ without OpenCode"
+  fi
+
+  # antigravity-worklist-guard: Bram's guard group is seeded into
+  # .agents/hooks.json where agy is installed (antigravity_hooks_wanted keys
+  # on its CLI) and nowhere else. assert_idempotent's fingerprint covers the
+  # file, so a second Setup must leave it byte-identical.
+  assert_field antigravityNeedsSetup false
+  if command -v agy > /dev/null 2>&1; then
+    assert_file "$dir" ".agents/hooks.json"
+    # The command wraps the guard so that no decision (an older guard that
+    # doesn't know the hook) becomes a deny; agy lets empty output through.
+    if jq -e '.["bram-worklist-guard"].PreToolUse[0]
+              | (.matcher == "^(write_file|edit_file|run_command|call_mcp_tool)$")
+                and (.hooks[0].command | contains("guard antigravity-worklist"))
+                and (.hooks[0].command | contains("\"decision\":\"deny\""))' \
+         "$dir/.agents/hooks.json" > /dev/null 2>&1; then
+      ok "Antigravity hooks register the guard"
+    else
+      bad "Antigravity hooks register the guard" "$(head -12 "$dir/.agents/hooks.json" 2>/dev/null)"
+    fi
+    # antigravity-signature-and-conventions: agy loads the conventions as
+    # always-on rules, cut in two to fit its 24,000-byte limit, which it
+    # enforces by truncating silently. Each slice must fit, and the slices
+    # minus their six header lines must give back the seeded conventions.
+    # assert_idempotent then covers a second Setup leaving them byte-identical.
+    assert_field antigravityRulesCurrent true
+    local slice slices_ok=1 slice_bad=""
+    for slice in "$dir/.agents/rules/bram-conventions-1.md" "$dir/.agents/rules/bram-conventions-2.md"; do
+      if [ ! -f "$slice" ]; then
+        slices_ok=0; slice_bad="$slice_bad missing:${slice##*/}"
+      elif [ "$(wc -c < "$slice")" -gt 24000 ]; then
+        slices_ok=0; slice_bad="$slice_bad over-24000:${slice##*/}"
+      elif [ "$(sed -n 2p "$slice")" != "trigger: always_on" ]; then
+        slices_ok=0; slice_bad="$slice_bad no-trigger:${slice##*/}"
+      fi
+    done
+    if [ "$slices_ok" = 1 ]; then
+      ok "Antigravity rules: two always-on slices within 24,000 bytes"
+    else
+      bad "Antigravity rules: two always-on slices within 24,000 bytes" "$slice_bad"
+    fi
+    if [ -e "$dir/.agents/rules/bram-conventions-3.md" ]; then
+      bad "Antigravity rules: no third slice" "bram-conventions-3.md present"
+    fi
+    if { tail -n +7 "$dir/.agents/rules/bram-conventions-1.md"; tail -n +7 "$dir/.agents/rules/bram-conventions-2.md"; } 2>/dev/null \
+         | cmp -s - "$dir/.claude/bram-conventions.md"; then
+      ok "Antigravity rules reassemble the seeded conventions"
+    else
+      bad "Antigravity rules reassemble the seeded conventions" "slices minus headers differ from .claude/bram-conventions.md"
+    fi
+  elif [ -e "$dir/.agents/hooks.json" ] || [ -e "$dir/.agents/rules" ]; then
+    bad "no .agents/ seeding without agy" "Setup created .agents/ files with no agy on PATH"
+  else
+    ok "no .agents/ seeding without agy"
   fi
 
   # Tonight's bug: firstRun keys on .bram.json (lib.rs:33551 / 21336), which
@@ -312,7 +371,7 @@ scenario_subfolder() {
     bad "toplevel names the repo root" "got: $top"
   fi
   local p written=""
-  for p in resources .claude AGENTS.md .bram.json; do
+  for p in resources .bram .claude AGENTS.md .bram.json; do
     [ -e "$repo/$p" ] && written="$written $p"
   done
   if [ -z "$written" ]; then ok "nothing written at the repo root"; else bad "nothing written at the repo root" "found:$written"; fi
@@ -351,7 +410,7 @@ scenario_already_setup() {
   # managed project does not track them (the bram repo keeps
   # resources/bram-traces/ untracked). Committing them would make this
   # scenario fail on its own live trace writes rather than on Setup churn.
-  printf 'resources/bram-traces/\nresources/.bram-port*\n' > "$dir/.gitignore"
+  printf 'resources/bram-traces/\nresources/.bram-port*\n.bram/bram-traces/\n.bram/.bram-port*\n' > "$dir/.gitignore"
   git -C "$dir" add -A
   git -C "$dir" -c user.email=h@h -c user.name=harness commit -qm init
   launch "$dir" || return
@@ -362,6 +421,76 @@ scenario_already_setup() {
   check "re-running Setup leaves the tree clean" git -C "$dir" diff --quiet
   assert_field firstRun false
   assert_field claudeNeedsSetup false
+  shutdown_bram
+}
+
+scenario_stale_instructions() {
+  # #465: a set-up project whose conventions copy no longer matches. The
+  # status used to say only claudeNeedsSetup=true; setupReasons must name the
+  # failed check, and a missing hook must read differently.
+  local dir="$WORK_ROOT/stale_instructions"; mkdir -p "$dir"
+  git -C "$dir" init -q
+  printf '# scratch\n' > "$dir/README.md"
+  launch "$dir" || return
+  run_setup; sleep 1
+  assert_field claudeNeedsSetup false
+  printf '<!-- bram v0.0.1 -->\nold text\n' > "$dir/.claude/bram-conventions.md"
+  sleep 1
+  assert_field claudeNeedsSetup true
+  assert_field claudeDocsCurrent false
+  assert_field menuHookRegistered true
+  local reasons; reasons="$(api __enhance/status | jq -c '.setupReasons')"
+  if [ "$reasons" = '["claude-instructions-stale"]' ]; then
+    ok "setupReasons names stale instructions only"
+  else
+    bad "setupReasons names stale instructions only" "got: $reasons"
+  fi
+  shutdown_bram
+}
+
+scenario_antigravity_reasons() {
+  # agy-setup-reasons: with Antigravity active, removing Bram's group from
+  # .agents/hooks.json or staling .agents/rules/ must report its own code in
+  # setupReasons rather than leaving setupReasons empty.
+  local dir="$WORK_ROOT/antigravity_reasons"; mkdir -p "$dir"
+  git -C "$dir" init -q
+  printf '# scratch\n' > "$dir/README.md"
+  printf '{"shell":{"agent":"antigravity","startupPolicy":"none"}}\n' > "$dir/.bram.json"
+  launch "$dir" || return
+  run_setup; sleep 1
+  assert_field activeProvider antigravity
+  assert_field antigravityNeedsSetup false
+  assert_field providerNeedsSetup false
+  local reasons; reasons="$(api __enhance/status | jq -c '.setupReasons')"
+  if [ "$reasons" = '[]' ]; then
+    ok "setupReasons empty when Antigravity setup is current"
+  else
+    bad "setupReasons empty when Antigravity setup is current" "got: $reasons"
+  fi
+  jq 'del(.["bram-worklist-guard"])' "$dir/.agents/hooks.json" > "$dir/.agents/hooks.json.tmp" \
+    && mv "$dir/.agents/hooks.json.tmp" "$dir/.agents/hooks.json"
+  sleep 1
+  assert_field antigravityNeedsSetup true
+  assert_field providerNeedsSetup true
+  assert_field antigravityHooks missing
+  reasons="$(api __enhance/status | jq -c '.setupReasons')"
+  if [ "$reasons" = '["antigravity-hook-missing"]' ]; then
+    ok "setupReasons names missing Antigravity hook group"
+  else
+    bad "setupReasons names missing Antigravity hook group" "got: $reasons"
+  fi
+  rm -f "$dir/.agents/rules/bram-conventions-1.md"
+  sleep 1
+  assert_field antigravityRulesCurrent false
+  reasons="$(api __enhance/status | jq -c '.setupReasons')"
+  if [ "$reasons" = '["antigravity-hook-missing","antigravity-rules-stale"]' ]; then
+    ok "setupReasons names missing hook group and stale rules"
+  else
+    bad "setupReasons names missing hook group and stale rules" "got: $reasons"
+  fi
+  run_setup; sleep 1
+  assert_field antigravityNeedsSetup false
+  assert_field providerNeedsSetup false
   shutdown_bram
 }
 
@@ -399,7 +528,7 @@ scenario_nested() {
   fi
   # The targeting check: a nested launch must not be auto-set-up.
   assert_trace "$dir" "\[auto-setup\] op=skip reason=nested" "auto-setup skipped on nested launch"
-  if [ -e "$dir/resources/.worklist-authorization.json" ]; then
+  if [ -e "$(bram_state_dir "$dir")/.worklist-authorization.json" ]; then
     bad "nested launch not seeded" "worklist authorization present"
   else
     ok "nested launch not seeded"
@@ -415,7 +544,7 @@ require_bin
 command -v jq >/dev/null || { echo "jq required"; exit 127; }
 printf 'workdir: %s\n' "$WORK_ROOT"
 
-SCENARIOS=(pristine_nogit subfolder pristine_git already_setup legacy_hooks nested)
+SCENARIOS=(pristine_nogit subfolder pristine_git already_setup stale_instructions antigravity_reasons legacy_hooks nested)
 [ $# -gt 0 ] && SCENARIOS=("$@")
 
 for s in "${SCENARIOS[@]}"; do

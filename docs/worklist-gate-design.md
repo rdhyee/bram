@@ -95,9 +95,9 @@ recorded as a tripwire (`worklist-strip op=anomaly`, `e5f745d`).
 Per row, on expand: **files expected to change**, **changes**, **shared with**.
 It renders for plan rows too — only the activity numbers are begun-gated —
 because the path list and the overlap are what a reader needs in order to
-decide what to do next. The `shared with` column renders each claimant as the
-same coloured badge that claimant's own row carries (`__bramItemColor`), so the
-join is recognition rather than label comparison.
+decide what to do next. The `shared with` column is one line of counts, such as
+`2 with lines · 1 listed`: items that own lines in the file, and items that only
+list it. The ⓘ dialog names each one.
 
 Below the action bar, a board-wide **Shared files** table
 (`__bramWorklistOverlapRows`) lists one row per path that more than one begun
@@ -130,21 +130,50 @@ that silently disappears.
 
 Which verbs are *enabled* is derived from the selection, not from a mode:
 
-- **Start N** — `__bramSelectionAllUnstarted`: every ticked item is unbegun.
-- **Start & commit N** — `__bramSelectionAllUnstarted` **and**
-  `__bramSelectionAllPlans` **and** exactly one item ticked (the
-  `worklist.oneClickApproveCommit` setting that once gated this was retired
-  in the 0.5.3 run). Single-item only for now — a
-  multi-item selection used to fuse every ticked item into one commit with no
-  path to N commits; see #272.
-- **Commit N** — `__bramSelectionAllCommittable`: every ticked item is begun
-  and has *exclusive* changes of its own (not every changed path shared with
-  another begun item).
-- **Refine N** — any non-empty message.
-- **Drop N** — always enabled while no claim is in flight.
+- **Start** (reads **Resume** on a begun item) —
+  `__bramSelectionAllNeedStart`: every ticked item is unapplied, not running,
+  and either not committable or still under a live approval, which means its
+  work was never declared finished.
+- **Start & commit** (reads **Resume & commit**) —
+  `__bramSelectionAllNeedStart` **and** exactly one item ticked **and** not
+  `__bramSelectionAllCommittable`. Single-item only for now — a multi-item
+  selection used to fuse every ticked item into one commit with no path to N
+  commits; see #272.
+- **Commit** — `__bramSelectionAllCommittable`: every ticked item is begun and
+  has changes of its own to commit, with the exceptions that predicate names.
+  On a `proposed` item it sends `apply-and-commit`, as Start & commit does, so
+  the agent may finish remaining edits first.
+- **Drop** — always enabled while no claim is in flight.
+
+The row offers one way to continue and one way to finish. On a begun item with
+a live approval and changes on disk, that is Resume and Commit; Resume & commit
+dims because it would repeat Commit.
+
+Follow-up messages aren't a gate verb: the composer sends them to the ticked
+items.
 
 A row's tickbox stays ticked and frozen while its action is in flight, because
 the tick is part of the sentence just submitted.
+
+Under the buttons, the gate bar keeps to one quiet line. With two or more items
+ticked and no posted plan, it ends in a **What's my next move?** button. The
+button asks the agent for the order and posts it as a plan
+(`__bramNextMoveSlot` puts it at the end of the gate's consequence line, else
+the take line, else on a row of its own). Two lines speak only to warn:
+
+- **Commits only together with X.** Commit is withheld while a same-click
+  partner that still has changes is unticked, because the host would refuse a
+  commit of one (`op=refuse-joint-interval`).
+- **The whole-file take line** (`__bramSelectionTakeLine`). It appears only when
+  Commit would take whole files that include lines no item wrote, as "Together,
+  Commit takes these files whole: +A −R, including +a −r no item wrote." A
+  whole-file take with no unowned lines, and the ordinary case of taking only
+  the items' own lines, say nothing.
+
+Two lines were retired: "Committable together with X — select both." and
+"Together, Commit takes only these items' own lines …". The button and the plan
+answer what to tick, and the ordinary case needs no sentence (`5e9eb4ab`,
+`2df62db2`; `e60b455b` added the button).
 
 Row expansion is keyed by item id and persisted to `sessionStorage`
 (`__bramRestoreWorklist2Expansion` / `__bramPersistWorklist2Expansion`), so it

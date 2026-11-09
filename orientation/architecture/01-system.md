@@ -1,0 +1,112 @@
+# Components: detail
+
+Click-through detail for 01-system.mmd. Facts are as of commit `e8a38ac0` (2026-11-02). One arrow, the conventions, depends on the agent reading and following instructions; the rest is what code does on its own. Where a claim is not backed by a cited line, the text says the repo is silent.
+
+## You
+
+<!-- read: README.md#Who is it for? -->
+
+Bram's README says it is for "Anyone who uses Claude Code, Codex, OpenCode and/or Antigravity." [`README.md:11-13`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/README.md?plain=1#L11-L13) You start it from the root of a git repo: "Anywhere else (your home directory, a folder that isn't a git repo, or a subfolder of one), Bram starts nothing and says where to start from." [`README.md:96-99`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/README.md?plain=1#L96-L99) The host enforces this in `run_enhance`, which refuses with "Setup refused" outside a repo root. [`src-tauri/src/lib.rs:59083-59102`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/src-tauri/src/lib.rs?plain=1#L59083-L59102)
+
+The repo doesn't say how many people use Bram or on which platforms beyond the build matrix in the release workflow (see diagram 6).
+
+## Agent pane
+
+<!-- read: README.md#Agent pane -->
+<!-- read: docs/session-context-architecture.md#The line -->
+
+Bram's own UI. The host page puts a terminal and two iframes side by side: `right-pane` (the target app) and `tools-pane` (the agent pane). [`app/index.html:31-53`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/app/index.html?plain=1#L31-L53) The agent pane is an XMLUI app; its navigation lists Worklist, Transcript, Sessions, Issues, Commits, Queue, Search, Alerts, History, Files, Settings, Tips, Context and Status. [`app/tools/Main.xmlui:727-770`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/app/tools/Main.xmlui?plain=1#L727-L770) Each tab is a routed `Page`. [`app/tools/Main.xmlui:1051-1063`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/app/tools/Main.xmlui?plain=1#L1051-L1063)
+
+State placement is a stated design line: "The shell owns the agent-session context and all expensive shared data. Pages are disposable lenses over it." [`docs/session-context-architecture.md:44-46`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/docs/session-context-architecture.md?plain=1#L44-L46) That doc names four layers (native shell, host page, agent-pane App scope, Pages). [`docs/session-context-architecture.md:8-40`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/docs/session-context-architecture.md?plain=1#L8-L40)
+
+## Tauri shell
+
+<!-- read: docs/session-context-architecture.md#First: which "shell"? -->
+
+The Rust host. `run()` registers two custom URI schemes (`tauri` and `bramapp`), lists the IPC commands the pane may invoke, and binds the HTTP server. [`src-tauri/src/lib.rs:97044-97044`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/src-tauri/src/lib.rs?plain=1#L97044-L97044) [`src-tauri/src/lib.rs:97098-97153`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/src-tauri/src/lib.rs?plain=1#L97098-L97153) The session-context doc describes it as the layer that "Owns the PTY, the agent process, turn-state detection, and pushes Tauri events." [`docs/session-context-architecture.md:13-16`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/docs/session-context-architecture.md?plain=1#L13-L16)
+
+The release doc describes the host as large: "The Rust host is large and carries most of Bram's logic". [`docs/releasing.md:3-5`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/docs/releasing.md?plain=1#L3-L5) At this commit `src-tauri/src/lib.rs` is 100,932 lines (`git show e8a38ac0:src-tauri/src/lib.rs | wc -l`), with `guard.rs`, `guard_policy.rs`, `worklist_state.rs`, `search_index.rs` and `grant_lifecycle.rs` beside it.
+
+## Terminal and agent CLI
+
+<!-- read: README.md#Terminal (optional) -->
+
+The terminal is xterm.js in the host page. [`app/main.js:179-195`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/app/main.js?plain=1#L179-L195) The host page waits for fonts and layout, then calls `pty_spawn`. [`app/main.js:1817-1834`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/app/main.js?plain=1#L1817-L1834) The CLI is one of four commands: `codex`, `claude`, `opencode` or `agy` (the provider named `antigravity`). [`src-tauri/src/lib.rs:28412-28424`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/src-tauri/src/lib.rs?plain=1#L28412-L28424) The terminal is optional to look at: "It starts closed, in favor of the agent pane's Worklist, Transcript, and Queue views." [`README.md:19-25`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/README.md?plain=1#L19-L25)
+
+## Loopback server
+
+<!-- read: docs/authorization.md#Transport does not confer authority -->
+
+An HTTP server on `127.0.0.1`. The host tries the previous run's port first, so allowlist entries that name literal ports keep working, and otherwise takes an ephemeral port. [`src-tauri/src/lib.rs:97166-97206`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/src-tauri/src/lib.rs?plain=1#L97166-L97206) It publishes the port to `.bram-port` in the state folder (`.bram/` if it exists, else `resources/`; `resource_relative_path`) "only after the accept loop is actually serving HTTP, and preserve a live same-project owner." [`src-tauri/src/lib.rs:97394-97399`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/src-tauri/src/lib.rs?plain=1#L97394-L97399) Each request is handled on its own thread. [`src-tauri/src/lib.rs:97390-97391`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/src-tauri/src/lib.rs?plain=1#L97390-L97391) Routes are dispatched in `handle_http` and `route_request`. [`src-tauri/src/lib.rs:96086-96097`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/src-tauri/src/lib.rs?plain=1#L96086-L96097) [`src-tauri/src/lib.rs:81189-81193`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/src-tauri/src/lib.rs?plain=1#L81189-L81193)
+
+Browser boundaries: the response header that allows cross-origin reads is echoed only for the shell origin ("ACAO is now echoed only for the shell origin"). [`src-tauri/src/lib.rs:96099-96110`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/src-tauri/src/lib.rs?plain=1#L96099-L96110) A same-user process is not covered: "a same-user process is not CORS-bound", which the security assessment accepts as a residual. [`docs/authorization.md:42-45`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/docs/authorization.md?plain=1#L42-L45)
+
+Request gate: before any route runs, `handle_http` calls `loopback_gate_refusal`, which answers 403 to a state-changing request whose `Origin` is not the shell's, and to any request whose `Host` is not `127.0.0.1` or `localhost` at this instance's port. [`src-tauri/src/lib.rs:96112-96140`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/src-tauri/src/lib.rs?plain=1#L96112-L96140) [`src-tauri/src/lib.rs:96505-96519`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/src-tauri/src/lib.rs?plain=1#L96505-L96519) A request with no `Origin` passes, as do the pane's own fetches, hooks and curl: "No-Origin callers pass". [`src-tauri/src/lib.rs:96464-96470`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/src-tauri/src/lib.rs?plain=1#L96464-L96470) State changes are every method other than GET, HEAD and OPTIONS, plus a hand-kept list of GET paths that act (`STATE_CHANGING_GET_PATHS`). [`src-tauri/src/lib.rs:96480-96487`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/src-tauri/src/lib.rs?plain=1#L96480-L96487) Refusals are traced as `loopback-refusal`. [`src-tauri/src/lib.rs:96127-96140`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/src-tauri/src/lib.rs?plain=1#L96127-L96140) The gate adds no caller identity: "The loopback gate stops pages, not local processes." [`docs/authorization.md:243-243`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/docs/authorization.md?plain=1#L243-L243) Security assessment H6 records the send half as closed and the local-process residual as accepted. [`docs/security.md:375-375`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/docs/security.md?plain=1#L375-L375)
+
+## Target pane (optional)
+
+<!-- read: README.md#Target app -->
+
+Off by default: "The embedded target app is **optional and off by default**". [`CLAUDE.md:84-86`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/CLAUDE.md?plain=1#L84-L86) The host reads the `show_target_app` setting under `ui` and defaults it to false. [`src-tauri/src/lib.rs:97088-97092`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/src-tauri/src/lib.rs?plain=1#L97088-L97092) The pane is served on a distinct origin (`bramapp://localhost`) so the target "is a pure display surface". [`src-tauri/src/lib.rs:96620-96631`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/src-tauri/src/lib.rs?plain=1#L96620-L96631) [`src-tauri/src/lib.rs:96722-96729`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/src-tauri/src/lib.rs?plain=1#L96722-L96729) CLAUDE.md puts it as "the pane is **display-only**". [`CLAUDE.md:132-139`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/CLAUDE.md?plain=1#L132-L139)
+
+## Project repo
+
+The git repo Bram was launched in; the project root is the first non-flag argument or the current directory. [`src-tauri/src/lib.rs:579-588`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/src-tauri/src/lib.rs?plain=1#L579-L588) Bram keeps its working state in the repo's state folder, which is `resources/` in practice at this commit (`.bram/` only if that folder exists; see diagram 4), much of it gitignored. [`.gitignore:48-74`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/.gitignore?plain=1#L48-L74) See diagram 4.
+
+## clicks and messages
+
+<!-- read: CLAUDE.md#The host helpers (cross-target) -->
+
+The pane's controls call window helpers. `toTurn` sends the text raw ("Send the text RAW") to the host through `queue_pty_intent`. [`app/__shell/helpers.js:668-691`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/app/__shell/helpers.js?plain=1#L668-L691) Gate buttons first record the action, then send the turn, in `submitAuthorizedWorklistTurn`. [`app/__shell/helpers.js:729-749`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/app/__shell/helpers.js?plain=1#L729-L749) See diagrams 2 and 3.
+
+## Tauri commands
+
+<!-- read: CLAUDE.md#The host helpers (cross-target) -->
+
+IPC commands are an explicit list in `invoke_handler`, including `pty_spawn`, `pty_write`, `queue_pty_intent` and `record_worklist_action_authorization`. [`src-tauri/src/lib.rs:97125-97153`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/src-tauri/src/lib.rs?plain=1#L97125-L97153) The target pane can't use them: cross-origin, the helpers "no-op inside an embedded target app". [`CLAUDE.md:132-139`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/CLAUDE.md?plain=1#L132-L139)
+
+## HTTP routes
+
+<!-- read: docs/apis.md#Key terms -->
+
+The agent pane's `/__*` requests go to `tauri://localhost`; the scheme handler proxies any path starting with `__` to the loopback server (its "Tier 3"). [`src-tauri/src/lib.rs:96693-96708`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/src-tauri/src/lib.rs?plain=1#L96693-L96708) Agents call the same server with `curl`, reading the port from `<state>/.bram-port`. [`app/__shell/conventions.md:414-424`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/app/__shell/conventions.md?plain=1#L414-L424) `docs/apis.md` is the route catalog; at this commit every quoted `/__` route literal in `lib.rs` appears in it (checked by grep for this refresh). It says of itself "Code is the source of truth; this is the announcement surface." [`docs/apis.md:72-73`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/docs/apis.md?plain=1#L72-L73) Nothing in `src-tauri/`, `scripts/` or `.github/` reads it to check it against `handle_http` (the only mentions of the file in the Rust and scripts are a test that keeps the seeded conventions from pointing at it), so its completeness rests on whoever adds a route updating it. [`src-tauri/src/lib.rs:100415-100415`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/src-tauri/src/lib.rs?plain=1#L100415-L100415)
+
+## spawns PTY
+
+`pty_spawn` first retires any terminal it replaces, then opens a pseudo-terminal sized to the pane and builds the command. [`src-tauri/src/lib.rs:20294-20316`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/src-tauri/src/lib.rs?plain=1#L20294-L20316) Output returns through an `on_data` channel to xterm.js. [`src-tauri/src/lib.rs:20287-20293`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/src-tauri/src/lib.rs?plain=1#L20287-L20293)
+
+## hosts
+
+Binding happens inside the Tauri `setup` hook: "Bind the right-pane HTTP server before anything else so the URL is available the moment the parent shell asks for it." [`src-tauri/src/lib.rs:97166-97169`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/src-tauri/src/lib.rs?plain=1#L97166-L97169)
+
+## Tauri events
+
+<!-- read: docs/developing-bram.md#Push over polling -->
+
+The host pushes state changes with `emit_replayable_payload`; for example the turn-state spine emits `turn-state-changed` only when "user-visible state changed". [`src-tauri/src/lib.rs:9267-9276`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/src-tauri/src/lib.rs?plain=1#L9267-L9276) [`src-tauri/src/lib.rs:9310-9312`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/src-tauri/src/lib.rs?plain=1#L9310-L9312) The pane subscribes instead of polling: "Do NOT add `pollIntervalInSeconds` to XMLUI DataSources for freshness." [`docs/developing-bram.md:323-335`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/docs/developing-bram.md?plain=1#L323-L335)
+
+## edits, gated by hooks
+
+<!-- read: app/__shell/conventions.md#Enforcement -->
+<!-- read: docs/authorization.md#Action matrix -->
+
+File edits by the agent are decided by `bram-guard`: "Worklist hooks decide with real exit codes and fail CLOSED on guard faults". [`src-tauri/src/guard.rs:1-15`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/src-tauri/src/guard.rs?plain=1#L1-L15) See diagram 1. Hooks "check coverage, which is not approval". [`app/__shell/conventions.md:508-511`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/app/__shell/conventions.md?plain=1#L508-L511)
+
+## Worklist calls
+
+<!-- read: app/__shell/conventions.md#Transports -->
+
+This is how an agent advances, prunes or commits an item. "Claude, OpenCode and Antigravity: loopback curl." [`app/__shell/conventions.md:416-416`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/app/__shell/conventions.md?plain=1#L416-L416) Codex's `workspace-write` sandbox refuses loopback connections, so it writes `<state>/.worklist-intent.json` and reads a result file. Both transports reach the same host-side handlers, so the checks are identical. [`app/__shell/reference/worklist-mechanics.md:268-275`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/app/__shell/reference/worklist-mechanics.md?plain=1#L268-L275)
+
+## serves project content
+
+<!-- read: README.md#Working with a real backend -->
+
+The target-app scheme proxies `/__project/*` to the project's upstream, which is the loopback server by default or an external dev server configured in `.bram.json`. [`src-tauri/src/lib.rs:96663-96673`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/src-tauri/src/lib.rs?plain=1#L96663-L96673) [`src-tauri/src/lib.rs:96752-96755`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/src-tauri/src/lib.rs?plain=1#L96752-L96755) [`src-tauri/src/lib.rs:97278-97286`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/src-tauri/src/lib.rs?plain=1#L97278-L97286)
+
+## conventions it should follow
+
+<!-- read: app/__shell/conventions.md -->
+<!-- read: README.md#How `conventions.md` governs each agent -->
+
+This arrow relies on the agent. Setup seeds `.claude/bram-conventions.md` and the README says each agent loads the conventions: "Claude through `CLAUDE.md`... Codex through a repo-local `AGENTS.md` block... OpenCode through an `instructions` entry... Antigravity through always-on rules". [`README.md:79-91`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/README.md?plain=1#L79-L91) The README adds that these "aren't merely advisory" because hooks enforce the core rule, so part of what this arrow carries is enforced; the rest is prose guidance the agent follows. [`README.md:86-91`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/README.md?plain=1#L86-L91) Setup writes the sidecar in [`src-tauri/src/lib.rs:59169-59191`](https://github.com/judell/bram/blob/e8a38ac08d3ac3a6323b712bb00ebf23aa4a0f05/src-tauri/src/lib.rs?plain=1#L59169-L59191).

@@ -1,0 +1,237 @@
+<Component
+  name="Log"
+  var.storyTick="{0}"
+  var.mountKey="{window.__bramStoryMountKey()}"
+  var.expanded="{[]}"
+  var.fullscreenImage="{null}">
+
+  <!-- issue-473-readable-launch-log: Bram's story of the last five hours
+       (one until log-shows-start-commit-push-search, 2026-11-07; the host's
+       trace tail grew to match). The host selects episode lines (/__story/lines);
+       helpers.js tells them (__bramStoryTell), so a wording change is a pane
+       reload. Fetched when the tab opens and refetched when a turn starts or
+       ends (turn-context-changed), or when the host sees a shown kind happen
+       (story-changed: a commit, push, search, queue change, selection
+       restore or gate click); no polling and no Refresh button, since what it
+       shows happens on other tabs. A tick rebuilds the URL, which also moves
+       the window's start. The window spans relaunches: the host reads the
+       rotated trace archives too (log-reads-across-trace-rotation), and
+       `kinds` limits the lines to the ones the shown kinds are told from.
+       Push, not polling: docs/developing-bram.md §Push over polling. -->
+  <DataSource id="story"
+    url="{'/__story/lines?since=' + window.__bramStorySince(300, mountKey + '.' + storyTick) + '&amp;kinds=' + window.__bramStoryShownKinds()}" />
+  <PushSource id="storyEvt" initial="{null}"
+    subscribe="{window.bramSubscribeTauriEvent('turn-context-changed')}" />
+  <ChangeListener listenTo="{storyEvt.value &amp;&amp; storyEvt.value.tick}"
+    onDidChange="storyTick = storyTick + 1" />
+  <!-- log-demo-restart-and-expanders: confirms parent state changes.
+       A row can still show stale state; this trace alone is not proof that
+       the visible entry expanded.
+       https://www.xmlui.org/docs/reference/components/ChangeListener -->
+  <ChangeListener listenTo="{expanded.join(',')}"
+    onDidChange="window.__bramLogExpandedTrace(expanded)" />
+  <PushSource id="storyChanged" initial="{null}"
+    subscribe="{window.bramSubscribeTauriEvent('story-changed')}" />
+  <ChangeListener listenTo="{storyChanged.value &amp;&amp; storyChanged.value.tick}"
+    onDidChange="storyTick = storyTick + 1" />
+
+  <!-- A queue message's screenshot opens full size, as in Transcript.xmlui. -->
+  <Theme maxWidth-ModalDialog="95vw">
+    <ModalDialog
+      when="{!!fullscreenImage}"
+      onClose="fullscreenImage = null">
+      <Image
+        src="{window.imageSrcForPath(fullscreenImage)}"
+        fit="contain"
+        width="100%"
+        height="80vh" />
+    </ModalDialog>
+  </Theme>
+
+  <VStack padding="$space-6" gap="$space-4">
+    <HStack gap="$space-3" verticalAlignment="center">
+      <Heading level="h2">Log</Heading>
+    </HStack>
+    <!-- No firm height: the List hands its scroll to the page, which is the
+         tab's own scroll container
+         (https://www.xmlui.org/docs/howto/pin-a-toolbar-above-a-bounded-scroll-region). -->
+    <!-- Expansion must be part of the row data: this List's cached rows
+         otherwise retain the old expanded array in both bindings and click
+         handlers, even while the parent ChangeListener sees the update.
+         https://www.xmlui.org/docs/howto/keep-per-item-state-in-a-loop -->
+    <List data="{window.__bramLogRows(window.__bramStoryTell(story.value), expanded)}" idKey="id">
+      <!-- While the story loads, a spinner; once loaded, an empty Log is
+           just empty (Jon, 2026-11-07: remove "Nothing to show yet").
+           https://www.xmlui.org/docs/reference/components/Spinner -->
+      <property name="emptyListTemplate">
+        <Spinner when="{!story.loaded}" />
+      </property>
+      <!-- The time and the sentence share a baseline. A Markdown paragraph
+           is <Text variant="paragraph"> (xmlui MarkdownReact.tsx), whose line
+           height and padding come from theme variables, not from a lineHeight
+           on the Markdown wrapper (that was 497d3c3's miss): so the row's
+           Theme sets the paragraph's line box (lineHeight-Text-paragraph,
+           not lineHeight-Text, which would loosen the detail lines too),
+           zeroes its padding (paddingVertical-Text-paragraph, default
+           $space-1) and margins (as the footer's status line does in
+           Main.xmlui), and flattens the item-name chips' bottom padding
+           (paddingBottom-Text-code). The time gets the same 1.5rem box.
+           https://www.xmlui.org/docs/reference/components/Text
+           https://www.xmlui.org/docs/reference/components/Markdown -->
+      <Theme marginTop-Text-markdown="0" marginBottom-Text-markdown="0"
+        paddingVertical-Text-paragraph="0"
+        lineHeight-Text-paragraph="1.5rem"
+        paddingBottom-Text-code="0">
+      <HStack gap="$space-2" paddingVertical="$space-1" verticalAlignment="start">
+        <!-- The time links into the Transcript at that moment
+             (/transcript?at=<ms>) when the entry happened in the session
+             the Transcript shows; otherwise it's plain. -->
+        <Theme textColor-Link="$textColor-secondary" textColor-Link--hover="$textColor-primary"
+          textColor-Link--active="$textColor-secondary">
+          <Link when="{!!window.__bramStoryTranscriptHref($item, story.value)}" noIndicator="true"
+            width="2.5rem" fontSize="$fontSize-sm" lineHeight="1.5rem"
+            tooltip="Open the Transcript here"
+            label="{$item.at}" to="{window.__bramStoryTranscriptHref($item, story.value)}" />
+        </Theme>
+        <Text when="{!window.__bramStoryTranscriptHref($item, story.value)}"
+          width="2.5rem" fontSize="$fontSize-sm" lineHeight="1.5rem" color="$textColor-secondary" value="{$item.at}" />
+        <!-- Transcript's ID-keyed fold, so refresh/reordering preserves the
+             expanded message rather than the row's former position.
+             https://www.xmlui.org/docs/howto/keep-per-item-state-in-a-loop -->
+        <VStack when="{!!$item.queueId}" width="*" gap="$space-2">
+          <!-- The label is the Link's own text, not a nested Text, so it
+               wraps; breakMode="word" breaks a long URL inside the quote
+               (https://www.xmlui.org/docs/howto/wrap-long-text-in-a-link). -->
+          <!-- Plain text color for the toggle, scoped to it alone so the
+               external-link icon below keeps the link color
+               (textColor-Link: https://www.xmlui.org/docs/reference/components/Link). -->
+          <Theme textColor-Link="$textColor-primary" textColor-Link--hover="$textColor-secondary"
+            textColor-Link--active="$textColor-primary">
+            <Link noIndicator="true" breakMode="word" lineHeight="1.5rem"
+              label="{($item.isExpanded ? '▾ ' : '▸ ') + $item.text}"
+              onClick="expanded = window.__bramToggleInArray(expanded, $item.id)" />
+          </Theme>
+          <VStack when="{$item.isExpanded}" padding="$space-2">
+            <!-- The message, then Open in Queue at its stable id
+                 (https://www.xmlui.org/docs/reference/components/Link), then
+                 the context recorded with its draft, in small print. -->
+            <!-- The message as an inline Text run inside an outer Text, with
+                 the compact Link as the next child: one line-breaking
+                 context, so the icon hugs the end of the message's last line
+                 however it wraps (Text `inline`:
+                 https://www.xmlui.org/docs/reference/components/Text).
+                 The link shows only when there is a saved draft to open. -->
+            <Text>
+              <Text inline="true" whiteSpace="pre-wrap" value="{$item.message}" />
+              <Link when="{!!$item.context}" icon="external-link" noIndicator="true" marginLeft="$space-1"
+                tooltip="Open in Queue" to="{'/queue?focus=' + $item.queueId}" />
+            </Text>
+            <!-- Screenshots sent with the message, as Transcript shows a
+                 turn's images: a thumbnail that opens full size. -->
+            <Items data="{$item.images || []}">
+              <Image
+                src="{window.imageSrcForPath($item)}"
+                maxHeight="220px"
+                maxWidth="100%"
+                fit="contain"
+                onClick="fullscreenImage = $item" />
+            </Items>
+            <Text when="{!!$item.context}" fontSize="$fontSize-xs" color="$textColor-secondary"
+              value="{$item.context}" />
+          </VStack>
+        </VStack>
+        <!-- log-shows-start-commit-push-search: the sentence is Markdown so
+             item names link to their History entry (/history?entry=<id>);
+             openLinkInNewTab false keeps the links in-app
+             (https://www.xmlui.org/docs/reference/components/Markdown).
+             A surprising line keeps its warning colour through the
+             textColor-Text variable Markdown's prose reads, scoped by Theme
+             (https://www.xmlui.org/docs/reference/components/Theme). -->
+        <!-- Every other entry expands (same ID-keyed fold as the queue rows)
+             to its context: the agent and session it happened in, from the
+             teller, and the board as it stood then, fetched only once opened
+             (/__worklist-history/at). A pushed commit's sha links to the
+             forge, opened in the system browser through openExternal
+             (helpers.js routes http links on this tab there); an unpushed
+             one links in-app to the Commits tab's local view
+             (/commits?sha=). A push's range links to the forge's compare
+             view. -->
+        <!-- The whole sentence is the toggle's click target, not just the
+             chevron. Embedded links still navigate and also toggle the row.
+             Stack click:
+             https://www.xmlui.org/docs/reference/components/Stack#click -->
+        <VStack when="{!$item.queueId}" width="*" gap="$space-0_5">
+          <HStack testId="log-row" gap="$space-2" verticalAlignment="start" cursor="pointer"
+            onClick="expanded = window.__bramLogRowToggle(null, expanded, $item.id)">
+            <Theme textColor-Link="$textColor-secondary" textColor-Link--hover="$textColor-primary"
+              textColor-Link--active="$textColor-secondary">
+              <Text lineHeight="1.5rem" color="$textColor-secondary" value="{$item.isExpanded ? '▾' : '▸'}" />
+            </Theme>
+            <Markdown when="{!$item.surprising}" width="*" lineHeight="1.5rem" content="{$item.text}" openLinkInNewTab="{false}" />
+            <Theme when="{$item.surprising}" textColor-Text="$color-warn-700">
+              <Markdown width="*" lineHeight="1.5rem" content="{$item.text}" openLinkInNewTab="{false}" />
+            </Theme>
+          </HStack>
+          <VStack when="{$item.isExpanded}" paddingLeft="$space-5" gap="$space-0_5">
+            <Text fontSize="$fontSize-xs" color="$textColor-secondary"
+              value="{window.__bramStoryEntryContext($item)}" />
+            <Text when="{!!$item.scenario}" fontSize="$fontSize-xs" color="$textColor-secondary"
+              value="{window.__bramStoryScenarioLine($item)}" />
+            <!-- log-push-lists-its-commits: a push lists what it carried,
+                 sliced from the Commits tab's list (/__commits, fetched only
+                 when a push is opened), one Markdown line per commit: its sha
+                 to the forge, its subject, its items to History. Small,
+                 secondary text through the paragraph's theme variables, the
+                 way the row's Theme sets its line box.
+                 https://www.xmlui.org/docs/reference/components/Markdown -->
+            <!-- A commit entry lists the files it changed (/__commit, fetched
+                 only when opened), with their line counts, the way the
+                 Commits tab's rows show +/- in color. -->
+            <DataSource id="commitFiles" url="/__commit" queryParams="{{ sha: $item.commitSha }}" when="{!!$item.commitSha}" />
+            <Text when="{!!$item.commitSha}" fontSize="$fontSize-xs" color="$textColor-secondary"
+              value="{window.__bramStoryCommitFilesHeading(commitFiles.value, commitFiles.loaded)}" />
+            <VStack when="{!!$item.commitSha}" gap="0" paddingLeft="$space-3">
+              <Items data="{window.__bramStoryCommitFiles(commitFiles.value)}">
+                <HStack gap="$space-2" verticalAlignment="center">
+                  <Text fontSize="$fontSize-xs" fontFamily="$fontFamily-monospace" color="$textColor-secondary"
+                    breakMode="anywhere" value="{$item.path}" />
+                  <Text fontSize="$fontSize-xs" fontFamily="$fontFamily-monospace" color="$color-success-700" value="{$item.added}" />
+                  <Text when="{!!$item.removed}" fontSize="$fontSize-xs" fontFamily="$fontFamily-monospace" color="$color-danger-700" value="{$item.removed}" />
+                </HStack>
+              </Items>
+            </VStack>
+            <DataSource id="pushCommits" url="/__commits" when="{!!$item.pushTo}" />
+            <Text when="{!!$item.pushTo}" fontSize="$fontSize-xs" color="$textColor-secondary"
+              value="{window.__bramStoryPushHeading(window.__bramStoryPushCommits(pushCommits.value, $item.pushFrom, $item.pushTo), pushCommits.loaded)}" />
+            <Theme fontSize-Text-paragraph="$fontSize-xs" fontSize-Text-markdown="$fontSize-xs"
+              lineHeight-Text-paragraph="1.4" textColor-Text="$textColor-secondary">
+              <VStack when="{!!$item.pushTo}" gap="0" paddingLeft="$space-3">
+                <Items data="{window.__bramStoryPushCommits(pushCommits.value, $item.pushFrom, $item.pushTo) || []}">
+                  <Markdown content="{$item.md}" openLinkInNewTab="{false}" />
+                </Items>
+              </VStack>
+            </Theme>
+            <DataSource id="boardThen" url="/__worklist-history/at" queryParams="{{ ts: $item.t }}" />
+            <Text fontSize="$fontSize-xs" color="$textColor-secondary"
+              value="{window.__bramStoryBoardLine(boardThen.value, boardThen.loaded)}" />
+            <!-- The board as a vertical list, each item linked to its History
+                 entry (/history?entry=<id>, the deep link the Commits tab and
+                 the sentence's item names use), with its state beside it.
+                 https://www.xmlui.org/docs/reference/components/Items -->
+            <VStack gap="0" paddingLeft="$space-3">
+              <Items data="{window.__bramStoryBoardItems(boardThen.value)}">
+                <HStack gap="$space-1" verticalAlignment="center">
+                  <Link noIndicator="true" fontSize="$fontSize-xs" breakMode="word"
+                    label="{$item.id}" to="{$item.href}" />
+                  <Text fontSize="$fontSize-xs" color="$textColor-secondary" value="{'(' + $item.state + ')'}" />
+                </HStack>
+              </Items>
+            </VStack>
+          </VStack>
+        </VStack>
+      </HStack>
+      </Theme>
+    </List>
+  </VStack>
+
+</Component>

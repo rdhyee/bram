@@ -32,13 +32,9 @@ the xmlui_rules, and follow them.
 
 **Reference files.** Detail you need only in a recognizable situation
 lives beside this file in `.claude/bram-reference/`:
-`worklist-mechanics.md` (transports, entangled commits, delegation,
-enforcement), `diagnostics.md` (stuck spinners, traces, logs, evidence,
-Bram's guards), `environment.md` (target-app helpers, `/query`, forge
-CLI, test suites, Windows, voice input setup, cross-project work,
-fresh-session suggestions) and `orientation.md` (orienting in a new
-repo). Each section below says
-when to read which. Setup refreshes these files and Bram-bundled skills
+`worklist-mechanics.md`, `diagnostics.md`, `environment.md` and
+`orientation.md` (orienting in a new repo). Each section below says when
+to read which. Setup refreshes these files and Bram-bundled skills
 (`.claude/skills/<name>/SKILL.md` carrying a `<!-- bram-managed` marker);
 don't make functional edits to installed copies, since the next Setup
 overwrites them.
@@ -46,16 +42,20 @@ overwrites them.
 
 ## Coordinate via worklist.json
 
-`resources/worklist.json` is the canonical surface for multi-step
-coordination between you and the user. The Worklist tab in the agent
-pane renders it as a checklist under "Worklist". It doesn't need to
-exist in advance — Bram serves an empty default and the Worklist tab
-creates the file (and `resources/`) on first use. Empty state is fine:
+Bram's state folder, written `<state>/` below, is `.bram/` if it
+exists, else `resources/`; whichever one holds `.bram-port` is in use.
+Before 0.8.4 the folder was `resources/`; that path in older
+transcripts and issues means `.bram/`.
+
+`<state>/worklist.json` is the canonical surface for multi-step
+coordination between you and the user; the Worklist tab renders it as
+a checklist. It needn't exist in advance: Bram serves an empty default
+and creates the file (and the folder) on first use. Empty is fine:
 `{ "description": "", "items": [] }`.
 
 ### When to route through the worklist
 
-**Default: every change request goes through `resources/worklist.json`.**
+**Default: every change request goes through `<state>/worklist.json`.**
 Single-file, single-line, single-attribute — size doesn't matter.
 Propose first, wait for the user's `approved:` payload, then apply. The
 two-stage proposed → applied flow lets the user redirect or veto before
@@ -73,14 +73,13 @@ Skip the worklist only in these contexts, never because the change is
   this", "don't bother with the worklist") no longer opt out. Every
   agent honors the same phrase.
 - **`skip-worklist:` structured prefix on this turn.** The turn begins
-  literally with `skip-worklist: ` followed by the request. Same family
-  as `approved:` / `drop:` / `iterate:`, but it authorizes a direct
-  edit rather than a lifecycle transition. The user types it, or sends
-  with ⌘Enter / Ctrl+Enter, adding a closing "Just do it and commit."
-  Unlike the other prefixes, the host forwards the **entire turn text
-  including the prefix**. On seeing it, skip propose-first, make the
-  change directly, write no worklist item, and commit only if the turn
-  asks; the PreToolUse hook allows the edits.
+  literally with `skip-worklist: ` followed by the request (typed, or
+  sent with ⌘Enter / Ctrl+Enter, which adds "Just do it and commit.").
+  The host forwards the **entire turn text including the prefix**. Skip
+  propose-first, make the change directly, write no worklist item, and
+  commit only if the turn asks. A direct commit to a file a begun item
+  already changed **strands** that item: commit the item first, or
+  re-anchor it (§Opt-out plumbing).
 - **Correcting code you just wrote in the current iteration.** Fixing a
   typo or off-by-one from your last turn is iteration on in-progress
   work, not a fresh change request.
@@ -104,7 +103,7 @@ suggest "just do it" unless the user asks how to skip the Worklist.
 
 **Worklist items represent repository changes.** A `proposed` item
 names a `file` (or `files`) plus `before` / `after` prose in
-`resources/worklist-drafts/<id>.md`, describing what would change on
+`<state>/worklist-drafts/<id>.md`, describing what would change on
 disk. An `applied` item has those changes on disk awaiting commit
 approval — and so can a `proposed` item that has **begun** (approved
 and started, not advanced): once its changes are on disk the pane
@@ -137,7 +136,7 @@ found the item's premise **false** (**Drop**, and the draft's own
 claims must say they are wrong), or **done elsewhere**: a PR in another
 repo, a server change, a forge action (**Drop**, and the draft links
 where the work landed). Record in
-`resources/worklist-drafts/<id>.md` which of the four it is: the
+`<state>/worklist-drafts/<id>.md` which of the four it is: the
 premise that failed, what was verified, and what would make the item
 actionable again.
 
@@ -172,8 +171,8 @@ the Alerts inbox key on that prefix.
 Metadata and review prose live in two files:
 
 ```text
-resources/worklist.json              # compact metadata index
-resources/worklist-drafts/<id>.md    # before / after prose per item
+<state>/worklist.json              # compact metadata index
+<state>/worklist-drafts/<id>.md    # before / after prose per item
 ```
 
 The draft file:
@@ -204,7 +203,7 @@ so the pane sees one combined item; hashes cover metadata + resolved
 prose. A missing draft yields empty `before` / `after` plus
 `"_draftMissing": true` and a placeholder in the UI.
 
-**`resources/worklist-history/` is host-written**; the guard denies
+**`<state>/worklist-history/` is host-written**; the guard denies
 agent edits. An instruction to edit it is stale.
 
 **The `version` rule.** `worklist.json` carries a top-level `version`
@@ -266,8 +265,8 @@ status; the user's Commit button judges committability independently.
 
 ### Lifecycle: propose → triage → mechanical transitions
 
-1. **Propose** — write the draft to `resources/worklist-drafts/<id>.md`,
-   then the metadata item to `resources/worklist.json`. Each item small,
+1. **Propose** — write the draft to `<state>/worklist-drafts/<id>.md`,
+   then the metadata item to `<state>/worklist.json`. Each item small,
    discrete, independently rejectable. Writing the item is *asking*, not
    approval. Don't show or instruct on raw `approved:` / `drop:` /
    `iterate:` payloads — the buttons generate them.
@@ -283,16 +282,12 @@ status; the user's Commit button judges committability independently.
    apply; `{"op":"prune","ids":[...]}` after a drop, or after a commit of
    already-`applied` items. Never rewrite `"status": "applied"` directly.
 
-**Selection decides who a message is addressed to.** With one or more
-Worklist items selected, a message the user sends (Enter in the message
-box) is **feedback addressed to those items**, and arrives as an
-`iterate:` turn. With nothing selected, it is **general chat** with you.
-The box's placeholder shows where Enter will send ("To <item>
-(feedback)", "To Claude (chat)"). With items selected, a line above it
-carries **Send as chat instead**, which sends that one message as
-general chat without clearing the selection; changing the selection
-switches it back to feedback. After **Start** the started items stay
-selected, so follow-ups arrive as `iterate:`; other gate verbs clear it.
+**Selection decides who a message is addressed to.** With Worklist
+items selected, a message the user sends is **feedback to those items**
+(an `iterate:` turn); with nothing selected, it is **general chat**.
+**Send as chat instead** sends one message as chat without clearing the
+selection. After **Start** or feedback the items stay selected (a pane
+reload keeps them); other gate verbs clear it.
 
 **The gate verbs.** The gate row is pure lifecycle: **Start / Start &
 commit / Commit / Drop**, each acting on the ticked items (hover names
@@ -315,7 +310,10 @@ turn; it also establishes claims for addressed feedback. Resolve can
 establish the drop claim, and advance/prune retire the affected ids.
 Respond to any per-item feedback, whatever the kind.
 
-- **Recommending Drop / Commit on named items** → post a plan; read `.claude/bram-reference/worklist-mechanics.md` (§Recommending next steps).
+- **Recommending Drop / Commit / Start on named items** → post a plan; read `.claude/bram-reference/worklist-mechanics.md` (§Recommending next steps).
+- **"What's my next move? (a, b, …)"** (a gate-bar button, sent as chat)
+  → post the order as a plan whose `why` says what another order would
+  break, or that order doesn't matter; same section.
 
 **`/__worklist/resolve`** returns `{"kind":"approved"|"drop", "items":
 [<recorded content>]}` — execute those items; don't re-read
@@ -327,7 +325,7 @@ as authorization**. `iterate:` and other non-authorization turns never
 route through `resolve`.
 
 **Item feedback (`iterate:`)** authorizes no state change. Re-read items from `/__worklist` (resolved prose) or
-`resources/worklist.json` (metadata), then per item:
+`<state>/worklist.json` (metadata), then per item:
 
 - **`proposed`, not yet begun** (no `begunAtMs`, nothing on disk):
   revise the draft's `before` / `after`; update `files` only if scope
@@ -347,7 +345,7 @@ for it as feedback on the item.
 - **Routing a change, or a commit left `unowned` residue** → read `.claude/bram-reference/worklist-mechanics.md` (§Routing edits to the right item; §Edits made in chat turns).
 
 Feedback items arrive as `{id, feedbackRef}`: read the user's
-full-fidelity text from `resources/feedback-drafts/<feedbackRef>.md`
+full-fidelity text from `<state>/feedback-drafts/<feedbackRef>.md`
 (refs are per send, typically `<unix-ms>-<item-id>`, not item ids).
 That text is the user's submission for this turn. An inline
 `{id, feedback}` appears only as a degradation fallback when the draft
@@ -414,9 +412,10 @@ response saying the commit "ALREADY RAN" is success.
 
 ### Transports
 
-**Claude and OpenCode: loopback curl.** Bram writes its port to `resources/.bram-port`
-(plain decimal). Read it once and substitute the literal number
-(`$BRAM_PORT` won't match the permission allowlist):
+**Claude, OpenCode and Antigravity: loopback curl.** Bram writes its port to
+`<state>/.bram-port` (plain decimal). Read it once and put the literal
+number where `61455` appears (`$BRAM_PORT` won't match the permission
+allowlist):
 
 ```
 curl -4 -sS --retry-connrefused --retry 3 --retry-delay 1 \
@@ -432,8 +431,7 @@ curl -4 -sS --retry-connrefused --retry 3 --retry-delay 1 -X POST \
   "http://127.0.0.1:61455/__worklist/commit"
 ```
 
-(replace `61455` with the value from `resources/.bram-port`). Two
-pitfalls:
+Two pitfalls:
 
 - **Include literal `-X POST`.** `--data` alone matches neither the
   POST nor the GET allowlist entry.
@@ -449,24 +447,16 @@ pitfalls:
 ### Notice when feedback drifts from its item
 
 Feedback sent with a row ticked is filed to that item's audit trail
-(`resources/feedback-drafts/`, then `feedback-history/`), so feedback
+(`<state>/feedback-drafts/`, then `feedback-history/`), so feedback
 about something else makes the record **false**. When a turn's feedback
 is plainly about something else — a different subsystem, bug or
-project — open with the question, verbatim:
+project — **flag it, say so in one line, and stop**; don't do the work
+in this turn. Fire on obvious drift only, **once per drift**; a tangent
+that touches the item, or a follow-up about work just done, is not
+drift.
 
-> Did you mean to address `<item-id>` just now?
-
-then note that **Send as chat instead** on the line above the message
-box (or sending with nothing selected) is how to talk outside an item's
-context, and **stop there and wait for the answer**. It is not a
-refusal — the answer is usually "that was meant as chat", after which
-you do the work — but it *is* blocking: proceeding writes a false audit
-record and does the work in the wrong context. Asking and then
-proceeding regardless is the worst option. Fire on obvious drift only,
-**once per drift**; a tangent that touches the item, or a follow-up
-about work just done, is not drift. The test: would a reader six months
-from now, seeing this feedback on this item, be misled about why it
-changed?
+- **Feedback plainly about something else** → read `.claude/bram-reference/worklist-mechanics.md` (§Flagging feedback that drifts from its item) before replying.
+- **Chat that is plainly feedback on an item on the board** (the other direction) → read `.claude/bram-reference/worklist-mechanics.md` (§Chat that should have been feedback).
 
 ### Authoring conventions
 
@@ -539,7 +529,7 @@ they'll grep.
 ### Cite, don't gesture
 
 When referencing a file, route, or doc, name it
-(`resources/worklist.json`, `/__worklist/resolve`,
+(`<state>/worklist.json`, `/__worklist/resolve`,
 `.claude/bram-reference/diagnostics.md`) so the user can verify in one
 click. If you can't cite, say so.
 
@@ -550,8 +540,6 @@ summary unless load-bearing. The Worklist tab shows the items, the diff
 shows the code; chat is for what those can't show.
 
 ### Narrate as you reach for tools
-
-Codex local launches use `--no-daemon` when supported.
 
 Before a tool call (or batch), say in a sentence what you're about to
 do and why. When a result changes your plan, say so before acting on
@@ -571,6 +559,10 @@ index and worklist history are scoped by working directory and record
 work where it *runs*. If the user proceeds from here anyway, make any
 artifact left in the target project (issue, doc, commit message)
 self-contained, carrying the evidence inline.
+
+**Sessions coordinate on the record.** Don't message another agent
+session directly unless the user says to for that case. Post on a forge
+issue, or tell the user what to relay.
 
 - **Two sessions coordinating across a boundary (upstream, another machine, another agent)** → read `.claude/bram-reference/environment.md` (§Working across project boundaries).
 
@@ -602,8 +594,9 @@ For example:
   `Bram unknown`, never a guess. Prefer the live `/__app-info` value: a
   long-running session's imported copy can be stale, and a present but
   wrong version is denied.
-- `<Agent>` — `Claude`, `Codex` or `OpenCode`. `<thread>` — `main
-  thread` or `subagent`. `<model>` — the model producing the words.
+- `<Agent>` — `Claude`, `Codex`, `OpenCode` or `Antigravity`.
+  `<thread>` — `main thread` or `subagent`. `<model>` — the model
+  producing the words.
 - `<os>` — `macOS`, `Windows` or `Linux`. `<machine>` — short hostname
   (`hostname -s`; `COMPUTERNAME` on Windows).
 - The locator is the checkout's `origin` normalized to `host/path`: no
@@ -664,7 +657,7 @@ you never meet them.
   tweaks; never switch branches without clear consent.
 - **Two unpushed commits look like one feature** → read `.claude/bram-reference/worklist-mechanics.md` (§Pushing: grace window and auto-rebase) before offering a squash.
 - **Don't rewrite a commit the worklist history has recorded.**
-  `resources/worklist-history/` stores commit links by SHA, so rewriting
+  `<state>/worklist-history/` stores commit links by SHA, so rewriting
   any commit made through the gate orphans them permanently, pushed or
   not. Prefer a follow-up commit. Guards deny a forge write citing a full
   40-hex SHA that doesn't resolve locally.
@@ -752,7 +745,7 @@ we done X / did we decide Y" questions.
 The test: if you're groveling through the tree or asking the user for a
 fact a prior session likely established, the query was overdue.
 
-**The call** (literal port from `resources/.bram-port`; allowlisted):
+**The call** (literal port from `<state>/.bram-port`; allowlisted):
 
 ```
 curl -4 -sS "http://127.0.0.1:61455/__search?q=<urlencoded>&limit=20&types=commit,issue"

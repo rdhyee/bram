@@ -5,10 +5,23 @@ The always-loaded conventions (`.claude/bram-conventions.md`) point
 here when one of these situations arises. Everything here binds when
 it applies; the core conventions stay authoritative for ordinary turns.
 
+`<state>/` below is Bram's state folder: `.bram/` if it exists, else
+`resources/`.
+
 ## Opt-out plumbing
 
 How the two direct-edit opt-outs ("just do it" and `skip-worklist:`)
 are honored. The user-facing contract is identical for every agent.
+
+`skip-worklist:` is in the same family as `approved:` / `drop:` /
+`iterate:`, but it authorizes a direct edit rather than a lifecycle
+transition; the PreToolUse hook allows the edits.
+
+**A direct commit strands a begun item.** When a direct commit changes a
+file a begun item has already changed, the item's own patch no longer
+applies to HEAD, and its row names the commit. Commit the item first, or
+re-anchor it afterwards (`POST /__worklist/reanchor {"ids": [...]}`,
+accepted once the file's uncommitted lines are all that item's).
 
 - **Claude, prose opt-out.** Claude's guard matches `_OPT_OUT_PATTERNS`
   against `transcript_path` on every `PreToolUse` and allows inline.
@@ -20,7 +33,7 @@ are honored. The user-facing contract is identical for every agent.
 - **Codex, prose opt-out.** Bram's host-side `toTurn` path matches the
   same phrase and writes a `direct-edit` record
   (`kind:"direct-edit"`, `paths:["*"]`, 1h TTL) to
-  `resources/.worklist-direct-edit.json` — the grant's own sidecar,
+  `<state>/.worklist-direct-edit.json` — the grant's own sidecar,
   separate from the single-slot `.worklist-authorization.json` that any
   gate click replaces. The single Codex `PreToolUse` hook reads it via
   `fresh_bypass()` (legacy records in `.worklist-authorization.json`
@@ -32,14 +45,19 @@ are honored. The user-facing contract is identical for every agent.
   `bram-guard guard opencode-worklist`) reads the record through the
   same `fresh_bypass()` path. As with Codex, only a message sent through
   Bram is seen; words typed straight into OpenCode's own prompt are not.
+- **Antigravity, prose opt-out.** Same host-side record again: agy's hook
+  payload carries no transcript a guard could read. Its guard (Bram's
+  `bram-worklist-guard` group in `.agents/hooks.json`, deciding through
+  `bram-guard guard antigravity-worklist`) reads the record through
+  `fresh_bypass()`. Only a message sent through Bram is seen.
 - **`skip-worklist:` prefix (every agent).** When the host's `toTurn`
   write path sees the prefix it writes the same `direct-edit`
-  record to `resources/.worklist-direct-edit.json`, then forwards the
+  record to `<state>/.worklist-direct-edit.json`, then forwards the
   entire turn text including the prefix. The PreToolUse hook allows the
   edits via the existing `fresh_bypass()` path.
 - Both opt-out matchers (guard-side and host-side) read the item-
   feedback drafts as well as inline text. Claude's guard also reads the
-  outbound-turn file a "Read and follow this Bram turn: @resources/
+  outbound-turn file a "Read and follow this Bram turn: @<state>/
   outbound-turns/<id>-turn.json" frame names, where a multi-line, long
   or image-carrying message's words live (#431); the host-side matcher
   sees the raw text before framing.
@@ -51,13 +69,22 @@ remain usable after that turn. Do not interpret this as permission to
 carry the user's opt-out into unrelated work. Neither an opt-out nor
 a tool allow supplies an approved/drop lifecycle grant.
 
+**Enforcement paused for Claude (experimental, #466).** The user can turn
+on `worklist.enforcement: "paused"` in Settings. While it's on, Claude's
+`SessionStart` and `UserPromptSubmit` hooks add a note saying so. The
+user is managing the work directly: edit without proposing items, and
+commit only when asked, with plain `git`. The guard turns coverage
+denials into `enforcement-paused:` allows; its other checks still deny.
+Codex, OpenCode and Antigravity stay enforced. Never turn the setting on
+yourself: the switch is the user's, even though `.bram.json` is writable.
+
 ## Feedback payload details
 
 Item feedback is a message sent with Worklist items selected; it arrives
 as an `iterate:` turn.
 
 - A feedback item is `{id, feedbackRef}`; `feedbackRef` names
-  `resources/feedback-drafts/<feedbackRef>.md`, the user's full-fidelity
+  `<state>/feedback-drafts/<feedbackRef>.md`, the user's full-fidelity
   feedback text. Read that file directly: `toTurn`'s `\s+ → " "`
   collapse and the receiving TUI's bracketed-paste limits don't apply,
   because the text never rode the PTY paste channel.
@@ -187,14 +214,14 @@ invocations, and the approval is consumed exactly once, so a second
 request can't produce a second commit. It returns instead an error
 naming the completed commit ("this commit ALREADY RAN … verify with git
 log"); read that as success, not failure. Watch the phases in
-`resources/bram-traces/bram-trace.log` — `[worklist-commit] op=staging`,
+`<state>/bram-traces/bram-trace.log` — `[worklist-commit] op=staging`,
 `op=committing`, `op=committed` — to tell a long commit from a stuck one
 without touching git state.
 
 The Codex intent channel carries the same rule: **do not rewrite
-`resources/.worklist-intent.json` with a fresh nonce after a slow
+`<state>/.worklist-intent.json` with a fresh nonce after a slow
 commit.** That is the re-POST in another spelling. Read
-`resources/.worklist-result.json` and the git state first; a result
+`<state>/.worklist-result.json` and the git state first; a result
 whose nonce matches your original request is still coming, and the
 commit it describes may already exist.
 
@@ -228,6 +255,12 @@ Flag rationale:
   transport upholds. Refusal-shaped failures return 4xx, which curl
   doesn't retry, so a 5xx from a Bram route is genuinely a server fault,
   and seeing one repeat four times is expected rather than a second bug.
+  The one 5xx the retry is expected to clear is an `index.lock` collision
+  (another git process, such as an editor, holding the index); the route now
+  waits that out itself for about 2 s first, so you see the 500 only when the
+  lock outlasts that. **Never delete `.git/index.lock` while a git process is
+  running** (`pgrep -x git`): removing a live lock can corrupt the index. If
+  none is running the lock is stale; tell the user before removing it.
 
 **If the port keeps refusing** after fresh re-reads, treat it as a
 stale-port / restarting-server diagnostic — don't continue without the
@@ -245,6 +278,16 @@ instructions reach it through `.opencode/opencode.json`'s
 `instructions` list, which Setup keeps pointing at this file's core,
 `.claude/bram-conventions.md`.
 
+**Antigravity** (`agy`) uses the same curl shapes. Its shell isn't
+sandboxed as Bram launches it, so loopback works, but agy asks before it
+runs any command (its own "command" permission) unless the user has
+allowed it; agy judges each part of a chained command separately. Its
+instructions arrive as always-on rules: Setup cuts the core into
+`.agents/rules/bram-conventions-1.md` and `-2.md`, each under agy's
+24,000-byte rule limit, and rewrites them when the core changes. Bram's
+`AGENTS.md` block, which agy also loads, describes Codex's filesystem
+channel; that works too, since the host drains it for every agent.
+
 ## Codex transport: filesystem intent/result files
 
 Codex's `workspace-write` sandbox refuses loopback connections, and the
@@ -254,7 +297,7 @@ coordination dot-files. Both transports dispatch through the same
 host-side handlers, so response kinds, consume-on-read, the inflight
 sentinel, and the auth checks are identical.
 
-1. **Write** `resources/.worklist-intent.json`:
+1. **Write** `<state>/.worklist-intent.json`:
 
    ```json
    { "nonce": "<unique-per-request>", "route": "<route>", "body": { ... } }
@@ -273,7 +316,7 @@ sentinel, and the auth checks are identical.
    Direct Drop, clear-landed, plan, and the retired iterate brackets
    also have no route in this dispatcher. Unknown routes fail.
 
-2. **Read** `resources/.worklist-result.json` for the record whose
+2. **Read** `<state>/.worklist-result.json` for the record whose
    `nonce` matches (ignore stale results from prior requests):
 
    ```json
@@ -291,7 +334,7 @@ sentinel, and the auth checks are identical.
 The Codex PreToolUse guard exempts `.worklist-intent.json` from
 worklist coverage — it's a coordination file, like the loopback curl is
 for Claude. Trace each drain by grepping `[worklist-intent]` in
-`resources/bram-traces/bram-trace.log`.
+`<state>/bram-traces/bram-trace.log`.
 
 ## Incremental claim and authorization retirement
 
@@ -368,6 +411,18 @@ Parallelize the *work*; serialize the *gates*.
   host. The check keys on the payload's `agent_id`, populated only for
   subagent-originated tool calls. Enforcement claims need a *fire*
   behind them (a deliberate violation), not an inspection.
+- **The host holds delegated rows until the subagent stops (Claude).** A
+  subagent spawned while your turn holds a claim is bound to that
+  claim's items. When your turn ends, the claim is held on those items
+  instead of cleared, so their rows stay locked and the subagent's
+  lines are credited to them, not to "no item". `SubagentStop`, the
+  session ending or a Bram restart releases the binding. While it's
+  live, commit, drop and prune of those ids answer 409
+  `refuse-delegated-live`. The user can release it from the row. So you
+  no longer need to commit delegated items together to place their
+  lines, and you can advance and commit once the subagent has returned.
+  Other providers don't bind yet, so for them the old advice stands:
+  commit delegated items together.
 
 ## Serializing entangled items approved together
 
@@ -569,8 +624,8 @@ the discipline for completing them serially.
 
 ## Recommending next steps
 
-When you recommend Drop or Commit steps on named items ("Drop `a` and `b`,
-then Commit `c`"), also post them as a plan, so the user can approve all of
+When you recommend Drop, Commit or Start steps on named items ("Drop `a` and
+`b`, then Commit `c`"), also post them as a plan, so the user can approve all of
 them with one click instead of ticking rows button by button (#413):
 
 ```
@@ -599,6 +654,59 @@ routes.
   reasoning. Don't post a plan the user hasn't seen described.
 - An empty `steps` list clears the plan. Push, PRs and other non-board steps
   don't belong in it.
+
+**Recommending Start.** A `{"verb": "start", "ids": [...]}` step starts
+items that haven't begun, so "Commit `a`, then Start `b`" is one click:
+
+```
+{"summary": "why, in a sentence", "why": "the reasoning, Markdown", "steps": [
+  {"verb": "commit", "ids": ["a"]},
+  {"verb": "start", "ids": ["b"]}
+]}
+```
+
+- **One approval, one turn.** **Do recommended** sends the commits and starts
+  as a single `approved:` turn, each item with its own gate (`to commit`,
+  `to apply`). Handle it in order: `worklist-commit` the commit items first,
+  then make the started items' edits and `mutate op:"advance"` them. The
+  commit retires only its own ids (§Incremental claim and authorization
+  retirement), so the started items' approval survives it.
+- **The host refuses**, naming the id:
+  - a start on an item that has already begun;
+  - a start beside a commit of an item that isn't `applied`. That commit
+    needs apply-and-commit consent, which is per approval, so the started
+    item would share it. Post that commit alone, then the start.
+  - a start beside a `feedback` step: each starts an agent turn.
+
+**The plan line shows only while two or more items are ticked.** A sequence
+only matters for a multi-item selection, so a plan posted while one item (or
+none) is ticked waits, unseen, until two are. Don't post a plan for a single
+item; say the one click in chat.
+
+**Explain the plan in `why`: why this order and not another.** Markdown,
+briefly. For each ordering choice, say what would go wrong the other way:
+which lines would entangle, which commit would be refused, which work would
+be wasted. **Where the order doesn't matter, say so, and say which you'll
+do** ("the start can go first or last. We'll do it last."). Don't recite the steps, what each item is, or that work
+is done: the line already shows the steps, and "A comes first because A is
+done" explains nothing (Jon, 2026-11-08: "You tautologically recite the
+sequence, but you don't say why things are in that order. If it doesn't
+matter, then we say that it doesn't matter."). The gate bar's **Why?**
+button opens it in a modal, so the reasoning stays on the board after the
+chat scrolls away. Without it, **Why?** shows `summary`.
+
+**"What's my next move? (a, b, …)"** is what the gate bar's **What's my next
+move?** button sends, as chat, when two or more items are ticked; the
+parentheses name them. Answer with the order for those items, then post it
+as a plan with a `why`. Order by what the board shows:
+
+- commit a committable item before starting one whose `files` overlap it
+  (it would entangle);
+- finish begun work before starting proposed work;
+- recommend Drop for an item that turned out to need nothing.
+
+A step a plan can't hold (Resume, Start & commit, Push) goes in the chat
+answer as a click to make.
 
 **Recommending feedback.** When you'd tell the user to tick an item and send
 it some text as feedback ("tick `x` and send: name your prerequisites"),
@@ -704,7 +812,7 @@ messages and batch-Clear UI are not the current implementation.
 
 The structured `approved:` / `drop:` line is not authority by itself.
 The pane asks the host to record clicked ids in
-`resources/.worklist-authorization.json` with kind `approved` / `drop`.
+`<state>/.worklist-authorization.json` with kind `approved` / `drop`.
 Resolve delivers the recorded item bodies. The ordinary agent
 advance/prune channel is mutate:
 
@@ -759,8 +867,8 @@ Continue to use the prescribed approval flow despite these limits.
 
 ## Signature deny reasons
 
-Both provider guards check the forge-artifact signature on `PreToolUse`
-and **deny** rather than warn. They fail open only when no inspectable
+Every agent's guard checks the forge-artifact signature on `PreToolUse`
+and **denies** rather than warns. Each fails open only when no inspectable
 prose body exists (`--body-file -` or a metadata-only command with no
 body flag). Coverage includes issue/PR/MR prose writes, GitHub gists,
 GitLab snippets, and inspectable `gh api` comment/gist writes.
@@ -843,3 +951,75 @@ the session; the reminder carries it across.
   expected, honorable ending, not a failure.
 - **Boundary.** Not a door back to investigation items: a reminder
   records a *decided future action*; an open question is chat's job.
+
+## Flagging feedback that drifts from its item
+
+When a turn's item feedback is plainly about something else (a
+different subsystem, bug or project), flag it, say so in one line, and
+stop:
+
+1. Flag the message you're answering (its `feedbackRef` from the
+   `iterate:` payload). Build the body in its own call, then:
+
+   ```
+   curl -4 -sS --retry-connrefused --retry 3 --retry-delay 1 -X POST \
+     -H "Content-Type: application/json" --data @/tmp/misaddressed.json \
+     "http://127.0.0.1:61455/__worklist/misaddressed"
+   ```
+
+   with `{"op":"flag","feedbackRef":"<ref>"}`. The host accepts only a
+   live draft whose item this turn is addressed to.
+2. Reply with one line: "That looks like chat, not feedback on
+   `<item-id>`." The message box now offers **Resend as chat**, which
+   unticks the item, sends the same text as chat, and notes on the
+   record that it was resent. Don't tell the user to retype it.
+3. **Stop.** Don't do the work in this turn: it would land in the
+   item's context.
+
+If the flag is refused, or you can't call the route (Codex, until its
+file transport gains it), fall back to asking, verbatim, "Did you mean
+to address `<item-id>` just now?", pointing at **Send as chat instead**,
+and wait. It is not a refusal — the answer is usually "that was meant as
+chat", after which you do the work — but it *is* blocking: proceeding
+writes a false audit record and does the work in the wrong context. Asking and then
+proceeding regardless is the worst option. Fire on obvious drift only,
+**once per drift**; a tangent that touches the item, or a follow-up
+about work just done, is not drift. The test: would a reader six months
+from now, seeing this feedback on this item, be misled about why it
+changed?
+
+## Chat that should have been feedback
+
+The reverse of a misaddressed feedback message: a message sent as **chat**
+(nothing ticked) that is plainly feedback on an item still on the board,
+usually a follow-up on work you just did for it. Answering it as chat files
+it under no item and grants no edits.
+
+1. Flag it. The `turnRef` is the outbound turn you were handed (the
+   `<ms>-turn` in `Read and follow this Bram turn: @<state>/outbound-turns/<ms>-turn.json`);
+   `id` is the item. Build the body in its own call, then:
+
+   ```
+   curl -4 -sS --retry-connrefused --retry 3 --retry-delay 1 -X POST \
+     -H "Content-Type: application/json" --data @/tmp/misaddressed.json \
+     "http://127.0.0.1:61455/__worklist/misaddressed"
+   ```
+
+   with `{"op":"flag-chat","turnRef":"<ms>-turn","id":"<item-id>"}`.
+   The host accepts it only for the running chat turn's own record (the
+   newest one, sent as chat, not `skip-worklist`) and an item on the board.
+2. Reply with one line: "That reads as feedback on `<item-id>`." The message
+   box now offers **Resend as feedback**, which ticks that item alone and
+   sends the same text and images to it as feedback, noting that it was
+   first sent as chat. Don't ask the user to retype it.
+3. **Stop.** The resend arrives as an `iterate:` turn for the item.
+
+**Which item.** The one the message is about. When it doesn't say, the
+most recent: the item most recently started, committed or given feedback
+that is still on the board. If none fits (its item was already committed
+and pruned), don't flag; propose an item as for any change request.
+
+Fire on plain cases only, once per message. A question about the item, or
+chat that merely mentions it, is chat. If the flag is refused, or you can't
+call the route (Codex, until its file transport gains it), propose an item
+or ask, as before.

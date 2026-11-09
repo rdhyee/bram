@@ -314,7 +314,36 @@ The receipts:
   scoped, rather than moving to `sessionStorage`. That move was tried first,
   and it would have dropped drafts on every relaunch.
 
-Existing unscoped keys haven't been audited against this rule yet.
+The unscoped keys were audited against this rule on 2026-10-31. Two project
+keys turned up, `bram.worklistSubmittedMessage` and `…Kind`, but nothing read
+them, so they were deleted, not scoped. When a key looks misfiled, check first
+that something reads it. `bram.dismissedAgentIds` stays unscoped: agent ids are
+unique per dispatch, so windows only share its cap of 500.
+
+## The orientation site's engine lives in the template
+
+Bram's own orientation site (`orientation/`) is a copy of the template in
+`app/__shell/reference/orientation-template/`, like every other repo's site.
+The template is the source; nothing flows from a site back to it
+(settled 2026-11-03, `orientation-scaffolding-managed-by-setup`).
+
+- **Engine files:** `arch.js` and `Main.xmlui` carry a
+  `bram-managed: orientation engine` marker. Setup finds every directory in a
+  project whose `arch.js` carries it, wherever it lives (code-exam's is
+  `docs/orientation/`), and refreshes both files from the template, keeping
+  the site's `SITE` / `ARCHITECTURE` block and its `PageMetaTitle`. Unmarked
+  files are never touched. Setup traces one
+  `op=orientation-scaffolding path=… outcome=…` line per file it finds.
+- **Here too:** the refresh runs on the source-repo path as well, which
+  otherwise skips seeded docs and skills, so `orientation/` here is refreshed
+  like any site.
+- **The loop for an engine change:** edit the template, run Setup
+  (`GET /__enhance/run?force=true` on the loopback port, or the Setup
+  button), reload `orientation/` on the preview server, and commit the
+  template and the refreshed `orientation/` files in one item. Editing
+  `orientation/arch.js` or `Main.xmlui` directly is lost on the next Setup.
+- **Content** (`OVERVIEW.md`, `architecture/*`, `screenshots/`, the `SITE`
+  block, every `index.html`) is the site's own, here and everywhere.
 
 ## Push over polling
 
@@ -418,6 +447,97 @@ A real subagent run in this project still costs up to a second per roster
 refetch (the 2026-10-28 04:00 hour had 141 spikes). That's open, and it
 starts with a Timeline.
 
+### The story of a stretch: the Log
+
+The **Log** tab (`app/tools/components/Log.xmlui`) narrates what Bram did
+around the work. Rust selects lines from the trace and `hook-events.log`
+through `/__story/lines`; JavaScript (`__bramStoryTell` in
+`app/__shell/helpers.js`) turns them into episodes; XMLUI displays them.
+Every sentence comes from a fixed template over trace fields, with no model
+call. When a signal is missing, the narrator says so rather than guessing.
+A wording change needs a pane reload.
+
+The original Python narrator and its standalone replay CLI were retired on
+2026-11-07 (`retire-python-narrator`). Its `--follow`, `--since`, `--until`,
+`--cite`, and `--root` commands are no longer available. The Log is the
+narration surface, and JavaScript is the sole maintained narrator; it has no
+Python runtime dependency.
+
+It shows the last five hours, across relaunches: each launch rotates the
+trace, so the host reads the rotated archives as well as the live file. It
+keeps what it selected in memory, reads each archive once, and reads the
+live file only from where it stopped, so a refetch costs what the trace
+gained since the last one. The pane names the kinds it shows (`kinds=`) and
+gets only the lines those are told from. It refreshes when a turn starts or
+ends, and when the host sees a shown kind happen (`story-changed`, debounced:
+a commit, push, search, queue change, selection restore, gate click, or a
+session change or failed agent launch).
+`[story] op=lines` records each request's cost. Before this
+(log-reads-across-trace-rotation, 2026-11-07), a relaunch blanked the Log,
+and every refetch re-read 32 MB and sent 2.6 MB to show 13 entries. Every
+entry expands, on a click anywhere on its sentence, to the agent and session
+it happened in and the board as it stood then (`/__worklist-history/at`).
+An entry's time links into the Transcript at that moment
+(`/transcript?at=<ms>`, landing on the first turn that began at or after it,
+from each turn's `ts`) when it happened in the session the Transcript shows. A pushed commit's sha links to the
+forge, and a push's range to its compare view; a commit no remote has yet
+links to the Commits tab's local view (`/commits?sha=`), since the forge would
+404 on it.
+What reaches it is opt-in (`STORY_SHOW` in `helpers.js`, Jon's 2026-11-05 rule:
+show nothing until asked): queue messages, selection changes, gate clicks,
+pushes, your searches, and demo instances starting and stopping
+(`scripts/demo_instance.py` appends `[demo-instance]` lines to this checkout's
+trace), as of 2026-11-07. Session switches joined them the same day
+(log-tells-session-switches). A switch is told when the session actually
+changes (an `[agent-switch] op=live-session-set` naming a different session),
+and the ops just before it say why: `op=start` (another agent, with its
+`resume_reason`), `op=fresh-partner`, `op=autostart` (the resume at launch),
+or `[session-new] op=create`. A set with none of those is the Sessions tab or
+the agent itself, and is told as that. A switch expands to from → to instead
+of the single context line. Session names aren't linked: the Sessions tab has
+no per-session deep link. Every other kind (turns, stalls,
+refusals, the launch) is told but held back until someone asks for it; adding
+one is a one-word change there, plus its lines in `story_kind_wants`
+(`lib.rs`); a kind the host doesn't know yet gets every line, so it still
+tells correctly, only less cheaply. Item names in a line are links to the
+item's History entry (`/history?entry=<id>`), so the sentence is rendered as
+Markdown. A gate line names the click and what landed; it doesn't recite the
+approval, the claim and the hand-off, which every click does and the row's
+spinner shows live. A Start & commit waits ten minutes for its commit, a
+Commit one; a line told before its deadline says the commit hasn't landed
+yet rather than that it never did. The Log also includes
+quoted openings of what you sent, and what each turn did ("ran 1 search, made
+3 edits"), counted from the Transcript projection by order, and left out
+when the order doesn't line up. Change the voice in `helpers.js`.
+
+### Does the pane slow with age, or with session size?
+
+`scripts/pane-age-health.py` answers that from the trace and the agent's
+session files. It reports projection p50/p90 and focused spikes over 1 s per
+active hour, by session size, by pane age, by active minutes since load
+(minutes with a focused drift line or a working turn, so a pane left idle
+overnight stops looking old), and as a size × age cross-tab. A pane load is
+the first `GET __app-info` after a 10 s gap. The session file's size at each
+tick is rebuilt from its own line timestamps, since the file is append-only.
+
+```sh
+python3 -I scripts/pane-age-health.py                                  # archives since 2026-10-15
+python3 -I scripts/pane-age-health.py --since 2026-11-01
+python3 -I scripts/pane-age-health.py --build-since 2026-11-04T04:06:00Z   # every table, before and after
+```
+
+The baseline, from this script on 2026-11-04 (archives since 2026-10-15: 21
+sessions, 373 pane loads), runs 19, 63, 112 and 121 spikes per active hour
+at wall-clock pane ages of 0–0.5 h, 0.5–1 h, 1–2 h and 2–4 h. By active
+hours since load it runs 19, 94 and 127 over the first two hours, then
+falls to 33 for 2–4 h, so the climb comes from use, not elapsed time.
+Session size barely moves it: 19–82 per hour across the size bins, with no
+trend, and projection p50 stays within 93–139 ms. (The scratch run of
+2026-11-03 that prompted the script read 20, 74, 121 and 123.) So a
+sluggish pane is fixed by a reload, not a new session. Start a new
+session for the agent's reasons. Use `--build-since` to score a pane change
+against the age curve.
+
 ## Build vs. reload boundary
 
 **Settled 2026-08-26 (the helpers.js-needs-rebuild mantra was wrong,
@@ -489,6 +609,10 @@ and the caller. `scripts/build-timings.sh` times synthetic edits on a
 quiet tree; this log catches the slow real builds it can't (#452:
 2m55s and 1m38s builds the same day the synthetic rows read 25–34 s).
 Read it by sorting on `seconds` and looking at the slow rows' context.
+On Windows, build through `scripts/build.ps1`
+(`powershell -NoProfile -File scripts\build.ps1`): it runs VsDevCmd
+itself, builds the `x86_64-pc-windows-msvc` target the Windows launch
+uses, and logs the same line with `platform: "windows"`.
 
 ### Formatting is enforced, so run `cargo fmt`
 
@@ -637,6 +761,33 @@ section, and any profile or crate-split argument resting on them, were
 measured on the polluted directory: re-measure on a clean one before
 relying on them.
 
+That warning missed the next incident. On 2026-11-03 a Windows rebuild
+failed with `There is not enough space on the disk. (os error 112)`, at
+0.2 GB free of 476 GB, while `deps` held 1,713 files. The space was in
+bytes, not files: lib-test PDBs of 92 to 167 MB from earlier tips, seven
+renamed exes, and 10.5 GB in a stale `target/debug` tree. And the check
+was bash-only, so the Windows build never ran it, and it looked only at
+`deps`. Both `scripts/build.sh` and `scripts/build.ps1` now log
+`target_bytes`, `free_bytes` and `stale_debug_tree_days`, and warn before
+building when free space is under 5 GB (`BRAM_DISK_WARN_GB`) or the
+target dir is over 20 GB (`BRAM_TARGET_WARN_GB`).
+
+On Windows the stale tree is `src-tauri\target\debug`. The Windows launch
+builds and runs `target\x86_64-pc-windows-msvc\debug`, so nothing uses
+the plain `debug` tree and it is safe to delete outright.
+
+`build.ps1` also moves a running Bram's exe aside, and it has to move
+both names. Cargo links `deps\bram.exe` and uplifts it to
+`debug\bram.exe`. On 2026-11-03, with only the `debug` name moved, the
+`deps` name still mapped the running image and the link failed twice
+with `LNK1104: cannot open file '…\deps\bram.exe'`. Moving both let it
+link in 10 s. The moved copies are `bram.exe.old-<timestamp>`; each run
+deletes the ones no process holds. It refuses to move anything when free
+space is under 2 GB, or under the largest `free_bytes_used` a logged
+build recorded, because a build that then fails for space would leave no
+exe to relaunch. If a build fails anyway with the exe gone, it moves the
+copies back.
+
 ## Hand-testing the Worklist gate
 
 The gate's selection matrix — which buttons light for which combination of
@@ -713,6 +864,19 @@ is what makes them assertable:
 | run Setup headlessly | `GET /__enhance/run?force=true` |
 | what Setup seeded | the file tree (`.claude/`, `AGENTS.md`, `CLAUDE.md`, `resources/.worklist-authorization.json`) |
 | what startup did | `resources/bram-traces/bram-trace.log` |
+
+The status says *which* check failed, not only that one did (#465):
+
+| field | meaning |
+|---|---|
+| `claudeDocsCurrent`, `menuHookRegistered` | the two halves of `claudeNeedsSetup` that were once invisible (`hookRegistered` and `coreInstalled` are the others) |
+| `setupReasons` | stable codes, computed beside the verdict for the providers `providerNeedsSetup` consults: `not-installed`, `claude-hook-missing`, `claude-menu-hook-missing`, `claude-instructions-stale`, `codex-hook-missing`, `codex-developer-instructions-missing`, `codex-instructions-stale`, `opencode-plugin-missing`, `opencode-instructions-missing`, `antigravity-hook-missing`, `antigravity-rules-stale`. The banner and an agent read this one list |
+| `runningVersion`, `checkoutVersion`, `processOlderThanCheckout` | the process's `CARGO_PKG_VERSION` against `src-tauri/Cargo.toml` beside the on-disk `app/` root; `checkoutVersion` is null when serving the embedded tree. Compared numerically |
+| `providerSetupKind` | `repo-setup`, `codex-hook-refresh`, or `restart-older-process` (the banner offers no Run Setup button there) |
+
+A process older than its checkout can't be produced by the harness's
+pristine scenarios; raise the worktree's `src-tauri/Cargo.toml` version
+under a running `./bram` launch and read the status.
 
 `/__enhance/status` fields answer *different questions* and can
 legitimately disagree — a fact that was itself a bug for a while.
@@ -918,8 +1082,8 @@ scripts/demo-instance.sh stop
 ```
 
 On Windows, use the same verbs through
-`scripts\demo-instance.ps1`. Run the established `build.ps1` from a VS
-Developer PowerShell first. The launcher refuses a debug binary older
+`scripts\demo-instance.ps1`. Build first with `scripts\build.ps1`, which
+sets up the VS developer environment itself. The launcher refuses a debug binary older
 than its Rust sources (see below) or a half-build where `bram-guard.exe`
 is newer than a locked `bram.exe`; it names existing Bram PIDs rather than killing them. On
 every launch it verifies a directory junction named `app` beside the
@@ -958,6 +1122,18 @@ a conspicuous marker and no remote; every destructive verb verifies
 both facts and the exact git toplevel before acting. Transfer a scenario
 branch with ordinary Git plumbing (for example, a bundle), but never add
 an upstream to the disposable instance.
+
+**Layout.** A scenario branch stores the board under `resources/`, the
+0.8.3 layout, so every capture stays valid for both binaries. Hydration
+(`new`, `use`, `reset`, `capture`) moves it into `.bram/` the way the
+mover does: `.gitignore` = `*` first, then the entries, then
+`.migrated-from`, so the demo's binary never runs the mover on it. The
+live port and traces survive in either folder. `capture` reads the board
+from whichever folder is live and writes it back at the `resources/`
+paths, so a board captured in either layout gives the same tree. Pass
+`--legacy-layout` to hydrate the 0.8.3 way and exercise the real mover.
+`reset` and `capture` repeat the active layout; `new` and `use` default
+to `.bram/` (judell/bram#469).
 
 ### Switch matrix
 
@@ -1029,6 +1205,27 @@ computes (the board header, strip wording); those stay rendered checks.
 It needs a windowing session, so it runs on demand, not in CI, like
 `setup-harness.sh`.
 
+### Forcing the suspicious-silence banner
+
+The footer's "terminal is suspiciously silent" banner normally needs a real
+silence with the terminal hidden. To raise it on demand, **Shift-click the
+button that hides the terminal**, while the terminal is showing. A plain click
+hides it with no banner, and a Shift-click that shows it does nothing extra.
+
+This is a deliberate self-test (`app/main.js`, `postSuspiciousSilenceSelfTest`).
+It posts the banner's message from the parent shell to the pane, and doesn't
+touch the live turn or the host's detector. It logs `op=self-test-dispatched`
+and an `op=warn` with `provider=self-test`. **Open terminal** clears it, the
+same way it clears a real one.
+
+For a footer layout check, start a slow turn first (`sleep 120` in the agent's
+shell), so the banner sits beside "working…", then resize the window. The
+trace's pass condition is no `flip:true` and no `wide` on
+`transcript-split-height`. An overlap inside the footer doesn't overflow the
+page, so the trace can't see it: a person has to look. On 2026-10-31 this test
+showed the jitter fixed while **Open terminal** still sat on top of the status
+label (footer-silence-banner-overflow-jitter).
+
 ### Relationship to the scripted sections
 
 The Worklist-gate walkthrough and the startup-dance harness are
@@ -1071,6 +1268,10 @@ fields of config away:
 |---|---|
 | Claude logged out | `CLAUDE_CONFIG_DIR=$(mktemp -d)`, unset `ANTHROPIC_API_KEY`, and pre-set onboarding and folder trust in its `.claude.json` (`hasCompletedOnboarding`, `projects."<dir>".hasTrustDialogAccepted`). Otherwise the first-run theme picker and the folder-trust prompt come first. |
 | Codex logged out | `CODEX_HOME=$(mktemp -d)`, unset `OPENAI_API_KEY`, and pre-trust the folder in its `config.toml` (`[projects."<dir>"] trust_level = "trusted"`). |
+| Antigravity logged out | Use the whole-screen specimen in `docs/agent-specimens/antigravity/logged-out.txt` (Antigravity CLI 1.4.12); it offers Google OAuth or a Google Cloud project. |
+| Antigravity folder trust | Use a fresh workspace with no trusted-workspace entry; see `docs/agent-specimens/antigravity/first-run-trust.txt` (CLI 1.4.12). |
+| Antigravity resume picker | Open the conversation picker at an idle composer; see `docs/agent-specimens/antigravity/resume-picker.txt` (CLI 1.4.12). |
+| Antigravity approval prompts | The `permission-prompt.txt` snapshot is an ordinary working screen, not an approval dialog. Use the captured file approvals (`approval.txt`, `tool-write-approval.txt`, `tool-edit-approval.txt`, `tool-shell-approval.txt`) or command approval (`command-approval.txt`), all Antigravity CLI 1.4.12. |
 | A first-run prompt | the same throwaway directory with nothing pre-set |
 | An OpenCode dialog | At an idle composer, Ctrl+P opens the command palette, and Ctrl+X then `m`, `l` or `a` opens the model, session or agent list. Bram drains its tail on every keystroke, so capture what is drawn after the last key, not the whole stream. |
 | OpenCode logged out | No such screen in 2.1.4. With empty `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME` and `XDG_CACHE_HOME`, it prints a stack trace (`cli.server-connection.resolve`) and exits before drawing its composer. With a real config, it runs its free models without signing in. |

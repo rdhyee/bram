@@ -7,10 +7,12 @@
 // (bram-guard-authority-fail-closed); menu hooks POST the pane's menu
 // claims/clears and stay deliberately fail-open, exit 0 always — a menu hook
 // must never gate or delay a tool call. Every invocation appends one
-// breadcrumb to resources/bram-traces/hook-events.log, tagged `claude-rs` /
-// `codex-rs` / `opencode-rs`, written only when <root>/resources already exists — outside
-// that, guard mode creates nothing (`guard_mode_is_inert_without_
-// resources_dir` holds the line).
+// breadcrumb to <state>/bram-traces/hook-events.log, tagged `claude-rs` /
+// `codex-rs` / `opencode-rs` / `antigravity-rs`, written only when the root's
+// state folder already exists — `<root>/.bram` if it exists, else
+// `<root>/resources` (issue-469, `guard_policy::state_dir`). Outside that,
+// guard mode creates nothing (`guard_mode_is_inert_without_resources_dir`
+// and its `.bram/` twin hold the line).
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -53,13 +55,19 @@ pub fn run_guard_mode(args: &[String]) -> i32 {
             started,
             authority_worklist_hook,
         ),
-        "codex-worklist" => authority_guarded_dispatch(
-            "codex-rs",
-            &payload,
-            stdin_error,
-            started,
-            authority_worklist_hook,
-        ),
+        // current-session-from-events: Codex reports from the guard it already
+        // runs, because registering a new hook event raises its "Hooks need
+        // review" prompt. So a change shows at the next tool call.
+        "codex-worklist" => {
+            session_report("codex", &payload);
+            authority_guarded_dispatch(
+                "codex-rs",
+                &payload,
+                stdin_error,
+                started,
+                authority_worklist_hook,
+            )
+        }
         // opencode-worklist-guard: called by the Bram OpenCode plugin's
         // `execute.before` hook with OpenCode's own tool event.
         "opencode-worklist" => authority_guarded_dispatch(
@@ -72,6 +80,21 @@ pub fn run_guard_mode(args: &[String]) -> i32 {
         // opencode-edit-advisory: called by the plugin's `execute.after` once
         // an OpenCode edit has landed.
         "opencode-after" => opencode_after_hook(&opencode_policy_payload(&payload), started),
+        // antigravity-worklist-guard: registered by Setup in the project's
+        // .agents/hooks.json as agy's PreToolUse hook. agy spawns hooks from
+        // `<workspace>/.agents` rather than `workspacePaths[0]`, and Claude's
+        // `normalize_target` resolves relative strings against the process cwd;
+        // staying in `.agents/` turns every whitespace-free string in
+        // `call_mcp_tool`'s `Arguments` (such as file `content`) into a
+        // creatable `.agents/<token>` candidate and blocks covered MCP writes.
+        "antigravity-worklist" => {
+            enter_antigravity_workspace(&payload);
+            antigravity_worklist_hook(&payload, stdin_error, started)
+        }
+        "antigravity-session" => {
+            session_report("antigravity", &payload);
+            0
+        }
         other => {
             // Misregistration surfaces in stderr, never in the exit code: a
             // nonzero exit from a PreToolUse-shaped hook could block a tool
@@ -93,22 +116,42 @@ pub fn run_guard_mode(args: &[String]) -> i32 {
 // hands the call to that one. Registrations don't change for either
 // provider. Any routing failure falls back to deciding in-process, as
 // before; routing never denies on its own.
+//
+// issue-469: the file lives in the root's state folder, `.bram/` if it
+// exists, else `resources/`. `GUARD_TARGET_REL` keeps the legacy spelling
+// for the host's callers until they move to `guard_target_path`.
 pub const GUARD_TARGET_REL: &str = "resources/.bram-guard-target";
+pub const GUARD_TARGET_LEAF: &str = ".bram-guard-target";
+
+/// `<root>/<state folder>/.bram-guard-target`, for the folder resolved for `root`.
+pub fn guard_target_path(root: &Path) -> PathBuf {
+    crate::guard_policy::state_path(root, GUARD_TARGET_LEAF)
+}
+
+/// The first readable `<dir>/<state folder>/<leaf>` walking up from `start`,
+/// trying `.bram/` then `resources/` at each level before moving up, so a
+/// nested instance is found before its parent. Returns the file's text and
+/// the directory it was found under.
+fn find_state_file_upward(start: &Path, leaf: &str) -> Option<(String, PathBuf)> {
+    let mut cur = start.to_path_buf();
+    loop {
+        for dir in crate::guard_policy::state_dir_candidates(&cur) {
+            if let Ok(text) = std::fs::read_to_string(dir.join(leaf)) {
+                return Some((text, cur));
+            }
+        }
+        if !cur.pop() {
+            return None;
+        }
+    }
+}
 const GUARD_ROUTED_ENV: &str = "BRAM_GUARD_ROUTED";
 
 // The project's recorded guard, when it exists and isn't `current`, with
 // the project root it was recorded in (where the breadcrumb belongs; the
 // hook's cwd can be a subdirectory with no resources/).
 pub(crate) fn route_target(start: &Path, current: &Path) -> Option<(PathBuf, PathBuf)> {
-    let mut cur = start.to_path_buf();
-    let text = loop {
-        if let Ok(text) = std::fs::read_to_string(cur.join(GUARD_TARGET_REL)) {
-            break text;
-        }
-        if !cur.pop() {
-            return None;
-        }
-    };
+    let (text, cur) = find_state_file_upward(start, GUARD_TARGET_LEAF)?;
     let target = PathBuf::from(text.trim());
     if text.trim().is_empty() || !target.is_file() {
         return None;
@@ -151,6 +194,8 @@ fn route_to_project_guard(
         "codex-rs"
     } else if hook.starts_with("opencode-") {
         "opencode-rs"
+    } else if hook.starts_with("antigravity-") {
+        "antigravity-rs"
     } else {
         "claude-rs"
     };
@@ -212,19 +257,13 @@ fn route_to_project_guard(
 
 // --- Deciding worklist hooks ----------------------------------------------
 
-// Walk up from `start` to the nearest resources/.bram-port, mirroring the
-// Python guard's port discovery so the [hook] trace lands the same way.
+// Walk up from `start` to the nearest `.bram/.bram-port` or
+// `resources/.bram-port` (both names at each level, `.bram/` first,
+// issue-469), mirroring the Python guard's port discovery so the [hook]
+// trace lands the same way.
 fn find_port_upward(start: &Path) -> Option<u16> {
-    let mut cur = start.to_path_buf();
-    loop {
-        let candidate = cur.join("resources").join(".bram-port");
-        if let Ok(text) = std::fs::read_to_string(&candidate) {
-            return text.trim().parse().ok();
-        }
-        if !cur.pop() {
-            return None;
-        }
-    }
+    let (text, _) = find_state_file_upward(start, ".bram-port")?;
+    text.trim().parse().ok()
 }
 
 // Minimal fail-silent HTTP POST over std TcpStream — the guard must never
@@ -260,6 +299,110 @@ fn post_json_outcome(port: u16, path: &str, body: &str) -> &'static str {
     let mut buf = [0u8; 256];
     let _ = std::io::Read::read(&mut stream, &mut buf);
     "ok"
+}
+
+// agy-reads-conversation-id: rule 1 of the session spine
+// (docs/decisions/2026-10-27-bram-chooses-the-session.md). agy's PreInvocation
+// names the conversation that is running, including after `/resume` inside
+// the TUI. Captured on agy 1.4.12, 2026-11-02:
+// - An agy in another terminal has no BRAM_PORT or BRAM_MENU_TOKEN, so it
+//   reports nothing, and a mismatched token is refused by the route.
+// - A subagent fires PreInvocation under its own conversationId, interleaved
+//   with its parent's, with an empty lastUserInput; the parent's carries the
+//   prompt. That is observed, not documented. If it stops holding, the
+//   Transcript follows the subagent until the parent's next invocation.
+fn session_report_body(
+    provider: &str,
+    payload: &serde_json::Value,
+    token: &str,
+) -> Option<serde_json::Value> {
+    let (session, mine) = if provider == "antigravity" {
+        (
+            str_field(payload, "conversationId"),
+            !str_field(payload, "lastUserInput").is_empty(),
+        )
+    } else {
+        // current-session-from-events: Claude's and Codex's subagent hooks
+        // carry the parent's session_id plus an agent_id (Claude 2.1, captured
+        // 2026-11-02; Codex: docs/agent-specimens/codex). Skipped regardless,
+        // so a CLI that changes this can't move the session.
+        (
+            str_field(payload, "session_id"),
+            str_field(payload, "agent_id").is_empty(),
+        )
+    };
+    if session.is_empty() || token.is_empty() || !mine {
+        return None;
+    }
+    Some(serde_json::json!({
+        "provider": provider,
+        "session": session,
+        "bram_token": token,
+    }))
+}
+
+// POST a token-authenticated report to the Bram that launched this agent. The
+// port comes from this terminal's environment, not resources/.bram-port,
+// which names whichever instance wrote it last; the token is per terminal, so
+// any other instance would refuse it anyway. `body` builds the request from
+// the token and returns None when there is nothing to report. Never affects
+// the hook's outcome: agy blocks on a failing hook, and this only informs.
+fn post_terminal_report(
+    path: &str,
+    body: impl FnOnce(&str) -> Option<serde_json::Value>,
+) -> &'static str {
+    let token = std::env::var("BRAM_MENU_TOKEN").unwrap_or_default();
+    let Some(body) = body(&token) else {
+        return "skipped=no-agent-or-token";
+    };
+    let Some(port) = std::env::var("BRAM_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+    else {
+        return "skipped=no-port";
+    };
+    post_json_outcome(port, path, &body.to_string())
+}
+
+fn session_report(provider: &str, payload: &serde_json::Value) {
+    let _ = post_terminal_report("/__agent/session", |token| {
+        session_report_body(provider, payload, token)
+    });
+}
+
+// delegated-work-action-gates: the /__agent/subagent body for a Claude
+// SubagentStart / SubagentStop payload. None without an agent_id or a token
+// (an agent Bram didn't launch), which the route would refuse anyway.
+fn subagent_report_body(payload: &serde_json::Value, token: &str) -> Option<serde_json::Value> {
+    let agent_id = str_field(payload, "agent_id");
+    if agent_id.is_empty() || token.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({
+        "event": str_field(payload, "hook_event_name"),
+        "agent_id": agent_id,
+        "agent_type": str_field(payload, "agent_type"),
+        "session_id": str_field(payload, "session_id"),
+        // A subagent that backgrounds a command and ends its turn fires
+        // SubagentStop with that task still pending; it resumes when the task
+        // finishes. The host keeps the binding while this list is non-empty
+        // (delegated-work-action-gates; seen live 2026-11-04).
+        "background_tasks": payload
+            .get("background_tasks")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+        // delegated-stop-counts-only-the-subagents-own-tasks: the list above is
+        // session-wide; the host reads this transcript to see which tasks are
+        // the subagent's own.
+        "agent_transcript_path": str_field(payload, "agent_transcript_path"),
+        "bram_token": token,
+    }))
+}
+
+fn subagent_report(payload: &serde_json::Value) -> &'static str {
+    post_terminal_report("/__agent/subagent", |token| {
+        subagent_report_body(payload, token)
+    })
 }
 
 // The [hook] decision line, shipped exactly the way the Python guards ship
@@ -359,6 +502,194 @@ fn opencode_policy_payload(payload: &serde_json::Value) -> serde_json::Value {
     })
 }
 
+// antigravity-worklist-guard: agy's PreToolUse payload in the vocabulary the
+// policy already judges, as OpenCode's is. The three native tools that change
+// files take Claude's shapes, and `call_mcp_tool` maps `ServerName` and
+// `ToolName` to `mcp__<server>__<tool>` with `Arguments` as `tool_input` so
+// Claude's MCP branch screens it (agy-guard-mcp-coverage). A payload that
+// doesn't have the captured shape never gets here: antigravity_worklist_hook
+// refuses it first, because this mapping would turn it into an empty tool name
+// or empty input, which the policy allows. Field names are from
+// docs/agent-specimens/antigravity/hooks/payloads/PreToolUse.jsonl.
+//
+// The payload has no `cwd`, and the hook runner's working directory isn't the
+// workspace (the specimen pack's relative logger path failed there), so the
+// root is `workspacePaths[0]`. No `transcript_path` either: agy's transcript
+// isn't Claude-shaped, so the typed opt-out reaches this guard through the
+// host's direct-edit record, as it does for Codex and OpenCode.
+fn antigravity_policy_payload(payload: &serde_json::Value) -> serde_json::Value {
+    let cwd = antigravity_workspace(payload).unwrap_or_default();
+    let call = payload
+        .get("toolCall")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let name = str_field(&call, "name");
+    let args = call
+        .get("args")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let field = |k: &str| args.get(k).cloned().unwrap_or(serde_json::Value::Null);
+    // agy sends absolute paths; a relative one is resolved against the
+    // workspace, as for OpenCode.
+    let path = args.get("Path").and_then(|v| v.as_str()).map(|p| {
+        if Path::new(p).is_absolute() || cwd.is_empty() {
+            p.to_string()
+        } else {
+            Path::new(&cwd).join(p).to_string_lossy().into_owned()
+        }
+    });
+    let (tool_name, tool_input) = match name.as_str() {
+        "write_file" => (
+            "Write".to_string(),
+            serde_json::json!({ "file_path": path, "content": field("Content") }),
+        ),
+        "edit_file" => (
+            "Edit".to_string(),
+            serde_json::json!({
+                "file_path": path,
+                "old_string": field("Target"),
+                "new_string": field("Replacement"),
+            }),
+        ),
+        "run_command" => (
+            "Bash".to_string(),
+            serde_json::json!({ "command": field("CommandLine") }),
+        ),
+        "call_mcp_tool" => (
+            format!(
+                "mcp__{}__{}",
+                str_field(&args, "ServerName"),
+                str_field(&args, "ToolName")
+            ),
+            args.get("Arguments")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({})),
+        ),
+        other => (other.to_string(), args.clone()),
+    };
+    serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": tool_name,
+        "tool_input": tool_input,
+        "cwd": cwd,
+    })
+}
+
+// agy-guard-fail-closed-on-drift: what's wrong with a payload that doesn't
+// have the captured shape, or None when it does. The hook's matcher admits
+// only the four captured tools, so anything else means agy's payload changed,
+// and agy updates itself without a Bram release. Run on the raw payload,
+// because translating erases the difference: renaming `toolCall`, `name`,
+// `Path` or `Arguments` comes out as a tool or input the policy has nothing to
+// refuse.
+fn antigravity_payload_fault(payload: &serde_json::Value) -> Option<String> {
+    if antigravity_workspace(payload).is_none() {
+        return Some("no workspacePaths".to_string());
+    }
+    let Some(call) = payload.get("toolCall") else {
+        return Some("no toolCall".to_string());
+    };
+    let name = str_field(call, "name");
+    if name == "call_mcp_tool" {
+        let Some(args) = call.get("args") else {
+            return Some("call_mcp_tool has no ServerName".to_string());
+        };
+        for key in ["ServerName", "ToolName"] {
+            let ok = args
+                .get(key)
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.trim().is_empty());
+            if !ok {
+                return Some(format!("call_mcp_tool has no {}", key));
+            }
+        }
+        if !args.get("Arguments").is_some_and(|v| v.is_object()) {
+            return Some("call_mcp_tool has no Arguments".to_string());
+        }
+        return None;
+    }
+    let required = match name.as_str() {
+        "write_file" | "edit_file" => "Path",
+        "run_command" => "CommandLine",
+        "" => return Some("no tool name".to_string()),
+        other => return Some(format!("unexpected tool {}", other)),
+    };
+    let present = call
+        .get("args")
+        .and_then(|args| args.get(required))
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.trim().is_empty());
+    if present {
+        None
+    } else {
+        Some(format!("{} has no {}", name, required))
+    }
+}
+
+// Unparseable stdin keeps its own fault in the dispatch; the shape check is
+// for a payload that parsed.
+fn antigravity_worklist_hook(
+    payload: &serde_json::Value,
+    stdin_error: Option<String>,
+    started: std::time::Instant,
+) -> i32 {
+    let fault = if stdin_error.is_none() {
+        antigravity_payload_fault(payload)
+    } else {
+        None
+    };
+    if let Some(detail) = fault {
+        let tool = payload
+            .get("toolCall")
+            .map(|call| str_field(call, "name"))
+            .unwrap_or_default();
+        return authority_fail_closed(
+            &resolve_project_root("antigravity-rs", payload),
+            "antigravity-rs",
+            &tool,
+            GuardFault::UnrecognizedPayload(detail),
+            started,
+        );
+    }
+    authority_guarded_dispatch(
+        "antigravity-rs",
+        &antigravity_policy_payload(payload),
+        stdin_error,
+        started,
+        authority_worklist_hook,
+    )
+}
+
+fn antigravity_workspace(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("workspacePaths")?
+        .as_array()?
+        .first()?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+fn enter_antigravity_workspace(payload: &serde_json::Value) {
+    if let Some(ws) = antigravity_workspace(payload) {
+        let _ = std::env::set_current_dir(ws);
+    }
+}
+
+// agy reads one JSON object from stdout. An explicit `allow` doesn't skip
+// agy's own permission check (the spike's `run_command` was still held for
+// agy's "command" permission), so the guard never answers `auto_approve`,
+// which would. Empty output also allows, so every path prints a decision.
+fn antigravity_answer(decision: &str, reason: &str) -> i32 {
+    let out = if reason.is_empty() {
+        serde_json::json!({ "decision": decision })
+    } else {
+        serde_json::json!({ "decision": decision, "reason": reason })
+    };
+    println!("{}", out);
+    0
+}
+
 // opencode-edit-advisory: the addressed-turn advisory Claude and Codex get as
 // PostToolUse additionalContext. OpenCode has no such field; its plugin appends
 // the note to the tool's result, which is what OpenCode's model reads. One JSON
@@ -405,14 +736,14 @@ fn authority_worklist_hook(
     let root = resolve_project_root(provider, payload);
     let policy_provider = match provider {
         "opencode-rs" if tool == "apply_patch" => "codex-rs",
-        "opencode-rs" => "claude-rs",
+        "opencode-rs" | "antigravity-rs" => "claude-rs",
         other => other,
     };
     let Some(v) = crate::guard_policy::shadow_worklist_decision(policy_provider, payload) else {
-        return if provider == "opencode-rs" {
-            opencode_answer("allow", "")
-        } else {
-            0
+        return match provider {
+            "opencode-rs" => opencode_answer("allow", ""),
+            "antigravity-rs" => antigravity_answer("allow", ""),
+            _ => 0,
         };
     };
     post_hook_trace(&root, &tool, &v.target, &v.decision, &v.reason);
@@ -464,6 +795,9 @@ fn authority_worklist_hook(
         if provider == "opencode-rs" {
             return opencode_answer("allow", "");
         }
+        if provider == "antigravity-rs" {
+            return antigravity_answer("allow", "");
+        }
         return 0;
     }
     // Deny. Codex answers by stdout JSON (permissionDecision deny, exit 0);
@@ -495,6 +829,16 @@ fn authority_worklist_hook(
             },
         );
     }
+    if provider == "antigravity-rs" {
+        return antigravity_answer(
+            "deny",
+            if message.is_empty() {
+                "blocked"
+            } else {
+                &message
+            },
+        );
+    }
     eprintln!("{}", message);
     2
 }
@@ -517,12 +861,15 @@ fn authority_worklist_hook(
 
 enum GuardFault {
     UnparseableStdin(String),
+    // agy-guard-fail-closed-on-drift: parsed, but not the captured shape.
+    UnrecognizedPayload(String),
     Panic(String),
 }
 
 fn fault_summary(fault: &GuardFault) -> String {
     match fault {
         GuardFault::UnparseableStdin(detail) => format!("unparseable stdin: {}", detail),
+        GuardFault::UnrecognizedPayload(detail) => format!("unrecognized payload: {}", detail),
         GuardFault::Panic(detail) => format!("guard panic: {}", detail),
     }
 }
@@ -550,7 +897,7 @@ fn codex_fault_message(fault: &GuardFault) -> String {
             "Blocked: the Bram worklist guard could not parse its hook payload (unparseable stdin: {}). This is a guard/runtime issue, not a policy decision; please report it.",
             truncate_chars(detail, 200)
         ),
-        GuardFault::Panic(_) => format!(
+        GuardFault::UnrecognizedPayload(_) | GuardFault::Panic(_) => format!(
             "Blocked: the Bram worklist guard failed and denied by default. {}. This is a guard bug, not a policy decision; please report it.",
             truncate_chars(&fault_summary(fault), 500)
         ),
@@ -622,6 +969,13 @@ fn authority_fail_closed(
         eprintln!("{}", message);
         return opencode_answer("deny", &message);
     }
+    // agy would block a crashed guard anyway (the spike: any nonzero exit,
+    // a kill at the timeout, or invalid JSON blocks the call), but an
+    // explicit deny carries the reason to the model.
+    if provider == "antigravity-rs" {
+        eprintln!("{}", message);
+        return antigravity_answer("deny", &message);
+    }
     eprintln!("{}", message);
     2
 }
@@ -689,6 +1043,14 @@ fn resolve_project_root(provider: &str, payload: &serde_json::Value) -> PathBuf 
     if !cwd.is_empty() {
         return PathBuf::from(cwd);
     }
+    // antigravity-worklist-guard: per-project routing reads agy's raw
+    // payload, which names the workspace but has no `cwd`, and agy doesn't
+    // run hooks from the workspace.
+    if provider == "antigravity-rs" {
+        if let Some(ws) = antigravity_workspace(payload) {
+            return PathBuf::from(ws);
+        }
+    }
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
@@ -718,7 +1080,7 @@ fn menu_would_action(provider: &str, event: &str, tool: &str) -> Option<&'static
 }
 
 fn read_port(root: &Path) -> Option<u16> {
-    std::fs::read_to_string(root.join("resources").join(".bram-port"))
+    std::fs::read_to_string(crate::guard_policy::state_path(root, ".bram-port"))
         .ok()?
         .trim()
         .parse()
@@ -791,6 +1153,57 @@ fn authority_menu_hook(
     started: std::time::Instant,
 ) -> i32 {
     let event = str_field(payload, "hook_event_name");
+    // current-session-from-events: SessionStart fires at once on `/clear` and
+    // on `/resume` inside the CLI, with the new id. UserPromptSubmit restores
+    // the session after a nested `claude -p`, which inherits the token.
+    if provider == "claude-rs" && matches!(event.as_str(), "SessionStart" | "UserPromptSubmit") {
+        session_report("claude", payload);
+        let cwd_s = str_field(payload, "cwd");
+        let cwd = if cwd_s.is_empty() {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+        } else {
+            std::path::PathBuf::from(cwd_s)
+        };
+        if crate::guard_policy::claude_enforcement_paused(&cwd) {
+            let out = serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": event,
+                    "additionalContext": crate::guard_policy::enforcement_paused_context(),
+                }
+            });
+            println!("{}", out);
+            let root = resolve_project_root(provider, payload);
+            append_breadcrumb(
+                &root,
+                provider,
+                &event,
+                "",
+                "action=enforcement-paused-context",
+            );
+        }
+        return 0;
+    }
+    // delegated-work-action-gates: report subagent start/stop so the host can
+    // bind the subagent to the claim it was spawned under and release it when
+    // it finishes. Fail-open like the session report: always exit 0 and print
+    // nothing. SubagentStop's exit 2 would PREVENT the subagent stopping, and
+    // its stdout `decision: block` would too, so neither is ever produced.
+    if provider == "claude-rs" && matches!(event.as_str(), "SubagentStart" | "SubagentStop") {
+        let root = resolve_project_root(provider, payload);
+        let outcome = subagent_report(payload);
+        append_breadcrumb(
+            &root,
+            provider,
+            &event,
+            "",
+            &format!(
+                "post=/__agent/subagent {} ms={}",
+                outcome,
+                started.elapsed().as_millis()
+            ),
+        );
+        return 0;
+    }
     let tool = str_field(payload, "tool_name");
     let root = resolve_project_root(provider, payload);
     let Some(path) = menu_would_action(provider, &event, &tool) else {
@@ -869,17 +1282,18 @@ fn authority_menu_hook(
 
 // One line per invocation into the hook breadcrumb file, same
 // refusal-to-create discipline the retired Python hooks applied: no
-// <root>/resources, no write anywhere; the existing log over the cap stops
+// state folder under <root> (`.bram/` or `resources/`), no write anywhere;
+// the existing log over the cap stops
 // growing rather than rotating. `reason=` fields are deliberately LAST and
 // run to end-of-line: Codex reasons are prose with spaces, so every
 // fixed-width field must precede them for lines to stay
 // whitespace-splittable.
 pub(crate) fn append_breadcrumb(root: &Path, provider: &str, event: &str, tool: &str, tail: &str) {
-    let resources = root.join("resources");
-    if !resources.is_dir() {
+    let state = crate::guard_policy::state_dir(root);
+    if !state.is_dir() {
         return;
     }
-    let dir = resources.join("bram-traces");
+    let dir = state.join("bram-traces");
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
@@ -1064,6 +1478,78 @@ pub fn guard_hook_command(link: &Path, hook: &str) -> String {
 #[cfg(test)]
 mod guard_mode_tests {
     use super::*;
+
+    #[test]
+    fn subagent_report_carries_agent_identity_and_never_blocks() {
+        // Shape from docs/agent-specimens/claude/hooks/SubagentStop.json.
+        let stop = serde_json::json!({
+            "session_id": "4f97c209",
+            "agent_id": "ae3fb2df9de52ea71",
+            "agent_type": "",
+            "hook_event_name": "SubagentStop",
+            "stop_hook_active": false,
+        });
+        let body = subagent_report_body(&stop, "tok").unwrap();
+        assert_eq!(body["event"], "SubagentStop");
+        assert_eq!(body["agent_id"], "ae3fb2df9de52ea71");
+        assert_eq!(body["session_id"], "4f97c209");
+        assert_eq!(body["bram_token"], "tok");
+        // No background_tasks in the payload: an empty list, so the host releases.
+        assert_eq!(body["background_tasks"], serde_json::json!([]));
+        // A pause with a pending background task is forwarded as-is, so the
+        // host can keep the binding until the subagent's final stop.
+        // delegated-stop-counts-only-the-subagents-own-tasks: forwarded for the host.
+        let mut with_path = stop.clone();
+        with_path["agent_transcript_path"] = serde_json::json!("/tmp/agent-x.jsonl");
+        let body = subagent_report_body(&with_path, "tok").unwrap();
+        assert_eq!(body["agent_transcript_path"], "/tmp/agent-x.jsonl");
+        let mut paused = stop.clone();
+        paused["background_tasks"] = serde_json::json!([{ "id": "bdv5odlm8" }]);
+        let body = subagent_report_body(&paused, "tok").unwrap();
+        assert_eq!(
+            body["background_tasks"].as_array().map(|a| a.len()),
+            Some(1)
+        );
+        // No token (not launched by Bram) or no agent_id: nothing to send.
+        assert!(subagent_report_body(&stop, "").is_none());
+        let no_agent = serde_json::json!({ "hook_event_name": "SubagentStart" });
+        assert!(subagent_report_body(&no_agent, "tok").is_none());
+        // Both events exit 0 (exit 2 on SubagentStop would keep the subagent
+        // from stopping). No agent_id here on purpose: a test run inside a
+        // Bram terminal inherits BRAM_PORT/BRAM_MENU_TOKEN, and a real POST
+        // would bind a fake agent in that live instance.
+        for event in ["SubagentStart", "SubagentStop"] {
+            let p = serde_json::json!({ "hook_event_name": event });
+            assert_eq!(
+                authority_menu_hook("claude-rs", &p, std::time::Instant::now()),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn session_report_skips_subagents_and_foreign_terminals() {
+        let turn = serde_json::json!({ "conversationId": "c1", "lastUserInput": "hi" });
+        let body = session_report_body("antigravity", &turn, "tok").unwrap();
+        assert_eq!(body["session"], "c1");
+        assert_eq!(body["bram_token"], "tok");
+        // Another terminal has no token.
+        assert!(session_report_body("antigravity", &turn, "").is_none());
+        // A subagent's payload has an empty lastUserInput (agy 1.4.12).
+        let sub = serde_json::json!({ "conversationId": "c2", "lastUserInput": "" });
+        assert!(session_report_body("antigravity", &sub, "tok").is_none());
+        let none = serde_json::json!({ "lastUserInput": "hi" });
+        assert!(session_report_body("antigravity", &none, "tok").is_none());
+        for provider in ["claude", "codex"] {
+            let start = serde_json::json!({ "session_id": "s1", "source": "clear" });
+            let body = session_report_body(provider, &start, "tok").unwrap();
+            assert_eq!(body["provider"], provider);
+            assert_eq!(body["session"], "s1");
+            assert!(session_report_body(provider, &start, "").is_none());
+            let sub = serde_json::json!({ "session_id": "s1", "agent_id": "a1" });
+            assert!(session_report_body(provider, &sub, "tok").is_none());
+        }
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir =
@@ -1547,6 +2033,389 @@ mod guard_mode_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // antigravity-worklist-guard: agy 1.4.12's PreToolUse payloads as the
+    // specimen pack captured them (docs/agent-specimens/antigravity/hooks/
+    // payloads/PreToolUse.jsonl), trimmed to the fields the guard reads.
+    #[test]
+    fn antigravity_payloads_translate_to_the_policy_vocabulary() {
+        let t = |name: &str, args: serde_json::Value| {
+            antigravity_policy_payload(&serde_json::json!({
+                "conversationId": "c", "stepIdx": 2, "workspacePaths": ["/p"],
+                "toolCall": { "name": name, "args": args }
+            }))
+        };
+        let write = t(
+            "write_file",
+            serde_json::json!({ "Content": "FIRST-VALUE", "Overwrite": true, "Path": "/p/a.txt" }),
+        );
+        assert_eq!(write["hook_event_name"], "PreToolUse");
+        assert_eq!(write["tool_name"], "Write");
+        assert_eq!(write["tool_input"]["file_path"], "/p/a.txt");
+        assert_eq!(write["tool_input"]["content"], "FIRST-VALUE");
+        assert_eq!(write["cwd"], "/p");
+        let edit = t(
+            "edit_file",
+            serde_json::json!({ "Path": "/p/a.txt", "Target": "FIRST-VALUE", "Replacement": "SECOND-VALUE" }),
+        );
+        assert_eq!(edit["tool_name"], "Edit");
+        assert_eq!(edit["tool_input"]["file_path"], "/p/a.txt");
+        assert_eq!(edit["tool_input"]["old_string"], "FIRST-VALUE");
+        assert_eq!(edit["tool_input"]["new_string"], "SECOND-VALUE");
+        let relative = t(
+            "write_file",
+            serde_json::json!({ "Content": "x", "Path": "b.txt" }),
+        );
+        assert_eq!(
+            relative["tool_input"]["file_path"],
+            Path::new("/p").join("b.txt").to_string_lossy().as_ref()
+        );
+        let shell = t(
+            "run_command",
+            serde_json::json!({ "CommandLine": "echo RUN-COMMAND-7731", "WaitMsBeforeAsync": 5000, "toolSummary": "Echo" }),
+        );
+        assert_eq!(shell["tool_name"], "Bash");
+        assert_eq!(shell["tool_input"]["command"], "echo RUN-COMMAND-7731");
+        let mcp = t(
+            "call_mcp_tool",
+            serde_json::json!({
+                "ServerName": "fsprobe_filesystem",
+                "ToolName": "write_file",
+                "Arguments": { "path": "/p/sub/mcp-out.txt", "content": "MCP-PROBE-7731" }
+            }),
+        );
+        assert_eq!(mcp["tool_name"], "mcp__fsprobe_filesystem__write_file");
+        assert_eq!(
+            mcp["tool_input"],
+            serde_json::json!({ "path": "/p/sub/mcp-out.txt", "content": "MCP-PROBE-7731" })
+        );
+        let read = t("read_file", serde_json::json!({ "Path": "/p/a.txt" }));
+        assert_eq!(read["tool_name"], "read_file");
+        assert_eq!(read["tool_input"]["Path"], "/p/a.txt");
+        // No workspace: an empty cwd, never a guess.
+        let bare = antigravity_policy_payload(&serde_json::json!({
+            "toolCall": { "name": "write_file", "args": { "Path": "/p/a.txt", "Content": "x" } }
+        }));
+        assert_eq!(bare["cwd"], "");
+        assert_eq!(bare["tool_input"]["file_path"], "/p/a.txt");
+    }
+
+    #[test]
+    fn antigravity_decisions_follow_worklist_coverage() {
+        let root = scratch("antigravity-coverage");
+        std::fs::create_dir_all(root.join("resources")).unwrap();
+        std::fs::write(root.join("resources/.worklist-authorization.json"), "{}").unwrap();
+        std::fs::write(
+            root.join("resources/worklist.json"),
+            r#"{"version":1,"items":[{"id":"x","status":"proposed","files":["covered.txt"]}]}"#,
+        )
+        .unwrap();
+        let at = |name: &str| root.join(name).to_string_lossy().into_owned();
+        let payload = |name: &str, args: serde_json::Value| {
+            antigravity_policy_payload(&serde_json::json!({
+                "workspacePaths": [root.to_string_lossy()],
+                "toolCall": { "name": name, "args": args }
+            }))
+        };
+        let decide = |name: &str, args: serde_json::Value| {
+            crate::guard_policy::shadow_worklist_decision("claude-rs", &payload(name, args))
+                .unwrap()
+                .decision
+        };
+        assert_eq!(
+            decide(
+                "write_file",
+                serde_json::json!({ "Path": at("covered.txt"), "Content": "ok" })
+            ),
+            "allow"
+        );
+        assert_eq!(
+            decide(
+                "write_file",
+                serde_json::json!({ "Path": at("other.txt"), "Content": "no" })
+            ),
+            "deny"
+        );
+        assert_eq!(
+            decide(
+                "edit_file",
+                serde_json::json!({ "Path": at("other.txt"), "Target": "a", "Replacement": "b" })
+            ),
+            "deny"
+        );
+        // Through the deciding hook itself: agy's answer is a stdout JSON
+        // line with exit 0 either way, and the breadcrumb names the provider.
+        let code = authority_worklist_hook(
+            "antigravity-rs",
+            &payload(
+                "write_file",
+                serde_json::json!({ "Path": at("other.txt"), "Content": "no" }),
+            ),
+            std::time::Instant::now(),
+        );
+        assert_eq!(code, 0, "agy reads the deny from stdout, exit 0");
+        let log = read_crumbs(&root);
+        assert!(
+            log.contains("antigravity-rs PreToolUse Write decided=deny"),
+            "log: {log}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn antigravity_authority_fails_closed_on_unparseable_stdin() {
+        let root = scratch("fault-antigravity-stdin");
+        std::fs::create_dir_all(root.join("resources")).unwrap();
+        let code = authority_fail_closed(
+            &root,
+            "antigravity-rs",
+            "",
+            GuardFault::UnparseableStdin("EOF while parsing".into()),
+            std::time::Instant::now(),
+        );
+        assert_eq!(code, 0, "agy denies via its stdout JSON line, exit 0");
+        let log = read_crumbs(&root);
+        assert!(log.contains("antigravity-rs PreToolUse ?"), "log: {log}");
+        assert!(log.contains("decided=error target=- ms="), "log: {log}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // agy-guard-fail-closed-on-drift: each of these was answered with an
+    // explicit allow on a project that denies the correct payload.
+    #[test]
+    fn antigravity_payload_drift_is_a_fault() {
+        let path = |p: &str| serde_json::json!({ "Path": p, "Content": "x" });
+        let drifted = [
+            serde_json::json!({ "workspacePaths": ["/p"], "tool_call": { "name": "write_file", "args": path("/p/a") } }),
+            serde_json::json!({ "workspacePaths": ["/p"], "toolCall": { "tool": "write_file", "args": path("/p/a") } }),
+            serde_json::json!({ "workspacePaths": ["/p"], "toolCall": { "name": "write_file", "args": { "FilePath": "/p/a" } } }),
+            serde_json::json!({ "workspacePaths": ["/p"], "toolCall": { "name": "edit_file", "args": { "Target": "a" } } }),
+            serde_json::json!({ "workspacePaths": ["/p"], "toolCall": { "name": "write_file", "args": path("  ") } }),
+            serde_json::json!({ "workspacePaths": ["/p"], "toolCall": { "name": "write_file" } }),
+            serde_json::json!({ "workspacePaths": ["/p"], "toolCall": { "name": "run_command", "args": { "Command": "echo x > a" } } }),
+            serde_json::json!({ "workspacePaths": ["/p"], "toolCall": { "name": "delete_file", "args": path("/p/a") } }),
+            serde_json::json!({ "workspacePaths": ["/p"], "toolCall": { "name": "mcp_filesystem_write_file", "args": { "path": "/p/a", "content": "x" } } }),
+            serde_json::json!({ "workspacePaths": ["/p"], "toolCall": { "name": "call_mcp_tool", "args": { "ToolName": "write_file", "Arguments": {} } } }),
+            serde_json::json!({ "workspacePaths": ["/p"], "toolCall": { "name": "call_mcp_tool", "args": { "ServerName": "  ", "ToolName": "write_file", "Arguments": {} } } }),
+            serde_json::json!({ "workspacePaths": ["/p"], "toolCall": { "name": "call_mcp_tool", "args": { "ServerName": "fs", "Arguments": {} } } }),
+            serde_json::json!({ "workspacePaths": ["/p"], "toolCall": { "name": "call_mcp_tool", "args": { "ServerName": "fs", "ToolName": "", "Arguments": {} } } }),
+            serde_json::json!({ "workspacePaths": ["/p"], "toolCall": { "name": "call_mcp_tool", "args": { "ServerName": "fs", "ToolName": "write_file" } } }),
+            serde_json::json!({ "workspacePaths": ["/p"], "toolCall": { "name": "call_mcp_tool", "args": { "ServerName": "fs", "ToolName": "write_file", "Input": { "path": "/p/a" } } } }),
+            serde_json::json!({ "workspacePaths": ["/p"], "toolCall": { "name": "call_mcp_tool", "args": { "ServerName": "fs", "ToolName": "write_file", "Arguments": "{\"path\":\"/p/a\"}" } } }),
+            serde_json::json!({ "workspacePaths": ["/p"], "toolCall": { "name": "call_mcp_tool", "args": { "ServerName": "fs", "ToolName": "write_file", "Arguments": null } } }),
+            serde_json::json!({ "toolCall": { "name": "write_file", "args": path("/p/a") } }),
+            serde_json::json!({ "workspacePaths": [], "toolCall": { "name": "write_file", "args": path("/p/a") } }),
+            serde_json::json!({ "workspacePaths": [""], "toolCall": { "name": "write_file", "args": path("/p/a") } }),
+            serde_json::json!({}),
+        ];
+        for payload in &drifted {
+            assert!(antigravity_payload_fault(payload).is_some(), "{payload}");
+        }
+        // The captured shapes still reach the policy.
+        for call in [
+            serde_json::json!({ "name": "write_file", "args": path("/p/a") }),
+            serde_json::json!({ "name": "edit_file", "args": { "Path": "/p/a", "Target": "a", "Replacement": "b" } }),
+            serde_json::json!({ "name": "run_command", "args": { "CommandLine": "git status" } }),
+            serde_json::json!({ "name": "call_mcp_tool", "args": { "ServerName": "xmlui", "ToolName": "xmlui_status", "Arguments": {} } }),
+            serde_json::json!({ "name": "call_mcp_tool", "args": { "ServerName": "fsprobe_filesystem", "ToolName": "write_file", "Arguments": { "path": "/p/sub/mcp-out.txt", "content": "MCP-PROBE-7731" } } }),
+        ] {
+            let payload = serde_json::json!({ "workspacePaths": ["/p"], "toolCall": call });
+            assert_eq!(antigravity_payload_fault(&payload), None, "{payload}");
+        }
+    }
+
+    // agy-guard-mcp-coverage: run the pinned PreToolUse.jsonl records through
+    // the real hook so both the shape check and Claude's MCP coverage branch
+    // are tested against captured payloads rather than hand-crafted copies.
+    #[test]
+    fn antigravity_pre_tool_use_specimens_parse_and_gate_mcp_writes() {
+        let specimens =
+            include_str!("../../docs/agent-specimens/antigravity/hooks/payloads/PreToolUse.jsonl");
+        let root = scratch("antigravity-mcp-specimens");
+        std::fs::create_dir_all(root.join("resources")).unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("resources/.worklist-authorization.json"), "{}").unwrap();
+        std::fs::write(
+            root.join("resources/worklist.json"),
+            r#"{"version":1,"items":[]}"#,
+        )
+        .unwrap();
+        // antigravity-specimen-test-escapes-windows-path: `<workspace>` sits
+        // inside JSON strings, and a Windows path carries backslashes, so
+        // splice the JSON-escaped form (quotes trimmed) rather than the raw path.
+        let ws_json = serde_json::to_string(&root.to_string_lossy().as_ref()).unwrap();
+        let ws = ws_json.trim_matches('"');
+        let records: Vec<serde_json::Value> = specimens
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|line| serde_json::from_str(&line.replace("<workspace>", ws)).unwrap())
+            .collect();
+        assert!(records.len() >= 13);
+        for rec in &records {
+            assert_eq!(antigravity_payload_fault(rec), None, "{rec}");
+        }
+        let mcp_read = records
+            .iter()
+            .find(|r| r["toolCall"]["args"]["ToolName"] == "xmlui_status")
+            .expect("pinned xmlui_status specimen");
+        let mcp_write = records
+            .iter()
+            .find(|r| {
+                r["toolCall"]["name"] == "call_mcp_tool"
+                    && r["toolCall"]["args"]["ToolName"] == "write_file"
+            })
+            .expect("pinned call_mcp_tool write_file specimen");
+
+        antigravity_worklist_hook(mcp_read, None, std::time::Instant::now());
+        let crumbs = read_crumbs(&root);
+        assert!(
+            crumbs.contains("PreToolUse mcp__xmlui__xmlui_status decided=allow target=- ms=")
+                && crumbs.contains("reason=mcp-read-only"),
+            "crumbs: {crumbs}"
+        );
+
+        antigravity_worklist_hook(mcp_write, None, std::time::Instant::now());
+        let crumbs = read_crumbs(&root);
+        assert!(
+            crumbs.contains("PreToolUse mcp__fsprobe_filesystem__write_file decided=deny"),
+            "uncovered MCP write must be denied, crumbs: {crumbs}"
+        );
+
+        std::fs::write(
+            root.join("resources/worklist.json"),
+            r#"{"version":2,"items":[{"id":"mcp","status":"proposed","files":["sub/mcp-out.txt"]}]}"#,
+        )
+        .unwrap();
+        antigravity_worklist_hook(mcp_write, None, std::time::Instant::now());
+        let crumbs = read_crumbs(&root);
+        assert!(
+            crumbs.contains("PreToolUse mcp__fsprobe_filesystem__write_file decided=allow"),
+            "covered MCP write must be allowed, crumbs: {crumbs}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Live agy 1.4.12 runs `.agents/hooks.json` hooks with process cwd set to
+    // `<workspace>/.agents`. Run in an isolated child process so `current_dir`
+    // starts in `.agents/` without racing other test threads: without
+    // `enter_antigravity_workspace`, `content: "MCP-PROBE-7731"` resolves to
+    // `.agents/MCP-PROBE-7731` and falsely blocks a covered MCP write.
+    #[test]
+    fn antigravity_mcp_hook_from_dot_agents_cwd_ignores_content_tokens() {
+        const CHILD_ENV: &str = "BRAM_TEST_AGY_DOT_AGENTS_WS";
+        if let Ok(ws) = std::env::var(CHILD_ENV) {
+            let root = PathBuf::from(&ws);
+            let payload = serde_json::json!({
+                "conversationId": "c",
+                "stepIdx": 6,
+                "workspacePaths": [ws],
+                "toolCall": {
+                    "name": "call_mcp_tool",
+                    "args": {
+                        "ServerName": "fsprobe_filesystem",
+                        "ToolName": "write_file",
+                        "Arguments": {
+                            "path": root.join("sub/mcp-out.txt").to_string_lossy(),
+                            "content": "MCP-PROBE-7731"
+                        }
+                    }
+                }
+            });
+            enter_antigravity_workspace(&payload);
+            antigravity_worklist_hook(&payload, None, std::time::Instant::now());
+            let crumbs = read_crumbs(&root);
+            assert!(
+                crumbs.contains("PreToolUse mcp__fsprobe_filesystem__write_file decided=allow"),
+                "covered MCP write from .agents cwd must be allowed, crumbs: {crumbs}"
+            );
+            return;
+        }
+        // Resolved, because macOS's temp dir is a symlink: with the unresolved
+        // root the child's cwd sits outside it, the candidate is dropped, and
+        // this test passes with the workspace switch removed.
+        let root = scratch("antigravity-dot-agents-cwd")
+            .canonicalize()
+            .unwrap();
+        std::fs::create_dir_all(root.join(".agents")).unwrap();
+        std::fs::create_dir_all(root.join("resources")).unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("resources/.worklist-authorization.json"), "{}").unwrap();
+        std::fs::write(
+            root.join("resources/worklist.json"),
+            r#"{"version":1,"items":[{"id":"mcp","status":"proposed","files":["sub/mcp-out.txt"]}]}"#,
+        )
+        .unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .current_dir(root.join(".agents"))
+            .env(CHILD_ENV, root.to_string_lossy().as_ref())
+            .args([
+                "guard::guard_mode_tests::antigravity_mcp_hook_from_dot_agents_cwd_ignores_content_tokens",
+                "--exact",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            out.status.success(),
+            "child failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // Through the hook itself: drift is the guard breaking (decided=error),
+    // never a decision, even in a project with nothing else to refuse it.
+    #[test]
+    fn antigravity_hook_fails_closed_on_drift_and_decides_the_captured_shape() {
+        let root = scratch("antigravity-drift");
+        std::fs::create_dir_all(root.join("resources")).unwrap();
+        std::fs::write(root.join("resources/.worklist-authorization.json"), "{}").unwrap();
+        std::fs::write(
+            root.join("resources/worklist.json"),
+            r#"{"version":1,"items":[]}"#,
+        )
+        .unwrap();
+        let file = root.join("a.txt").to_string_lossy().into_owned();
+        let workspace = root.to_string_lossy().into_owned();
+        let drifted = serde_json::json!({
+            "workspacePaths": [workspace],
+            "toolCall": { "name": "write_file", "args": { "FilePath": file, "Content": "x" } }
+        });
+        let code = antigravity_worklist_hook(&drifted, None, std::time::Instant::now());
+        assert_eq!(code, 0, "agy denies via its stdout JSON line, exit 0");
+        let log = read_crumbs(&root);
+        assert!(log.contains("decided=error"), "log: {log}");
+        assert!(
+            log.contains("unrecognized payload: write_file has no Path"),
+            "log: {log}"
+        );
+        assert!(!log.contains("decided=allow"), "log: {log}");
+
+        let captured = serde_json::json!({
+            "workspacePaths": [workspace],
+            "toolCall": { "name": "write_file", "args": { "Path": file, "Content": "x" } }
+        });
+        antigravity_worklist_hook(&captured, None, std::time::Instant::now());
+        assert!(
+            read_crumbs(&root).contains("PreToolUse Write decided=deny"),
+            "the captured shape still reaches the policy"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Per-project routing reads agy's raw payload, before translation.
+    #[test]
+    fn antigravity_root_comes_from_the_workspace() {
+        let raw = serde_json::json!({
+            "workspacePaths": ["/work/space"],
+            "toolCall": { "name": "write_file", "args": {} }
+        });
+        assert_eq!(
+            resolve_project_root("antigravity-rs", &raw),
+            PathBuf::from("/work/space")
+        );
+    }
+
     #[test]
     fn authority_dispatch_contains_panics_to_fail_closed() {
         // Deliberate fire: a panicking hook must convert to the fail-closed
@@ -1720,5 +2589,129 @@ mod guard_mode_tests {
         install_guard_link(&home, &exe_b).expect("retarget link");
         assert_eq!(std::fs::read_link(&link).unwrap(), exe_b);
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // --- issue-469: the `.bram/` twins ----------------------------------------
+
+    #[test]
+    fn route_target_finds_the_project_guard_under_dot_bram() {
+        let root = scratch("route-found-dot-bram");
+        let nested = root.join("app").join("tools");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(root.join(".bram")).unwrap();
+        let project_guard = root.join("project-guard");
+        std::fs::write(&project_guard, "").unwrap();
+        let running_guard = root.join("running-guard");
+        std::fs::write(&running_guard, "").unwrap();
+        assert_eq!(
+            guard_target_path(&root),
+            root.join(".bram/.bram-guard-target")
+        );
+        std::fs::write(
+            guard_target_path(&root),
+            format!("{}\n", project_guard.display()),
+        )
+        .unwrap();
+        let (target, found_root) = route_target(&nested, &running_guard).expect("routed");
+        assert_eq!(
+            target.canonicalize().unwrap(),
+            project_guard.canonicalize().unwrap()
+        );
+        assert_eq!(found_root, root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn guard_mode_is_inert_without_either_state_dir() {
+        // No `.bram/` and no `resources/` under root: nothing written, and
+        // no `.bram/` created either.
+        let root = scratch("inert-both");
+        let payload = serde_json::json!({
+            "hook_event_name": "PermissionRequest",
+            "tool_name": "Bash",
+            "cwd": root.to_string_lossy(),
+        });
+        authority_menu_hook("codex-rs", &payload, std::time::Instant::now());
+        authority_menu_hook("claude-rs", &payload, std::time::Instant::now());
+        assert_eq!(count_entries(&root), 0, "guard mode created files");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn breadcrumb_lands_under_dot_bram_when_it_exists() {
+        let root = scratch("crumb-dot-bram");
+        std::fs::create_dir_all(root.join(".bram")).unwrap();
+        // A legacy folder beside it is not the state folder any more.
+        std::fs::create_dir_all(root.join("resources")).unwrap();
+        let payload = serde_json::json!({
+            "hook_event_name": "PermissionRequest",
+            "tool_name": "Bash",
+            "cwd": root.to_string_lossy(),
+        });
+        authority_menu_hook("codex-rs", &payload, std::time::Instant::now());
+        let log = std::fs::read_to_string(root.join(".bram/bram-traces/hook-events.log"))
+            .expect("breadcrumb written under .bram");
+        assert!(
+            log.contains("codex-rs PermissionRequest Bash"),
+            "log: {log}"
+        );
+        assert!(log.contains("post=skipped port=none"), "log: {log}");
+        assert!(!root.join("resources/bram-traces").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn port_is_read_from_either_state_dir() {
+        let legacy = scratch("port-legacy");
+        std::fs::create_dir_all(legacy.join("resources")).unwrap();
+        std::fs::write(legacy.join("resources/.bram-port"), "4101\n").unwrap();
+        assert_eq!(read_port(&legacy), Some(4101));
+        assert_eq!(find_port_upward(&legacy), Some(4101));
+
+        let dot = scratch("port-dot-bram");
+        std::fs::create_dir_all(dot.join(".bram")).unwrap();
+        std::fs::write(dot.join(".bram/.bram-port"), "4102\n").unwrap();
+        assert_eq!(read_port(&dot), Some(4102));
+        let deep = dot.join("a").join("b");
+        std::fs::create_dir_all(&deep).unwrap();
+        assert_eq!(find_port_upward(&deep), Some(4102));
+        let _ = std::fs::remove_dir_all(&legacy);
+        let _ = std::fs::remove_dir_all(&dot);
+    }
+
+    #[test]
+    fn walk_up_finds_a_nested_dot_bram_instance_before_its_parent() {
+        // root/resources/.bram-port (parent, old name) and
+        // root/sub/.bram/.bram-port (nested, new name): a run from
+        // root/sub/x resolves to root/sub.
+        let root = scratch("nested-dot-bram");
+        std::fs::create_dir_all(root.join("resources")).unwrap();
+        std::fs::write(root.join("resources/.bram-port"), "5001").unwrap();
+        let sub = root.join("sub");
+        std::fs::create_dir_all(sub.join(".bram")).unwrap();
+        std::fs::write(sub.join(".bram/.bram-port"), "5002").unwrap();
+        let x = sub.join("x");
+        std::fs::create_dir_all(&x).unwrap();
+        let (_, found) = find_state_file_upward(&x, ".bram-port").expect("found");
+        assert_eq!(found, sub);
+        assert_eq!(find_port_upward(&x), Some(5002));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn walk_up_reaches_the_parent_when_the_child_has_neither_name() {
+        let root = scratch("parent-only");
+        std::fs::create_dir_all(root.join("resources")).unwrap();
+        std::fs::write(root.join("resources/.bram-port"), "5003").unwrap();
+        let x = root.join("sub").join("x");
+        std::fs::create_dir_all(&x).unwrap();
+        let (_, found) = find_state_file_upward(&x, ".bram-port").expect("found");
+        assert_eq!(found, root);
+        assert_eq!(find_port_upward(&x), Some(5003));
+        // The child, having no state folder, gets no breadcrumb either.
+        append_breadcrumb(&root.join("sub"), "claude-rs", "PreToolUse", "Edit", "t");
+        assert!(!root.join("sub/resources").exists());
+        assert!(!root.join("sub/.bram").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

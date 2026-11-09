@@ -5,6 +5,9 @@ the relevant section when your project's markup talks to the agent,
 binds project SQLite, uses the forge CLI, runs heavy test suites, hits a
 Windows block, or coordinates with a session across a project boundary.
 
+`<state>/` below is Bram's state folder: `.bram/` if it exists, else
+`resources/`.
+
 ## Target app helpers
 
 Bram's own Worklist and Sessions tabs already use these helpers
@@ -82,7 +85,7 @@ response is a JSON array of column-keyed row objects:
 - **Scratch-pad pattern**: the agent can materialize an analysis (a
   normalized import, an aggregation, a cross-source join) as tables in a
   project-local scratch database — e.g. a gitignored
-  `resources/scratch.db` pointed at by `db` — and hand the user a live
+  `<state>/scratch.db` pointed at by `db` — and hand the user a live
   table or chart in three lines of markup. Analyses that prove out get
   promoted to project-owned data and, if the app ships, a project-owned
   endpoint.
@@ -164,21 +167,46 @@ hit, this is the advice protocol (user-facing twin: the Bram README's
   `bram-guard` hook binary (`~/.bram`, spawned on every hook event):
   hook invocations failing while the app runs fine — the signature is
   missing `claude-rs` / `codex-rs` breadcrumbs in
-  `resources/bram-traces/hook-events.log`, or hook timeouts/errors, with
+  `<state>/bram-traces/hook-events.log`, or hook timeouts/errors, with
   no visible launch failure.
-- **Verify before advising.** Confirm the block dialog actually names
-  Smart App Control — Defender and SmartScreen blocks read differently,
-  and their remedies differ.
-- **State the trade-off honestly, then let the user decide.** Disabling
-  SAC is currently the only workaround short of a signed executable
-  (signing is not currently planned). Windows Defender remains fully
-  active with SAC off — if the user deems Defender sufficient
-  protection, disabling is the supported path. Name the UI path:
-  **Windows Security → App & browser control → Smart App Control
-  settings**, and point at Microsoft's Smart App Control FAQ
-  (https://support.microsoft.com/en-us/windows/smart-app-control-frequently-asked-questions-285ea03d-fa88-4d56-882e-6698afdb7003) —
-  including that the switch is effectively one-way on current Windows
-  builds (re-enabling has required a Windows reset).
+- **Verify before advising.**
+  - Confirm the block dialog actually names Smart App Control. Defender
+    and SmartScreen blocks read differently, and their remedies differ.
+  - Check the machine's state. It needs no admin rights:
+    `(Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy').VerifiedAndReputablePolicyState`
+    returns `0` for Off, `1` for On (enforcing) and `2` for Evaluation.
+    Only `1` blocks.
+  - A refusal leaves events 3077 in the Code Integrity log (Event
+    Viewer → Microsoft → Windows → CodeIntegrity → Operational).
+- **Each release is judged on its own.** For an unsigned file, SAC's
+  verdict is Microsoft's cloud reputation for that exact file. So "the
+  last version worked" says nothing about the next one: on
+  judell/bram#470, v0.8.0 was allowed and v0.8.1 and v0.8.2 were refused
+  on the same machine, minutes apart.
+- **State the trade-off honestly, then let the user decide.** Use
+  Microsoft's own words, from the Microsoft Support page
+  [What is Smart App Control](https://support.microsoft.com/en-us/topic/what-is-smart-app-control-285ea03d-fa88-4d56-882e-6698afdb7003):
+  - **Developer default.** Windows turns SAC off on its own when it
+    detects "a corporate user, developer, or similar", "so you can work
+    with fewer interruptions". It is also off when "Your device is
+    enterprise-managed or developer-mode has been configured".
+  - **Two remedies.** "There is currently no way to bypass Smart App
+    Control protection for individual apps." Microsoft's remedies are to
+    turn SAC off or to use a signed build. Signing is not currently
+    planned (judell/bram#6 holds the plan).
+  - **Defender is unaffected.** "Smart App Control works alongside your
+    other security software, such as Microsoft Defender."
+  - **Reversible, mostly.** The support page says "Recent Windows
+    updates allow Smart App Control to be re‑enabled without requiring
+    a clean installation" (since the April 2026 update for 25H2). Its
+    developer page,
+    [Test App Signatures with Smart App Control](https://learn.microsoft.com/en-us/windows/apps/develop/smart-app-control/test-your-app-with-smart-app-control),
+    still calls the switch "a one-way operation". Say both.
+  - **The October 2026 bug.** The October 2026 update (KB5127648) can
+    grey out the toggle on 24H2, 25H2 and 26H2.
+
+  Name the UI path: **Windows Security → App & browser control → Smart
+  App Control settings**.
 - **Never flip the setting on the user's behalf.** It is a machine-level
   security decision; the agent names the control and the consequences,
   the user clicks.
@@ -234,7 +262,7 @@ It means: the user asked you to install what's missing. Handle it this way:
 - **Report what happened,** then ask the user to click 🎤 again.
 - **If it still fails,** read the trace: each click writes
   `[whisper] preflight binary=… model=… ffmpeg=… searched=… path=…` and
-  `[whisper] start convert=…` to `resources/bram-traces/bram-trace.log`,
+  `[whisper] start convert=…` to `<state>/bram-traces/bram-trace.log`,
   and the pane writes `[iframe] subkind=voice-setup` lines for the dialog.
   Those lines name what was found and where Bram looked.
 
@@ -295,6 +323,21 @@ what you *cannot* check from here rather than letting silence imply it's
 fine. *Local absence is not disproof* (in `diagnostics.md` §Log-first
 development) is the special case of this rule for machine-specific
 artifacts; this is the general one.
+
+### Coordinate on the record, not session to session
+
+Some agents can message other running sessions directly. Don't, by
+default. The user can't see that exchange, and it leaves nothing for
+later readers: no issue, no Worklist item, no Bram turn.
+
+- Put a request for another session on the relevant forge issue, signed
+  as usual, or tell the user what to relay.
+- Message a session directly only when the user says to for that case,
+  and tell the user that it happened and by what channel.
+- If it has already happened, put the request and its outcome on the
+  issue so the record is whole.
+- Reading another session's transcript, trace or repo is observation,
+  not messaging. It stays allowed.
 
 ### The thread is the design document
 

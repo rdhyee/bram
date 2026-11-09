@@ -38,6 +38,8 @@ xmlui-desktop
 AGENTS.md
 .opencode/plugins/bram.js
 .opencode/opencode.json
+.agents/hooks.json
+.agents/rules/bram-conventions-*.md
 
 # This repo opts out of committed worklist-history snapshots for the
 # Codex-themed release; revisit whether to track them in a later release.
@@ -49,14 +51,17 @@ resources/worklist-drafts/
 resources/feedback-drafts/
 resources/feedback-history/
 resources/message-drafts/
+resources/queue-drafts/
 resources/outbound-turns/
 resources/session-digests/
 # build-log-real-builds: scripts/build.sh's per-build log (machine-local).
 resources/build-log.jsonl
+resources/settings.json
 resources/.bram-port
 resources/.bram-port.json
 resources/.bram-guard-target
 resources/.inflight-claim.json
+resources/.delegated-bindings.json
 resources/.claim-intervals.json
 resources/.pty-intent.jsonl
 resources/.worklist-authorization.json
@@ -70,6 +75,12 @@ resources/.bram-queue.json
 resources/.bram-message-draft.json
 resources/.worklist-plan.json
 resources/.host-notes.json
+resources/.needs-you-dismissed.json
+resources/.worklist-direct-edit.json
+resources/.turn-context.json
+resources/.target-server-pid
+resources/.settings-note
+resources/.state-move
 
 # issue-229 lean audit ledger: machine-local, append-only record of
 # authorization decisions and Bram-gated commits. Untracked by design —

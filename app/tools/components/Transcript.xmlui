@@ -74,14 +74,6 @@
        the single canonical menu surface (same place on every tab, always
        visible). The menu-prose provisional block went with it; the real
        assistant record renders when it lands. -->
-  <!-- Session metadata for the header: /__sessions/list flags the live
-       session with current:true and carries title/mtime/size. Auto-detects
-       the provider when none is passed (see list_sessions). Refetched on
-       sessions-list-changed so the size/date track the growing live file. -->
-  <DataSource
-    id="transcriptSessions"
-    url="/__sessions/list"
-    queryParams="{{ limit: 20 }}" />
   <!-- Subagent stream for the chip-selected view (agentId prop from the
        footer chips strip). Refreshed by the dedicated subagents-changed
        signal (subagent JSONL appends never reach sessions-list-changed —
@@ -107,13 +99,6 @@
   <ChangeListener
     listenTo="{transcriptSubagentsChangedEvt.value &amp;&amp; transcriptSubagentsChangedEvt.value.tick}"
     onDidChange="() => { if ($props.agentId) { subagentTurns.refetch(); } }" />
-  <PushSource
-    id="transcriptSessionsChangedEvt"
-    initial="{null}"
-    subscribe="{window.bramSubscribeTauriEvent('sessions-list-changed')}" />
-  <ChangeListener
-    listenTo="{transcriptSessionsChangedEvt.value &amp;&amp; transcriptSessionsChangedEvt.value.tick}"
-    onDidChange="() => transcriptSessions.refetch()" />
   <!-- Feedback refs (iterate turns) are resolved inside the host
        projection; no client-side feedback map is needed. -->
   <Theme maxWidth-ModalDialog="95vw">
@@ -155,23 +140,29 @@
          closures stay here because they assign this component's xs vars
          (atBottom) and reach transcriptList; __bramTranscriptOnMount
          registers them and runs the mount work, with an enter trace. -->
-    onMount="window.__bramTranscriptOnMount(() => { atBottom = window.__bramFollowTransition(false, 'footer-arrow-up', $props.agentId); transcriptList.scrollToTop(); }, () => { window.__bramClearTranscriptFind('footer-arrow-down'); atBottom = window.__bramFollowTransition(true, 'footer-arrow-down', $props.agentId); window.__bramBottomJumpRetry(transcriptList, 'footer-arrow-down', $props.agentId, events.length); })"
+    onMount="window.__bramTranscriptOnMount(() => { atBottom = window.__bramFollowTransition(false, 'footer-arrow-up', $props.agentId); transcriptList.scrollToTop(); }, () => { window.__bramClearTranscriptFind('footer-arrow-down'); atBottom = window.__bramFollowTransition(true, 'footer-arrow-down', $props.agentId); window.__bramBottomJumpRetry(transcriptList, 'footer-arrow-down', $props.agentId, events.length); }, (dir) => { youStepSeq = window.__bramYouStep(dir, events, transcriptList, $props.agentId); })"
     onUnmount="window.__bramTranscriptUnmount(atBottom, events.length, $props.agentId)"
-    var.events="{window.__bramTranscriptEventsFromTurns($props.agentId ? subagentTurns.value : turnsEvt.value, null)}"
+    var.allEvents="{window.__bramLiveTranscriptEvents($props.agentId ? subagentTurns.value : turnsEvt.value, null)}"
+    var.youOnly="{window.__bramYouOnlyInitial()}"
+    var.events="{window.__bramShownTranscriptEvents(allEvents, youOnly)}"
+    var.youTick="{''}"
+    var.youStepSeq="{0}"
+    var.youNav="{window.__bramYouNavState(events, youTick + ':' + youStepSeq)}"
     var.eventsVersion="{($props.agentId ? (subagentTurns.value &amp;&amp; subagentTurns.value.total) : (turnsEvt.value &amp;&amp; turnsEvt.value.revision)) || events.length}"
     var.expanded="{[]}"
+    var.compactToggled="{[]}"
     var.atBottom="{!window.__bramVisibleRange || window.__bramVisibleRange.atBottom !== false}"
     var.repinArmed="{false}"
     var.settleArmed="{false}"
-    var.mountReturnState="{window.__bramVisibleRange || null}"
-    var.mountFollow="{window.__bramMountFollow(mountReturnState, $props.agentId)}"
+    var.mountReturnState="{$queryParams.at ? null : (window.__bramVisibleRange || null)}"
+    var.mountFollow="{$queryParams.at ? false : window.__bramMountFollow(mountReturnState, $props.agentId)}"
+    var.linkAt="{$props.agentId ? 0 : (Number($queryParams.at) || 0)}"
     var.mountPinArmed="{true}"
     var.mountPinTicks="{0}"
     var.findText="{''}"
     var.appliedNeedle="{''}"
     var.findCursor="{0}"
-    var.findPlan="{null}"
-    var.currentSession="{((transcriptSessions.value || []).find(s => s.current)) || ((transcriptSessions.value || [])[0])}">
+    var.findPlan="{null}">
     <!-- transcript-stream-switch-mount-keyed: a chip switch REMOUNTS this
          component (transcript-mount-pin/-restore fire per switch), so
          98b9f84's ChangeListener on $props.agentId never fired — zero
@@ -208,7 +199,15 @@
            https://www.xmlui.org/docs/howto/wrap-items-across-multiple-rows -->
       <HStack verticalAlignment="center" gap="$space-2" paddingVertical="$space-2" wrapContent="true">
         <Heading level="h2">Transcript</Heading>
-        <Text fontSize="$fontSize-sm" color="$textColor-secondary" value="{events.length + ' events'}" />
+        <Text fontSize="$fontSize-sm" color="$textColor-secondary" value="{window.__bramTranscriptCountLabel(events, allEvents, youOnly)}" />
+        <!-- transcript-show-only-you-messages (Peggy): narrow the List to your
+             own turns. `events` is the shown set (helpers.js
+             __bramShownTranscriptEvents), so find, follow and the You nav act
+             on what is shown. The listener below the List lands the reader
+             where they were. https://www.xmlui.org/docs/reference/components/Switch -->
+        <Switch label="Only mine" labelPosition="end"
+          initialValue="{youOnly}"
+          onDidChange="(v) => youOnly = window.__bramYouOnlySet(v, events, allEvents, $props.agentId)" />
         <FindBar id="transcriptFindBar" placeholder="Find in transcript…"
           clearRevision="{transcriptFindClearEvt.value &amp;&amp; transcriptFindClearEvt.value.tick}"
           matchCount="{findPlan ? findPlan.total : 0}"
@@ -221,12 +220,9 @@
              where the pane it opens appears (#427's split, below). -->
       </HStack>
     </StickySection>
-    <Text
-      when="{currentSession}"
-      paddingHorizontal="$space-4"
-      fontSize="$fontSize-sm"
-      maxLines="1"
-      value="{window.__bramSessionMetaLine(currentSession)}" />
+    <!-- transcript-session-line-removed (Jon, 2026-11-07): the session line
+         under the header ("CLAUDE peggy asks · id … · size") duplicated the
+         footer's status line, so it and its /__sessions/list source are gone. -->
     <!-- Subagent-view banner: which agent's stream is showing and whether
          it is still running. The footer's Main chip swaps back. -->
     <Text
@@ -288,26 +284,50 @@
       data="{(findPlan &amp;&amp; findPlan.rows) || events}"
       idKey="{findPlan ? '__findKey' : 'id'}"
       onScroll="(ev) => atBottom = window.__bramFollowClassify(atBottom, ev.atEnd, $props.agentId)"
-      onVisibleRangeDidChange="(range) => window.__bramSetVisibleRange(range, transcriptList, $props.agentId)">
-      <!-- transcript-worklist-bar-full-width: "No transcript yet" lives in
+      onVisibleRangeDidChange="(range) => youTick = window.__bramSetVisibleRangeYou(range, transcriptList, $props.agentId, events)">
+      <!-- transcript-worklist-bar-full-width: the empty message lives in
            the List's own empty state
            (https://www.xmlui.org/docs/reference/components/List). Above the
            split it was 35 px that vanished when the transcript loaded, which
            shifted the split up until the next re-measure ~0.8 s later: the
-           bar's jump up and back on every load. The `when` keeps a find
-           with no matches from claiming there is no transcript. -->
+           bar's jump up and back on every load.
+           transcript-tool-expand-lag: keep this Text static. A
+           when="{events.length === 0}" here delayed tool-row expansion by up
+           to ~10 s (mechanism unknown; bisected to this binding). The List
+           shows this for an empty transcript and a find with no matches
+           alike, hence the neutral wording. -->
       <property name="emptyListTemplate">
         <Text
-          when="{events.length === 0}"
           paddingHorizontal="$space-4"
           color="$textColor-secondary"
-          value="No transcript yet." />
+          value="Nothing to show." />
       </property>
       <VStack gap="$space-1" paddingVertical="$space-1" paddingHorizontal="$space-4">
-        <!-- user message -->
+        <!-- transcript-host-notes-render-as-bram: host notes that were
+             prepended to the user's message render as quiet "Bram" lines
+             above the You row (they were shown at the same weight as what
+             the user typed). Display only; the agent still receives them
+             inline. https://www.xmlui.org/docs/reference/components/Items -->
         <VStack
-          when="{$item.kind === 'user'}"
-          backgroundColor="$color-surface-100"
+          when="{$item.kind === 'user' &amp;&amp; $item.hostNotes &amp;&amp; $item.hostNotes.length}"
+          gap="$space-0_5"
+          paddingHorizontal="$space-2">
+          <Items data="{$item.hostNotes}">
+            <HStack gap="$space-2">
+              <Text value="Bram" fontWeight="bold" fontSize="$fontSize-sm" color="$textColor-secondary" />
+              <Text fontSize="$fontSize-sm" color="$textColor-secondary" value="{$item}" />
+            </HStack>
+          </Items>
+        </VStack>
+        <!-- user message. transcript-you-messages-stand-out (Peggy): an
+             accent bar and a primary tint mark your turns at a glance; the
+             agent's rows stay unboxed. borderLeft is the layout shorthand
+             (https://www.xmlui.org/docs/styles-and-themes/theme-variables);
+             the tone switch adapts the tint in dark mode. -->
+        <VStack
+          when="{$item.kind === 'user' &amp;&amp; $item.text}"
+          backgroundColor="$color-primary-50"
+          borderLeft="3px solid $color-primary-500"
           padding="$space-2"
           borderRadius="$borderRadius"
           gap="$space-1">
@@ -332,6 +352,41 @@
           content="{$item.text}"
           highlightText="{window.__bramSearchTerms($item.__needle)}"
           highlightActiveIndex="{$item.__activeOcc}" />
+        <!-- issue-470-compaction-summary-collapsed: Claude Code's compaction
+             hand-off summary (helpers.js __bramLiveTranscriptEvents) renders
+             as one muted line instead of a "You" turn, the full text one
+             click away. Open/closed is keyed by the row's content-derived id
+             in compactToggled (rows flipped from the Settings default), the
+             same id-keyed when-gated fold the tool rows use above, never
+             ExpandableItem's own positional state in a List
+             (docs/developing-bram.md §Failure modes).
+             https://www.xmlui.org/docs/reference/components/Link
+             https://www.xmlui.org/docs/reference/components/List -->
+        <VStack when="{$item.kind === 'compaction'}" gap="$space-0_5">
+          <Link noIndicator="true" onClick="compactToggled = window.__bramToggleInArray(compactToggled, $item.id)">
+            <Text
+              fontSize="$fontSize-sm"
+              fontStyle="italic"
+              color="$textColor-secondary"
+              value="{(window.__bramCompactionOpen(compactToggled, $item) ? '▾ ' : '▸ ') + window.__bramCompactionLabel($item) + (window.__bramCompactionOpen(compactToggled, $item) ? ' · Hide' : ' · Show')}" />
+          </Link>
+          <Text
+            when="{$item.__findPreview}"
+            fontSize="$fontSize-sm"
+            color="$textColor-secondary"
+            value="{$item.__findPreview}"
+            highlightText="{window.__bramSearchTerms($item.__needle)}"
+            highlightActiveIndex="{$item.__activeOcc}" />
+          <VStack
+            when="{window.__bramCompactionOpen(compactToggled, $item)}"
+            backgroundColor="$color-surface-50"
+            padding="$space-2"
+            borderRadius="$borderRadius">
+            <Markdown
+              content="{window.__bramHardBreaks($item.text)}"
+              interpolateBindings="false" allowHtml="false" />
+          </VStack>
+        </VStack>
         <!-- task notification: quiet system-note row (host-reclassified
              subagent completion report — never rendered as "You") -->
         <Text
@@ -489,6 +544,17 @@
       </VStack>
     </List>
     </Stack>
+    <!-- transcript-you-message-nav: the ▲/▼ for your messages live beside
+         the message box (MessageAgentComposer.xmlui) and step through the
+         closure onMount registers. A step returns a step number; this sets
+         atBottom=false, the find-step contract. youNav (a var above) computes
+         their enablement and publishes it (helpers.js bramSubscribeYouNav). -->
+    <ChangeListener
+      listenTo="{youStepSeq}"
+      onDidChange="() => youStepSeq > 0 ? (atBottom = false) : null" />
+    <ChangeListener
+      listenTo="{youOnly}"
+      onDidChange="() => window.__bramYouOnlyRestore(events, allEvents, transcriptList, $props.agentId)" />
     <!-- Opening the Worklist pane (now in the App Footer, passed in as
          $props.worklistOpen) shrinks the transcript; land it on the newest
          turn, the message most likely to name the rows to act on. Same
@@ -496,12 +562,14 @@
          worklist-bar-on-every-page: the pane no longer remounts the List
          (no Splitter here), so a close needs no re-landing, and the
          splitter's onResize re-jump becomes a jump on the measured height
-         changing, which is when the shrink or growth actually lands. The
-         helper yields if the user has scrolled up. Event driven, no timed
-         wait. -->
+         changing, which is when the shrink or growth actually lands.
+         transcript-worklist-open-keeps-reading: the contract is that opening
+         the Worklist lands the newest turn ONLY for a reader who was
+         following; a reader who scrolled up stays put, and so does follow
+         (helpers.js __bramWorklistOpenLand). Event driven, no timed wait. -->
     <ChangeListener
       listenTo="{$props.worklistOpen}"
-      onDidChange="() => { if ($props.worklistOpen) { atBottom = window.__bramFollowTransition(true, 'worklist-open', $props.agentId); window.__bramBottomJumpRetry(transcriptList, 'worklist-open', $props.agentId, events.length); } }" />
+      onDidChange="() => atBottom = window.__bramWorklistOpenLand($props.worklistOpen, atBottom, transcriptList, $props.agentId, events.length)" />
     <ChangeListener
       listenTo="{splitHeight.value}"
       onDidChange="window.__bramBottomJumpRetry(transcriptList, 'worklist-resize', $props.agentId, null)" />
@@ -601,6 +669,18 @@
       interval="250"
       enabled="{mountPinArmed}"
       onTick="() => { mountPinTicks = mountPinTicks + 1; if (!mountFollow) { mountPinArmed = false; atBottom = window.__bramFollowTransition(false, 'mount-restore-reading', $props.agentId); if (mountReturnState &amp;&amp; mountReturnState.startIndex > 0) { transcriptList.scrollToIndex(mountReturnState.startIndex); } window.__bramIframeTrace('transcript-mount-restore', {index: (mountReturnState &amp;&amp; mountReturnState.startIndex) || 0, events: events.length}); } else if (window.__bramVisibleRange &amp;&amp; window.__bramVisibleRange.endIndex >= events.length - 1) { mountPinArmed = false; window.__bramFollowVerify('mount-pin', $props.agentId, events.length); window.__bramIframeTrace('transcript-mount-pin', {ticks: mountPinTicks, events: events.length}); } else if (mountPinTicks > 8) { mountPinArmed = false; window.__bramIframeTrace('follow-state', {op: 'pin-abandoned', cause: 'mount-pin', ticks: mountPinTicks, total: events.length, endIndex: (window.__bramVisibleRange &amp;&amp; window.__bramVisibleRange.endIndex) || -1, agentId: $props.agentId || 'main'}); window.__bramFollowVerify('mount-pin-abandoned', $props.agentId, events.length); } else { transcriptList.scrollToBottom(); } }" />
+    <!-- log-rows-baseline-and-spacing: /transcript?at=<ms>, from a Log
+         entry's time. The mount neither restores the old position nor pins
+         to the bottom (mountReturnState null, mountFollow false: the
+         restore branch above just enters READING), and this Timer lands on
+         the turn that began at or after the moment, retrying until the
+         events load (__bramTranscriptLinkStep returns 0 when done). A
+         Timer, not delay(), for the same unmount reason as the pin above.
+         https://www.xmlui.org/docs/howto/deep-link-to-a-tab-or-section -->
+    <Timer
+      interval="250"
+      enabled="{linkAt > 0}"
+      onTick="() => { linkAt = window.__bramTranscriptLinkStep(transcriptList, events, linkAt, $props.agentId); }" />
     <ChangeListener
       listenTo="{$props.agentId}"
       onDidChange="() => { atBottom = window.__bramFollowTransition(true, 'agent-chip-switch', $props.agentId); repinArmed = true; window.__bramIframeTrace('subagent-switch', {agentId: $props.agentId || 'main', events: events.length}); window.__bramBottomJumpRetry(transcriptList, 'agent-chip-switch', $props.agentId, events.length); }" />

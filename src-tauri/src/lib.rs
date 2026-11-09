@@ -396,6 +396,8 @@ struct WorklistConfig {
     batch_commit_actions: Option<bool>,
     #[serde(default, rename = "gateExplainer")]
     gate_explainer: Option<bool>,
+    #[serde(default)]
+    enforcement: Option<String>,
 }
 
 // Optional UI block. `showTargetApp` controls whether the embedded
@@ -409,6 +411,12 @@ struct UiConfig {
     show_target_app: Option<bool>,
     #[serde(default, rename = "toolsPaneHotReload")]
     tools_pane_hot_reload: Option<bool>,
+    // pane-idle-flush-when-degraded: opt-in WORKAROUND for an unexplained
+    // agent-pane slowdown (judell/bram#482 for the underlying leak). When
+    // on, the pane reloads itself once it has measurably degraded and nobody
+    // is using it. Default off.
+    #[serde(default, rename = "paneIdleFlush")]
+    pane_idle_flush: Option<bool>,
 }
 
 // suggest-fresh-session: when the agent may suggest starting a fresh session.
@@ -792,6 +800,26 @@ fn parse_cli_flags() {
                 }
             }
         }
+        // issue-469: the state-folder dry run without a window, so the
+        // acceptance checkouts (and Windows) can record what the 0.8.4 move
+        // would do with no instance running. Same JSON as /__state-dir/plan.
+        "--state-dir-plan" => {
+            let Some(dir) = args.get(2) else {
+                eprintln!("bram: --state-dir-plan requires a project root path");
+                std::process::exit(1);
+            };
+            let root = Path::new(dir);
+            if !root.is_dir() {
+                eprintln!("bram: {} is not a directory", dir);
+                std::process::exit(1);
+            }
+            let plan = state_dir_plan(root);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&plan).unwrap_or_else(|_| plan.to_string())
+            );
+            std::process::exit(0);
+        }
         s if is_launch_flag(s) => {}
         s if s.starts_with('-') => {
             eprintln!("bram: unknown option '{}'", s);
@@ -896,7 +924,7 @@ fn init_bram_trace_from_env() {
     BRAM_TRACE_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
     if over == Some(true) {
         eprintln!(
-            "[bram-trace] enabled (BRAM_TRACE=1); live trace destination: <project_root>/resources/bram-traces/bram-trace.log; previous runs archived at startup as <project_root>/resources/bram-traces/bram-trace-YYYY-MM-DD*.log"
+            "[bram-trace] enabled (BRAM_TRACE=1); live trace destination: bram-traces/bram-trace.log in Bram's state folder (<project_root>/.bram/ if it exists, else <project_root>/resources/); previous runs archived at startup as bram-traces/bram-trace-YYYY-MM-DD*.log in Bram's state folder"
         );
     }
 }
@@ -1285,41 +1313,93 @@ struct LastResolvedPromptInfo {
 static LAST_RESOLVED_PROMPT: std::sync::Mutex<Option<LastResolvedPromptInfo>> =
     std::sync::Mutex::new(None);
 
-fn prompt_shown<R: tauri::Runtime>(
-    app: &AppHandle<R>,
+struct PromptShownEvent {
+    prompt_id: String,
+    tool: String,
+    tool_use_id: Option<String>,
+    labels: Vec<String>,
+    source: &'static str,
+    at_ms: i64,
+}
+
+struct PromptResolvedEvent {
+    open: OpenPrompt,
+    outcome: String,
+    detail: String,
+    at_ms: i64,
+}
+
+fn prompt_resolved_in(
+    open: &mut Option<OpenPrompt>,
+    expected_source: Option<&str>,
+    outcome: &str,
+    detail: &str,
+    now: i64,
+) -> Option<PromptResolvedEvent> {
+    if let Some(src) = expected_source {
+        if open.as_ref().map(|o| o.source) != Some(src) {
+            return None;
+        }
+    }
+    let o = open.take()?;
+    Some(PromptResolvedEvent {
+        open: o,
+        outcome: outcome.to_string(),
+        detail: detail.to_string(),
+        at_ms: now,
+    })
+}
+
+fn prompt_shown_in(
+    open: &mut Option<OpenPrompt>,
     tool: &str,
     tool_use_id: Option<&str>,
     labels: Vec<String>,
     source: &'static str,
-) {
-    {
-        let Ok(mut open) = prompt_open_cell().lock() else {
-            return;
-        };
-        if let Some(o) = open.as_mut() {
-            if o.tool == tool && o.labels == labels {
-                // Same prompt re-emitted (enrichment, redetect). Adopt a
-                // newly-known id; no lifecycle event.
-                if o.tool_use_id.is_none() {
-                    o.tool_use_id = tool_use_id.map(|s| s.to_string());
-                }
-                return;
+    now: i64,
+) -> (Option<PromptResolvedEvent>, Option<PromptShownEvent>) {
+    if let Some(o) = open.as_mut() {
+        if o.tool == tool && o.labels == labels {
+            // Same prompt re-emitted (enrichment, redetect). Adopt a
+            // newly-known id; no lifecycle event.
+            if o.tool_use_id.is_none() {
+                o.tool_use_id = tool_use_id.map(|s| s.to_string());
             }
+            return (None, None);
         }
     }
     // A different prompt: the open one is superseded first.
-    prompt_resolved(app, "superseded", source);
+    let superseded = prompt_resolved_in(open, None, "superseded", source, now);
     let seq = PROMPT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    let now = unix_now_ms();
     let prompt_id = format!("p{}-{}", now, seq);
+    let ev = PromptShownEvent {
+        prompt_id: prompt_id.clone(),
+        tool: tool.to_string(),
+        tool_use_id: tool_use_id.map(|s| s.to_string()),
+        labels: labels.clone(),
+        source,
+        at_ms: now,
+    };
+    *open = Some(OpenPrompt {
+        prompt_id,
+        tool: tool.to_string(),
+        tool_use_id: tool_use_id.map(|s| s.to_string()),
+        labels,
+        source,
+        shown_at_ms: now,
+    });
+    (superseded, Some(ev))
+}
+
+fn record_prompt_shown<R: tauri::Runtime>(app: &AppHandle<R>, ev: PromptShownEvent) {
     let rec = serde_json::json!({
         "event": "prompt-shown",
-        "promptId": prompt_id,
-        "tool": tool,
-        "toolUseId": tool_use_id,
-        "labels": labels,
-        "source": source,
-        "atMs": now,
+        "promptId": ev.prompt_id,
+        "tool": ev.tool,
+        "toolUseId": ev.tool_use_id,
+        "labels": ev.labels,
+        "source": ev.source,
+        "atMs": ev.at_ms,
     });
     prompt_history_push(rec);
     if bram_trace_enabled() {
@@ -1328,23 +1408,82 @@ fn prompt_shown<R: tauri::Runtime>(
             "prompt-lifecycle",
             &format!(
                 "op=shown id={} tool={} source={} tool_use_id={} labels=[{}]",
-                prompt_id,
-                tool,
-                source,
-                tool_use_id.unwrap_or("none"),
-                labels_preview(&labels),
+                ev.prompt_id,
+                ev.tool,
+                ev.source,
+                ev.tool_use_id.as_deref().unwrap_or("none"),
+                labels_preview(&ev.labels),
             ),
         );
     }
-    if let Ok(mut open) = prompt_open_cell().lock() {
-        *open = Some(OpenPrompt {
-            prompt_id,
-            tool: tool.to_string(),
-            tool_use_id: tool_use_id.map(|s| s.to_string()),
-            labels,
-            source,
-            shown_at_ms: now,
+}
+
+fn record_prompt_resolved<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    ev: PromptResolvedEvent,
+) -> OpenPrompt {
+    let o = ev.open;
+    if ev.outcome == "superseded" {
+        LAST_SUPERSEDE_MS.store(ev.at_ms, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Ok(mut last) = LAST_RESOLVED_PROMPT.lock() {
+        *last = Some(LastResolvedPromptInfo {
+            at_ms: ev.at_ms,
+            prompt_id: o.prompt_id.clone(),
+            tool: o.tool.clone(),
+            outcome: ev.outcome.clone(),
+            labels: labels_preview(&o.labels),
         });
+    }
+    let rec = serde_json::json!({
+        "event": "prompt-resolved",
+        "promptId": o.prompt_id,
+        "tool": o.tool,
+        "toolUseId": o.tool_use_id,
+        "source": o.source,
+        "outcome": ev.outcome,
+        "detail": ev.detail,
+        "shownAtMs": o.shown_at_ms,
+        "atMs": ev.at_ms,
+        "openMs": ev.at_ms - o.shown_at_ms,
+    });
+    prompt_history_push(rec);
+    if bram_trace_enabled() {
+        append_bram_trace_line(
+            app,
+            "prompt-lifecycle",
+            &format!(
+                "op=resolved id={} tool={} outcome={} detail={} open_ms={}",
+                o.prompt_id,
+                o.tool,
+                ev.outcome,
+                ev.detail,
+                ev.at_ms - o.shown_at_ms,
+            ),
+        );
+    }
+    o
+}
+
+fn prompt_shown<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    tool: &str,
+    tool_use_id: Option<&str>,
+    labels: Vec<String>,
+    source: &'static str,
+) {
+    let now = unix_now_ms();
+    let (superseded, shown) = {
+        let Ok(mut open) = prompt_open_cell().lock() else {
+            return;
+        };
+        prompt_shown_in(&mut open, tool, tool_use_id, labels, source, now)
+    };
+    if let Some(sup) = superseded {
+        let _ = record_prompt_resolved(app, sup);
+    }
+    if let Some(ev) = shown {
+        record_prompt_shown(app, ev);
     }
 }
 
@@ -1375,49 +1514,12 @@ fn prompt_resolved<R: tauri::Runtime>(
     outcome: &str,
     detail: &str,
 ) -> Option<OpenPrompt> {
-    let open = prompt_open_cell().lock().ok().and_then(|mut o| o.take());
-    let o = open?;
     let now = unix_now_ms();
-    if outcome == "superseded" {
-        LAST_SUPERSEDE_MS.store(now, std::sync::atomic::Ordering::Relaxed);
-    }
-    if let Ok(mut last) = LAST_RESOLVED_PROMPT.lock() {
-        *last = Some(LastResolvedPromptInfo {
-            at_ms: now,
-            prompt_id: o.prompt_id.clone(),
-            tool: o.tool.clone(),
-            outcome: outcome.to_string(),
-            labels: labels_preview(&o.labels),
-        });
-    }
-    let rec = serde_json::json!({
-        "event": "prompt-resolved",
-        "promptId": o.prompt_id,
-        "tool": o.tool,
-        "toolUseId": o.tool_use_id,
-        "source": o.source,
-        "outcome": outcome,
-        "detail": detail,
-        "shownAtMs": o.shown_at_ms,
-        "atMs": now,
-        "openMs": now - o.shown_at_ms,
-    });
-    prompt_history_push(rec);
-    if bram_trace_enabled() {
-        append_bram_trace_line(
-            app,
-            "prompt-lifecycle",
-            &format!(
-                "op=resolved id={} tool={} outcome={} detail={} open_ms={}",
-                o.prompt_id,
-                o.tool,
-                outcome,
-                detail,
-                now - o.shown_at_ms,
-            ),
-        );
-    }
-    Some(o)
+    let ev = prompt_open_cell()
+        .lock()
+        .ok()
+        .and_then(|mut o| prompt_resolved_in(&mut o, None, outcome, detail, now))?;
+    Some(record_prompt_resolved(app, ev))
 }
 
 // claim-id-resolution (upstream ask #1 implemented locally):
@@ -2312,9 +2414,1007 @@ fn bram_trace_log_file<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<PathBuf>
     project_resource_path(app, "bram-traces/bram-trace.log")
 }
 
-fn is_bram_trace_archive_rel(rel: &str) -> bool {
-    rel.starts_with("resources/bram-traces/bram-trace-")
+// issue-473-readable-launch-log: what /__story/lines selects. Trace lines in
+// these categories (and these iframe subkinds) mark episodes; everything
+// else, such as [pty-in], [watcher] and event plumbing, is left out. Guard
+// denies come from hook-events.log.
+const STORY_TRACE_CATEGORIES: &[&str] = &[
+    "turn-state",
+    "turn-context",
+    "inflight-sentinel",
+    "auth-record",
+    "turn-send",
+    "worklist-commit",
+    "queue",
+    "bram-trace",
+    // log-shows-start-commit-push-search: one op=push-result line per push
+    // (issue-383), told as "You pushed main (a..b)".
+    "git-push",
+    // log-records-demo-instances: scripts/demo_instance.py appends
+    // op=launch / op=stop here when a demo instance starts or stops.
+    "demo-instance",
+    // log-tells-session-switches: op=create, the New session dialog, so a
+    // switch into a new session is told as one.
+    "session-new",
+];
+// log-tells-session-switches: the [agent-switch] ops a switch is told from.
+// The session sets name each entry's session too; the rest say why the
+// session changed (a switch to another agent, a fresh partner, the resume
+// at launch) or that the agent never came up. Its mechanics (interrupts,
+// the launch gate, digests, pair offers, pane reloads) stay out.
+const STORY_AGENT_SWITCH_OPS: &[&str] = &[
+    "live-session-set",
+    "start",
+    "fresh-partner",
+    "autostart",
+    "launch-timeout",
+    "launch-exited",
+    "launch-superseded",
+];
+// The line that changes which session is current. The window's seed and the
+// lines every kind receives for context are these, not the category's other
+// ops, so a later op=start can't displace the session the window opened in.
+fn story_is_session_set(l: &StoryLine) -> bool {
+    l.cat == "agent-switch" && l.text.starts_with("op=live-session-set ")
+}
+const STORY_IFRAME_SUBKINDS: &[&str] = &[
+    "click",
+    "queue",
+    "long-task",
+    "input-latency",
+    "heartbeat-drift",
+    // keep-selection-reload (#479): a pane reload restoring the Worklist
+    // selection. Its own subkind, so the busy w2-selection lines stay out.
+    "w2-selection-restore",
+    // log-shows-start-commit-push-search: the Search tab's results per
+    // bucket, told as "You searched for “…” and got N hits".
+    "search-query",
+];
+
+// log-reads-across-trace-rotation: the Log's lines, held in memory.
+//
+// Every launch rotates the trace (prepare_bram_trace_log), and the route
+// used to read only the live file's last 32 MB, so a relaunch blanked the
+// Log's five-hour window. Measured 2026-11-07 over five hours: 207,843
+// trace lines, 12,612 selected, a 2.6 MB payload, 13 entries shown, and the
+// 32 MB tail re-read at every turn boundary. So the index reads each rotated
+// archive once (they never change) and the live files incrementally, from
+// the offset it stopped at. A refetch costs what the trace gained since the
+// last one. The pane names the kinds it shows (`kinds=`), and only the lines
+// those kinds are told from are sent.
+//
+// Plain archives only: they are gzipped after archiveAfterDays (default
+// 14), far outside any window the Log asks for.
+#[derive(Clone)]
+struct StoryLine {
+    ts: String,
+    src: &'static str,
+    cat: String,
+    text: String,
+}
+
+impl StoryLine {
+    fn subkind(&self, k: &str) -> bool {
+        self.cat == "iframe"
+            && self
+                .text
+                .strip_prefix("subkind=")
+                .and_then(|r| r.strip_prefix(k))
+                .is_some_and(|r| r.starts_with(' ') || r.is_empty())
+    }
+}
+
+#[derive(Default)]
+struct StoryFileCursor {
+    path: PathBuf,
+    // The file's first bytes when the cursor started, so a file replaced by
+    // rotation (hook-events.log rotates at its size cap while Bram runs) is
+    // noticed even after the new file outgrows the old offset.
+    head: Vec<u8>,
+    offset: u64,
+    partial: Vec<u8>,
+    lines: Vec<StoryLine>,
+    // The last session-set line pruned from `lines`, kept so the window's
+    // first entries can still be named with their session.
+    seed: Option<StoryLine>,
+}
+
+#[derive(Default)]
+struct StoryIndex {
+    // Rotated archives: path → (len, mtime ms, selected lines).
+    archives: HashMap<PathBuf, (u64, i64, Vec<StoryLine>)>,
+    live_trace: StoryFileCursor,
+    live_hook: StoryFileCursor,
+}
+
+static STORY_INDEX: OnceLock<Mutex<StoryIndex>> = OnceLock::new();
+
+fn story_select_trace_line(line: &str) -> Option<StoryLine> {
+    let rest = line.strip_prefix('[')?;
+    let (ts, rest) = rest.split_once("] [")?;
+    let (cat, text) = rest.split_once(']')?;
+    let text = text.trim_start();
+    let keep = match cat {
+        "iframe" => STORY_IFRAME_SUBKINDS
+            .iter()
+            .any(|k| text.starts_with(&format!("subkind={} ", k))),
+        "turn-state" => !text.starts_with("from=working to=working "),
+        // log-shows-start-commit-push-search: which session each entry
+        // happened in, for its expanded detail. log-tells-session-switches:
+        // and the ops a switch is told from; the category's offers,
+        // refusals and mechanics stay out.
+        "agent-switch" => STORY_AGENT_SWITCH_OPS
+            .iter()
+            .any(|op| text.starts_with(&format!("op={} ", op))),
+        _ => STORY_TRACE_CATEGORIES.contains(&cat),
+    };
+    keep.then(|| StoryLine {
+        ts: ts.to_string(),
+        src: "trace",
+        cat: cat.to_string(),
+        text: text.to_string(),
+    })
+}
+
+fn story_select_hook_line(line: &str) -> Option<StoryLine> {
+    if !line.contains(" decided=deny ") {
+        return None;
+    }
+    let (ts, text) = line.split_once(' ')?;
+    Some(StoryLine {
+        ts: ts.to_string(),
+        src: "hook",
+        cat: "hook-deny".to_string(),
+        text: text.to_string(),
+    })
+}
+
+fn story_file_head(path: &Path) -> Vec<u8> {
+    let mut buf = Vec::new();
+    if let Ok(f) = std::fs::File::open(path) {
+        let _ = f.take(64).read_to_end(&mut buf);
+    }
+    buf
+}
+
+// Reads what `path` gained since the cursor's offset and selects from it.
+// Returns the bytes read.
+fn story_cursor_advance(
+    c: &mut StoryFileCursor,
+    path: &Path,
+    select: fn(&str) -> Option<StoryLine>,
+) -> u64 {
+    use std::io::{Seek, SeekFrom};
+    let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let head_now = story_file_head(path);
+    if c.path != path || len < c.offset || (c.offset > 0 && !head_now.starts_with(&c.head)) {
+        *c = StoryFileCursor {
+            path: path.to_path_buf(),
+            ..StoryFileCursor::default()
+        };
+    }
+    if c.offset == 0 {
+        c.head = head_now;
+    }
+    if len <= c.offset {
+        return 0;
+    }
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return 0;
+    };
+    if f.seek(SeekFrom::Start(c.offset)).is_err() {
+        return 0;
+    }
+    let mut buf = Vec::new();
+    let _ = f.take(len - c.offset).read_to_end(&mut buf);
+    let read = buf.len() as u64;
+    c.offset += read;
+    let mut bytes = std::mem::take(&mut c.partial);
+    bytes.extend_from_slice(&buf);
+    let complete = match bytes.iter().rposition(|&b| b == b'\n') {
+        Some(i) => {
+            c.partial = bytes.split_off(i + 1);
+            bytes
+        }
+        None => {
+            c.partial = bytes;
+            return read;
+        }
+    };
+    for line in String::from_utf8_lossy(&complete).lines() {
+        if let Some(l) = select(line) {
+            c.lines.push(l);
+        }
+    }
+    read
+}
+
+// Drops lines before `since`, keeping the last session set among them.
+fn story_cursor_prune(c: &mut StoryFileCursor, since: &str) {
+    let cut = c.lines.partition_point(|l| l.ts.as_str() < since);
+    if cut == 0 {
+        return;
+    }
+    if let Some(set) = c.lines[..cut]
+        .iter()
+        .rev()
+        .find(|l| story_is_session_set(l))
+    {
+        c.seed = Some(set.clone());
+    }
+    c.lines.drain(..cut);
+}
+
+// The kinds a Log entry can be, and the lines its episodes are told from
+// (the handlers in helpers.js __bramStoryTell). A kind not listed here gets
+// every selected line, so a kind added in the pane before the host learns
+// it is told correctly, only less cheaply.
+fn story_kind_wants(kind: &str, l: &StoryLine) -> bool {
+    let cat = l.cat.as_str();
+    match kind {
+        "gate" => {
+            l.subkind("click") || matches!(cat, "auth-record" | "turn-send" | "worklist-commit")
+        }
+        "push" => cat == "git-push",
+        "search" => l.subkind("search-query"),
+        "queue-add" | "queue-delete" | "queue" => l.subkind("queue"),
+        "selection" => l.subkind("w2-selection-restore"),
+        "turn" => {
+            matches!(
+                cat,
+                "turn-state" | "turn-context" | "inflight-sentinel" | "turn-send"
+            ) || l.subkind("queue")
+        }
+        "stall" => {
+            l.subkind("long-task") || l.subkind("input-latency") || l.subkind("heartbeat-drift")
+        }
+        "refusal" => l.src == "hook" || matches!(cat, "auth-record" | "queue"),
+        "launch" => cat == "bram-trace",
+        "demo" => cat == "demo-instance",
+        "switch" => matches!(cat, "agent-switch" | "session-new"),
+        _ => true,
+    }
+}
+
+struct StoryRead {
+    lines: Vec<StoryLine>,
+    read_bytes: u64,
+    files: usize,
+    archives_read: usize,
+}
+
+fn story_read_lines(traces_dir: &Path, since: &str) -> StoryRead {
+    let mut read_bytes = 0u64;
+    let mut archives_read = 0usize;
+    let since_ms = parse_iso_to_epoch_ms(since);
+    let mut idx = STORY_INDEX
+        .get_or_init(|| Mutex::new(StoryIndex::default()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    // Rotated archives that can hold lines inside the window: an archive's
+    // mtime is its last write, so one older than `since` holds nothing newer.
+    // With no parseable `since`, only the live files are read.
+    let mut wanted: Vec<(PathBuf, u64, i64, bool)> = Vec::new();
+    if let (Some(since_ms), Ok(rd)) = (since_ms, std::fs::read_dir(traces_dir)) {
+        for e in rd.filter_map(|e| e.ok()) {
+            let name = e.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let is_trace = name.starts_with("bram-trace-") && name.ends_with(".log");
+            let is_hook = name.starts_with("hook-events-") && name.ends_with(".log");
+            if !is_trace && !is_hook {
+                continue;
+            }
+            let Ok(meta) = e.metadata() else { continue };
+            let mtime_ms = meta
+                .modified()
+                .ok()
+                .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            if mtime_ms >= since_ms {
+                wanted.push((e.path(), meta.len(), mtime_ms, is_hook));
+            }
+        }
+    }
+    let wanted_paths: HashSet<PathBuf> = wanted.iter().map(|w| w.0.clone()).collect();
+    idx.archives.retain(|p, _| wanted_paths.contains(p));
+    for (path, len, mtime_ms, is_hook) in &wanted {
+        let fresh = idx
+            .archives
+            .get(path)
+            .is_some_and(|(l, m, _)| l == len && m == mtime_ms);
+        if fresh {
+            continue;
+        }
+        let select = if *is_hook {
+            story_select_hook_line
+        } else {
+            story_select_trace_line
+        };
+        let bytes = std::fs::read(path).unwrap_or_default();
+        read_bytes += bytes.len() as u64;
+        archives_read += 1;
+        let lines: Vec<StoryLine> = String::from_utf8_lossy(&bytes)
+            .lines()
+            .filter_map(select)
+            .collect();
+        idx.archives.insert(path.clone(), (*len, *mtime_ms, lines));
+    }
+
+    let StoryIndex {
+        archives,
+        live_trace,
+        live_hook,
+    } = &mut *idx;
+    read_bytes += story_cursor_advance(
+        live_trace,
+        &traces_dir.join("bram-trace.log"),
+        story_select_trace_line,
+    );
+    read_bytes += story_cursor_advance(
+        live_hook,
+        &traces_dir.join("hook-events.log"),
+        story_select_hook_line,
+    );
+    if !since.is_empty() {
+        story_cursor_prune(live_trace, since);
+        story_cursor_prune(live_hook, since);
+    }
+
+    let mut seed: Option<StoryLine> = live_trace.seed.clone();
+    let mut lines: Vec<StoryLine> = Vec::new();
+    for (_, _, a) in archives.values() {
+        for l in a {
+            if l.ts.as_str() >= since {
+                lines.push(l.clone());
+            } else if story_is_session_set(l) && seed.as_ref().is_none_or(|s| s.ts < l.ts) {
+                seed = Some(l.clone());
+            }
+        }
+    }
+    lines.extend(live_trace.lines.iter().cloned());
+    lines.extend(live_hook.lines.iter().cloned());
+    // The session in force when the window opened, told as the window's
+    // first line so every entry can name its session.
+    if let Some(s) = seed {
+        lines.push(s);
+    }
+    lines.sort_by(|a, b| a.ts.cmp(&b.ts));
+    lines.dedup_by(|a, b| a.ts == b.ts && a.cat == b.cat && a.text == b.text);
+    StoryRead {
+        lines,
+        read_bytes,
+        files: wanted.len() + 2,
+        archives_read,
+    }
+}
+
+// log-reads-across-trace-rotation: a trace line that can end an episode the
+// Log shows. The host emits `story-changed` for it (debounced), so a search,
+// a push or a commit reaches an open Log without waiting for a turn boundary.
+fn story_trace_line_triggers(category: &str, body: &str) -> bool {
+    let has_op = |op: &str| body.split(' ').any(|kv| kv == op);
+    match category {
+        "worklist-commit" => has_op("op=committed"),
+        "git-push" => has_op("op=push-result"),
+        // log-tells-session-switches: the session changed, or a switch's
+        // agent never came up.
+        "agent-switch" => {
+            has_op("op=live-session-set")
+                || has_op("op=launch-timeout")
+                || has_op("op=launch-exited")
+        }
+        "iframe" => {
+            ["search-query", "queue", "w2-selection-restore"]
+                .iter()
+                .any(|k| body.starts_with(&format!("subkind={} ", k)))
+                || (body.starts_with("subkind=click ") && body.contains("gatebar-"))
+        }
+        _ => false,
+    }
+}
+
+static STORY_CHANGED_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+// One `story-changed` per burst: the first trigger schedules an emit 1.5 s
+// out, and the triggers inside that wait ride along with it. A commit's
+// staging and committed lines land milliseconds apart; this tells them once.
+fn story_changed_soon<R: tauri::Runtime>(app: &AppHandle<R>) {
+    if STORY_CHANGED_PENDING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        STORY_CHANGED_PENDING.store(false, std::sync::atomic::Ordering::SeqCst);
+        emit_replayable_signal(&app, "story-changed");
+    });
+}
+
+#[cfg(test)]
+mod story_index_tests {
+    use super::*;
+
+    // log-reads-across-trace-rotation: the window spans a rotation, an
+    // archive older than the window is skipped, a refetch with nothing new
+    // reads nothing, and an append is read alone.
+    #[test]
+    fn reads_across_rotation_and_then_only_what_was_appended() {
+        let d = std::env::temp_dir().join(format!(
+            "bram-story-index-{}-{}",
+            std::process::id(),
+            unix_now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        // A launch whose archive ends before the window: skipped by mtime.
+        std::fs::write(
+            d.join("bram-trace-2026-11-06.log"),
+            "[2026-11-06T01:00:00.000Z] [git-push] op=push-result branch=old ok=true\n",
+        )
+        .unwrap();
+        let old = std::fs::File::options()
+            .write(true)
+            .open(d.join("bram-trace-2026-11-06.log"))
+            .unwrap();
+        old.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000))
+            .unwrap();
+        // The launch the window opens in, rotated.
+        std::fs::write(
+            d.join("bram-trace-2026-11-07-2.log"),
+            concat!(
+                "[2026-11-07T09:00:00.000Z] [agent-switch] op=live-session-set provider=claude session=s1\n",
+                "[2026-11-07T10:00:00.000Z] [git-push] op=push-result branch=main ok=true\n",
+                "[2026-11-07T11:00:00.000Z] [watcher] path=x\n",
+                "[2026-11-07T12:00:00.000Z] [worklist-commit] op=committed sha=abc1234\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("bram-trace.log"),
+            "[2026-11-07T13:00:00.000Z] [iframe] subkind=search-query {\"q\":\"x\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("hook-events.log"),
+            "2026-11-07T13:30:00.000Z claude-rs PreToolUse Bash decided=deny reason=r\n",
+        )
+        .unwrap();
+
+        let since = "2026-11-07T09:30:00.000Z";
+        let r = story_read_lines(&d, since);
+        let got: Vec<(&str, &str)> = r
+            .lines
+            .iter()
+            .map(|l| (l.ts.as_str(), l.cat.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("2026-11-07T09:00:00.000Z", "agent-switch"),
+                ("2026-11-07T10:00:00.000Z", "git-push"),
+                ("2026-11-07T12:00:00.000Z", "worklist-commit"),
+                ("2026-11-07T13:00:00.000Z", "iframe"),
+                ("2026-11-07T13:30:00.000Z", "hook-deny"),
+            ],
+            "the archive's lines, the live file's and the hook's, in order, with \
+             the session set before the window as its first line; the old archive \
+             and the unselected watcher line stay out"
+        );
+        assert_eq!(r.archives_read, 1);
+
+        let again = story_read_lines(&d, since);
+        assert_eq!(again.read_bytes, 0, "nothing new, nothing read");
+        assert_eq!(again.archives_read, 0, "the archive is cached");
+        assert_eq!(again.lines.len(), 5);
+
+        let appended = "[2026-11-07T14:00:00.000Z] [git-push] op=push-result branch=main ok=true\n";
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(d.join("bram-trace.log"))
+            .unwrap();
+        f.write_all(appended.as_bytes()).unwrap();
+        let third = story_read_lines(&d, since);
+        assert_eq!(third.read_bytes, appended.len() as u64, "only the append");
+        assert_eq!(third.lines.len(), 6);
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn kinds_keep_only_their_lines() {
+        let line = |cat: &str, text: &str| StoryLine {
+            ts: String::new(),
+            src: "trace",
+            cat: cat.to_string(),
+            text: text.to_string(),
+        };
+        let push = line("git-push", "op=push-result branch=main");
+        let search = line("iframe", "subkind=search-query {}");
+        let drift = line("iframe", "subkind=heartbeat-drift {}");
+        let turn = line("turn-state", "from=idle to=working");
+        assert!(story_kind_wants("push", &push));
+        assert!(story_kind_wants("search", &search));
+        assert!(!story_kind_wants("search", &drift));
+        assert!(!story_kind_wants("gate", &turn));
+        assert!(story_kind_wants("turn", &turn));
+        assert!(story_kind_wants(
+            "demo",
+            &line("demo-instance", "op=launch scenario=s pid=1")
+        ));
+        assert!(!story_kind_wants("demo", &push));
+        assert!(
+            story_kind_wants("not-yet-known", &drift),
+            "an unknown kind gets everything"
+        );
+        assert!(story_trace_line_triggers(
+            "git-push",
+            "op=push-result branch=main ok=true"
+        ));
+        assert!(story_trace_line_triggers(
+            "worklist-commit",
+            "op=committed sha=abc"
+        ));
+        assert!(!story_trace_line_triggers(
+            "worklist-commit",
+            "op=staging files=2"
+        ));
+        assert!(story_trace_line_triggers(
+            "iframe",
+            "subkind=click {\"op\":\"act\",\"target\":\"gatebar-commit\"}"
+        ));
+        assert!(!story_trace_line_triggers(
+            "iframe",
+            "subkind=click {\"target\":\"nav-log\"}"
+        ));
+        assert!(!story_trace_line_triggers("iframe", "subkind=queue-x {}"));
+    }
+
+    // log-tells-session-switches: the ops a switch is told from pass, its
+    // mechanics don't, and only a session set seeds the window.
+    #[test]
+    fn switch_lines_are_selected_and_seed_only_on_sets() {
+        let sel = |l: &str| story_select_trace_line(l);
+        for op in [
+            "live-session-set provider=claude session=s2 source=explicit-resume",
+            "start provider=codex command=codex pending=none resume_reason=partner",
+            "fresh-partner provider=codex reason=new-session from=s1 sid=unbound",
+            "autostart provider=claude policy=lastActive exact_session=s1",
+            "launch-timeout provider=claude source=switch waited_ms=45010",
+            "launch-exited provider=opencode source=switch status=0",
+            "launch-superseded provider=claude source=switch stage=confirm",
+        ] {
+            let l = format!("[2026-11-07T09:00:00.000Z] [agent-switch] op={}", op);
+            let got = sel(&l).unwrap_or_else(|| panic!("kept: {}", op));
+            assert!(story_kind_wants("switch", &got));
+        }
+        for op in [
+            "switch provider=codex step=escape",
+            "launch-gated provider=codex source=switch",
+            "digest-written provider=claude session=s1",
+            "pair-offer active=false",
+            "resync provider=claude session=s1",
+        ] {
+            let l = format!("[2026-11-07T09:00:00.000Z] [agent-switch] op={}", op);
+            assert!(sel(&l).is_none(), "left out: {}", op);
+        }
+        let create =
+            sel("[2026-11-07T09:00:00.000Z] [session-new] op=create provider=claude named=true")
+                .expect("New session kept");
+        assert!(story_kind_wants("switch", &create));
+        assert!(!story_kind_wants("push", &create));
+
+        let set = sel("[2026-11-07T09:00:00.000Z] [agent-switch] op=live-session-set provider=claude session=s1")
+            .unwrap();
+        let start = sel("[2026-11-07T09:00:01.000Z] [agent-switch] op=start provider=codex resume_reason=latest")
+            .unwrap();
+        assert!(story_is_session_set(&set));
+        assert!(!story_is_session_set(&start));
+        let mut c = StoryFileCursor::default();
+        c.lines = vec![set.clone(), start];
+        story_cursor_prune(&mut c, "2026-11-07T10:00:00.000Z");
+        assert_eq!(
+            c.seed.as_ref().map(|s| s.text.as_str()),
+            Some(set.text.as_str()),
+            "a later op=start doesn't displace the session the window opened in"
+        );
+
+        assert!(story_trace_line_triggers(
+            "agent-switch",
+            "op=live-session-set provider=claude session=s2 source=agent-event"
+        ));
+        assert!(story_trace_line_triggers(
+            "agent-switch",
+            "op=launch-timeout provider=claude source=switch waited_ms=45010"
+        ));
+        assert!(!story_trace_line_triggers(
+            "agent-switch",
+            "op=switch provider=codex step=escape"
+        ));
+    }
+}
+
+// Trace and hook-events timestamps share one ISO-8601 UTC form
+// (2026-11-05T05:05:52.296Z), so `since` filters by string comparison.
+fn story_lines<R: tauri::Runtime>(app: &AppHandle<R>, since: &str, kinds: &[String]) -> Vec<u8> {
+    let started = std::time::Instant::now();
+    let read = match bram_trace_log_file(app).and_then(|p| p.parent().map(Path::to_path_buf)) {
+        Some(dir) => story_read_lines(&dir, since),
+        None => StoryRead {
+            lines: Vec::new(),
+            read_bytes: 0,
+            files: 0,
+            archives_read: 0,
+        },
+    };
+    let selected = read.lines.len();
+    let lines: Vec<serde_json::Value> = read
+        .lines
+        .into_iter()
+        .filter(|l| {
+            kinds.is_empty()
+                || story_is_session_set(l)
+                || kinds.iter().any(|k| story_kind_wants(k, l))
+        })
+        .map(|l| {
+            serde_json::json!({
+                "ts": l.ts, "src": l.src, "cat": l.cat, "text": l.text,
+            })
+        })
+        .collect();
+    let drafts = project_resource_path(app, ".bram-queue.json")
+        .and_then(|p| p.parent().map(|s| story_queue_drafts(s, &lines)))
+        .unwrap_or_default();
+    // log-shows-start-commit-push-search: what an entry's expanded detail
+    // needs beside the lines. The session in force before the window's
+    // first live-session-set line is unknown to the tail; when the tail has
+    // no set at all, the current session held for the whole window.
+    let current_session = current_provider(app).and_then(|p| {
+        let sid = live_session_id(app, p)?;
+        Some(serde_json::json!({
+            "provider": session_provider_label(p),
+            "sessionId": sid,
+            "title": session_title_by_id(app, p, &sid).unwrap_or_default(),
+        }))
+    });
+    let mut session_titles = serde_json::Map::new();
+    for l in &lines {
+        if l["cat"] != "agent-switch" {
+            continue;
+        }
+        let text = l["text"].as_str().unwrap_or("");
+        let field = |k: &str| {
+            text.split(' ')
+                .find_map(|kv| kv.strip_prefix(k).and_then(|v| v.strip_prefix('=')))
+                .unwrap_or("")
+        };
+        let (prov, sid) = (field("provider"), field("session"));
+        if sid.is_empty() || session_titles.contains_key(sid) {
+            continue;
+        }
+        let title = SessionProvider::from_str(prov)
+            .and_then(|p| session_title_by_id(app, p, sid))
+            .unwrap_or_default();
+        session_titles.insert(sid.to_string(), serde_json::Value::String(title));
+    }
+    let commit_url_base = git_run(app, &["remote", "get-url", "origin"])
+        .ok()
+        .map(|u| remote_to_html(u.trim()))
+        .filter(|b| !b.is_empty())
+        .map(|b| format!("{}/commit/", b));
+    // The commits on HEAD that no remote has yet: the Log links these to
+    // the Commits tab's local view (/commits?sha=), since the forge would
+    // 404 on them, and every other sha to the forge.
+    let unpushed: Vec<String> = git_run(
+        app,
+        &["rev-list", "HEAD", "--not", "--remotes", "--max-count=500"],
+    )
+    .map(|out| {
+        out.lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    })
+    .unwrap_or_default();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "lines": lines,
+        "queueDrafts": drafts,
+        "currentSession": current_session,
+        "sessionTitles": session_titles,
+        "commitUrlBase": commit_url_base,
+        "unpushedShas": unpushed,
+    }))
+    .unwrap_or_default();
+    // log-reads-across-trace-rotation: what each request cost, so a claim
+    // about the Log's cost is a number (read_bytes is near zero on a
+    // refetch with nothing new).
+    append_bram_trace_line(
+        app,
+        "story",
+        &format!(
+            "op=lines kinds={} selected={} lines={} bytes={} read_bytes={} files={} archives_read={} ms={}",
+            if kinds.is_empty() { "-".to_string() } else { kinds.join(",") },
+            selected,
+            lines.len(),
+            body.len(),
+            read.read_bytes,
+            read.files,
+            read.archives_read,
+            started.elapsed().as_millis()
+        ),
+    );
+    body
+}
+
+// log-shows-start-commit-push-search: the board as it stood at a moment.
+// Each history snapshot holds the board as it was just before the change
+// stamped in its name, so the board at `ts` is the earliest snapshot stamped
+// at or after `ts`, and the live board when no change has happened since.
+fn worklist_board_at<R: tauri::Runtime>(app: &AppHandle<R>, ts: u64) -> serde_json::Value {
+    let items_of = |doc: &serde_json::Value| -> Vec<serde_json::Value> {
+        doc["items"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|it| {
+                        serde_json::json!({
+                            "id": it["id"],
+                            "status": it["status"].as_str().unwrap_or("proposed"),
+                            "begun": it.get("begunAtMs").is_some(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let next = worklist_history_dir(app).and_then(|dir| {
+        std::fs::read_dir(dir)
+            .ok()?
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name();
+                let name = name.to_str()?;
+                let stem = name.strip_suffix(".json")?;
+                let stamp: u64 = stem.parse().ok()?;
+                (stamp >= ts).then_some((stamp, e.path()))
+            })
+            .min_by_key(|(stamp, _)| *stamp)
+    });
+    if let Some((stamp, path)) = next {
+        if let Ok(doc) = std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .ok_or(())
+        {
+            return serde_json::json!({ "ts": stamp, "live": false, "items": items_of(&doc) });
+        }
+    }
+    let live = worklist_file(app)
+        .and_then(|p| std::fs::read(p).ok())
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .unwrap_or_default();
+    serde_json::json!({ "ts": serde_json::Value::Null, "live": true, "items": items_of(&live) })
+}
+
+// The queue's stable ID names its saved draft, even after send/delete removes
+// the entry from the active queue. Message bodies never go in the trace.
+fn queue_draft_path(state: &Path, id: &str) -> Option<PathBuf> {
+    if !id.starts_with("q-")
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+    {
+        return None;
+    }
+    Some(state.join("queue-drafts").join(format!("{}.json", id)))
+}
+
+fn retain_queue_drafts(
+    state: &Path,
+    previous: &serde_json::Value,
+    incoming: &serde_json::Value,
+) -> Result<(), String> {
+    let mut drafts = std::collections::BTreeMap::new();
+    // Preserve legacy saved entries too. The pane's removed entries carry
+    // final edits made inside the debounce window; current entries win last.
+    for entries in [
+        previous["entries"].as_array(),
+        previous["retainedEntries"].as_array(),
+        incoming["retainedEntries"].as_array(),
+        incoming["entries"].as_array(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        for entry in entries {
+            let id = entry["id"].as_str().ok_or("queue entry has no id")?;
+            let path = queue_draft_path(state, id).ok_or("invalid queue draft id")?;
+            drafts.insert(path, entry);
+        }
+    }
+    if drafts.is_empty() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(state.join("queue-drafts")).map_err(|e| e.to_string())?;
+    for (path, entry) in drafts {
+        let text = serde_json::to_string_pretty(entry).map_err(|e| e.to_string())?;
+        atomic_write_text(&path, &format!("{}\n", text))?;
+    }
+    Ok(())
+}
+
+// One queue message by id: `{ "active": true, "entry": … }` while it is
+// queued, `{ "active": false, "entry": … }` from its retained draft, or
+// `{ "missing": true }`. An id that isn't a queue id is missing, never a path.
+fn queue_draft_lookup(state: &Path, id: &str) -> serde_json::Value {
+    let Some(path) = queue_draft_path(state, id) else {
+        return serde_json::json!({ "missing": true });
+    };
+    let active = std::fs::read(state.join(".bram-queue.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|q| {
+            q["entries"]
+                .as_array()
+                .and_then(|es| es.iter().find(|e| e["id"].as_str() == Some(id)).cloned())
+        });
+    if let Some(entry) = active {
+        return serde_json::json!({ "active": true, "entry": entry });
+    }
+    match std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .filter(|e| e["id"].as_str() == Some(id))
+    {
+        Some(entry) => serde_json::json!({ "active": false, "entry": entry }),
+        None => serde_json::json!({ "missing": true }),
+    }
+}
+
+fn story_queue_drafts(
+    state: &Path,
+    lines: &[serde_json::Value],
+) -> serde_json::Map<String, serde_json::Value> {
+    let active = std::fs::read(state.join(".bram-queue.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .unwrap_or_default();
+    let mut drafts = serde_json::Map::new();
+    for line in lines {
+        if line["cat"] != "iframe" {
+            continue;
+        }
+        let text = line["text"].as_str().unwrap_or("");
+        if !text.starts_with("subkind=queue ") {
+            continue;
+        }
+        let event = text
+            .find('{')
+            .and_then(|i| serde_json::from_str::<serde_json::Value>(&text[i..]).ok())
+            .unwrap_or_default();
+        let Some(id) = event["id"].as_str() else {
+            continue;
+        };
+        let Some(path) = queue_draft_path(state, id) else {
+            continue;
+        };
+        if drafts.contains_key(id) {
+            continue;
+        }
+        let saved = std::fs::read(path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .filter(|entry| entry["id"].as_str() == Some(id));
+        // Existing unsent messages predate draft retention until next save.
+        let entry = active["entries"]
+            .as_array()
+            .and_then(|entries| entries.iter().find(|e| e["id"].as_str() == Some(id)))
+            .cloned()
+            .or(saved);
+        if let Some(entry) = entry {
+            drafts.insert(id.to_string(), entry);
+        }
+    }
+    drafts
+}
+
+#[cfg(test)]
+mod queue_draft_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn saved_queue_draft_survives_removal_and_final_debounced_edit() {
+        let state =
+            std::env::temp_dir().join(format!("bram-queue-drafts-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&state).unwrap();
+        let original = json!({"entries":[{"id":"q-one", "text":"Before sending.", "sendMode":"iterate", "targetItemId":"item-one", "images":["/tmp/image.png"]}], "version":12});
+        let line =
+            json!({"cat":"iframe", "text":"subkind=queue {\"op\":\"add\",\"id\":\"q-one\"}"});
+        std::fs::write(state.join(".bram-queue.json"), original.to_string()).unwrap();
+        assert_eq!(
+            story_queue_drafts(&state, &[line.clone()])["q-one"],
+            original["entries"][0]
+        );
+        // An old pane sends no retainedEntries; its previously saved message
+        // must still be retained when that pane removes it from the queue.
+        let empty = json!({"entries":[], "version":13});
+        retain_queue_drafts(&state, &original, &empty).unwrap();
+        std::fs::write(state.join(".bram-queue.json"), empty.to_string()).unwrap();
+        assert_eq!(
+            story_queue_drafts(&state, &[line.clone()])["q-one"],
+            original["entries"][0]
+        );
+        // The new pane includes the final edit even if the active queue save
+        // was debounced away by Send/Delete. Preserve routing and images too.
+        let mut final_entry = original["entries"][0].clone();
+        final_entry["text"] = json!("Final edit. More detail.");
+        let removal = json!({"entries":[], "retainedEntries":[final_entry]});
+        retain_queue_drafts(&state, &original, &removal).unwrap();
+        assert_eq!(
+            story_queue_drafts(&state, &[line.clone()])["q-one"],
+            removal["retainedEntries"][0]
+        );
+        retain_queue_drafts(&state, &empty, &empty).unwrap();
+        assert_eq!(
+            story_queue_drafts(&state, &[line])["q-one"]["text"],
+            "Final edit. More detail."
+        );
+        assert!(story_queue_drafts(&state, &[]).is_empty());
+        // The Open in Queue lookup: retained draft once removed, missing for
+        // unknown or path-shaped ids, never a recreated entry.
+        assert_eq!(
+            queue_draft_lookup(&state, "q-one"),
+            json!({"active": false, "entry": removal["retainedEntries"][0]})
+        );
+        assert_eq!(
+            queue_draft_lookup(&state, "q-none"),
+            json!({"missing": true})
+        );
+        assert_eq!(queue_draft_lookup(&state, "../x"), json!({"missing": true}));
+        std::fs::write(state.join(".bram-queue.json"), original.to_string()).unwrap();
+        assert_eq!(queue_draft_lookup(&state, "q-one")["active"], json!(true));
+        std::fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn queue_draft_upgrade_retains_old_hosts_extra_payload_and_rejects_paths() {
+        let state =
+            std::env::temp_dir().join(format!("bram-queue-upgrade-{}", uuid::Uuid::new_v4()));
+        let old_host = json!({"entries":[], "retainedEntries":[{"id":"q-removed", "text":"Saved by an older host."}]});
+        retain_queue_drafts(&state, &old_host, &json!({"entries":[]})).unwrap();
+        assert!(queue_draft_path(&state, "q-removed").unwrap().is_file());
+        for bad in [
+            "../outside",
+            "q-../../outside",
+            "q-foo/bar",
+            "q-foo\\bar",
+            "",
+            "q-☃",
+        ] {
+            assert!(queue_draft_path(&state, bad).is_none());
+            assert!(
+                retain_queue_drafts(&state, &json!({}), &json!({"entries":[{"id":bad}]})).is_err()
+            );
+        }
+        std::fs::remove_dir_all(state).unwrap();
+    }
+}
+
+// `rel` is repo-relative under `root`.
+fn is_bram_trace_archive_rel(root: &Path, rel: &str) -> bool {
+    bram_state_rel_strip(root, rel)
+        .map(|r| r.starts_with("bram-traces/bram-trace-"))
+        .unwrap_or(false)
         && (rel.ends_with(".log") || rel.ends_with(".log.gz"))
+}
+
+// `rel` is repo-relative under `root`: the live trace log.
+fn is_bram_trace_live_rel(root: &Path, rel: &str) -> bool {
+    bram_state_rel_strip(root, rel) == Some("bram-traces/bram-trace.log")
 }
 
 fn bram_trace_date_stamp_local() -> String {
@@ -2992,6 +4092,10 @@ fn append_bram_trace_line<R: tauri::Runtime>(app: &AppHandle<R>, category: &str,
             body
         );
     }
+    drop(guard);
+    if story_trace_line_triggers(category, body) {
+        story_changed_soon(app);
+    }
 }
 
 const BRAM_REDACTED: &str = "[REDACTED]";
@@ -3382,14 +4486,23 @@ mod secret_observability_tests {
 
     #[test]
     fn raw_and_gzip_trace_archives_are_ignored_by_project_watchers() {
+        let root = std::path::Path::new("/nonexistent-bram-469-root");
+        let rel = |r: &str| super::bram_state_rel(root, r);
         assert!(is_bram_trace_archive_rel(
-            "resources/bram-traces/bram-trace-2026-01-01.log"
+            root,
+            &rel("bram-traces/bram-trace-2026-01-01.log")
         ));
         assert!(is_bram_trace_archive_rel(
-            "resources/bram-traces/bram-trace-2026-01-01.log.gz"
+            root,
+            &rel("bram-traces/bram-trace-2026-01-01.log.gz")
         ));
         assert!(!is_bram_trace_archive_rel(
-            "resources/bram-traces/bram-trace.log"
+            root,
+            &rel("bram-traces/bram-trace.log")
+        ));
+        assert!(super::is_bram_trace_live_rel(
+            root,
+            &rel("bram-traces/bram-trace.log")
         ));
     }
 
@@ -3896,19 +5009,7 @@ fn pty_tail_snippet_or_drained(max_chars: usize) -> String {
         Ok(g) => g.clone(),
         Err(e) => e.into_inner().clone(),
     };
-    let stripped = strip_ansi(&raw);
-    let text = String::from_utf8_lossy(&stripped);
-    let collapsed = text
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .replace('"', "'");
-    let n = collapsed.chars().count();
-    if n <= max_chars {
-        collapsed
-    } else {
-        collapsed.chars().skip(n - max_chars).collect()
-    }
+    collapse_tail(&raw, max_chars)
 }
 
 fn pty_tail_snippet(max_chars: usize) -> String {
@@ -3916,7 +5017,11 @@ fn pty_tail_snippet(max_chars: usize) -> String {
         Ok(g) => g.clone(),
         Err(e) => e.into_inner().clone(),
     };
-    let stripped = strip_ansi(&raw);
+    collapse_tail(&raw, max_chars)
+}
+
+fn collapse_tail(raw: &[u8], max_chars: usize) -> String {
+    let stripped = strip_ansi(raw);
     let text = String::from_utf8_lossy(&stripped);
     let collapsed = text
         .split_whitespace()
@@ -3982,12 +5087,14 @@ fn emit_talk_session_changed_for_provider<R: tauri::Runtime>(
         // the one Bram resumed or its events named, not the newest export;
         // otherwise this path re-marks the newest export current.
         let ordinary_latest = if provider == SessionProvider::Opencode {
-            opencode_live_session_cell()
+            match opencode_live_session_cell()
                 .lock()
                 .ok()
                 .and_then(|g| g.clone())
-                .and_then(|id| opencode_session_path_for_id(app, &id))
-                .or(ordinary_latest)
+            {
+                Some(id) => opencode_session_path_for_id(app, &id),
+                None => ordinary_latest,
+            }
         } else {
             ordinary_latest
         };
@@ -4005,21 +5112,36 @@ fn emit_talk_session_changed_for_provider<R: tauri::Runtime>(
         let pending_handoff = pending_latest.is_some();
         let latest_path = pending_latest.or(ordinary_latest);
         let (sid, len) = session_change_snapshot(provider, latest_path.as_deref());
-        // Bram-level last-active state advances only with the foreground
-        // provider. Watchers also emit for inactive-provider files, so writing
-        // every observed session here would redefine "last active" as merely
-        // "last file touched" and revive the original conflation.
-        // delete-live-session-leaves-stub: with the shell at its prompt no
-        // agent is running, so this write is an exiting or failed CLI (at
-        // 2026-10-27 20:49:39 a resume that hit "No conversation found"),
-        // not the session the user is in. Don't make it the one to resume.
-        let sf = shell_foreground();
-        if current_provider(app) == Some(provider) && !(sf.seen && sf.at_prompt) {
+        // last-active-only-from-bram-evidence: this path no longer writes the
+        // last-active record. The newest session file can't say whose it is:
+        // on 2026-11-07 a Claude session started outside Bram's terminal
+        // (20:16) became the newest file, the next launch's startup seed
+        // recorded it here (20:21:32.797) and autostart resumed it. The record
+        // now advances only on evidence the session is Bram's: a resume,
+        // switch or New session Bram ran (resync, OpenCode and Antigravity
+        // resumes) and the token-checked /__agent/session report from the agent
+        // in Bram's terminal (Claude, Codex, Antigravity), which also covers an
+        // id change such as Claude's /clear. What this inference would have
+        // written is traced, so a case only it covered shows up here rather
+        // than as a wrong resume.
+        if current_provider(app) == Some(provider) && bram_trace_enabled() {
             if let Some(session_id) = latest_path
                 .as_deref()
                 .and_then(|path| session_id_for_path(provider, path))
             {
-                remember_last_active_session(app, provider, &session_id);
+                let recorded = read_last_active_session(app).map(|r| r.session_id);
+                if recorded.as_deref() != Some(session_id.as_str()) {
+                    append_bram_trace_line(
+                        app,
+                        "agent-switch",
+                        &format!(
+                            "op=remember-last-active-skipped reason=inferred provider={} session={} recorded={}",
+                            session_provider_label(provider),
+                            session_id,
+                            recorded.as_deref().unwrap_or("")
+                        ),
+                    );
+                }
             }
         }
         merge_json_object_fields(
@@ -5676,6 +6798,10 @@ struct RevealFloorInputs {
     identity: String,
     authoritative_open: bool,
     menu_displayed: bool,
+    // terminal-attention-suppresses-silence: Bram already told the user why
+    // the terminal is quiet. An Antigravity permission prompt is read from the
+    // screen and puts up no menu, so menu_displayed doesn't cover it.
+    terminal_attention_open: bool,
     post_escape: bool,
     cancelled: bool,
     bytes: usize,
@@ -5788,6 +6914,8 @@ impl RevealFloorTracker {
         self.silent_ms += REVEAL_FLOOR_TICK_MS;
         let suppression = if input.menu_displayed {
             Some("menu-displayed")
+        } else if input.terminal_attention_open {
+            Some("terminal-attention")
         } else if input.cancelled {
             Some("cancelled-turn")
         } else if input.post_escape {
@@ -5904,11 +7032,73 @@ mod reveal_floor_tests {
             identity: format!("codex:{identity}"),
             authoritative_open: true,
             menu_displayed: false,
+            terminal_attention_open: false,
             post_escape: false,
             cancelled: false,
             bytes,
             now_ms,
         }
+    }
+
+    // terminal-attention-suppresses-silence, 2026-11-02 18:15: an Antigravity
+    // permission prompt raised both banners.
+    #[test]
+    fn an_open_attention_prompt_holds_the_silence_warning() {
+        let mut tracker = RevealFloorTracker::new();
+        tracker.step(&input("1", 9, 1_000));
+        let mut held = input("1", 0, 2_000);
+        held.terminal_attention_open = true;
+        let mut seen = Vec::new();
+        for i in 0..40 {
+            held.now_ms = 2_000 + i * REVEAL_FLOOR_TICK_MS;
+            seen.extend(tracker.step(&held));
+        }
+        assert!(!seen.contains(&RevealFloorTransition::Warn), "{seen:?}");
+        assert!(seen.contains(&RevealFloorTransition::Suppressed("terminal-attention")));
+    }
+
+    #[test]
+    fn an_attention_prompt_clears_a_warning_already_up() {
+        let mut tracker = RevealFloorTracker::new();
+        tracker.step(&input("1", 9, 1_000));
+        let mut seen = Vec::new();
+        for i in 0..40 {
+            seen.extend(tracker.step(&input("1", 0, 2_000 + i * REVEAL_FLOOR_TICK_MS)));
+        }
+        assert!(seen.contains(&RevealFloorTransition::Warn));
+        let mut held = input("1", 0, 20_000);
+        held.terminal_attention_open = true;
+        assert_eq!(
+            tracker.step(&held),
+            vec![
+                RevealFloorTransition::Cleared {
+                    reason: "terminal-attention",
+                    was_warned: true
+                },
+                RevealFloorTransition::Suppressed("terminal-attention"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_real_silence_after_the_prompt_is_answered_still_warns() {
+        let mut tracker = RevealFloorTracker::new();
+        tracker.step(&input("1", 9, 1_000));
+        let mut held = input("1", 0, 2_000);
+        held.terminal_attention_open = true;
+        for i in 0..40 {
+            held.now_ms = 2_000 + i * REVEAL_FLOOR_TICK_MS;
+            tracker.step(&held);
+        }
+        // Answering it draws to the terminal. The wait counts as a gap, so the
+        // threshold has grown.
+        tracker.step(&input("1", 9, 30_000));
+        let ticks = tracker.threshold_ms() / REVEAL_FLOOR_TICK_MS + 2;
+        let mut seen = Vec::new();
+        for i in 0..ticks {
+            seen.extend(tracker.step(&input("1", 0, 31_000 + i * REVEAL_FLOOR_TICK_MS)));
+        }
+        assert!(seen.contains(&RevealFloorTransition::Warn), "{seen:?}");
     }
 
     fn quiet(
@@ -6162,6 +7352,25 @@ fn terminal_attention_prompt_shape(stripped_tail: &str) -> Option<&'static str> 
     const CLAUDE_LOGIN_WINDOW: usize = 60;
     const CODEX_LOGIN_MARKERS: &[&str] = &["sign in with chatgpt", "provide your own api key"];
     const CODEX_LOGIN_FOOTER: &str = "press enter to continue";
+    // Antigravity CLI 1.4.12, captured in docs/agent-specimens/antigravity.
+    // The login chooser has its own footer. Trust/resume and approval screens
+    // need their captured menu footer to be almost the last thing drawn: in
+    // every capture only the "esc to cancel" hint and agy's model line follow
+    // it (19 to 55 squashed chars, the model line 19 of them). The model line
+    // ("Gemini 3.8 Flash · high") is the user's model and thinking level, so
+    // it is not matched (antigravity-login-and-startup-choice review). A reply
+    // quoting a dialog is followed by agy's composer, two full-width rules
+    // and "? for shortcuts", which puts the quoted footer past the bound.
+    const AGY_LOGIN_MARKER: &str = "you are currently not signed in";
+    const AGY_LOGIN_FOOTER: &str = "↑/↓ navigate · enter select";
+    const AGY_TRUST_MARKER: &str = "do you trust the contents of this project?";
+    const AGY_TRUST_FOOTER: &str = "↑/↓ navigate · enter confirm";
+    const AGY_RESUME_MARKERS: &[&str] = &["conversations", "type to search conversations"];
+    const AGY_RESUME_FOOTER: &str = "f2 rename f4 delete tab switch tab esc go back / clear search";
+    const AGY_PERMISSION_FOOTER: &str = "↑/↓ navigate · tab amend";
+    // Squashed chars allowed after a dialog footer: the captures' 36 of fixed
+    // hints plus room for a model line up to 64 chars.
+    const AGY_AFTER_FOOTER_MAX: usize = 100;
     // v080-codex-session-lock: resuming a session that another Codex process
     // (an old shared server) still owns draws "This conversation is open in
     // another app … r retry f fork esc/ctrl+c/q exit". Its keys are bare
@@ -6278,6 +7487,27 @@ fn terminal_attention_prompt_shape(stripped_tail: &str) -> Option<&'static str> 
     if CODEX_LOGIN_MARKERS.iter().any(|m| has(m)) && ends_with_footer(CODEX_LOGIN_FOOTER) {
         return Some("codex-login");
     }
+    if has(AGY_LOGIN_MARKER) && ends_with_footer(AGY_LOGIN_FOOTER) {
+        return Some("antigravity-login");
+    }
+    let agy_footer_last = |marker: &str| {
+        let m = squash(marker);
+        tail.rfind(&m)
+            .is_some_and(|i| tail[i + m.len()..].chars().count() <= AGY_AFTER_FOOTER_MAX)
+    };
+    if has(AGY_TRUST_MARKER) && agy_footer_last(AGY_TRUST_FOOTER) {
+        return Some("antigravity-folder-trust");
+    }
+    if AGY_RESUME_MARKERS.iter().all(|m| has(m)) && agy_footer_last(AGY_RESUME_FOOTER) {
+        return Some("antigravity-resume-picker");
+    }
+    // agy-permission-menu-parser: the footer alone, last on the screen. Its
+    // title and first option can scroll off a dialog taller than the screen
+    // (the 46x12 specimen), so neither can be required, and the footer belongs
+    // to this dialog alone.
+    if agy_footer_last(AGY_PERMISSION_FOOTER) {
+        return Some("antigravity-permission");
+    }
     if CODEX_SESSION_LOCK_MARKERS.iter().any(|m| has(m))
         && ends_with_footer(CODEX_SESSION_LOCK_FOOTER)
     {
@@ -6328,6 +7558,7 @@ struct TerminalAttentionTracker {
     silent_ms: i64,
     active: bool,
     shape: Option<&'static str>,
+    permission_blocked_active: bool,
     // Guards both the Fire and the observe-only Candidate paths to at most
     // one evaluation per continuous silence episode. Byte-silence means the
     // tail can't have changed since the last evaluation, so re-checking
@@ -6343,6 +7574,7 @@ impl TerminalAttentionTracker {
             silent_ms: 0,
             active: false,
             shape: None,
+            permission_blocked_active: false,
             episode_evaluated: false,
         }
     }
@@ -6365,6 +7597,7 @@ impl TerminalAttentionTracker {
         self.step_with_permission_block(authoritative_open, bytes, false, tail_fn)
     }
 
+    #[cfg(test)]
     fn step_with_permission_block<F: FnOnce() -> (String, Option<SessionProvider>)>(
         &mut self,
         authoritative_open: bool,
@@ -6372,26 +7605,58 @@ impl TerminalAttentionTracker {
         permission_blocked: bool,
         tail_fn: F,
     ) -> Vec<TerminalAttentionTransition> {
+        self.step_with_permission_block_shape(
+            authoritative_open,
+            false,
+            bytes,
+            permission_blocked.then_some("codex-permission"),
+            tail_fn,
+        )
+    }
+
+    fn step_with_permission_block_shape<F: FnOnce() -> (String, Option<SessionProvider>)>(
+        &mut self,
+        authoritative_open: bool,
+        menu_displayed: bool,
+        bytes: usize,
+        permission_block: Option<&'static str>,
+        tail_fn: F,
+    ) -> Vec<TerminalAttentionTransition> {
         let mut out = Vec::new();
 
-        if self.active && self.shape == Some("codex-permission") && !permission_blocked {
-            out.push(TerminalAttentionTransition::Clear {
-                reason: "permission-unblocked",
-            });
-            self.active = false;
-            self.shape = None;
-            self.episode_evaluated = false;
+        if self.permission_blocked_active && permission_block.is_none() {
+            self.permission_blocked_active = false;
+            if self.active {
+                out.push(TerminalAttentionTransition::Clear {
+                    reason: "permission-unblocked",
+                });
+                self.active = false;
+                self.shape = None;
+                self.episode_evaluated = false;
+            }
         }
 
         // Unlike a guessed boot prompt, the CLI explicitly reports this
         // block. Reveal it immediately, even during an open turn/redraw.
-        if permission_blocked {
-            if !self.active || self.shape != Some("codex-permission") {
+        if let Some(block_shape) = permission_block {
+            self.permission_blocked_active = true;
+            if !self.active || self.shape != Some(block_shape) {
                 self.active = true;
-                self.shape = Some("codex-permission");
-                out.push(TerminalAttentionTransition::Fire {
-                    shape: "codex-permission",
+                self.shape = Some(block_shape);
+                out.push(TerminalAttentionTransition::Fire { shape: block_shape });
+            }
+            return out;
+        }
+
+        if menu_displayed {
+            self.silent_ms = 0;
+            self.episode_evaluated = false;
+            if self.active {
+                out.push(TerminalAttentionTransition::Clear {
+                    reason: "menu-displayed",
                 });
+                self.active = false;
+                self.shape = None;
             }
             return out;
         }
@@ -6498,6 +7763,58 @@ mod terminal_attention_permission_tests {
                 .is_empty());
         }
     }
+
+    #[test]
+    fn displayed_menu_suppresses_antigravity_silence_fire_and_clears_active_banner() {
+        let approval = include_str!("../../docs/agent-specimens/antigravity/approval.txt");
+        assert_eq!(
+            prompt_shape_for_provider(approval, Some(SessionProvider::Antigravity)),
+            Some("antigravity-permission")
+        );
+
+        let silent_ticks = (TERMINAL_ATTENTION_SILENT_MS / REVEAL_FLOOR_TICK_MS) + 5;
+
+        let mut suppressed = TerminalAttentionTracker::new();
+        for _ in 0..silent_ticks {
+            assert!(suppressed
+                .step_with_permission_block_shape(false, true, 0, None, || (
+                    approval.to_string(),
+                    Some(SessionProvider::Antigravity),
+                ))
+                .is_empty());
+        }
+        assert!(!suppressed.active);
+        assert_eq!(suppressed.silent_ms, 0);
+
+        let mut tracker = TerminalAttentionTracker::new();
+        let mut fired = Vec::new();
+        for _ in 0..silent_ticks {
+            fired.extend(
+                tracker.step_with_permission_block_shape(false, false, 0, None, || {
+                    (approval.to_string(), Some(SessionProvider::Antigravity))
+                }),
+            );
+        }
+        assert_eq!(
+            fired,
+            vec![TerminalAttentionTransition::Fire {
+                shape: "antigravity-permission",
+            }]
+        );
+        assert!(tracker.active);
+
+        assert_eq!(
+            tracker.step_with_permission_block_shape(false, true, 0, None, || {
+                panic!("menu-displayed clear must not inspect tail")
+            }),
+            vec![TerminalAttentionTransition::Clear {
+                reason: "menu-displayed",
+            }]
+        );
+        assert!(!tracker.active);
+        assert_eq!(tracker.shape, None);
+        assert_eq!(tracker.silent_ms, 0);
+    }
 }
 
 fn trace_terminal_attention_transition<R: tauri::Runtime>(
@@ -6574,36 +7891,38 @@ fn emit_terminal_attention<R: tauri::Runtime>(
     );
 }
 
-// Three agents, one slot order: Claude, Codex, OpenCode. Index into every
+// Four agents, one slot order: Claude, Codex, OpenCode, Antigravity. Index into every
 // per-agent flag array here, so the picker, the login offer and their tests
 // can't drift apart. issue-448's picker and terminal-attention-login-screen's
 // offer were written for two agents; catch-up-with-main-after-v0.7.8 widened
 // both.
-const STARTUP_AGENTS: [SessionProvider; 3] = [
+const STARTUP_AGENTS: [SessionProvider; 4] = [
     SessionProvider::Claude,
     SessionProvider::Codex,
     SessionProvider::Opencode,
+    SessionProvider::Antigravity,
 ];
 
 // The login offer's preference order when no installed agent has sessions in
 // this project: Codex, Claude, OpenCode. Codex first keeps the two-agent
 // behaviour — a logged-out Claude was always traded for Codex.
-const LOGIN_SWITCH_ORDER: [SessionProvider; 3] = [
+const LOGIN_SWITCH_ORDER: [SessionProvider; 4] = [
     SessionProvider::Codex,
     SessionProvider::Claude,
     SessionProvider::Opencode,
+    SessionProvider::Antigravity,
 ];
 
-fn provider_slot(provider: SessionProvider) -> usize {
-    match provider {
-        SessionProvider::Claude => 0,
-        SessionProvider::Codex => 1,
-        SessionProvider::Opencode => 2,
-    }
+// The provider's slot in the fixed-size STARTUP_AGENTS arrays (`installed`,
+// `has_sessions`). Derived from the list rather than hand-numbered, so a
+// provider that isn't in it has no slot; Antigravity is explicitly the final
+// slot so the established three-agent order remains intact.
+fn provider_slot(provider: SessionProvider) -> Option<usize> {
+    STARTUP_AGENTS.iter().position(|p| *p == provider)
 }
 
-fn installed_agent_flags() -> [bool; 3] {
-    STARTUP_AGENTS.map(|provider| agent_cli_on_path(session_provider_label(provider)))
+fn installed_agent_flags() -> [bool; 4] {
+    STARTUP_AGENTS.map(|provider| agent_cli_on_path(provider_cli_name(provider)))
 }
 
 fn installed_agent_labels() -> Vec<&'static str> {
@@ -6611,7 +7930,7 @@ fn installed_agent_labels() -> Vec<&'static str> {
     STARTUP_AGENTS
         .iter()
         .copied()
-        .filter(|provider| installed[provider_slot(*provider)])
+        .filter(|provider| provider_slot(*provider).is_some_and(|slot| installed[slot]))
         .map(session_provider_label)
         .collect()
 }
@@ -6623,15 +7942,29 @@ fn provider_has_sessions<R: tauri::Runtime>(app: &AppHandle<R>, provider: Sessio
         .is_some()
 }
 
-fn session_flags<R: tauri::Runtime>(app: &AppHandle<R>) -> [bool; 3] {
+fn session_flags<R: tauri::Runtime>(app: &AppHandle<R>) -> [bool; 4] {
     STARTUP_AGENTS.map(|provider| provider_has_sessions(app, provider))
 }
 
+// login-fallback-offers-the-agent-you-left: the provider that was current
+// before the latest deliberate switch. set_current_provider writes it whenever
+// the current-provider record changes, so it survives only within this
+// process; None until the first real switch (or a launch whose provider
+// differs from the last run's record).
+fn previous_provider_cell() -> &'static Mutex<Option<SessionProvider>> {
+    static CELL: OnceLock<Mutex<Option<SessionProvider>>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+fn previous_provider() -> Option<SessionProvider> {
+    previous_provider_cell().lock().ok().and_then(|g| *g)
+}
+
 // terminal-attention-login-screen (#448): the pane offers one other agent, but
-// only when its CLI is on PATH. With three agents "the other one" isn't
-// defined, so the offer is the installed agent with sessions in this project,
-// else the first installed one in LOGIN_SWITCH_ORDER — never the agent that
-// isn't logged in.
+// only when its CLI is on PATH. The offer is the agent the user just left
+// (login-fallback-offers-the-agent-you-left), else the installed agent with
+// sessions in this project, else the first installed one in
+// LOGIN_SWITCH_ORDER — never the agent that isn't logged in.
 fn login_switch_target<R: tauri::Runtime>(
     app: &AppHandle<R>,
     shape: Option<&str>,
@@ -6639,40 +7972,161 @@ fn login_switch_target<R: tauri::Runtime>(
     let blocked = match shape {
         Some("claude-login") => SessionProvider::Claude,
         Some("codex-login") => SessionProvider::Codex,
+        Some("antigravity-login") => SessionProvider::Antigravity,
         _ => return None,
     };
-    login_switch_choice(blocked, installed_agent_flags(), session_flags(app))
-        .map(session_provider_label)
+    let previous = previous_provider();
+    let choice = login_switch_choice(
+        blocked,
+        installed_agent_flags(),
+        session_flags(app),
+        previous,
+    );
+    if bram_trace_enabled() {
+        let (offer, basis) = match choice {
+            Some((provider, basis)) => (session_provider_label(provider), basis),
+            None => ("none", "none"),
+        };
+        append_bram_trace_line(
+            app,
+            "terminal-attention",
+            &format!(
+                "op=switch-offer blocked={} offer={} basis={} previous={}",
+                session_provider_label(blocked),
+                offer,
+                basis,
+                previous.map(session_provider_label).unwrap_or("none")
+            ),
+        );
+    }
+    choice.map(|(provider, _)| session_provider_label(provider))
 }
 
-// The pure half, so the three-agent rule is testable without an AppHandle.
+// The pure half, so the four-agent rule is testable without an AppHandle.
+// Returns the offer and its basis: "previous" (the agent the user left),
+// "sessions" (has sessions in this project) or "order" (LOGIN_SWITCH_ORDER).
 fn login_switch_choice(
     blocked: SessionProvider,
-    installed: [bool; 3],
-    has_sessions: [bool; 3],
-) -> Option<SessionProvider> {
-    let eligible =
-        |provider: SessionProvider| provider != blocked && installed[provider_slot(provider)];
+    installed: [bool; 4],
+    has_sessions: [bool; 4],
+    previous: Option<SessionProvider>,
+) -> Option<(SessionProvider, &'static str)> {
+    let eligible = |provider: SessionProvider| {
+        provider != blocked && provider_slot(provider).is_some_and(|slot| installed[slot])
+    };
+    if let Some(provider) = previous.filter(|p| eligible(*p)) {
+        return Some((provider, "previous"));
+    }
     LOGIN_SWITCH_ORDER
         .iter()
         .copied()
         .filter(|provider| eligible(*provider))
-        .find(|provider| has_sessions[provider_slot(*provider)])
+        .find(|provider| provider_slot(*provider).is_some_and(|slot| has_sessions[slot]))
+        .map(|provider| (provider, "sessions"))
         .or_else(|| {
             LOGIN_SWITCH_ORDER
                 .iter()
                 .copied()
                 .find(|provider| eligible(*provider))
+                .map(|provider| (provider, "order"))
         })
 }
 
 #[cfg(test)]
 mod login_switch_offer_tests {
-    use super::{login_switch_choice, SessionProvider};
+    use super::SessionProvider;
 
-    // Slots: Claude, Codex, OpenCode.
-    const ALL_INSTALLED: [bool; 3] = [true, true, true];
-    const NO_SESSIONS: [bool; 3] = [false, false, false];
+    // Slots: Claude, Codex, OpenCode, Antigravity.
+    const ALL_INSTALLED: [bool; 4] = [true, true, true, true];
+    const NO_SESSIONS: [bool; 4] = [false, false, false, false];
+
+    // The pre-existing cases: no agent was left (startup straight into a
+    // login screen), so the order and session rules decide as before.
+    fn login_switch_choice(
+        blocked: SessionProvider,
+        installed: [bool; 4],
+        has_sessions: [bool; 4],
+    ) -> Option<SessionProvider> {
+        with_previous(blocked, installed, has_sessions, None).map(|(p, _)| p)
+    }
+
+    fn with_previous(
+        blocked: SessionProvider,
+        installed: [bool; 4],
+        has_sessions: [bool; 4],
+        previous: Option<SessionProvider>,
+    ) -> Option<(SessionProvider, &'static str)> {
+        super::login_switch_choice(blocked, installed, has_sessions, previous)
+    }
+
+    #[test]
+    fn the_agent_you_left_is_offered_over_the_fixed_order() {
+        // Windows 2026-11-02: Claude -> new Antigravity session, agy asks to
+        // sign in; Codex is installed and has sessions here, but Claude is
+        // the agent the user just left.
+        assert_eq!(
+            with_previous(
+                SessionProvider::Antigravity,
+                ALL_INSTALLED,
+                [true, true, false, false],
+                Some(SessionProvider::Claude)
+            ),
+            Some((SessionProvider::Claude, "previous"))
+        );
+    }
+
+    #[test]
+    fn a_previous_agent_that_is_the_blocked_one_falls_back_to_the_order() {
+        assert_eq!(
+            with_previous(
+                SessionProvider::Antigravity,
+                ALL_INSTALLED,
+                NO_SESSIONS,
+                Some(SessionProvider::Antigravity)
+            ),
+            Some((SessionProvider::Codex, "order"))
+        );
+        // With sessions, the session rule still applies.
+        assert_eq!(
+            with_previous(
+                SessionProvider::Antigravity,
+                ALL_INSTALLED,
+                [false, true, false, false],
+                Some(SessionProvider::Antigravity)
+            ),
+            Some((SessionProvider::Codex, "sessions"))
+        );
+    }
+
+    #[test]
+    fn a_previous_agent_that_is_not_installed_falls_back_to_the_order() {
+        assert_eq!(
+            with_previous(
+                SessionProvider::Antigravity,
+                [false, true, true, true],
+                NO_SESSIONS,
+                Some(SessionProvider::Claude)
+            ),
+            Some((SessionProvider::Codex, "order"))
+        );
+    }
+
+    #[test]
+    fn no_previous_agent_keeps_the_existing_order() {
+        assert_eq!(
+            with_previous(
+                SessionProvider::Antigravity,
+                ALL_INSTALLED,
+                [true, true, false, false],
+                None
+            ),
+            Some((SessionProvider::Codex, "sessions"))
+        );
+        assert_eq!(
+            with_previous(SessionProvider::Claude, ALL_INSTALLED, NO_SESSIONS, None),
+            Some((SessionProvider::Codex, "order"))
+        );
+    }
 
     #[test]
     fn a_logged_out_claude_is_traded_for_codex_as_before() {
@@ -6687,14 +8141,38 @@ mod login_switch_offer_tests {
     }
 
     #[test]
+    fn antigravity_is_eligible_last_in_the_fallback_order() {
+        assert_eq!(
+            login_switch_choice(
+                SessionProvider::Claude,
+                [false, false, false, true],
+                NO_SESSIONS
+            ),
+            Some(SessionProvider::Antigravity)
+        );
+        assert_eq!(
+            login_switch_choice(SessionProvider::Antigravity, ALL_INSTALLED, NO_SESSIONS),
+            Some(SessionProvider::Codex)
+        );
+    }
+
+    #[test]
     fn opencode_is_offered_when_it_is_the_installed_alternative() {
         // The only other CLI on this machine.
         assert_eq!(
-            login_switch_choice(SessionProvider::Claude, [true, false, true], NO_SESSIONS),
+            login_switch_choice(
+                SessionProvider::Claude,
+                [true, false, true, false],
+                NO_SESSIONS
+            ),
             Some(SessionProvider::Opencode)
         );
         assert_eq!(
-            login_switch_choice(SessionProvider::Codex, [false, true, true], NO_SESSIONS),
+            login_switch_choice(
+                SessionProvider::Codex,
+                [false, true, true, false],
+                NO_SESSIONS
+            ),
             Some(SessionProvider::Opencode)
         );
     }
@@ -6704,7 +8182,11 @@ mod login_switch_offer_tests {
         // Codex is installed, but this project has only ever run OpenCode:
         // offer the agent that already has context here.
         assert_eq!(
-            login_switch_choice(SessionProvider::Claude, ALL_INSTALLED, [false, false, true]),
+            login_switch_choice(
+                SessionProvider::Claude,
+                ALL_INSTALLED,
+                [false, false, true, false]
+            ),
             Some(SessionProvider::Opencode)
         );
     }
@@ -6713,11 +8195,19 @@ mod login_switch_offer_tests {
     fn the_logged_out_agent_is_never_offered() {
         // Codex has sessions here, but Codex is the one that isn't logged in.
         assert_eq!(
-            login_switch_choice(SessionProvider::Codex, ALL_INSTALLED, [false, true, false]),
+            login_switch_choice(
+                SessionProvider::Codex,
+                ALL_INSTALLED,
+                [false, true, false, false]
+            ),
             Some(SessionProvider::Claude)
         );
         assert_eq!(
-            login_switch_choice(SessionProvider::Claude, ALL_INSTALLED, [true, false, false]),
+            login_switch_choice(
+                SessionProvider::Claude,
+                ALL_INSTALLED,
+                [true, false, false, false]
+            ),
             Some(SessionProvider::Codex)
         );
     }
@@ -6725,15 +8215,19 @@ mod login_switch_offer_tests {
     #[test]
     fn no_installed_alternative_offers_nothing() {
         assert_eq!(
-            login_switch_choice(SessionProvider::Claude, [true, false, false], NO_SESSIONS),
+            login_switch_choice(
+                SessionProvider::Claude,
+                [true, false, false, false],
+                NO_SESSIONS
+            ),
             None
         );
         // Sessions of an uninstalled agent don't make it offerable.
         assert_eq!(
             login_switch_choice(
                 SessionProvider::Claude,
-                [true, false, false],
-                [false, false, true]
+                [true, false, false, false],
+                [false, false, true, false]
             ),
             None
         );
@@ -6759,6 +8253,8 @@ mod terminal_attention_login_tests {
         Business, and Enterprise plans 2. Sign in with Device Code Sign in from another \
         device with a one-time code 3. Provide your own API key Pay for what you use \
         Press enter to continue";
+    const AGY_LOGGED_OUT: &str =
+        include_str!("../../docs/agent-specimens/antigravity/logged-out.txt");
 
     #[test]
     fn specimens_classify() {
@@ -6769,6 +8265,10 @@ mod terminal_attention_login_tests {
         assert_eq!(
             terminal_attention_prompt_shape(CODEX_SIGN_IN),
             Some("codex-login")
+        );
+        assert_eq!(
+            terminal_attention_prompt_shape(AGY_LOGGED_OUT),
+            Some("antigravity-login")
         );
     }
 
@@ -6784,6 +8284,10 @@ mod terminal_attention_login_tests {
         let codex_quoting = "Codex says Sign in with ChatGPT then Press enter to continue. \
             › Ask Codex to do anything ? for shortcuts";
         assert_eq!(terminal_attention_prompt_shape(codex_quoting), None);
+        let agy_quoting = format!(
+            "Antigravity may show this login screen: {AGY_LOGGED_OUT}\n────────────────────────\n> composer text"
+        );
+        assert_eq!(terminal_attention_prompt_shape(&agy_quoting), None);
     }
 
     #[test]
@@ -6799,6 +8303,14 @@ mod terminal_attention_login_tests {
         // Codex's screen counts only while Codex is the live agent.
         assert_eq!(
             pane_input_blocking_prompt(CODEX_SIGN_IN, Some(SessionProvider::Claude)),
+            None
+        );
+        assert_eq!(
+            pane_input_blocking_prompt(AGY_LOGGED_OUT, Some(SessionProvider::Antigravity)),
+            Some("antigravity-login")
+        );
+        assert_eq!(
+            pane_input_blocking_prompt(AGY_LOGGED_OUT, Some(SessionProvider::Claude)),
             None
         );
     }
@@ -7061,6 +8573,190 @@ mod terminal_attention_tests {
     #[test]
     fn empty_tail_is_none() {
         assert_eq!(terminal_attention_prompt_shape(""), None);
+    }
+}
+
+#[cfg(test)]
+mod antigravity_prompt_specimen_tests {
+    use super::{pane_input_blocking_prompt, terminal_attention_prompt_shape, SessionProvider};
+
+    // Whole Antigravity CLI 1.4.12 captures; pinned with the original text in
+    // docs/agent-specimens/antigravity so markers stay specimen-derived.
+    const TRUST: &str = include_str!("../../docs/agent-specimens/antigravity/first-run-trust.txt");
+    const RESUME: &str = include_str!("../../docs/agent-specimens/antigravity/resume-picker.txt");
+    const APPROVAL: &str = include_str!("../../docs/agent-specimens/antigravity/approval.txt");
+    const TOOL_WRITE_APPROVAL: &str =
+        include_str!("../../docs/agent-specimens/antigravity/tool-write-approval.txt");
+    const TOOL_EDIT_APPROVAL: &str =
+        include_str!("../../docs/agent-specimens/antigravity/tool-edit-approval.txt");
+    const TOOL_SHELL_APPROVAL: &str =
+        include_str!("../../docs/agent-specimens/antigravity/tool-shell-approval.txt");
+    const COMMAND_APPROVAL: &str =
+        include_str!("../../docs/agent-specimens/antigravity/command-approval.txt");
+    const MCP_APPROVAL: &str =
+        include_str!("../../docs/agent-specimens/antigravity/mcp-approval.txt");
+    const MCP_APPROVAL_REASON: &str =
+        include_str!("../../docs/agent-specimens/antigravity/mcp-approval-reason.txt");
+    const WORKING_PROMPT: &str =
+        include_str!("../../docs/agent-specimens/antigravity/permission-prompt.txt");
+    const WORKING_LIFECYCLE: &str =
+        include_str!("../../docs/agent-specimens/antigravity/lifecycle-working.txt");
+
+    #[test]
+    fn captured_dialogs_classify_and_hold_only_antigravity() {
+        for (screen, shape) in [
+            (TRUST, "antigravity-folder-trust"),
+            (RESUME, "antigravity-resume-picker"),
+            (APPROVAL, "antigravity-permission"),
+            (TOOL_WRITE_APPROVAL, "antigravity-permission"),
+            (TOOL_EDIT_APPROVAL, "antigravity-permission"),
+            (TOOL_SHELL_APPROVAL, "antigravity-permission"),
+            (COMMAND_APPROVAL, "antigravity-permission"),
+            (MCP_APPROVAL, "antigravity-permission"),
+            (MCP_APPROVAL_REASON, "antigravity-permission"),
+        ] {
+            assert_eq!(terminal_attention_prompt_shape(screen), Some(shape));
+            assert_eq!(
+                pane_input_blocking_prompt(screen, Some(SessionProvider::Antigravity)),
+                Some(shape)
+            );
+            assert_eq!(
+                pane_input_blocking_prompt(screen, Some(SessionProvider::Claude)),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_dialog_text_followed_by_composer_is_a_near_miss() {
+        for screen in [TRUST, RESUME] {
+            let quoted = format!(
+                "I saw this Antigravity screen: {screen}\n────────────────────────────────────────\n> {}\n────────────────────────────────────────\nGemini 3.8 Flash · high",
+                "ordinary composer text ".repeat(30)
+            );
+            assert_eq!(terminal_attention_prompt_shape(&quoted), None);
+            assert_eq!(
+                pane_input_blocking_prompt(&quoted, Some(SessionProvider::Antigravity)),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_working_screens_do_not_classify_as_permission_prompts() {
+        for screen in [WORKING_PROMPT, WORKING_LIFECYCLE] {
+            assert_ne!(
+                terminal_attention_prompt_shape(screen),
+                Some("antigravity-permission")
+            );
+            assert_eq!(
+                pane_input_blocking_prompt(screen, Some(SessionProvider::Antigravity)),
+                None
+            );
+        }
+    }
+
+    // The tail Bram really classifies: the raw PTY stream, ANSI-stripped and
+    // whitespace-collapsed by the same collapse_tail pty_tail_snippet uses.
+    fn collapsed_tail(raw: &[u8]) -> String {
+        super::collapse_tail(raw, super::TERMINAL_ATTENTION_TAIL_CHARS)
+    }
+
+    #[test]
+    fn collapsed_raw_streams_classify() {
+        for (raw, shape) in [
+            (
+                &include_bytes!("../../docs/agent-specimens/antigravity/first-run-trust.raw")[..],
+                "antigravity-folder-trust",
+            ),
+            (
+                &include_bytes!("../../docs/agent-specimens/antigravity/resume-picker.raw")[..],
+                "antigravity-resume-picker",
+            ),
+            (
+                &include_bytes!("../../docs/agent-specimens/antigravity/approval.raw")[..],
+                "antigravity-permission",
+            ),
+            (
+                &include_bytes!("../../docs/agent-specimens/antigravity/command-approval.raw")[..],
+                "antigravity-permission",
+            ),
+            (
+                &include_bytes!("../../docs/agent-specimens/antigravity/mcp-approval.raw")[..],
+                "antigravity-permission",
+            ),
+            (
+                &include_bytes!("../../docs/agent-specimens/antigravity/mcp-approval-reason.raw")[..],
+                "antigravity-permission",
+            ),
+            (
+                &include_bytes!(
+                    "../../docs/agent-specimens/antigravity/permission-full-screen-44x67.raw"
+                )[..],
+                "antigravity-permission",
+            ),
+            (
+                &include_bytes!(
+                    "../../docs/agent-specimens/antigravity/permission-short-46x26.raw"
+                )[..],
+                "antigravity-permission",
+            ),
+            (
+                &include_bytes!(
+                    "../../docs/agent-specimens/antigravity/permission-scrolled-title-46x12.raw"
+                )[..],
+                "antigravity-permission",
+            ),
+        ] {
+            let tail = collapsed_tail(raw);
+            assert_eq!(
+                terminal_attention_prompt_shape(&tail),
+                Some(shape),
+                "{tail}"
+            );
+        }
+        for raw in [
+            &include_bytes!("../../docs/agent-specimens/antigravity/idle-composer.raw")[..],
+            &include_bytes!("../../docs/agent-specimens/antigravity/lifecycle-working.raw")[..],
+        ] {
+            assert_eq!(terminal_attention_prompt_shape(&collapsed_tail(raw)), None);
+        }
+    }
+
+    // The model line is the user's model and thinking level: a dialog drawn
+    // under another model, with a longer line, still holds.
+    #[test]
+    fn dialogs_classify_whatever_the_model_line_says() {
+        for (screen, shape) in [
+            (TRUST, "antigravity-folder-trust"),
+            (RESUME, "antigravity-resume-picker"),
+            (APPROVAL, "antigravity-permission"),
+            (COMMAND_APPROVAL, "antigravity-permission"),
+        ] {
+            assert!(screen.contains("Gemini 3.8 Flash · high"));
+            let other = screen.replace(
+                "Gemini 3.8 Flash · high",
+                "Claude Sonnet 4.6 (Thinking) · low",
+            );
+            assert_eq!(terminal_attention_prompt_shape(&other), Some(shape));
+            assert_eq!(
+                pane_input_blocking_prompt(&other, Some(SessionProvider::Antigravity)),
+                Some(shape)
+            );
+        }
+    }
+
+    // What the model-line check used to catch: agy's own reply quoting a
+    // dialog, followed by its idle composer. The composer's rules push the
+    // quoted footer past the bound.
+    #[test]
+    fn quoted_dialog_followed_by_agys_idle_composer_is_a_near_miss() {
+        let rule = "─".repeat(120);
+        for screen in [TRUST, RESUME, APPROVAL, COMMAND_APPROVAL] {
+            let quoted =
+                format!("{screen}\n{rule}\n>\n{rule}\n? for shortcuts    Gemini 3.8 Pro · low");
+            assert_eq!(terminal_attention_prompt_shape(&quoted), None);
+        }
     }
 }
 
@@ -8756,7 +10452,11 @@ fn update_turn_state<R: tauri::Runtime, F>(
         // attributed (each turn gets its own window and capture boundary)
         // and the gate is locked exactly while something is running — never
         // between turns, which is where the wedge used to live.
-        if prev.phase != "working" && next.phase == "working" {
+        let opened = turn_phase_open(&next.phase);
+        if opened != turn_phase_open(&prev.phase) {
+            delegated_note_turn_edge(app, opened);
+        }
+        if turn_state_transition_rearms_claim(&prev, &next) {
             rearm_claim_for_live_authorization(app);
         }
         trace_turn_state_transition(app, &prev, &next, emitted);
@@ -8764,6 +10464,10 @@ fn update_turn_state<R: tauri::Runtime, F>(
     if let Some(payload) = emit_payload {
         emit_replayable_payload(app, "turn-state-changed", &payload);
     }
+}
+
+fn turn_state_transition_rearms_claim(prev: &TurnState, next: &TurnState) -> bool {
+    prev.phase != "working" && next.phase == "working"
 }
 
 // separate-authorization-from-claim: re-establish the execution claim at the
@@ -8774,7 +10478,12 @@ fn update_turn_state<R: tauri::Runtime, F>(
 // consumed, interrupted (the Escape path) and past-TTL records, so a
 // cancelled approval can never re-arm itself.
 fn rearm_claim_for_live_authorization<R: tauri::Runtime>(app: &AppHandle<R>) {
-    if inflight_claim_ids_and_claimed_at(app).is_some() {
+    // delegated-work-action-gates: a claim of bound ids only is not this
+    // turn's, so it doesn't stop the re-arm (see rearm_blocked).
+    if rearm_blocked(
+        read_inflight_claim(app).as_ref(),
+        &delegated_bound_ids_union(app),
+    ) {
         return;
     }
     let Some((kind, _age_ms, ids)) = worklist_active_authorization_summary(app) else {
@@ -8812,6 +10521,18 @@ fn session_provider_label(provider: SessionProvider) -> &'static str {
         SessionProvider::Claude => "claude",
         SessionProvider::Codex => "codex",
         SessionProvider::Opencode => "opencode",
+        SessionProvider::Antigravity => "antigravity",
+    }
+}
+
+// The CLI Bram looks for on PATH, and the command a launch starts. For three
+// providers the wire label IS the binary; Antigravity's is `agy`, so probing
+// PATH with the label would report it missing and the launch ladder would fall
+// back to another agent (antigravity-provider-switch).
+fn provider_cli_name(provider: SessionProvider) -> &'static str {
+    match provider {
+        SessionProvider::Antigravity => "agy",
+        other => session_provider_label(other),
     }
 }
 
@@ -8858,16 +10579,46 @@ fn turn_state_set_menu<R: tauri::Runtime>(
         );
         m.at_host_ms = Some(unix_now_ms());
     }
-    let phase = if menu.is_some() {
-        "waiting-for-permission"
-    } else {
-        "working"
-    };
+    let antigravity_turn_open = source == "antigravity-permission"
+        && antigravity_turn_cell()
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .is_some();
     update_turn_state(app, source, reason, |s| {
-        s.provider = current_provider(app).map(|p| session_provider_label(p).to_string());
-        s.phase = phase.to_string();
-        s.pending_menu = menu;
+        apply_menu_turn_state(
+            s,
+            current_provider(app).map(|p| session_provider_label(p).to_string()),
+            menu,
+            source,
+            antigravity_turn_open,
+        );
     });
+}
+
+fn apply_menu_turn_state(
+    s: &mut TurnState,
+    provider: Option<String>,
+    menu: Option<PtyMenu>,
+    source: &str,
+    antigravity_turn_open: bool,
+) {
+    s.provider = provider;
+    if let Some(phase) = if menu.is_some() {
+        Some("waiting-for-permission")
+    } else if source == "antigravity-permission" && !antigravity_turn_open {
+        // agy-menu-clear-keeps-turn-closed: note_antigravity_state_markers runs
+        // before antigravity_permission_menu_update on the same chunk. When Esc
+        // (permission-escape.raw) or shutdown ends the turn on `idle`, the turn
+        // is already closed (`finished`); clearing the menu must not put phase
+        // back to `working` or re-arm a live authorization's claim.
+        None
+    } else {
+        Some("working")
+    } {
+        s.phase = phase.to_string();
+    }
+    s.pending_menu = menu;
 }
 
 fn stamp_pty_menu_payload(
@@ -10938,7 +12689,9 @@ fn esc_waits_for_agent_interrupt_now<R: tauri::Runtime>(app: &AppHandle<R>) -> b
 
 // How many Esc presses the pane's Esc button sends: two to stop a running
 // OpenCode turn, one otherwise (Claude stops on one; an idle Esc or an open
-// menu wants a single key).
+// menu wants a single key). Antigravity stops on one: the specimen pack's
+// permission capture has a single Escape interrupting an agy turn, and a
+// second press is not needed, so it takes the default.
 fn pane_esc_presses(provider: Option<SessionProvider>, phase: &str, menu_pending: bool) -> u8 {
     if provider == Some(SessionProvider::Opencode) && phase == "working" && !menu_pending {
         2
@@ -11056,6 +12809,7 @@ fn pty_turn_provider_label(provider: Option<SessionProvider>) -> &'static str {
     match provider {
         Some(SessionProvider::Codex) => "codex",
         Some(SessionProvider::Opencode) => "opencode",
+        Some(SessionProvider::Antigravity) => "antigravity",
         Some(SessionProvider::Claude) | None => "claude",
     }
 }
@@ -11079,6 +12833,10 @@ mod pty_turn_provider_label_tests {
         assert_eq!(
             pty_turn_provider_label(Some(SessionProvider::Opencode)),
             "opencode"
+        );
+        assert_eq!(
+            pty_turn_provider_label(Some(SessionProvider::Antigravity)),
+            "antigravity"
         );
         assert_eq!(pty_turn_provider_label(None), "claude");
     }
@@ -11320,7 +13078,11 @@ fn maybe_emit_agent_status<R: tauri::Runtime>(app: &AppHandle<R>, payload: &Agen
         }
         return;
     }
-    emit_replayable_payload(app, "agent-status-changed", payload);
+    emit_replayable_payload(
+        app,
+        "agent-status-changed",
+        agent_status_with_error(payload),
+    );
 }
 
 // Clear the cached agent status (banner provider + verb) and push the idle
@@ -11334,6 +13096,7 @@ fn reset_agent_status<R: tauri::Runtime>(app: &AppHandle<R>) {
     if let Ok(mut guard) = agent_status_cell().lock() {
         *guard = AgentStatus::idle();
     }
+    antigravity_clear_error();
     emit_replayable_payload(app, "agent-status-changed", &idle);
 }
 
@@ -12752,6 +14515,21 @@ fn report_grid_menu(app: AppHandle, payload: serde_json::Value) {
         .get("present")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    // antigravity-live-check-fixes: while Antigravity is current, its approval
+    // menu is read from the screen with its OSC state
+    // (antigravity_permission_menu) and answered with a digit alone. Live
+    // (2026-10-31) the grid also read that dialog's "1. Yes … 2. No", and its
+    // rescue superseded the Antigravity menu with one whose answers default to
+    // "<n>\r"; the Enter lands in agy's composer. So the grid stands aside.
+    if current_provider(&app) == Some(SessionProvider::Antigravity) {
+        if let Ok(mut cell) = latest_grid_menu_cell().lock() {
+            *cell = None;
+        }
+        if present && bram_trace_enabled() {
+            append_bram_trace_line(&app, "grid-menu", "op=skip reason=antigravity-screen-menu");
+        }
+        return;
+    }
     // Update the stored grid menu. Scoped so the lock is released before the
     // forced pty_menu_update() below re-locks it via the detect-path override.
     {
@@ -13220,6 +14998,7 @@ fn pty_menu_update<R: tauri::Runtime>(app: &AppHandle<R>, chunk: &[u8]) {
         }
     }
     note_agent_state_marker(chunk);
+    note_antigravity_state_markers(app, chunk);
     let tail_cell = pty_tail_cell();
     let mut tail = match tail_cell.lock() {
         Ok(g) => g,
@@ -13256,6 +15035,28 @@ fn pty_menu_update<R: tauri::Runtime>(app: &AppHandle<R>, chunk: &[u8]) {
         if let Some(nl_pos) = tail.iter().position(|&b| b == b'\n') {
             tail.drain(..=nl_pos);
         }
+    }
+    // antigravity-permission-menu: two in-memory checks first, because this
+    // runs for every chunk of every provider. The latest-state cell is only
+    // written while Antigravity is current (note_antigravity_state_markers),
+    // and the update reads the provider itself (a file read) and clears a
+    // shown menu once Antigravity isn't current.
+    let state_is_permission = antigravity_latest_state_cell()
+        .lock()
+        .ok()
+        .and_then(|state| {
+            state.as_deref().map(|state| {
+                state.starts_with("blocked:kind=permission") && state.contains("app=antigravity")
+            })
+        })
+        .unwrap_or(false);
+    let menu_is_shown = antigravity_permission_menu_shown_cell()
+        .lock()
+        .map(|shown| shown.is_some())
+        .unwrap_or(false);
+    if state_is_permission || menu_is_shown {
+        let collapsed = collapse_tail(&tail, TERMINAL_ATTENTION_TAIL_CHARS);
+        antigravity_permission_menu_update(app, &collapsed);
     }
     // menus.parseAndDisplay off (the default): the rolling pty_tail is kept up
     // to date above -- pty_agent_status_update reads it to scrape the status
@@ -17977,8 +19778,7 @@ enum Forge {
 // "gitlab"` (or "github") at the top level of the project's .bram.json.
 fn bram_config_forge<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<Forge> {
     let root = project_root(Some(app))?;
-    let text = std::fs::read_to_string(root.join(".bram.json")).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let (_, v, _) = merged_project_config(&root)?;
     match v.get("forge").and_then(|f| f.as_str())? {
         "gitlab" => Some(Forge::GitLab),
         "github" => Some(Forge::GitHub),
@@ -19764,10 +21564,45 @@ fn pty_spawn(
     } else if let Some(home) = home_dir() {
         command.cwd(home);
     }
+    // windows-pty-path-from-registry: CommandBuilder::new read the registry's
+    // PATH into its base env; the loop below replaces it with the inherited
+    // one, so take it first and merge it back in after.
+    #[cfg(windows)]
+    let registry_path = command.get_env("PATH").map(|v| v.to_os_string());
     for (k, v) in std::env::vars() {
         command.env(k, v);
     }
+    #[cfg(windows)]
+    {
+        let composed = windows_path_with_registry(registry_path.as_deref());
+        let added = composed.as_ref().map(|(_, n)| *n).unwrap_or(0);
+        if let Some((path, _)) = composed {
+            // Keep the inherited key's spelling (normally `Path`).
+            let key = std::env::vars_os()
+                .map(|(k, _)| k)
+                .find(|k| k.eq_ignore_ascii_case("path"))
+                .unwrap_or_else(|| "Path".into());
+            command.env(key, path);
+        }
+        if bram_trace_enabled() {
+            append_bram_trace_line(
+                &app,
+                "pty",
+                &format!("op=path-compose added={} source=registry", added),
+            );
+        }
+    }
     command.env("TERM", "xterm-256color");
+    // antigravity-turn-lifecycle: agy reports its turn state over OSC 7501
+    // (note_antigravity_state_markers) only in a terminal that answers its
+    // `ESC ] 7501 ; ?` check, and xterm.js doesn't. agy 1.4.0's release note:
+    // "Set AGY_CLI_OSC7501=on for a terminal that supports it but doesn't
+    // answer the check." Set at spawn rather than typed into the launch
+    // command, so it holds under any shell, PowerShell included. A value the
+    // user set (`off`, say) is kept.
+    if std::env::var_os("AGY_CLI_OSC7501").is_none() {
+        command.env("AGY_CLI_OSC7501", "on");
+    }
     // Reset the host-owned current-provider record at spawn; autostart (below)
     // or the first deliberate transition writes the new value. The shell no
     // longer reads or writes this file, so no BRAM_AGENT_HINT env is injected.
@@ -19889,7 +21724,7 @@ fn pty_spawn(
                         // issue-439: rotate the guard's breadcrumb log at its
                         // cap (first pass is at launch: last_ensure starts 0).
                         if let Some(root) = project_root(Some(&app_for_throughput)) {
-                            let dir = root.join("resources").join("bram-traces");
+                            let dir = resource_relative_path(&root, "bram-traces");
                             if let Some((bytes, to, removed)) = rotate_hook_events_log(
                                 &dir,
                                 &bram_trace_date_stamp_local(),
@@ -20026,6 +21861,9 @@ fn pty_spawn(
                     authoritative_open,
                     menu_displayed: turn.pending_menu.is_some()
                         || PANE_MENU_DISPLAYED.load(Ordering::Relaxed),
+                    // Last tick's: this detector steps first. A warning that
+                    // lands on the same tick clears on the next.
+                    terminal_attention_open: terminal_attention.active,
                     post_escape,
                     cancelled,
                     bytes,
@@ -20109,16 +21947,35 @@ fn pty_spawn(
                         _ => {}
                     }
                 }
-                let permission_blocked =
-                    codex_permission_blocked_since_launch(current_provider(&app_for_throughput))
-                        && turn_state_cell()
-                            .lock()
-                            .map(|s| s.pending_menu.is_none())
-                            .unwrap_or(false);
-                for transition in terminal_attention.step_with_permission_block(
+                let live_provider = current_provider(&app_for_throughput);
+                let no_pending_menu = turn_state_cell()
+                    .lock()
+                    .map(|s| s.pending_menu.is_none())
+                    .unwrap_or(false);
+                let menu_displayed = turn_state_cell()
+                    .lock()
+                    .map(|s| s.pending_menu.is_some())
+                    .unwrap_or(false)
+                    || PANE_MENU_DISPLAYED.load(Ordering::Relaxed);
+                let permission_block_shape =
+                    if no_pending_menu && codex_permission_blocked_since_launch(live_provider) {
+                        Some("codex-permission")
+                    } else if no_pending_menu
+                        && antigravity_permission_blocked_since_launch(live_provider)
+                    {
+                        let tail = pty_tail_snippet_or_drained(TERMINAL_ATTENTION_TAIL_CHARS);
+                        match prompt_shape_for_provider(&tail, live_provider) {
+                            Some("antigravity-folder-trust") => Some("antigravity-folder-trust"),
+                            _ => Some("antigravity-permission"),
+                        }
+                    } else {
+                        None
+                    };
+                for transition in terminal_attention.step_with_permission_block_shape(
                     authoritative_open,
+                    menu_displayed,
                     bytes,
-                    permission_blocked,
+                    permission_block_shape,
                     || {
                         (
                             pty_tail_snippet_or_drained(TERMINAL_ATTENTION_TAIL_CHARS),
@@ -20589,13 +22446,12 @@ fn run_startup_autostart(
     // other is present; when neither is found, leave the pick alone.
     {
         let picked = session_provider_label(launch.provider);
-        if !agent_cli_on_path(picked) {
+        if !agent_cli_on_path(provider_cli_name(launch.provider)) {
             // The other two, in STARTUP_AGENTS order: the first installed one
             // wins. With Claude and Codex installed this is exactly the old
             // pair; OpenCode is the last resort rather than unreachable.
             let fallback = STARTUP_AGENTS.iter().copied().find(|candidate| {
-                *candidate != launch.provider
-                    && agent_cli_on_path(session_provider_label(*candidate))
+                *candidate != launch.provider && agent_cli_on_path(provider_cli_name(*candidate))
             });
             if let Some(other) = fallback {
                 append_bram_trace_line(
@@ -20712,11 +22568,20 @@ fn run_startup_autostart(
                     if launch_provider == SessionProvider::Codex {
                         let _ = pin_codex_reload_target(app, session_id);
                     }
+                    if launch_provider == SessionProvider::Antigravity {
+                        mark_antigravity_session_current(app, session_id, "autostart");
+                    }
+                    set_named_session(launch_provider, Some(session_id));
                     // Make the exact resumed conversation current
                     // immediately; neither CLI is guaranteed to touch its
                     // JSONL before the tools pane asks for the first
                     // transcript.
                     resync_transcript_to_session(app, launch_provider, session_id);
+                } else {
+                    set_named_session(launch_provider, None);
+                    if launch_provider == SessionProvider::Antigravity {
+                        clear_antigravity_live_session(app, "autostart");
+                    }
                 }
                 schedule_agent_switch_refresh(app.clone(), provider, "autostart");
             }),
@@ -20740,8 +22605,8 @@ enum StartupAgentPick {
 
 fn startup_agent_pick(
     agent_configured: bool,
-    installed: [bool; 3],
-    has_sessions: [bool; 3],
+    installed: [bool; 4],
+    has_sessions: [bool; 4],
 ) -> StartupAgentPick {
     // The launch ladder already decides when the project named an agent, and
     // its sole-CLI rung covers a machine with one agent installed. With two or
@@ -20751,8 +22616,7 @@ fn startup_agent_pick(
         return StartupAgentPick::Configured;
     }
     let mut evidenced = STARTUP_AGENTS.iter().copied().filter(|provider| {
-        let slot = provider_slot(*provider);
-        installed[slot] && has_sessions[slot]
+        provider_slot(*provider).is_some_and(|slot| installed[slot] && has_sessions[slot])
     });
     match (evidenced.next(), evidenced.next()) {
         (Some(provider), None) => StartupAgentPick::Evidence(provider),
@@ -20895,11 +22759,19 @@ fn choose_startup_agent(app: AppHandle, provider: String) -> Result<(), String> 
 
 #[cfg(test)]
 mod startup_agent_pick_tests {
-    use super::{startup_agent_pick, SessionProvider, StartupAgentPick};
+    use super::{provider_slot, startup_agent_pick, SessionProvider, StartupAgentPick};
 
-    // Slots: Claude, Codex, OpenCode.
-    const ALL_INSTALLED: [bool; 3] = [true, true, true];
-    const NO_SESSIONS: [bool; 3] = [false, false, false];
+    // Slots: Claude, Codex, OpenCode, Antigravity.
+    const ALL_INSTALLED: [bool; 4] = [true, true, true, true];
+    const NO_SESSIONS: [bool; 4] = [false, false, false, false];
+
+    // Antigravity is now the fourth startup slot, after the established trio.
+    #[test]
+    fn antigravity_is_last_in_startup_slots() {
+        assert_eq!(provider_slot(SessionProvider::Antigravity), Some(3));
+        assert_eq!(provider_slot(SessionProvider::Claude), Some(0));
+        assert_eq!(provider_slot(SessionProvider::Opencode), Some(2));
+    }
 
     #[test]
     fn configured_agent_always_decides() {
@@ -20908,7 +22780,7 @@ mod startup_agent_pick_tests {
             StartupAgentPick::Configured
         );
         assert_eq!(
-            startup_agent_pick(true, ALL_INSTALLED, [true, true, true]),
+            startup_agent_pick(true, ALL_INSTALLED, [true, true, true, true]),
             StartupAgentPick::Configured
         );
     }
@@ -20916,15 +22788,19 @@ mod startup_agent_pick_tests {
     #[test]
     fn one_cli_leaves_it_to_the_sole_cli_rung() {
         assert_eq!(
-            startup_agent_pick(false, [true, false, false], NO_SESSIONS),
+            startup_agent_pick(false, [true, false, false, false], NO_SESSIONS),
             StartupAgentPick::Configured
         );
         assert_eq!(
-            startup_agent_pick(false, [false, true, false], NO_SESSIONS),
+            startup_agent_pick(false, [false, true, false, false], NO_SESSIONS),
             StartupAgentPick::Configured
         );
         assert_eq!(
-            startup_agent_pick(false, [false, false, true], NO_SESSIONS),
+            startup_agent_pick(false, [false, false, true, false], NO_SESSIONS),
+            StartupAgentPick::Configured
+        );
+        assert_eq!(
+            startup_agent_pick(false, [false, false, false, true], NO_SESSIONS),
             StartupAgentPick::Configured
         );
     }
@@ -20932,16 +22808,20 @@ mod startup_agent_pick_tests {
     #[test]
     fn sessions_for_one_agent_pick_it() {
         assert_eq!(
-            startup_agent_pick(false, ALL_INSTALLED, [false, true, false]),
+            startup_agent_pick(false, ALL_INSTALLED, [false, true, false, false]),
             StartupAgentPick::Evidence(SessionProvider::Codex)
         );
         assert_eq!(
-            startup_agent_pick(false, ALL_INSTALLED, [true, false, false]),
+            startup_agent_pick(false, ALL_INSTALLED, [true, false, false, false]),
             StartupAgentPick::Evidence(SessionProvider::Claude)
         );
         assert_eq!(
-            startup_agent_pick(false, ALL_INSTALLED, [false, false, true]),
+            startup_agent_pick(false, ALL_INSTALLED, [false, false, true, false]),
             StartupAgentPick::Evidence(SessionProvider::Opencode)
+        );
+        assert_eq!(
+            startup_agent_pick(false, ALL_INSTALLED, [false, false, false, true]),
+            StartupAgentPick::Evidence(SessionProvider::Antigravity)
         );
     }
 
@@ -20949,12 +22829,16 @@ mod startup_agent_pick_tests {
     fn two_installed_agents_can_still_use_evidence() {
         // Claude and OpenCode installed, OpenCode the only one with sessions.
         assert_eq!(
-            startup_agent_pick(false, [true, false, true], [false, false, true]),
+            startup_agent_pick(
+                false,
+                [true, false, true, false],
+                [false, false, true, false]
+            ),
             StartupAgentPick::Evidence(SessionProvider::Opencode)
         );
         // ... and with no sessions anywhere, the card asks.
         assert_eq!(
-            startup_agent_pick(false, [true, false, true], NO_SESSIONS),
+            startup_agent_pick(false, [true, false, true, false], NO_SESSIONS),
             StartupAgentPick::Ask
         );
     }
@@ -20963,7 +22847,11 @@ mod startup_agent_pick_tests {
     fn sessions_for_an_uninstalled_agent_do_not_pick_it() {
         // OpenCode ran here once but its CLI is gone: starting it would fail.
         assert_eq!(
-            startup_agent_pick(false, [true, true, false], [false, false, true]),
+            startup_agent_pick(
+                false,
+                [true, true, false, false],
+                [false, false, true, false]
+            ),
             StartupAgentPick::Ask
         );
     }
@@ -20975,11 +22863,11 @@ mod startup_agent_pick_tests {
             StartupAgentPick::Ask
         );
         assert_eq!(
-            startup_agent_pick(false, ALL_INSTALLED, [true, true, true]),
+            startup_agent_pick(false, ALL_INSTALLED, [true, true, true, true]),
             StartupAgentPick::Ask
         );
         assert_eq!(
-            startup_agent_pick(false, ALL_INSTALLED, [true, false, true]),
+            startup_agent_pick(false, ALL_INSTALLED, [true, false, true, false]),
             StartupAgentPick::Ask
         );
     }
@@ -21467,9 +23355,11 @@ fn drain_pty_intents<R: tauri::Runtime>(
     // user answers the prompt. codex-update joins them: its Enter runs
     // "Update now" and exits Codex. slash-panel is left out: Esc closes it,
     // and an Enter there grants nothing.
-    let prompt_shape = pane_input_blocking_prompt(
+    let live_provider = current_provider(app);
+    let prompt_shape = pane_input_blocking_prompt_or_osc(
         &pty_tail_snippet(TERMINAL_ATTENTION_TAIL_CHARS),
-        current_provider(app),
+        live_provider,
+        antigravity_permission_blocked_since_launch(live_provider),
     );
     let mut prompt_restores: Vec<(String, String)> = Vec::new();
     let mut esc_held: usize = 0;
@@ -21714,15 +23604,23 @@ fn drain_pty_intents<R: tauri::Runtime>(
                         .map(|t| menu_answer_opens_free_text(t.pending_menu.as_ref(), data))
                         .unwrap_or(false);
                     let r = pty_write_internal(app, state, data, "pty-intent-menuAnswer");
-                    if r.is_ok() && opens_free_text {
-                        AUQ_FREE_TEXT_SINCE_MS
-                            .store(unix_now_ms(), std::sync::atomic::Ordering::Relaxed);
-                        if bram_trace_enabled() {
-                            append_bram_trace_line(
-                                app,
-                                "send-gate",
-                                &format!("op=free-text-open key={}", data.trim()),
-                            );
+                    if r.is_ok() {
+                        let resolved = prompt_open_cell().lock().ok().and_then(|mut open| {
+                            finish_antigravity_menu_answer_prompt(&mut open, unix_now_ms())
+                        });
+                        if let Some(ev) = resolved {
+                            let _ = record_prompt_resolved(app, ev);
+                        }
+                        if opens_free_text {
+                            AUQ_FREE_TEXT_SINCE_MS
+                                .store(unix_now_ms(), std::sync::atomic::Ordering::Relaxed);
+                            if bram_trace_enabled() {
+                                append_bram_trace_line(
+                                    app,
+                                    "send-gate",
+                                    &format!("op=free-text-open key={}", data.trim()),
+                                );
+                            }
                         }
                     }
                     r
@@ -22033,6 +23931,12 @@ fn worklist_attach_last_sessions<R: tauri::Runtime>(
                 .cloned()
                 .or_else(|| codex_session_title(&path).ok().flatten()),
             SessionProvider::Opencode => claude_session_title(&path).ok().flatten(),
+            // No session discovery for Antigravity yet
+            // (antigravity-sessions-browser).
+            SessionProvider::Antigravity => antigravity_summary_rows_for_id(app, &sid)
+                .map(|(_, title, _)| title)
+                .filter(|title| !title.trim().is_empty())
+                .or_else(|| claude_session_title(&path).ok().flatten()),
         };
         let is_current = cur_provider == Some(provider) && cur_sid.as_deref() == Some(sid.as_str());
         if let Some(obj) = item.as_object_mut() {
@@ -22113,7 +24017,8 @@ fn record_prefixed_inflight_sentinel<R: tauri::Runtime>(
 // exists only while an ADDRESSED turn is in flight — absent means a general
 // turn, a terminal-typed turn, or a pre-368 build, which the guard reads as
 // ctx=none and the gate as unblocked.
-const TURN_CONTEXT_REL: &str = "resources/.turn-context.json";
+// Relative to Bram's state folder (resource_relative_path).
+const TURN_CONTEXT_REL: &str = ".turn-context.json";
 
 fn emit_turn_context<R: tauri::Runtime>(app: &AppHandle<R>, ids: &[String], kind: &str) {
     let payload = serde_json::json!({
@@ -22123,7 +24028,7 @@ fn emit_turn_context<R: tauri::Runtime>(app: &AppHandle<R>, ids: &[String], kind
         "atMs": unix_now_ms(),
     });
     if let Some(root) = project_root(Some(app)) {
-        let path = root.join(TURN_CONTEXT_REL);
+        let path = resource_relative_path(&root, TURN_CONTEXT_REL);
         if ids.is_empty() {
             let _ = std::fs::remove_file(&path);
         } else if let Ok(text) = serde_json::to_string(&payload) {
@@ -22150,7 +24055,9 @@ fn emit_turn_context<R: tauri::Runtime>(app: &AppHandle<R>, ids: &[String], kind
 // the whole turn. Same 2 s guard here.
 fn end_turn_context_unless_fresh<R: tauri::Runtime>(app: &AppHandle<R>, source: &str) {
     let set_at_ms = project_root(Some(app))
-        .and_then(|root| std::fs::read_to_string(root.join(TURN_CONTEXT_REL)).ok())
+        .and_then(|root| {
+            std::fs::read_to_string(resource_relative_path(&root, TURN_CONTEXT_REL)).ok()
+        })
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .and_then(|v| v.get("atMs").and_then(|t| t.as_i64()));
     if let Some(at) = set_at_ms {
@@ -22207,7 +24114,7 @@ fn record_turn_context<R: tauri::Runtime>(app: &AppHandle<R>, turn_text: &str) {
 // would otherwise pin the gate's withhold and skew the guard soak.
 fn cleanup_stale_turn_context<R: tauri::Runtime>(app: &AppHandle<R>) {
     if let Some(root) = project_root(Some(app)) {
-        let path = root.join(TURN_CONTEXT_REL);
+        let path = resource_relative_path(&root, TURN_CONTEXT_REL);
         if path.exists() {
             let _ = std::fs::remove_file(&path);
             if bram_trace_enabled() {
@@ -22881,6 +24788,8 @@ static AGENT_LAUNCH_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic
 static AGENT_LAUNCH_BEGAN_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 static CODEX_PERMISSION_BLOCKED_AT_MS: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(0);
+static ANTIGRAVITY_PERMISSION_BLOCKED_AT_MS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
 
 fn codex_permission_marker(body: &str) -> bool {
     // Captured Codex 0.165.0 Windows OSC 7501, 2026-10-28 (#455).
@@ -22893,6 +24802,20 @@ fn codex_permission_marker(body: &str) -> bool {
 fn codex_permission_blocked_since_launch(provider: Option<SessionProvider>) -> bool {
     let at = CODEX_PERMISSION_BLOCKED_AT_MS.load(std::sync::atomic::Ordering::SeqCst);
     provider == Some(SessionProvider::Codex)
+        && at > 0
+        && at >= AGENT_LAUNCH_BEGAN_MS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn antigravity_permission_state(body: &str) -> bool {
+    let parts: Vec<&str> = body.split(':').collect();
+    parts.first() == Some(&"blocked")
+        && parts.contains(&"app=antigravity")
+        && parts.contains(&"kind=permission")
+}
+
+fn antigravity_permission_blocked_since_launch(provider: Option<SessionProvider>) -> bool {
+    let at = ANTIGRAVITY_PERMISSION_BLOCKED_AT_MS.load(std::sync::atomic::Ordering::SeqCst);
+    provider == Some(SessionProvider::Antigravity)
         && at > 0
         && at >= AGENT_LAUNCH_BEGAN_MS.load(std::sync::atomic::Ordering::SeqCst)
 }
@@ -22944,6 +24867,7 @@ fn agent_state_marker_since_launch(provider: SessionProvider) -> bool {
 
 fn begin_agent_launch() -> u64 {
     CODEX_PERMISSION_BLOCKED_AT_MS.store(0, std::sync::atomic::Ordering::SeqCst);
+    ANTIGRAVITY_PERMISSION_BLOCKED_AT_MS.store(0, std::sync::atomic::Ordering::SeqCst);
     AGENT_LAUNCH_BEGAN_MS.store(unix_now_ms(), std::sync::atomic::Ordering::SeqCst);
     // codex-resume-false-working: a fresh launch hasn't shown its composer.
     CODEX_COMPOSER_SEEN.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -23048,6 +24972,30 @@ fn launch_exit_tail(raw: &[u8]) -> String {
     out
 }
 
+// windows-pty-path-from-registry: when the launch's own command wasn't found,
+// the pane says so plainly instead of quoting the shell. Read from the whole
+// stripped tail, not launch_exit_tail's last three lines: PowerShell 5.1's
+// "is not recognized" line is followed by four more. Shapes: PowerShell
+// ("The term 'agy' is not recognized as the name of a cmdlet…",
+// CommandNotFoundException), cmd.exe ("'agy' is not recognized as an internal
+// or external command"), bash/zsh ("agy: command not found", "zsh: command
+// not found: agy"). The message must name the launched command, so another
+// command's error earlier in the tail doesn't count.
+fn launch_command_not_found(raw: &[u8], command: &str) -> Option<String> {
+    let head = command.split_whitespace().next()?;
+    let stripped = strip_ansi(raw);
+    let text = String::from_utf8_lossy(&stripped);
+    let quoted = format!("'{}'", head);
+    let found = text.lines().any(|line| {
+        let line = line.trim();
+        ((line.contains("is not recognized as") || line.contains("CommandNotFoundException"))
+            && (line.contains(&quoted) || line.contains(&format!("({}:String)", head))))
+            || line.ends_with(&format!("{}: command not found", head))
+            || line.ends_with(&format!("command not found: {}", head))
+    });
+    found.then(|| head.to_string())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LaunchPhase {
     // The gate passed; the command is about to be written.
@@ -23116,6 +25064,51 @@ fn codex_instance_launch_command(command: &str, supported: bool) -> String {
     format!("{command} --no-daemon")
 }
 
+// opencode-session-own-terminal: the same shape as Codex's --no-daemon (#455).
+// OpenCode's plugin normally runs in a background service shared by every
+// terminal, with none of Bram's environment, so its events couldn't be told
+// from another OpenCode's. `--standalone` gives this launch a private server,
+// a child of this terminal, in the same session store. Checked on 2.1.4.
+fn opencode_supports_standalone() -> bool {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        #[cfg(windows)]
+        let mut command = {
+            use std::os::windows::process::CommandExt;
+            // npm installs a .cmd shim, which Command::new cannot run directly.
+            let mut command = std::process::Command::new("cmd.exe");
+            command.args(["/d", "/c", "opencode", "--help"]);
+            command.creation_flags(CREATE_NO_WINDOW);
+            command
+        };
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut command = std::process::Command::new("opencode");
+            command.arg("--help");
+            command
+        };
+        command
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()
+            .is_some_and(|out| {
+                out.status.success()
+                    && String::from_utf8_lossy(&out.stdout).contains("--standalone")
+            })
+    })
+}
+
+fn opencode_instance_launch_command(command: &str, supported: bool) -> String {
+    if !supported
+        || command
+            .split_whitespace()
+            .any(|arg| arg == "--standalone" || arg == "--server" || arg.starts_with("--server="))
+    {
+        return command.to_string();
+    }
+    format!("{command} --standalone")
+}
+
 fn launch_agent_command<R: tauri::Runtime>(mut launch: AgentLaunch<R>) {
     std::thread::spawn(move || {
         // A shared Codex server inherits another launch's environment. Hooks
@@ -23125,8 +25118,38 @@ fn launch_agent_command<R: tauri::Runtime>(mut launch: AgentLaunch<R>) {
             launch.command =
                 codex_instance_launch_command(&launch.command, codex_supports_no_daemon());
         }
+        if launch.provider == "opencode" {
+            launch.command =
+                opencode_instance_launch_command(&launch.command, opencode_supports_standalone());
+        }
         run_agent_launch(launch)
     });
+}
+
+#[cfg(test)]
+mod opencode_instance_launch_tests {
+    use super::opencode_instance_launch_command as launch;
+
+    #[test]
+    fn opencode_launches_get_a_private_server() {
+        assert_eq!(launch("opencode", true), "opencode --standalone");
+        assert_eq!(
+            launch("opencode --session ses_a", true),
+            "opencode --session ses_a --standalone"
+        );
+        assert_eq!(launch("opencode --continue", false), "opencode --continue");
+    }
+
+    #[test]
+    fn a_users_own_server_choice_stands() {
+        for command in [
+            "opencode --standalone",
+            "opencode --server http://x",
+            "opencode --server=http://x",
+        ] {
+            assert_eq!(launch(command, true), command);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -23164,6 +25187,8 @@ fn emit_launch_outcome<R: tauri::Runtime>(
     outcome: &str,
     status: Option<i32>,
     tail: &str,
+    // The launched command, when the shell said it wasn't found.
+    not_found: Option<&str>,
 ) {
     // agent-launch-failure-in-pane: replayable, because a cross-provider
     // launch reloads the pane ~2.5 s later and an exit is reported ~0.2 s in;
@@ -23177,6 +25202,7 @@ fn emit_launch_outcome<R: tauri::Runtime>(
             "outcome": outcome,
             "status": status,
             "tail": tail,
+            "notFound": not_found,
             "atMs": unix_now_ms(),
         }),
     );
@@ -23216,7 +25242,7 @@ fn run_agent_launch<R: tauri::Runtime>(l: AgentLaunch<R>) {
                     l.provider, l.source, waited
                 ));
                 (l.hook)(app, LaunchPhase::Timeout);
-                emit_launch_outcome(&l, "timeout", None, "");
+                emit_launch_outcome(&l, "timeout", None, "", None);
                 return;
             }
             Ok((waited, via)) => trace(format!(
@@ -23248,7 +25274,7 @@ fn run_agent_launch<R: tauri::Runtime>(l: AgentLaunch<R>) {
             "op=launch-error provider={} source={} error={}",
             l.provider, l.source, error
         ));
-        emit_launch_outcome(&l, "error", None, &error);
+        emit_launch_outcome(&l, "error", None, &error, None);
         return;
     }
     shell_foreground_note_launch_written(written_from);
@@ -23271,15 +25297,17 @@ fn run_agent_launch<R: tauri::Runtime>(l: AgentLaunch<R>) {
                     Err(e) => e.into_inner().clone(),
                 };
                 let tail = launch_exit_tail(&raw);
+                let not_found = launch_command_not_found(&raw, &l.command);
                 trace(format!(
-                    "op=launch-exited provider={} source={} status={} after_ms={} tail=\"{}\"",
+                    "op=launch-exited provider={} source={} status={} after_ms={} not_found={} tail=\"{}\"",
                     l.provider,
                     l.source,
                     status.map(|s| s.to_string()).unwrap_or_else(|| "?".into()),
                     elapsed,
+                    not_found.as_deref().unwrap_or("-"),
                     tail
                 ));
-                emit_launch_outcome(&l, "exited", status, &tail);
+                emit_launch_outcome(&l, "exited", status, &tail, not_found.as_deref());
                 return;
             }
             LaunchConfirm::Pending if elapsed < AGENT_LAUNCH_CONFIRM_MS => {}
@@ -23295,7 +25323,7 @@ fn run_agent_launch<R: tauri::Runtime>(l: AgentLaunch<R>) {
                     "op=launch-confirmed provider={} source={} via={} exec_seen={}",
                     l.provider, l.source, via, exec_seen
                 ));
-                emit_launch_outcome(&l, "confirmed", None, "");
+                emit_launch_outcome(&l, "confirmed", None, "", None);
                 (l.hook)(app, LaunchPhase::Confirmed);
                 break;
             }
@@ -23330,9 +25358,44 @@ fn usable_codex_reload_target<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<C
 #[cfg(test)]
 mod agent_launch_tests {
     use super::{
-        codex_pin_usable, launch_confirm_state as confirm, launch_exit_tail, launch_line,
-        CodexReloadTarget, LaunchConfirm, ShellForeground,
+        codex_pin_usable, launch_command_not_found, launch_confirm_state as confirm,
+        launch_exit_tail, launch_line, CodexReloadTarget, LaunchConfirm, ShellForeground,
     };
+
+    #[test]
+    fn command_not_found_names_the_launched_command() {
+        // PowerShell 5.1: the recognizable line is five lines above the prompt.
+        let ps = b"agy : The term 'agy' is not recognized as the name of a cmdlet, function, script file, or operable program. Check the spelling of the name, or if a path was included, verify that the path is correct and try again.\r\nAt line:1 char:1\r\n+ agy\r\n+ ~~~\r\n    + CategoryInfo          : ObjectNotFound: (agy:String) [], CommandNotFoundException\r\n    + FullyQualifiedErrorId : CommandNotFoundException\r\n \r\nPS C:\\Users\\jon\\bram> ";
+        assert_eq!(
+            launch_command_not_found(ps, "agy --continue"),
+            Some("agy".to_string())
+        );
+        // PowerShell 7, only the CategoryInfo line left in the tail.
+        let ps7 = b"    + CategoryInfo          : ObjectNotFound: (agy:String) [], CommandNotFoundException\r\nPS> ";
+        assert_eq!(launch_command_not_found(ps7, "agy"), Some("agy".into()));
+        let cmd = b"'codex' is not recognized as an internal or external command,\r\noperable program or batch file.\r\n";
+        assert_eq!(launch_command_not_found(cmd, "codex"), Some("codex".into()));
+        let bash = b"bash: opencode: command not found\r\nbash-3.2$ ";
+        assert_eq!(
+            launch_command_not_found(bash, "opencode --continue"),
+            Some("opencode".into())
+        );
+        let zsh = b"zsh: command not found: claude\r\n% ";
+        assert_eq!(
+            launch_command_not_found(zsh, "claude"),
+            Some("claude".into())
+        );
+    }
+
+    #[test]
+    fn other_exits_and_other_commands_are_not_command_not_found() {
+        let other = b"No conversation found to continue\r\nPS C:\\> ";
+        assert_eq!(launch_command_not_found(other, "claude --continue"), None);
+        // A different command's error earlier in the tail doesn't count.
+        let earlier = b"The term 'foo' is not recognized as the name of a cmdlet\r\nPS C:\\> ";
+        assert_eq!(launch_command_not_found(earlier, "agy"), None);
+        assert_eq!(launch_command_not_found(b"", ""), None);
+    }
 
     #[test]
     fn unix_launches_clear_the_shell_line_first() {
@@ -23409,11 +25472,11 @@ mod agent_launch_tests {
     #[test]
     fn catch_up_exchanges_are_not_new_work() {
         use super::{catch_up_turn_text, drop_catch_up_exchanges};
-        let catch_up = catch_up_turn_text(
-            "Codex session 'X'",
-            4,
-            "resources/session-digests/codex-x.md",
+        let digest = super::bram_state_rel(
+            std::path::Path::new("/nonexistent-bram-469-root"),
+            "session-digests/codex-x.md",
         );
+        let catch_up = catch_up_turn_text("Codex session 'X'", 4, &digest);
         let turns = vec![
             serde_json::json!({"role": "user", "text": "real question"}),
             serde_json::json!({"role": "assistant", "text": "real answer"}),
@@ -23482,6 +25545,7 @@ fn switch_agent(
         "codex" => "codex",
         "claude" | "claud" => "claude",
         "opencode" => "opencode",
+        "antigravity" => "antigravity",
         other => return Err(format!("unknown agent provider: {}", other)),
     };
     refuse_agent_typing_if_policy_none(&app, "switch")?;
@@ -23795,6 +25859,20 @@ fn switch_agent(
             let _ = pin_codex_reload_target(&app, id);
         }
     }
+    // agy-current-session-on-resume: mark the exact conversation `agy
+    // --conversation <id>` launches as current now; clear on a fresh or
+    // `--continue` launch so `fresh_baseline` below reads the newest session.
+    if target_provider == SessionProvider::Antigravity {
+        if let Some(id) = partner.as_deref().or(latest_target.as_deref()) {
+            mark_antigravity_session_current(&app, id, "switch");
+        } else {
+            clear_antigravity_live_session(&app, "switch");
+        }
+    }
+    set_named_session(
+        target_provider,
+        partner.as_deref().or(latest_target.as_deref()),
+    );
     let pair_from = leaving.clone();
     // new-session-switch-starts-fresh-partner: queue the fresh partner's name
     // (applied when its session surfaces), and note the target's live session
@@ -23990,7 +26068,9 @@ fn switch_agent(
                     // show its prompt, so it is waited on like Codex.
                     if matches!(
                         target_provider,
-                        SessionProvider::Codex | SessionProvider::Opencode
+                        SessionProvider::Codex
+                            | SessionProvider::Opencode
+                            | SessionProvider::Antigravity
                     ) {
                         let app2 = app.clone();
                         std::thread::spawn(move || {
@@ -24096,15 +26176,29 @@ fn pair_offers_enabled<R: tauri::Runtime>(app: &AppHandle<R>) -> bool {
         .unwrap_or(true)
 }
 
-// provider-session-pair-offer: Keep these together, from the pair offer.
-fn pair_sessions_route<R: tauri::Runtime>(
-    app: &AppHandle<R>,
-    query: &str,
-) -> Result<Vec<u8>, String> {
+// issue-461-refuse-placeholder-pair: the Sessions row's bridge id for a
+// session that hasn't started yet. `pending_session_entry` builds it from
+// this prefix and the pair route refuses it, so the two can't drift.
+const PENDING_SESSION_ID_PREFIX: &str = "pending-";
+
+fn session_id_is_placeholder(id: &str) -> bool {
+    id.starts_with(PENDING_SESSION_ID_PREFIX)
+}
+
+const PAIR_PLACEHOLDER_REFUSAL: &str =
+    "That session hasn't started yet, so it can't be kept together with another. Try again once it has.";
+
+type PairSide = (SessionProvider, String);
+
+// issue-461-refuse-placeholder-pair: the route's query parsing and refusal,
+// pure so tests can run it without an app. Returns (anchor, arrived). A
+// placeholder on either side is refused here, before anything is recorded.
+// A preallocated real id is accepted with no transcript: this never touches
+// disk.
+fn parse_pair_sessions_query(query: &str) -> Result<(PairSide, PairSide), String> {
     // opencode-partner-handoff: the two sides arrive as `<provider>=<id>`,
-    // any two of claude / codex / opencode (the pane always sent claude and
-    // codex before).
-    let mut sides: Vec<(SessionProvider, String)> = Vec::new();
+    // any two known session providers.
+    let mut sides: Vec<PairSide> = Vec::new();
     // provider-session-digest-for-codex: the side the offer was about (the
     // session you switched away from), whose digest the other side reads.
     let mut from: Option<SessionProvider> = None;
@@ -24124,9 +26218,46 @@ fn pair_sessions_route<R: tauri::Runtime>(
     let [a, b] = sides.as_slice() else {
         return Err("two sessions of different providers required".to_string());
     };
+    if session_id_is_placeholder(&a.1) || session_id_is_placeholder(&b.1) {
+        return Err(PAIR_PLACEHOLDER_REFUSAL.to_string());
+    }
     // session-groups: the session you switched away from anchors the join, so
     // the one you arrived at moves into its group (or both start one).
-    let (anchor, arrived) = if from == Some(b.0) { (b, a) } else { (a, b) };
+    Ok(if from == Some(b.0) {
+        (b.clone(), a.clone())
+    } else {
+        (a.clone(), b.clone())
+    })
+}
+
+// provider-session-pair-offer: Keep these together, from the pair offer.
+fn pair_sessions_route<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    query: &str,
+) -> Result<Vec<u8>, String> {
+    let from = query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == "from")
+            .then(|| SessionProvider::from_str(&percent_decode(value)))
+            .flatten()
+    });
+    let (anchor, arrived) = match parse_pair_sessions_query(query) {
+        Ok(sides) => sides,
+        Err(e) => {
+            if e == PAIR_PLACEHOLDER_REFUSAL && bram_trace_enabled() {
+                append_bram_trace_line(
+                    app,
+                    "state-mirror",
+                    &format!(
+                        "op=pair-refused source=offer-keep detail=placeholder-session query-len={}",
+                        query.len()
+                    ),
+                );
+            }
+            return Err(e);
+        }
+    };
+    let (anchor, arrived) = (&anchor, &arrived);
     record_pair_for(app, anchor, arrived, "offer-keep");
     emit_pair_offer(app, None, None);
     if from.is_some() {
@@ -24160,6 +26291,10 @@ fn session_title_by_id<R: tauri::Runtime>(
         // the group line, and group naming compared against it).
         SessionProvider::Opencode => opencode_session_title_from_db(id)
             .or_else(|| claude_session_title(&path).ok().flatten()),
+        SessionProvider::Antigravity => antigravity_summary_rows_for_id(app, id)
+            .map(|(_, title, _)| title)
+            .filter(|title| !title.trim().is_empty())
+            .or_else(|| claude_session_title(&path).ok().flatten()),
     }
 }
 
@@ -24168,7 +26303,20 @@ fn session_title_by_id<R: tauri::Runtime>(
 // Bram's export, which lags OpenCode until discovery re-exports it. Read the
 // newest assistant message's model from OpenCode's database instead, like the
 // title (opencode_session_title_from_db); the export tail is the fallback.
+//
+// footer-model-follows-requested-provider (Windows, 2026-11-02): the footer
+// read "ANTIGRAVITY (Fable 5.1)". Antigravity's transcript records carry no
+// model (docs/agent-specimens/antigravity/*.jsonl), so its model is unknown,
+// and a wrong model is worse than none: return empty for its exports rather
+// than whatever a `model` key elsewhere in the file might say. The roster
+// also reports `mainProvider` (the label of the path this model came from) so
+// the pane can refuse a model from another provider's session, which is what
+// active_session_path's freshest-session fallback hands back when the active
+// provider has no session file yet.
 fn main_session_model<R: tauri::Runtime>(app: &AppHandle<R>, session_path: &Path) -> String {
+    if projected_turns_provider_label(session_path) == "antigravity" {
+        return String::new();
+    }
     let is_opencode = opencode_export_dir(app)
         .ok()
         .is_some_and(|dir| is_opencode_export_path(session_path, &dir));
@@ -24270,6 +26418,51 @@ mod opencode_model_tests {
     }
 }
 
+#[cfg(test)]
+mod footer_model_provider_tests {
+    use super::{
+        antigravity_transcript_jsonl, projected_turns_provider_label, st_last_session_model,
+        ANTIGRAVITY_EXPORT_DIR,
+    };
+    use std::path::Path;
+
+    // footer-model-follows-requested-provider: an Antigravity export has no
+    // model to report, so the footer must show none rather than another
+    // session's. The specimen is a real Antigravity CLI 1.4.12 transcript.
+    #[test]
+    fn antigravity_export_reports_no_model() {
+        let source =
+            include_str!("../../docs/agent-specimens/antigravity/transcript-record-tools.jsonl");
+        let (jsonl, _) = antigravity_transcript_jsonl("agy-test", source).unwrap();
+        assert!(
+            jsonl.contains("\"assistant\""),
+            "specimen converted to turns"
+        );
+        let tmp =
+            std::env::temp_dir().join(format!("bram-footer-model-{}.jsonl", uuid::Uuid::new_v4()));
+        std::fs::write(&tmp, &jsonl).unwrap();
+        assert_eq!(st_last_session_model(&tmp), "");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    // `mainProvider` labels the roster's session path, so the pane can tell a
+    // Claude session's model from the requested provider's.
+    #[test]
+    fn main_provider_labels_each_providers_session_path() {
+        let claude = Path::new("/home/me/.claude/projects/-home-me-bram/a.jsonl");
+        let codex = Path::new("/home/me/.codex/sessions/2026/11/02/rollout-x.jsonl");
+        let opencode = Path::new("/cache/opencode-sessions/-home-me-bram/ses_1.jsonl");
+        let agy = Path::new("/cache")
+            .join(ANTIGRAVITY_EXPORT_DIR)
+            .join("-home-me-bram")
+            .join("3c7851eb.jsonl");
+        assert_eq!(projected_turns_provider_label(claude), "claude");
+        assert_eq!(projected_turns_provider_label(codex), "codex");
+        assert_eq!(projected_turns_provider_label(opencode), "opencode");
+        assert_eq!(projected_turns_provider_label(&agy), "antigravity");
+    }
+}
+
 fn opencode_session_title_from_db(id: &str) -> Option<String> {
     let conn = opencode_open_db()?;
     conn.query_row(
@@ -24319,33 +26512,86 @@ fn harmonize_group_names<R: tauri::Runtime>(
         return;
     };
     for (p, id) in &group.members {
-        let Some(sp) = SessionProvider::from_str(p) else {
-            continue;
-        };
-        let current = session_title_by_id(app, sp, id);
-        if current.as_deref() == Some(name.as_str()) {
-            continue;
-        }
-        let result = rename_session(app, id, Some(sp), &name);
-        if bram_trace_enabled() {
-            append_bram_trace_line(
-                app,
-                "state-mirror",
-                &format!(
-                    "op=group-name {}={} from={:?} to={:?} source={} result={}",
-                    p,
-                    id,
-                    current.unwrap_or_default(),
-                    name,
-                    source,
-                    match &result {
-                        Ok(_) => "ok".to_string(),
-                        Err(e) => format!("error detail={}", e),
-                    }
-                ),
-            );
-        }
+        take_group_name(app, p, id, &name, source);
     }
+}
+
+fn take_group_name<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    provider: &str,
+    id: &str,
+    name: &str,
+    source: &str,
+) {
+    let Some(sp) = SessionProvider::from_str(provider) else {
+        return;
+    };
+    let current = session_title_by_id(app, sp, id);
+    if current.as_deref() == Some(name) {
+        return;
+    }
+    let result = rename_session(app, id, Some(sp), name);
+    if bram_trace_enabled() {
+        append_bram_trace_line(
+            app,
+            "state-mirror",
+            &format!(
+                "op=group-name {}={} from={:?} to={:?} source={} result={}",
+                provider,
+                id,
+                current.unwrap_or_default(),
+                name,
+                source,
+                match &result {
+                    Ok(_) => "ok".to_string(),
+                    Err(e) => format!("error detail={}", e),
+                }
+            ),
+        );
+    }
+    // agy-session-rename: a member that can't take the name looks wrong and
+    // says nothing, which is how 2026-11-02's two Leaves happened. agy's title
+    // file is a private format, so this can fail again.
+    if let Err(detail) = result {
+        emit_replayable_payload(
+            app,
+            "group-name-failed",
+            serde_json::json!({
+                "provider": provider,
+                "group": name,
+                "detail": detail,
+                "at": unix_now_ms(),
+            }),
+        );
+    }
+}
+
+// agy-session-rename: members that joined while Bram couldn't name Antigravity
+// sessions take the name once, off the startup thread: reading titles reads
+// each agent's session list.
+fn harmonize_antigravity_members_at_startup<R: tauri::Runtime>(app: AppHandle<R>) {
+    std::thread::spawn(move || {
+        let Some(conn) = worklist_state_open(&app) else {
+            return;
+        };
+        let Ok(snap) = worklist_state::group_snapshot(&conn) else {
+            return;
+        };
+        let label = session_provider_label(SessionProvider::Antigravity);
+        for group in snap.groups() {
+            let members: Vec<_> = group.members.iter().filter(|(p, _)| p == label).collect();
+            if members.is_empty() {
+                continue;
+            }
+            let Some(name) = group_title(&app, &group) else {
+                continue;
+            };
+            for (p, id) in members {
+                take_group_name(&app, p, id, &name, "startup");
+            }
+        }
+        emit_replayable_signal(&app, "sessions-list-changed");
+    });
 }
 
 // provider-session-pair-offer, session-groups: each /__sessions/list row whose
@@ -24598,6 +26844,81 @@ fn opencode_composer_ready(tail: &str) -> bool {
     squashed.contains("ctrl+pcommands") || squashed.contains("askanything\u{2026}")
 }
 
+// Antigravity's idle composer has a `>` row between horizontal rules and a
+// shortcuts footer. Anchor the footer at the end; the account-specific model
+// text after the footer marker is intentionally not part of this signal.
+fn antigravity_composer_ready(tail: &str) -> bool {
+    let squashed: String = tail
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_lowercase();
+    let Some(footer) = squashed.rfind("?forshortcuts") else {
+        return false;
+    };
+    if squashed[footer + "?forshortcuts".len()..].chars().count() > 100 {
+        return false;
+    }
+    let Some(prompt) = squashed[..footer].rfind('>') else {
+        return false;
+    };
+    squashed[..prompt].ends_with('─') && squashed[prompt + 1..footer].contains('─')
+}
+
+#[cfg(test)]
+mod antigravity_composer_ready_tests {
+    use super::{antigravity_composer_ready, collapse_tail};
+
+    #[test]
+    fn raw_idle_composer_captures_are_ready() {
+        for raw in [
+            include_bytes!("../../docs/agent-specimens/antigravity/idle-composer.raw").as_slice(),
+            include_bytes!("../../docs/agent-specimens/antigravity/tool-idle.raw").as_slice(),
+            include_bytes!("../../docs/agent-specimens/antigravity/lifecycle-idle.raw").as_slice(),
+            include_bytes!("../../docs/agent-specimens/antigravity/resume-by-id.raw").as_slice(),
+        ] {
+            assert!(antigravity_composer_ready(&collapse_tail(raw, 1200)));
+        }
+    }
+
+    #[test]
+    fn raw_working_and_dialog_captures_are_not_ready() {
+        for raw in [
+            include_bytes!("../../docs/agent-specimens/antigravity/lifecycle-working.raw")
+                .as_slice(),
+            include_bytes!("../../docs/agent-specimens/antigravity/lifecycle-complete.raw")
+                .as_slice(),
+            include_bytes!("../../docs/agent-specimens/antigravity/completed.raw").as_slice(),
+            include_bytes!("../../docs/agent-specimens/antigravity/first-run-trust.raw").as_slice(),
+            include_bytes!("../../docs/agent-specimens/antigravity/command-approval.raw")
+                .as_slice(),
+        ] {
+            assert!(!antigravity_composer_ready(&collapse_tail(raw, 1200)));
+        }
+    }
+
+    #[test]
+    fn startup_prefix_before_composer_is_not_ready() {
+        let raw = include_bytes!("../../docs/agent-specimens/antigravity/startup.raw");
+        let composer_start = raw
+            .windows(b"\r\n>\r\n".len())
+            .position(|window| window == b"\r\n>\r\n")
+            .expect("startup capture contains its composer row");
+        assert!(!antigravity_composer_ready(&collapse_tail(
+            &raw[..composer_start],
+            1200
+        )));
+    }
+
+    #[test]
+    fn model_label_is_not_part_of_the_ready_signal() {
+        let raw = include_bytes!("../../docs/agent-specimens/antigravity/idle-composer.raw");
+        let collapsed =
+            collapse_tail(raw, 1200).replace("Gemini 3.8 Flash · high", "Gemini 3.8 Pro · low");
+        assert!(antigravity_composer_ready(&collapsed));
+    }
+}
+
 #[cfg(test)]
 mod opencode_composer_ready_tests {
     use super::opencode_composer_ready;
@@ -24691,6 +27012,7 @@ fn composer_ready(provider: SessionProvider, tail: &str) -> bool {
         SessionProvider::Codex => codex_catch_up_composer_ready(tail),
         SessionProvider::Opencode => opencode_composer_ready(tail),
         SessionProvider::Claude => true,
+        SessionProvider::Antigravity => antigravity_composer_ready(tail),
     }
 }
 
@@ -25069,11 +27391,14 @@ fn session_digest_dir<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<PathBuf> 
     project_resource_path(app, "session-digests")
 }
 
-fn session_digest_rel_path(provider: SessionProvider, id: &str) -> String {
-    format!(
-        "resources/session-digests/{}-{}.md",
-        session_provider_label(provider),
-        id
+fn session_digest_rel_path(root: &Path, provider: SessionProvider, id: &str) -> String {
+    bram_state_rel(
+        root,
+        &format!(
+            "session-digests/{}-{}.md",
+            session_provider_label(provider),
+            id
+        ),
     )
 }
 
@@ -25393,7 +27718,8 @@ fn write_session_digest<R: tauri::Runtime>(
             ),
         );
     }
-    Some((session_digest_rel_path(provider, id), take))
+    let root = project_root(Some(app))?;
+    Some((session_digest_rel_path(&root, provider, id), take))
 }
 
 // "Claude session '<title>'", or the id's first 8 characters when untitled.
@@ -25640,6 +27966,7 @@ fn session_provider_display(provider: SessionProvider) -> &'static str {
         SessionProvider::Claude => "Claude",
         SessionProvider::Codex => "Codex",
         SessionProvider::Opencode => "OpenCode",
+        SessionProvider::Antigravity => "Antigravity",
     }
 }
 
@@ -25667,6 +27994,12 @@ fn fallback_latest_session_id<R: tauri::Runtime>(
             .ok()
             .flatten()
             .and_then(|p| session_id_for_path(SessionProvider::Opencode, &p)),
+        // Nothing to fall back to until antigravity-sessions-browser.
+        SessionProvider::Antigravity => discover_antigravity_sessions(app, Some(1))
+            .ok()?
+            .into_iter()
+            .next()
+            .map(|s| s.id),
     }
 }
 
@@ -25785,6 +28118,8 @@ fn session_path_for_id<R: tauri::Runtime>(
         }
         SessionProvider::Codex => codex_session_path_for_id(app, id),
         SessionProvider::Opencode => opencode_session_path_for_id(app, id),
+        // No file-discovery for Antigravity yet (antigravity-sessions-browser).
+        SessionProvider::Antigravity => antigravity_export_path(app, id),
     }
 }
 
@@ -25864,6 +28199,13 @@ fn set_current_provider<R: tauri::Runtime>(
         })
         .unwrap_or_default();
     let provider_label = session_provider_label(provider);
+    // login-fallback-offers-the-agent-you-left: remember the agent being left,
+    // so a sign-in screen on the new one offers the way back.
+    if let Some(left) = SessionProvider::from_str(&old_provider).filter(|p| *p != provider) {
+        if let Ok(mut slot) = previous_provider_cell().lock() {
+            *slot = Some(left);
+        }
+    }
     let body = serde_json::json!({
         "provider": provider_label,
         "reason": reason,
@@ -25901,10 +28243,9 @@ fn set_current_provider<R: tauri::Runtime>(
 // clear the tail cursor so the next emit is a full reset, then emit — the
 // iframe replaces its transcript buffer with the resumed conversation.
 //
-// Claude `--resume <id>` reuses the same file, so it's the final target.
-// Codex `resume` rotates to a NEW sid: bumping the clicked file shows the
-// resumed history right away, and once codex writes the rotated file (real
-// user activity, newer mtime) latest_codex_session_path transitions to it.
+// Claude `--resume <id>` and Codex `resume <id>` both keep the session id
+// (docs/agent-specimens/codex, SessionStart-resume.json), so this is the final
+// target either way.
 fn resync_transcript_to_session<R: tauri::Runtime>(
     app: &AppHandle<R>,
     provider: SessionProvider,
@@ -26029,6 +28370,7 @@ fn reload_agent_session(
         "codex" => "codex",
         "claude" | "claud" => "claude",
         "opencode" => "opencode",
+        "antigravity" => "antigravity",
         other => return Err(format!("unknown agent provider: {}", other)),
     };
     refuse_agent_typing_if_policy_none(&app, "session-reload")?;
@@ -26078,6 +28420,14 @@ fn reload_agent_session(
     if session_provider == SessionProvider::Opencode && session_exists {
         mark_opencode_session_current(&app, &session, "reload");
     }
+    if session_provider == SessionProvider::Antigravity {
+        if session_exists {
+            mark_antigravity_session_current(&app, &session, "reload");
+        } else {
+            clear_antigravity_live_session(&app, "reload-fresh");
+        }
+    }
+    set_named_session(session_provider, session_exists.then_some(session.as_str()));
     let generation = begin_agent_launch();
     // pair-offer-warns-before-replacing: a newer launch ends the situation the
     // pair offer described; on 2026-10-27 22:08Z it outlived a reload.
@@ -26159,6 +28509,7 @@ fn start_agent_fresh(
         "codex" => "codex",
         "claude" | "claud" => "claude",
         "opencode" => "opencode",
+        "antigravity" => "antigravity",
         other => return Err(format!("unknown agent provider: {}", other)),
     };
     refuse_agent_typing_if_policy_none(&app, "start-fresh")?;
@@ -26189,6 +28540,10 @@ fn start_agent_fresh(
     pty_write_internal(&app, &state, "\x03", "agent-fresh-interrupt-2")?;
     let session_provider =
         SessionProvider::from_str(provider_key).unwrap_or(SessionProvider::Claude);
+    if session_provider == SessionProvider::Antigravity {
+        clear_antigravity_live_session(&app, "start-fresh");
+    }
+    set_named_session(session_provider, None);
     launch_agent_command(AgentLaunch {
         app: app.clone(),
         generation,
@@ -26376,11 +28731,10 @@ fn pending_codex_session_path<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<P
     paths
         .into_iter()
         .filter_map(|candidate| {
-            let (session_id, cwd) = codex_session_meta(&candidate).ok().flatten()?;
+            let session_id = codex_main_session_id(&candidate, &project_cwd)
+                .ok()
+                .flatten()?;
             if rec.previous_session_id.as_deref() == Some(session_id.as_str()) {
-                return None;
-            }
-            if canonical_path_string(Path::new(&cwd)) != project_cwd {
                 return None;
             }
             let metadata = std::fs::metadata(&candidate).ok()?;
@@ -26467,10 +28821,17 @@ fn apply_pending_session_title<R: tauri::Runtime>(
     // is only to stop it attaching to an unrelated much-later rotation.
     let stale = unix_now_ms() - rec.created_at_ms > 600_000;
     if rec.provider == want && !stale {
-        let created_ms = session_path_for_id(app, provider, new_sid)
-            .and_then(|p| std::fs::metadata(p).ok())
-            .and_then(|m| m.created().ok())
-            .and_then(system_time_ms);
+        // agy-session-rename: agy's birth evidence is its conversation file.
+        // None yet means a conversation too new to have one, while a
+        // `/resume`d old one has an old file and can't take the name.
+        let created_ms = if matches!(provider, SessionProvider::Antigravity) {
+            antigravity_conversation_created_ms(new_sid).or_else(|| Some(unix_now_ms()))
+        } else {
+            session_path_for_id(app, provider, new_sid)
+                .and_then(|p| std::fs::metadata(p).ok())
+                .and_then(|m| m.created().ok())
+                .and_then(system_time_ms)
+        };
         let old_target = rec.session_id.clone();
         if !claim_pending_session_title(&mut rec, new_sid, allow_claim, created_ms) {
             return;
@@ -26503,7 +28864,9 @@ fn apply_pending_session_title<R: tauri::Runtime>(
             // fresh-partner-takes-partner-name: an OpenCode fresh partner's
             // queued name lands here once its session rotates in; the rename
             // is a title UPDATE in OpenCode's database (509deb8).
-            SessionProvider::Claude | SessionProvider::Opencode => {
+            // Antigravity's fresh partner lands here from its session event;
+            // New session itself still refuses (see that refusal).
+            SessionProvider::Claude | SessionProvider::Opencode | SessionProvider::Antigravity => {
                 rename_session(app, new_sid, Some(provider), &rec.title).map(|_| ())
             }
         };
@@ -26560,12 +28923,13 @@ fn apply_pending_session_title<R: tauri::Runtime>(
 #[cfg(test)]
 mod pending_session_title_tests {
     use super::{
-        agent_provider_from_command, agent_resume_command, claim_pending_session_title,
-        codex_session_is_visible, fresh_partner_reason, fresh_partner_title,
-        merge_pending_session_entry, new_session_launch_command,
+        agent_launch_command, agent_provider_from_command, agent_resume_command,
+        claim_pending_session_title, codex_session_is_visible, fresh_partner_reason,
+        fresh_partner_title, merge_pending_session_entry, new_session_launch_command,
         pending_session_title_abandoned_by_resume, pending_session_title_can_claim,
-        pending_title_marks_new_session, provider_switch_launch, session_change_snapshot,
-        switch_starts_fresh_partner, PendingSessionTitle, SessionEntry, SessionProvider,
+        pending_title_marks_new_session, provider_cli_name, provider_switch_launch,
+        session_change_snapshot, session_provider_label, switch_starts_fresh_partner,
+        PendingSessionTitle, SessionEntry, SessionProvider,
     };
 
     #[test]
@@ -26797,6 +29161,59 @@ mod pending_session_title_tests {
         assert_eq!(
             SessionProvider::from_str("opencode"),
             Some(SessionProvider::Opencode)
+        );
+        // antigravity-provider-switch: the label is `antigravity` but the CLI
+        // is `agy`, so the launch, the resume and the PATH probe all take the
+        // second name.
+        assert_eq!(agent_launch_command("antigravity"), Some("agy"));
+        assert_eq!(
+            agent_resume_command("antigravity", "").as_deref(),
+            Some("agy --continue")
+        );
+        assert_eq!(
+            agent_resume_command("antigravity", "3f6c1d2e").as_deref(),
+            Some("agy --conversation 3f6c1d2e")
+        );
+        assert_eq!(
+            agent_provider_from_command(Some("antigravity")),
+            "antigravity"
+        );
+        // A literal command in `shell.agent`, rather than the wire string.
+        assert_eq!(agent_provider_from_command(Some("agy")), "antigravity");
+        // antigravity-agent-command-detection: `agy` counts as the command's
+        // own name only, never as three letters inside a path or argument.
+        for agy in [
+            "agy --model gemini-3.8-flash-high",
+            "/Users/x/.local/bin/agy",
+            "\"/Users/x/.local/bin/agy\" --continue",
+            "C:\\Users\\x\\bin\\agy.exe",
+            "AGY",
+        ] {
+            assert_eq!(
+                agent_provider_from_command(Some(agy)),
+                "antigravity",
+                "{agy}"
+            );
+        }
+        for (command, provider) in [
+            ("/Users/nagy/.local/bin/codex", "codex"),
+            ("claude --name hagyma", "claude"),
+            ("/opt/agy/bin/opencode", "opencode"),
+            ("agyx", "claude"),
+        ] {
+            assert_eq!(
+                agent_provider_from_command(Some(command)),
+                provider,
+                "{command}"
+            );
+        }
+        assert_eq!(
+            SessionProvider::from_str("antigravity"),
+            Some(SessionProvider::Antigravity)
+        );
+        assert_ne!(
+            provider_cli_name(SessionProvider::Antigravity),
+            session_provider_label(SessionProvider::Antigravity)
         );
         let rec = PendingSessionTitle {
             provider: "claude".into(),
@@ -27072,9 +29489,21 @@ fn create_new_session(
         "codex" => "codex",
         "claude" | "claud" => "claude",
         "opencode" => "opencode",
+        "antigravity" => "antigravity",
         other => return Err(format!("unknown agent provider: {}", other)),
     };
     refuse_agent_typing_if_policy_none(&app, "new-session")?;
+    // antigravity-provider-switch: New session promises a name, and a name
+    // lands by renaming the session once its file surfaces. rename_session
+    // can now name an agy session (agy-session-rename), but this path hasn't
+    // been tried with one, so New session stays refused. Refuse rather than
+    // create a session titled with its first message.
+    if provider_key == "antigravity" {
+        return Err(
+            "Named new sessions aren't available for Antigravity yet. Start a new session from inside Antigravity."
+                .to_string(),
+        );
+    }
     // session-groups (2026-10-28 05:15Z): OpenCode is named like the others.
     // This once skipped it ("Bram can't rename them"), but Bram writes
     // OpenCode titles into its database (opencode-session-rename) and the
@@ -27240,49 +29669,78 @@ fn pty_resize(cols: u16, rows: u16, state: State<'_, AppState>) -> Result<(), St
 static LAST_PROJECT_CONFIG_LOGGED: std::sync::Mutex<Option<(String, u64)>> =
     std::sync::Mutex::new(None);
 
-fn load_project_config(root: &Path) -> Option<ProjectConfig> {
+// The merged settings view (judell/bram#469 0.8.4): `.bram/settings.json`
+// (personal, written by Bram) over the first of `.bram.json` /
+// `.xmlui-desktop.json` (possibly tracked, team keys like `server.*`). Deep
+// merge, settings.json wins; root-only keys still apply. Returns the root
+// path (for logging), the merged value, and a digest of both files' bytes.
+// settings.json is consulted only once `.bram/` exists (before the move there
+// is none, and a settings write never creates the folder).
+fn merged_project_config(root: &Path) -> Option<(PathBuf, serde_json::Value, u64)> {
+    let mut path = root.join(".bram.json");
+    let mut root_bytes = None;
     for rel in [".bram.json", ".xmlui-desktop.json"] {
-        let path = root.join(rel);
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(_) => continue,
-        };
-        return match serde_json::from_slice::<ProjectConfig>(&bytes) {
-            Ok(cfg) => {
-                // Log only when the loaded bytes actually change (#275). This
-                // function has 19 call sites and several are per-request --
-                // `route_request` for `__settings` and `__worklist-config`,
-                // `current_describe_model` once per Tool-Description request,
-                // the search-index depth/limit readers once per pass -- so an
-                // unconditional eprintln! reprinted an unchanged fact hundreds
-                // of times a day. It reached the launch terminal only (never
-                // bram-trace.log), which is why it went unnoticed for so long.
-                //
-                // Keyed on the file's content hash rather than mtime: a
-                // rewrite that restores identical bytes is not a change worth
-                // announcing, and editors touch mtimes freely. The read and
-                // parse still happen every call -- deliberately, because that
-                // is what keeps a hand-edit of .bram.json live -- so this is a
-                // logging fix, not a cache.
-                let digest = bytes.len() as u64
-                    ^ bytes.iter().fold(1469598103934665603u64, |h, b| {
-                        (h ^ (*b as u64)).wrapping_mul(1099511628211)
-                    });
-                let key = (path.display().to_string(), digest);
-                let mut last = LAST_PROJECT_CONFIG_LOGGED.lock().unwrap();
-                if last.as_ref() != Some(&key) {
-                    eprintln!("[project-config] loaded {}", path.display());
-                    *last = Some(key);
-                }
-                Some(cfg)
-            }
-            Err(e) => {
-                eprintln!("[project-config] failed to parse {}: {}", path.display(), e);
-                None
-            }
-        };
+        if let Ok(bytes) = std::fs::read(root.join(rel)) {
+            path = root.join(rel);
+            root_bytes = Some(bytes);
+            break;
+        }
     }
-    None
+    let settings_bytes = (bram_state_dir_name(root) == BRAM_STATE_DIR_NEW)
+        .then(|| std::fs::read(bram_state_dir(root).join("settings.json")).ok())
+        .flatten();
+    if root_bytes.is_none() && settings_bytes.is_none() {
+        return None;
+    }
+    let parse = |bytes: &[u8], p: &Path| match serde_json::from_slice::<serde_json::Value>(bytes) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            eprintln!("[project-config] failed to parse {}: {}", p.display(), e);
+            None
+        }
+    };
+    let mut merged = serde_json::Value::Object(serde_json::Map::new());
+    if let Some(bytes) = &root_bytes {
+        merged = parse(bytes, &path)?;
+    }
+    if let Some(bytes) = &settings_bytes {
+        let sp = bram_state_dir(root).join("settings.json");
+        merged = merge_settings_into_config(merged, &parse(bytes, &sp)?);
+    }
+    let digest = root_bytes
+        .iter()
+        .chain(settings_bytes.iter())
+        .flat_map(|b| b.iter().chain(std::iter::once(&0u8)))
+        .fold(1469598103934665603u64, |h, b| {
+            (h ^ (*b as u64)).wrapping_mul(1099511628211)
+        });
+    Some((path, merged, digest))
+}
+
+fn load_project_config(root: &Path) -> Option<ProjectConfig> {
+    let (path, merged, digest) = merged_project_config(root)?;
+    match serde_json::from_value::<ProjectConfig>(merged) {
+        Ok(cfg) => {
+            // Log only when the loaded bytes actually change (#275). This
+            // function has 19 call sites and several are per-request, so an
+            // unconditional eprintln! reprinted an unchanged fact hundreds of
+            // times a day. Keyed on a content digest (of both files) rather
+            // than mtime. The read and parse still happen every call --
+            // deliberately, because that keeps a hand-edit live -- so this is
+            // a logging fix, not a cache.
+            let key = (path.display().to_string(), digest);
+            let mut last = LAST_PROJECT_CONFIG_LOGGED.lock().unwrap();
+            if last.as_ref() != Some(&key) {
+                eprintln!("[project-config] loaded {}", path.display());
+                *last = Some(key);
+            }
+            Some(cfg)
+        }
+        Err(e) => {
+            eprintln!("[project-config] failed to parse {}: {}", path.display(), e);
+            None
+        }
+    }
 }
 
 fn project_config_batch_commit_actions(config: Option<ProjectConfig>) -> bool {
@@ -27312,7 +29770,12 @@ fn project_config_mirror_worklist_lifecycle_to_issue(config: Option<ProjectConfi
 
 fn agent_provider_from_command(command: Option<&str>) -> &'static str {
     let lower = command.unwrap_or("").to_ascii_lowercase();
-    if lower.contains("opencode") {
+    if lower.contains("antigravity") || command_head_is_agy(&lower) {
+        // antigravity-provider-switch: `shell.agent` holds either the wire
+        // string or a literal command, and agy's binary shares no substring
+        // with its provider name, so both spellings are checked here.
+        "antigravity"
+    } else if lower.contains("opencode") {
         "opencode"
     } else if lower.contains("codex") {
         "codex"
@@ -27320,6 +29783,18 @@ fn agent_provider_from_command(command: Option<&str>) -> &'static str {
         // Covers claude/claud and the empty/unknown setting default.
         "claude"
     }
+}
+
+// antigravity-agent-command-detection: "agy" turns up inside ordinary words
+// and paths (`/Users/nagy/.local/bin/codex`, `--name hagyma`), and the
+// Antigravity check runs before the others, so a substring match took those
+// for Antigravity. It counts only as the command's own name: the first word,
+// with any directory, surrounding quotes and a Windows `.exe` stripped.
+fn command_head_is_agy(lower: &str) -> bool {
+    let (head, _) = split_command_head_tail(lower);
+    let head = head.trim_matches(['"', '\'']);
+    let name = head.rsplit(['/', '\\']).next().unwrap_or(head);
+    name == "agy" || name == "agy.exe"
 }
 
 fn split_command_head_tail(command: &str) -> (&str, &str) {
@@ -27356,6 +29831,10 @@ fn agent_launch_command(provider: &str) -> Option<&'static str> {
         "codex" => Some("codex"),
         "claude" | "claud" => Some("claude"),
         "opencode" => Some("opencode"),
+        // Antigravity CLI 1.4.12 (docs/agent-specimens/antigravity/version.txt).
+        // It self-updates, so a behaviour change may arrive without a Bram
+        // release.
+        "antigravity" => Some("agy"),
         _ => None,
     }
 }
@@ -27379,6 +29858,9 @@ fn new_session_launch_command(provider: &str, title: &str, session_id: Option<&s
         // No naming flag, and New session refuses OpenCode until its
         // sessions are visible (opencode-sessions-browser).
         "opencode" => "opencode".to_string(),
+        // Same for Antigravity: its title lands after launch
+        // (antigravity_set_title).
+        "antigravity" => "agy".to_string(),
         _ => "".to_string(),
     }
 }
@@ -27406,6 +29888,15 @@ fn agent_resume_command(provider: &str, session_id: &str) -> Option<String> {
             "opencode --continue".to_string()
         } else {
             format!("opencode --session {}", id)
+        }),
+        // antigravity-provider-switch: `-c/--continue` continues the most
+        // recent conversation, and `--conversation <id>` resumes a specific
+        // one (help.txt, resume-by-id.txt). Ids come from hook payloads and
+        // reach this once antigravity-sessions-browser lists sessions.
+        "antigravity" => Some(if id.is_empty() {
+            "agy --continue".to_string()
+        } else {
+            format!("agy --conversation {}", id)
         }),
         _ => None,
     }
@@ -27756,6 +30247,101 @@ mod agent_startup_policy_tests {
         assert_eq!(merged["shell"]["firstCommand"], "/status");
     }
 
+    fn split_settings_root(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "bram-split-settings-{}-{}-{}",
+            tag,
+            std::process::id(),
+            super::unix_now_ms()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    // #469 0.8.4: settings.json wins, root-only keys survive, objects merge.
+    #[test]
+    fn project_config_merges_settings_json_over_root_file() {
+        let root = split_settings_root("merge");
+        std::fs::create_dir_all(root.join(".bram")).unwrap();
+        std::fs::write(
+            root.join(".bram.json"),
+            r#"{"server":{"command":"npm start","port":4000},"shell":{"agent":"claude","args":"--x"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".bram/settings.json"),
+            r#"{"shell":{"agent":"codex"}}"#,
+        )
+        .unwrap();
+        let (_, v, _) = super::merged_project_config(&root).unwrap();
+        assert_eq!(v["shell"]["agent"], "codex");
+        assert_eq!(v["shell"]["args"], "--x");
+        assert_eq!(v["server"]["port"], 4000);
+        let cfg = super::load_project_config(&root).unwrap();
+        assert_eq!(cfg.shell.unwrap().agent.as_deref(), Some("codex"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // After the move a write lands in .bram/settings.json and the root file's
+    // bytes (here in a non-Bram key order) are untouched (#469 finding 4).
+    #[test]
+    fn settings_write_after_move_leaves_root_file_bytes_alone() {
+        let root = split_settings_root("after");
+        std::fs::create_dir_all(root.join(".bram")).unwrap();
+        let original = "{\n  \"shell\": {\"agent\": \"claude\"},\n  \"server\": {\"port\": 1},\n  \"forge\": \"github\"\n}\n";
+        std::fs::write(root.join(".bram.json"), original).unwrap();
+        let update = serde_json::json!({ "shell": { "agent": "codex" } });
+        super::write_settings_to_config(&root, &update).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join(".bram.json")).unwrap(),
+            original
+        );
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join(".bram/settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(written["shell"]["agent"], "codex");
+        assert_eq!(
+            super::merged_project_config(&root).unwrap().1["shell"]["agent"],
+            "codex"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Before the move a write goes to the root file as today, and never
+    // creates `.bram/` (that would make the mover skip as already-moved).
+    #[test]
+    fn settings_write_before_move_uses_root_file_and_creates_no_state_dir() {
+        let root = split_settings_root("before");
+        std::fs::write(root.join(".bram.json"), r#"{"server":{"port":1}}"#).unwrap();
+        super::write_settings_to_config(
+            &root,
+            &serde_json::json!({ "shell": { "agent": "codex" } }),
+        )
+        .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join(".bram.json")).unwrap()).unwrap();
+        assert_eq!(v["shell"]["agent"], "codex");
+        assert_eq!(v["server"]["port"], 1);
+        assert!(!root.join(".bram").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn project_config_path_predicate_includes_state_settings_json() {
+        assert!(super::is_project_config_path(std::path::Path::new(
+            "/p/.bram.json"
+        )));
+        assert!(super::is_project_config_path(std::path::Path::new(
+            "/p/.bram/settings.json"
+        )));
+        assert!(!super::is_project_config_path(std::path::Path::new(
+            "/p/.claude/settings.json"
+        )));
+        assert!(!super::is_project_config_path(std::path::Path::new(
+            "/p/resources/settings.json"
+        )));
+    }
+
     // suggest-fresh-session: defaults, and a partial `sessions` save that
     // flips one key without disturbing the other keys or other sections.
     #[test]
@@ -27800,8 +30386,8 @@ mod agent_startup_policy_tests {
                 "startupPolicy": "agentRecent",
                 "continueLast": true
             },
-            "worklist": { "batchCommitActions": false },
-            "ui": { "showTargetApp": false, "toolsPaneHotReload": false },
+            "worklist": { "batchCommitActions": false, "enforcement": "on" },
+            "ui": { "showTargetApp": false, "toolsPaneHotReload": false, "paneIdleFlush": false },
             "sessions": {
                 "suggestOnNewItem": true,
                 "suggestOnNewIssue": true,
@@ -27968,6 +30554,16 @@ fn settings_view_from_config(config: Option<ProjectConfig>) -> serde_json::Value
     // commands, diffs, written content, context, or result excerpts to an
     // external model. Only an explicit project setting enables the route.
     let describe_commands = project_config_describe_commands(config.clone());
+    let enforcement = if config
+        .as_ref()
+        .and_then(|c| c.worklist.as_ref())
+        .and_then(|w| w.enforcement.as_deref())
+        == Some("paused")
+    {
+        "paused"
+    } else {
+        "on"
+    };
     let search_commit_depth = search_commit_depth_from_config(config.as_ref());
     let search_issue_limit = search_issue_limit_from_config(config.as_ref());
     let sessions_cfg = config.as_ref().and_then(|c| c.sessions.clone());
@@ -27995,6 +30591,7 @@ fn settings_view_from_config(config: Option<ProjectConfig>) -> serde_json::Value
         batch,
         show_target_app,
         tools_pane_hot_reload,
+        pane_idle_flush,
         tracing_enabled,
         inspector_tap,
         archive_after_days,
@@ -28029,7 +30626,11 @@ fn settings_view_from_config(config: Option<ProjectConfig>) -> serde_json::Value
                 // Default OFF — the embedded target app is opt-in.
                 ui.as_ref().and_then(|u| u.show_target_app).unwrap_or(false),
                 // Default OFF — only explicit `true` enables.
-                ui.and_then(|u| u.tools_pane_hot_reload).unwrap_or(false),
+                ui.as_ref()
+                    .and_then(|u| u.tools_pane_hot_reload)
+                    .unwrap_or(false),
+                // pane-idle-flush-when-degraded: default OFF, opt-in workaround.
+                ui.and_then(|u| u.pane_idle_flush).unwrap_or(false),
                 // Default ON — tracing is the observability backbone; an
                 // explicit `false` (or BRAM_TRACE=0) turns it off.
                 traces.as_ref().and_then(|t| t.enabled).unwrap_or(true),
@@ -28055,6 +30656,7 @@ fn settings_view_from_config(config: Option<ProjectConfig>) -> serde_json::Value
             false,
             false,
             false,
+            false,
             true,
             false,
             DEFAULT_TRACE_ARCHIVE_AFTER_DAYS,
@@ -28074,8 +30676,12 @@ fn settings_view_from_config(config: Option<ProjectConfig>) -> serde_json::Value
             "continueLast": startup_policy != AgentStartupPolicy::NewSession.as_str()
                 && startup_policy != AgentStartupPolicy::None.as_str()
         },
-        "worklist": { "batchCommitActions": batch },
-        "ui": { "showTargetApp": show_target_app, "toolsPaneHotReload": tools_pane_hot_reload },
+        "worklist": { "batchCommitActions": batch, "enforcement": enforcement },
+        "ui": {
+            "showTargetApp": show_target_app,
+            "toolsPaneHotReload": tools_pane_hot_reload,
+            "paneIdleFlush": pane_idle_flush
+        },
         "sessions": {
             "suggestOnNewItem": suggest_on_new_item,
             "suggestOnNewIssue": suggest_on_new_issue,
@@ -28116,6 +30722,11 @@ fn emit_settings_changed<R: tauri::Runtime>(app: &AppHandle<R>, settings: &serde
 fn is_project_config_path(path: &Path) -> bool {
     path.file_name()
         .map_or(false, |n| n == ".bram.json" || n == ".xmlui-desktop.json")
+        || (path.file_name().is_some_and(|n| n == "settings.json")
+            && path
+                .parent()
+                .and_then(|p| p.file_name())
+                .is_some_and(|n| n == BRAM_STATE_DIR_NEW))
 }
 
 // Merge a Settings-tab POST body into the on-disk .bram.json, preserving
@@ -28153,6 +30764,11 @@ fn merge_settings_into_config(
 }
 
 fn settings_target_path(root: &Path) -> PathBuf {
+    // Once `.bram/` exists, writes go to its settings.json and the root file
+    // is never rewritten (#469 finding 4). Never creates `.bram/` itself.
+    if bram_state_dir_name(root) == BRAM_STATE_DIR_NEW {
+        return bram_state_dir(root).join("settings.json");
+    }
     let bram = root.join(".bram.json");
     if bram.exists() {
         return bram;
@@ -28250,7 +30866,7 @@ fn bram_port_metadata_path(port_path: &Path) -> PathBuf {
 }
 
 fn write_bram_port_files(proj: &Path, port: u16, started_at_ms: i64) -> Result<(), String> {
-    let port_path = proj.join("resources/.bram-port");
+    let port_path = resource_relative_path(proj, ".bram-port");
     if let Some(parent) = port_path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("create {}: {}", parent.display(), e))?;
@@ -28271,11 +30887,314 @@ fn write_bram_port_files(proj: &Path, port: u16, started_at_ms: i64) -> Result<(
     Ok(())
 }
 
-fn remove_bram_port_files(proj: &Path) {
-    let port_path = proj.join("resources/.bram-port");
-    let meta_path = bram_port_metadata_path(&port_path);
-    let _ = std::fs::remove_file(port_path);
-    let _ = std::fs::remove_file(meta_path);
+// A listening socket (or any HTTP response) is not enough: the previous
+// port may now belong to another project or an unrelated server. An
+// unresponsive listener is uncertain, not permission to replace its record.
+fn bram_port_serves_project(port: u16, proj: &Path) -> Result<bool, String> {
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::time::Duration;
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    // windows-dead-port-probe-timeout: a port nobody holds can be bound, which
+    // settles "dead" at once on every platform. It matters on Windows, where
+    // a connect to a closed loopback port is refused only after about 2 s of
+    // SYN retries, so the 200 ms probe below reported a timeout, which the
+    // rule treats as uncertain, and the stale record was kept (2026-11-03).
+    // A failed bind proves nothing (a live listener, or TIME_WAIT on Unix)
+    // and falls through to the probe.
+    if TcpListener::bind(addr).is_ok() {
+        return Ok(false);
+    }
+    match TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => return Ok(false),
+        Err(e) => return Err(format!("probe port {}: {} (kind {:?})", port, e, e.kind())),
+    }
+    let response = match ureq::AgentBuilder::new()
+        .try_proxy_from_env(false)
+        .redirects(0)
+        .timeout(Duration::from_secs(1))
+        .build()
+        .get(&format!("http://127.0.0.1:{}/__app-info", port))
+        .call()
+    {
+        Ok(response) => response,
+        Err(ureq::Error::Status(_, _)) => return Ok(false),
+        Err(e) => return Err(format!("probe port {}: {}", port, e)),
+    };
+    let mut body = String::new();
+    response
+        .into_reader()
+        .take(65536)
+        .read_to_string(&mut body)
+        .map_err(|e| format!("read port {} identity: {}", port, e))?;
+    let info: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+    let Some(root) = info.get("projectKey").and_then(|v| v.as_str()) else {
+        return Ok(false);
+    };
+    if info.get("current").and_then(|v| v.as_str()).is_none() {
+        return Ok(false);
+    }
+    Ok(std::fs::canonicalize(root)
+        .ok()
+        .zip(std::fs::canonicalize(proj).ok())
+        .is_some_and(|(owner, project)| owner == project))
+}
+
+// Returns the preserved owner's port, or None when this instance publishes.
+// Keep the lock in this worktree's git directory: it is local runtime state,
+// and separate worktrees must not share the lock. Never unlink a lock file;
+// the OS releases the lock when this handle closes (including on a crash).
+fn publish_bram_port_files(
+    proj: &Path,
+    git_dir: &Path,
+    port: u16,
+    started_at_ms: i64,
+) -> Result<Option<u16>, String> {
+    let lock_path = git_dir.join("bram-port.lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| format!("open {}: {}", lock_path.display(), e))?;
+    lock.lock()
+        .map_err(|e| format!("lock {}: {}", lock_path.display(), e))?;
+    let port_path = resource_relative_path(proj, ".bram-port");
+    let recorded_port = std::fs::read_to_string(&port_path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .or_else(|| {
+            let raw = std::fs::read(bram_port_metadata_path(&port_path)).ok()?;
+            let meta: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+            u16::try_from(meta.get("port")?.as_u64()?).ok()
+        })
+        .filter(|p| *p != 0);
+    if let Some(previous) = recorded_port {
+        if previous != port && bram_port_serves_project(previous, proj)? {
+            return Ok(Some(previous));
+        }
+    }
+    write_bram_port_files(proj, port, started_at_ms)?;
+    Ok(None)
+}
+
+#[cfg(test)]
+mod bram_port_publication_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
+
+    struct Project(PathBuf);
+    impl Project {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("bram-port-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(root.join(".git")).unwrap();
+            Self(root)
+        }
+        fn publish(&self, port: u16) -> Result<Option<u16>, String> {
+            publish_bram_port_files(&self.0, &self.0.join(".git"), port, 123)
+        }
+        fn bytes(&self) -> (Vec<u8>, Vec<u8>) {
+            (
+                std::fs::read(super::resource_relative_path(&self.0, ".bram-port")).unwrap(),
+                std::fs::read(super::resource_relative_path(&self.0, ".bram-port.json")).unwrap(),
+            )
+        }
+    }
+    impl Drop for Project {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct Server {
+        port: u16,
+        stop: Arc<AtomicBool>,
+        task: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Server {
+        fn new(body: String, status: u16, delay: Duration) -> Self {
+            let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let port = server.server_addr().to_ip().unwrap().port();
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopping = stop.clone();
+            let task = std::thread::spawn(move || {
+                while !stopping.load(Ordering::SeqCst) {
+                    if let Ok(Some(request)) = server.recv_timeout(Duration::from_millis(20)) {
+                        assert_eq!(request.url(), "/__app-info");
+                        std::thread::sleep(delay);
+                        let _ = request.respond(
+                            tiny_http::Response::from_string(&body).with_status_code(status),
+                        );
+                    }
+                }
+            });
+            Self {
+                port,
+                stop,
+                task: Some(task),
+            }
+        }
+        fn project(project: &Project) -> Self {
+            Self::new(
+                serde_json::json!({"current":"0.8.2", "projectKey":project.0}).to_string(),
+                200,
+                Duration::ZERO,
+            )
+        }
+    }
+    impl Drop for Server {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            self.task.take().unwrap().join().unwrap();
+            // port-test-waits-for-the-dead-owner-to-close: the listening
+            // socket can outlive the join by a moment. A probe in that gap
+            // connects and is reset (Linux CI, v0.8.4 run 41957673757), which
+            // the probe rightly reports as uncertain. Wait until the port can
+            // be bound, so a dropped server is a dead owner.
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            while std::net::TcpListener::bind(("127.0.0.1", self.port)).is_err()
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    #[test]
+    fn second_instance_preserves_both_live_owner_files_byte_for_byte() {
+        let project = Project::new();
+        let first = Server::project(&project);
+        let second = Server::project(&project);
+        assert_eq!(project.publish(first.port).unwrap(), None);
+        let before = project.bytes();
+        assert_eq!(project.publish(second.port).unwrap(), Some(first.port));
+        assert_eq!(project.bytes(), before);
+        drop(second);
+        assert!(bram_port_serves_project(first.port, &project.0).unwrap());
+        assert_eq!(project.bytes(), before);
+    }
+
+    #[test]
+    fn dead_owner_is_replaced_and_restart_can_reuse_its_port() {
+        let project = Project::new();
+        let old = Server::project(&project);
+        let dead_port = old.port;
+        project.publish(dead_port).unwrap();
+        drop(old);
+        let new = Server::project(&project);
+        assert_eq!(project.publish(new.port).unwrap(), None);
+        let (plain, meta) = project.bytes();
+        assert_eq!(String::from_utf8(plain).unwrap(), new.port.to_string());
+        let meta: serde_json::Value = serde_json::from_slice(&meta).unwrap();
+        assert_eq!(meta["port"], new.port);
+        assert_eq!(meta["pid"], std::process::id());
+        assert_eq!(meta["startedAtMs"], 123);
+        assert_eq!(project.publish(new.port).unwrap(), None);
+    }
+
+    // windows-dead-port-probe-timeout: a port nobody holds is reported dead
+    // well inside the probe's 200 ms, on every platform; Windows used to
+    // answer "connection timed out" here, because it refuses a closed
+    // loopback port only after about 2 s.
+    #[test]
+    fn a_closed_port_is_dead_at_once() {
+        let project = Project::new();
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let started = std::time::Instant::now();
+        assert_eq!(bram_port_serves_project(port, &project.0).unwrap(), false);
+        assert!(
+            started.elapsed() < Duration::from_millis(1000),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn other_projects_and_non_bram_http_do_not_own_this_project() {
+        let project = Project::new();
+        let other = Project::new();
+        let new = Server::project(&project);
+        for (body, status) in [
+            (
+                serde_json::json!({"current":"0.8.2", "projectKey":other.0}).to_string(),
+                200,
+            ),
+            ("<html>another server</html>".to_string(), 200),
+            ("not found".to_string(), 404),
+        ] {
+            let old = Server::new(body, status, Duration::ZERO);
+            write_bram_port_files(&project.0, old.port, 1).unwrap();
+            assert_eq!(project.publish(new.port).unwrap(), None);
+        }
+        // A separate project has an independent lock and publication.
+        let other_server = Server::project(&other);
+        assert_eq!(other.publish(other_server.port).unwrap(), None);
+    }
+
+    #[test]
+    fn uncertain_listener_leaves_the_previous_record_untouched() {
+        let project = Project::new();
+        let slow = Server::new("{}".to_string(), 200, Duration::from_millis(1300));
+        let new = Server::project(&project);
+        write_bram_port_files(&project.0, slow.port, 1).unwrap();
+        let before = project.bytes();
+        assert!(project.publish(new.port).is_err());
+        assert_eq!(project.bytes(), before);
+    }
+
+    #[test]
+    fn legacy_port_file_without_metadata_still_preserves_a_live_owner() {
+        let project = Project::new();
+        let old = Server::project(&project);
+        let new = Server::project(&project);
+        std::fs::create_dir_all(super::bram_state_dir(&project.0)).unwrap();
+        std::fs::write(
+            super::resource_relative_path(&project.0, ".bram-port"),
+            old.port.to_string(),
+        )
+        .unwrap();
+        assert_eq!(project.publish(new.port).unwrap(), Some(old.port));
+        assert!(!super::resource_relative_path(&project.0, ".bram-port.json").exists());
+    }
+
+    #[test]
+    fn simultaneous_publishers_choose_one_owner_and_keep_the_pair_consistent() {
+        let project = Project::new();
+        let a = Server::project(&project);
+        let b = Server::project(&project);
+        let barrier = Arc::new(Barrier::new(2));
+        let tasks: Vec<_> = [a.port, b.port]
+            .into_iter()
+            .map(|port| {
+                let root = project.0.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (
+                        port,
+                        publish_bram_port_files(&root, &root.join(".git"), port, 123).unwrap(),
+                    )
+                })
+            })
+            .collect();
+        let results: Vec<_> = tasks.into_iter().map(|task| task.join().unwrap()).collect();
+        let owners: Vec<_> = results.iter().filter(|(_, kept)| kept.is_none()).collect();
+        assert_eq!(owners.len(), 1, "{results:?}");
+        let owner = owners[0].0;
+        assert!(results.iter().any(|(_, kept)| *kept == Some(owner)));
+        let (plain, meta) = project.bytes();
+        assert_eq!(String::from_utf8(plain).unwrap(), owner.to_string());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&meta).unwrap()["port"],
+            owner
+        );
+    }
 }
 
 fn wait_for_loopback_http(port: u16, total_ms: u64) -> bool {
@@ -28331,7 +31250,7 @@ fn spawn_project_server(
     // bound while every request gets an empty reply — a half-dead orphan.
     // With a file, an orphan lingers HEALTHY: the next launch either
     // reuses it (port responsive) or reaps it via the sidecar below.
-    let log_path = project_root.join("resources/bram-traces/target-server.log");
+    let log_path = resource_relative_path(&project_root, "bram-traces/target-server.log");
     if let Some(parent) = log_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -28362,7 +31281,7 @@ fn spawn_project_server(
     );
     // issue-341 sidecar: enough identity for the next launch to reap a
     // verified orphan instead of printing a kill-it-yourself HINT.
-    let sidecar = project_root.join("resources/.target-server-pid");
+    let sidecar = resource_relative_path(&project_root, ".target-server-pid");
     let _ = std::fs::write(
         &sidecar,
         format!(
@@ -28479,7 +31398,7 @@ fn kill_server_group(pid: u32, root: Option<&Path>) {
     #[cfg(windows)]
     taskkill_tree(pid, true);
     if let Some(root) = root {
-        let _ = std::fs::remove_file(root.join("resources/.target-server-pid"));
+        let _ = std::fs::remove_file(resource_relative_path(&root, ".target-server-pid"));
     }
 }
 
@@ -28488,7 +31407,7 @@ fn kill_server_group(pid: u32, root: Option<&Path>) {
 // the recorded command (pid-reuse guard). Returns true when the port was
 // freed and a fresh spawn is safe.
 fn try_reap_orphan_server(cfg: &ServerConfig, root: &Path) -> bool {
-    let sidecar = root.join("resources/.target-server-pid");
+    let sidecar = resource_relative_path(root, ".target-server-pid");
     let Ok(text) = std::fs::read_to_string(&sidecar) else {
         return false;
     };
@@ -31037,6 +33956,19 @@ fn handle_settings_post<R: tauri::Runtime>(
     if let Err(e) = write_settings_to_config(&root, &update) {
         return (500, "text/plain; charset=utf-8", e.into_bytes());
     }
+    if let Some(v) = update.pointer("/worklist/enforcement") {
+        if bram_trace_enabled() {
+            let paused = v.as_str() == Some("paused");
+            append_bram_trace_line(
+                app,
+                "worklist-enforcement",
+                &format!(
+                    "op={} provider=claude",
+                    if paused { "paused" } else { "resumed" }
+                ),
+            );
+        }
+    }
     // Publish and return the freshly merged view rather than echoing the POST
     // body. PushSource consumers see the canonical state immediately; the
     // filesystem watcher echo is deduplicated by emit_settings_changed.
@@ -31174,10 +34106,18 @@ struct SessionEntry {
 enum SessionProvider {
     Claude,
     Codex,
-    // opencode-provider-switch: launch, resume and the header switcher only.
-    // Its sessions live in SQLite, not transcript files, so every
-    // file-discovery site answers "none" for it until opencode-sessions-browser.
+    // Its sessions live in SQLite, not transcript files. Bram exports each one
+    // to a Claude-shaped JSONL, which file discovery then reads
+    // (opencode-sessions-browser).
     Opencode,
+    // antigravity-provider-switch: launch, resume and the header switcher only,
+    // as OpenCode did. Its transcript lives under
+    // ~/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/, and the
+    // conversation-to-project mapping is unidentified, so every file-discovery
+    // site answers "none" for it until antigravity-sessions-browser. The CLI is
+    // `agy`, not `antigravity`: provider_cli_name is the binary, this label is
+    // the wire string.
+    Antigravity,
 }
 
 impl SessionProvider {
@@ -31186,6 +34126,7 @@ impl SessionProvider {
             "claude" => Some(Self::Claude),
             "codex" => Some(Self::Codex),
             "opencode" => Some(Self::Opencode),
+            "antigravity" => Some(Self::Antigravity),
             _ => None,
         }
     }
@@ -31201,14 +34142,17 @@ fn provider_needs_setup_for(
     claude_needs: bool,
     codex_needs: bool,
     opencode_needs: bool,
+    antigravity_needs: bool,
 ) -> bool {
     match active {
         Some(SessionProvider::Claude) => claude_needs,
         Some(SessionProvider::Codex) => codex_needs,
         Some(SessionProvider::Opencode) => opencode_needs,
         // opencode_needs is already false wherever OpenCode isn't installed
-        // (opencode_plugin_wanted), so it raises no banner for non-users.
-        None => claude_needs || codex_needs || opencode_needs,
+        // (opencode_plugin_wanted), so it raises no banner for non-users;
+        // antigravity_needs likewise (antigravity_hooks_wanted).
+        Some(SessionProvider::Antigravity) => antigravity_needs,
+        None => claude_needs || codex_needs || opencode_needs || antigravity_needs,
     }
 }
 
@@ -31370,6 +34314,11 @@ fn session_id_for_path(provider: SessionProvider, path: &Path) -> Option<String>
         SessionProvider::Codex => codex_session_meta(path).ok().flatten().map(|(id, _)| id),
         // An export is named for its session.
         SessionProvider::Opencode => path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(str::to_string),
+        // No transcript paths for Antigravity until antigravity-sessions-browser.
+        SessionProvider::Antigravity => path
             .file_stem()
             .and_then(|stem| stem.to_str())
             .map(str::to_string),
@@ -31968,30 +34917,212 @@ fn codex_session_meta(path: &Path) -> std::io::Result<Option<(String, String)>> 
 }
 
 fn codex_session_meta_read(path: &Path) -> std::io::Result<Option<(String, String)>> {
+    Ok(codex_session_meta_payload(path)?.and_then(|payload| {
+        let id = payload.get("id")?.as_str()?.to_string();
+        let cwd = payload.get("cwd")?.as_str()?.to_string();
+        Some((id, cwd))
+    }))
+}
+
+// The head's `session_meta` payload: the first one carrying an id and cwd.
+fn codex_session_meta_payload(path: &Path) -> std::io::Result<Option<serde_json::Value>> {
     let reader = BufReader::new(std::fs::File::open(path)?);
     for line in reader.lines().take(20) {
         let line = line?;
         if line.is_empty() {
             continue;
         }
-        let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
+        let Ok(mut record) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
         if record.get("type").and_then(|v| v.as_str()) != Some("session_meta") {
             continue;
         }
-        let Some(payload) = record.get("payload") else {
+        let Some(payload) = record.get_mut("payload").map(serde_json::Value::take) else {
             continue;
         };
-        let Some(id) = payload.get("id").and_then(|v| v.as_str()) else {
+        if payload.get("id").and_then(|v| v.as_str()).is_none()
+            || payload.get("cwd").and_then(|v| v.as_str()).is_none()
+        {
             continue;
-        };
-        let Some(cwd) = payload.get("cwd").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        return Ok(Some((id.to_string(), cwd.to_string())));
+        }
+        return Ok(Some(payload));
     }
     Ok(None)
+}
+
+// codex-subagents-stay-out-of-main-session: a subagent is a rollout of its
+// own, in the same date directory and with its parent's cwd, so nothing about
+// its path or cwd sets it apart. Its session_meta does. Never use `session_id`
+// here: a child's is its parent's. See
+// docs/decisions/2026-10-30-subagent-transcript-provider-discovery.md.
+fn codex_payload_is_subagent(payload: &serde_json::Value) -> bool {
+    payload.get("thread_source").and_then(|v| v.as_str()) == Some("subagent")
+        || payload.pointer("/source/subagent").is_some()
+}
+
+#[derive(Clone)]
+struct CodexChildMeta {
+    parent_id: String,
+    agent_path: String,
+    nickname: String,
+}
+
+fn codex_payload_child_meta(payload: &serde_json::Value) -> Option<CodexChildMeta> {
+    if !codex_payload_is_subagent(payload) {
+        return None;
+    }
+    let spawn = payload.pointer("/source/subagent/thread_spawn");
+    let field = |name: &str| {
+        payload
+            .get(name)
+            .or_else(|| spawn.and_then(|s| s.get(name)))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    Some(CodexChildMeta {
+        parent_id: field("parent_thread_id"),
+        agent_path: field("agent_path"),
+        nickname: field("agent_nickname"),
+    })
+}
+
+static CODEX_CHILD_CACHE: CodexMetaCache<Option<CodexChildMeta>> = std::sync::OnceLock::new();
+
+fn codex_child_meta(path: &Path) -> std::io::Result<Option<CodexChildMeta>> {
+    let cache =
+        CODEX_CHILD_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    codex_cached_read(cache, path, |p| {
+        Ok(codex_session_meta_payload(p)?
+            .as_ref()
+            .and_then(codex_payload_child_meta))
+    })
+}
+
+fn codex_session_is_subagent(path: &Path) -> std::io::Result<bool> {
+    Ok(codex_child_meta(path)?.is_some())
+}
+
+// codex-subagent-roster-and-transcripts: a parent's children, wherever they
+// are under `sessions_root`. A resumed parent writes its children under
+// today's date directory, not its own.
+fn codex_child_rollouts_in(
+    sessions_root: &Path,
+    parent_id: &str,
+) -> Vec<(String, PathBuf, CodexChildMeta)> {
+    let mut paths = Vec::new();
+    if collect_codex_session_paths(sessions_root, &mut paths).is_err() {
+        return Vec::new();
+    }
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let child = codex_child_meta(&path).ok().flatten()?;
+            if child.parent_id != parent_id {
+                return None;
+            }
+            let (id, _) = codex_session_meta(&path).ok().flatten()?;
+            Some((id, path, child))
+        })
+        .collect()
+}
+
+fn codex_child_rollouts(session_path: &Path) -> Vec<(String, PathBuf, CodexChildMeta)> {
+    let Some((parent_id, _)) = codex_session_meta(session_path).ok().flatten() else {
+        return Vec::new();
+    };
+    let Some(home) = home_dir() else {
+        return Vec::new();
+    };
+    codex_child_rollouts_in(&home.join(".codex").join("sessions"), &parent_id)
+}
+
+// Whether a child's latest turn has ended. Codex writes no record that a child
+// is done, and none exists to close one: `task_complete` ends a turn, and a
+// `followup_task` from the parent opens another. So idle is the closest thing
+// to finished, and a follow-up takes it back to running. With neither record
+// in the tail, it isn't idle, and recency decides.
+fn codex_child_is_idle(tail: &str) -> bool {
+    for line in tail.lines().rev() {
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if record.get("type").and_then(|v| v.as_str()) != Some("event_msg") {
+            continue;
+        }
+        match record.pointer("/payload/type").and_then(|v| v.as_str()) {
+            Some("task_started") => return false,
+            Some("task_complete") | Some("turn_aborted") => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn codex_child_state(path: &Path, updated_at_ms: i64, now_ms: i64) -> &'static str {
+    let idle = st_read_tail(path, 64 * 1024).is_some_and(|tail| codex_child_is_idle(&tail));
+    st_subagent_state_str(idle, updated_at_ms, now_ms)
+}
+
+// What the poll compares between ticks: each child and its change token. A
+// long-lived writer's appends raise no file events on macOS, only its create
+// and close, so the watcher can't keep a child's chip current.
+fn codex_children_signature(session_path: &Path) -> Vec<(PathBuf, Option<(u128, u64)>)> {
+    let mut signature: Vec<_> = codex_child_rollouts(session_path)
+        .into_iter()
+        .map(|(_, path, _)| {
+            let token = codex_file_change_token(&path);
+            (path, token)
+        })
+        .collect();
+    signature.sort();
+    signature
+}
+
+// A child's rollout opens with a replay of its parent's history, and its own
+// work starts after the developer message that tells it it was spawned. Take
+// the last one: a grandchild replays its parent's. With no marker (a CLI that
+// doesn't write it), the whole file. Every parsed line is compared, because a
+// session about this code quotes the phrase.
+fn codex_child_own_records(text: &str) -> &str {
+    const SPAWNED: &str = "You are now a newly spawned child agent";
+    let mut start = 0;
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        offset += line.len();
+        if !line.contains(SPAWNED) {
+            continue;
+        }
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let is_spawn_note = record.pointer("/payload/role").and_then(|v| v.as_str())
+            == Some("developer")
+            && record
+                .pointer("/payload/content/0/text")
+                .and_then(|v| v.as_str())
+                .is_some_and(|t| t.starts_with(SPAWNED));
+        if is_spawn_note {
+            start = offset;
+        }
+    }
+    &text[start..]
+}
+
+// The rollout's session id when it is a main session of this project: its cwd
+// matches and it isn't a subagent. A working child is often the most recent
+// writer, so every site that picks or lists main sessions goes through here
+// (the 2026-10-30 trace: the child named active, an empty roster, and Bram
+// switching between parent and child).
+fn codex_main_session_id(path: &Path, project_cwd: &str) -> std::io::Result<Option<String>> {
+    let Some((id, cwd)) = codex_session_meta(path)? else {
+        return Ok(None);
+    };
+    if canonical_path_string(Path::new(&cwd)) != project_cwd || codex_session_is_subagent(path)? {
+        return Ok(None);
+    }
+    Ok(Some(id))
 }
 
 fn codex_startup_context_text(text: &str) -> bool {
@@ -32354,12 +35485,10 @@ fn discover_codex_sessions<R: tauri::Runtime>(
     let mut total = 0usize;
     let mut hidden_bootstrap = 0usize;
     for path in paths {
-        let Some((id, cwd)) = codex_session_meta(&path).map_err(|e| e.to_string())? else {
+        let Some(id) = codex_main_session_id(&path, &project_cwd).map_err(|e| e.to_string())?
+        else {
             continue;
         };
-        if canonical_path_string(Path::new(&cwd)) != project_cwd {
-            continue;
-        }
         total += 1;
         let metadata = path.metadata().map_err(|e| e.to_string())?;
         let mtime = metadata
@@ -32637,7 +35766,10 @@ fn opencode_tool_as_claude(name: &str, input: &serde_json::Value) -> (String, se
                 "replace_all": field("replaceAll"),
             }),
         ),
-        "shell" => (
+        // opencode-bash-tool-maps-to-bash: OpenCode names its shell tool
+        // `bash` (all 32 shell calls in this machine's opencode.db,
+        // 2026-11-05); "shell" is kept for older sessions that used it.
+        "bash" | "shell" => (
             "Bash".into(),
             serde_json::json!({ "command": field("command"), "description": field("description") }),
         ),
@@ -32891,6 +36023,1481 @@ fn opencode_session_path_for_id<R: tauri::Runtime>(
         .map(|s| s.path)
 }
 
+// Antigravity stores the project association in conversation_summaries.db;
+// the per-conversation brain directory contains the transcript, not a cwd.
+// Both inputs are opened read-only. The provider's records are unlike Claude's
+// JSONL, so a disposable Claude-shaped projection in Bram's cache lets every
+// existing transcript consumer keep using the same parser.
+fn antigravity_data_dir() -> Option<PathBuf> {
+    Some(home_dir()?.join(".gemini").join("antigravity-cli"))
+}
+
+// agy-session-rename: agy keeps a conversation's title in
+// annotations/<id>.pbtxt, one text-format field: `title:"..."`. /rename writes
+// it; conversation_summaries.db copies it, but only when agy next loads the
+// conversation: a write from outside didn't reach the database within 24 s
+// of an idle agy, or by its exit. So the file is the title and the database a
+// lagging copy. Checked on agy 1.4.12 from outside, with agy closed, running,
+// and in its first turn, whose auto-title didn't overwrite it; see
+// docs/agent-specimens/antigravity/README.md. This is agy's private format.
+fn antigravity_annotation_path(data_dir: &Path, id: &str) -> PathBuf {
+    data_dir.join("annotations").join(format!("{id}.pbtxt"))
+}
+
+// agy writes `\"` and `\\` and leaves UTF-8 raw, as this does.
+fn antigravity_annotation_text(title: &str) -> String {
+    let mut out = String::with_capacity(title.len() + 9);
+    out.push_str("title:\"");
+    for c in title.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+// The title, or None for anything but exactly one `title` field: a file this
+// doesn't fully understand must be neither shown nor overwritten.
+fn antigravity_annotation_title(text: &str) -> Option<String> {
+    let body = text
+        .trim()
+        .strip_prefix("title:")?
+        .trim_start()
+        .strip_prefix('"')?;
+    let mut bytes = Vec::with_capacity(body.len());
+    let mut chars = body.bytes().peekable();
+    while let Some(b) = chars.next() {
+        match b {
+            b'"' => {
+                return chars
+                    .next()
+                    .is_none()
+                    .then(|| String::from_utf8(bytes).ok())
+                    .flatten();
+            }
+            b'\\' => match chars.next()? {
+                b'n' => bytes.push(b'\n'),
+                b'r' => bytes.push(b'\r'),
+                b't' => bytes.push(b'\t'),
+                b @ (b'"' | b'\'' | b'\\') => bytes.push(b),
+                // Text format's octal byte, as protobuf's own printers write
+                // non-ASCII.
+                d @ b'0'..=b'7' => {
+                    let mut value = u32::from(d - b'0');
+                    for _ in 0..2 {
+                        match chars.peek() {
+                            Some(&o @ b'0'..=b'7') => {
+                                value = value * 8 + u32::from(o - b'0');
+                                chars.next();
+                            }
+                            _ => break,
+                        }
+                    }
+                    bytes.push(u8::try_from(value).ok()?);
+                }
+                _ => return None,
+            },
+            b => bytes.push(b),
+        }
+    }
+    None
+}
+
+// An id needs no check that agy has its conversation yet: a group joins on
+// agy's first hook, which can be before the conversation file exists.
+fn antigravity_set_title(data_dir: &Path, id: &str, title: &str) -> Result<(), String> {
+    let path = antigravity_annotation_path(data_dir, id);
+    if !path.parent().is_some_and(Path::is_dir) {
+        return Err("Antigravity's annotations folder wasn't found".to_string());
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(text) if !text.trim().is_empty() && antigravity_annotation_title(&text).is_none() => {
+            return Err("Antigravity's title file has a format Bram doesn't know".to_string());
+        }
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(format!("read {}: {}", path.display(), e));
+        }
+        _ => {}
+    }
+    atomic_write_text(&path, &antigravity_annotation_text(title))
+}
+
+// agy-session-delete: what `/resume`'s F4 removes (agy has no delete command),
+// less its conversation_summaries.db row: that's agy's private database, and
+// agy's list dropped a conversation with these gone while the row remained.
+// antigravity_summary_rows_from_db drops it for Bram.
+//
+// agy holds an OS lock on presence/<id>.lock while a conversation is open, in
+// any terminal, and Bram's running check sees only its own. Holding it here
+// also keeps one from opening mid-delete. The conversation file goes first
+// because the row filter keys on it: a failure after that leaves a hidden
+// remainder, not a row that resumes into nothing. Checked on agy 1.4.12.
+const ANTIGRAVITY_DELETE_OPEN_REFUSAL: &str =
+    "This conversation is open in Antigravity. Close it there first.";
+
+fn antigravity_delete_conversation(data_dir: &Path, id: &str) -> Result<(), String> {
+    let conversations = data_dir.join("conversations");
+    if !conversations.is_dir() {
+        return Err("Antigravity's conversations folder wasn't found".to_string());
+    }
+    let lock_path = data_dir.join("presence").join(format!("{id}.lock"));
+    let _lock = match std::fs::File::options()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+    {
+        Ok(file) => match file.try_lock() {
+            Ok(()) => Some(file),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(ANTIGRAVITY_DELETE_OPEN_REFUSAL.to_string());
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(format!("lock {}: {}", lock_path.display(), e));
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("open {}: {}", lock_path.display(), e)),
+    };
+    let remove = |result: std::io::Result<()>, path: &Path| match result {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(format!("remove {}: {}", path.display(), e))
+        }
+        _ => Ok(()),
+    };
+    let database = conversations.join(format!("{id}.db"));
+    remove(std::fs::remove_file(&database), &database)?;
+    for suffix in ["db-wal", "db-shm"] {
+        let sidecar = conversations.join(format!("{id}.{suffix}"));
+        remove(std::fs::remove_file(&sidecar), &sidecar)?;
+    }
+    let annotation = antigravity_annotation_path(data_dir, id);
+    remove(std::fs::remove_file(&annotation), &annotation)?;
+    let brain = data_dir.join("brain").join(id);
+    remove(std::fs::remove_dir_all(&brain), &brain)
+}
+
+fn antigravity_conversation_created_ms(id: &str) -> Option<i64> {
+    let path = antigravity_data_dir()?
+        .join("conversations")
+        .join(format!("{id}.db"));
+    let created = std::fs::metadata(path).ok()?.created().ok()?;
+    system_time_ms(created)
+}
+
+// windows-antigravity-sessions-workspace-match: agy stores a workspace as a
+// file URI. On Windows that is `file:///C:/Users/jon/bram` (forward slashes,
+// a slash before the drive letter), while the canonical root the callers
+// pass is `\\?\C:\Users\jon\bram`; compared whole, no row ever matched, so
+// the Sessions tab listed no Antigravity session there (2026-11-03,
+// `[sessions] op=list provider=antigravity visible=0` with three rows for
+// this workspace). Both sides reduce to one spelling: no scheme, no
+// verbatim prefix, forward slashes, no slash before a drive letter, and
+// case-folded on Windows, where NTFS ignores case and agy records the
+// folder as the user typed it.
+fn antigravity_workspace_key(value: &str) -> String {
+    let decoded = percent_decode(value);
+    let mut path = decoded
+        .strip_prefix("file://")
+        .unwrap_or(&decoded)
+        .to_string();
+    if cfg!(windows) {
+        if let Some(rest) = path.strip_prefix(r"\\?\") {
+            if !rest.starts_with("UNC\\") {
+                path = rest.to_string();
+            }
+        }
+        path = path.replace('\\', "/");
+        let b = path.as_bytes();
+        if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' {
+            path.remove(0);
+        }
+        path = path.to_lowercase();
+    }
+    path.trim_end_matches('/').to_string()
+}
+
+fn antigravity_workspace_matches(value: &str, canonical: &str) -> bool {
+    antigravity_workspace_key(value) == antigravity_workspace_key(canonical)
+}
+
+fn antigravity_summary_rows(canonical_root: &str) -> Vec<(String, String, i64)> {
+    let Some(path) = antigravity_data_dir().map(|p| p.join("conversation_summaries.db")) else {
+        return Vec::new();
+    };
+    antigravity_summary_rows_from_db(&path, canonical_root)
+}
+
+fn antigravity_summary_rows_from_db(
+    path: &Path,
+    canonical_root: &str,
+) -> Vec<(String, String, i64)> {
+    let read_only =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = match rusqlite::Connection::open_with_flags(path, read_only) {
+        Ok(conn) => conn,
+        Err(_) => {
+            // Antigravity removes its WAL sidecars on exit. Immutable mode
+            // reads the checkpointed database without requiring those files.
+            let uri = format!("file:{}?immutable=1", path.to_string_lossy());
+            let flags = read_only | rusqlite::OpenFlags::SQLITE_OPEN_URI;
+            let Ok(conn) = rusqlite::Connection::open_with_flags(uri, flags) else {
+                return Vec::new();
+            };
+            conn
+        }
+    };
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT conversation_id, title, workspace_uris, last_modified_time
+         FROM conversation_summaries ORDER BY last_modified_time DESC",
+    ) else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    }) else {
+        return Vec::new();
+    };
+    rows.filter_map(Result::ok)
+        .filter_map(|(id, title, workspaces, modified)| {
+            if !session_id_is_safe(&id) {
+                return None;
+            }
+            // agy-session-delete: a deleted conversation keeps its row. No
+            // folder at all means the layout moved, not that all were deleted.
+            if let Some(dir) = path
+                .parent()
+                .map(|p| p.join("conversations"))
+                .filter(|d| d.is_dir())
+            {
+                if !dir.join(format!("{id}.db")).exists() {
+                    return None;
+                }
+            }
+            let value: serde_json::Value = serde_json::from_str(&workspaces).ok()?;
+            let matches = value
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str())
+                        .any(|s| antigravity_workspace_matches(s, canonical_root))
+                })
+                .unwrap_or_else(|| {
+                    value
+                        .as_str()
+                        .is_some_and(|s| antigravity_workspace_matches(s, canonical_root))
+                });
+            if !matches {
+                return None;
+            }
+            // ISO-8601 timestamps sort lexically in the database query. Keep
+            // an order-preserving numeric token for SessionRecord consumers.
+            let millis = antigravity_timestamp_ms(&modified);
+            // agy-session-rename: the database lags the annotation file.
+            let title = path
+                .parent()
+                .and_then(|dir| std::fs::read_to_string(antigravity_annotation_path(dir, &id)).ok())
+                .and_then(|text| antigravity_annotation_title(&text))
+                .unwrap_or(title);
+            Some((id, title, millis))
+        })
+        .collect()
+}
+
+fn antigravity_timestamp_ms(value: &str) -> i64 {
+    use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+    let normalized = if value.as_bytes().get(10) == Some(&b' ') {
+        let mut value = value.to_string();
+        value.replace_range(10..11, "T");
+        value
+    } else {
+        value.to_string()
+    };
+    OffsetDateTime::parse(&normalized, &Rfc3339)
+        .map(|timestamp| (timestamp.unix_timestamp_nanos() / 1_000_000) as i64)
+        .unwrap_or(0)
+}
+
+fn antigravity_summary_rows_for_id<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    id: &str,
+) -> Option<(String, String, i64)> {
+    let root = project_root(Some(app))?.canonicalize().ok()?;
+    antigravity_summary_rows(&root.to_string_lossy())
+        .into_iter()
+        .find(|row| row.0 == id)
+}
+
+// agy-session-export-and-search: agy wraps what the user typed. Every USER_INPUT
+// record reads `<USER_REQUEST>…</USER_REQUEST>`, followed by metadata blocks
+// the user never wrote. Only the request is a user turn: anything that reads
+// the export expects a turn to start with what was sent (`approved:`, `iterate:`).
+fn antigravity_user_text(content: &str) -> &str {
+    const OPEN: &str = "<USER_REQUEST>";
+    const CLOSE: &str = "</USER_REQUEST>";
+    match (content.find(OPEN), content.rfind(CLOSE)) {
+        (Some(start), Some(end)) if start + OPEN.len() <= end => {
+            content[start + OPEN.len()..end].trim()
+        }
+        _ => content,
+    }
+}
+
+// agy's own text, as a quiet note rather than anyone's speech: the prefix is
+// the notification shape st_notification_turn renders.
+fn antigravity_note(text: &str, stamp: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"type":"user","message":{"role":"user","content":format!("[SYSTEM NOTIFICATION] {text}")},"timestamp":stamp})
+}
+
+// A SYSTEM_MESSAGE opens with a sentence for the model, which names the tag
+// itself, followed by `\n\n<SYSTEM_MESSAGE>\n`. Match the standalone line
+// opener first so `<SYSTEM_MESSAGE>` inside a background task's output cannot
+// cut the note mid-stream.
+fn antigravity_system_message(content: &str) -> &str {
+    const LINE_OPEN: &str = "\n<SYSTEM_MESSAGE>";
+    const OPEN: &str = "<SYSTEM_MESSAGE>";
+    const CLOSE: &str = "</SYSTEM_MESSAGE>";
+    let open_end = if content.starts_with(OPEN) {
+        Some(OPEN.len())
+    } else {
+        content.find(LINE_OPEN).map(|i| i + LINE_OPEN.len())
+    }
+    .or_else(|| content.rfind(OPEN).map(|i| i + OPEN.len()));
+    match (open_end, content.rfind(CLOSE)) {
+        (Some(start), Some(end)) if start <= end => content[start..end].trim(),
+        _ => content,
+    }
+}
+
+// agy-file-edits-in-pane: the four tools the local transcripts actually hold
+// file and shell work in, in Claude's names and fields, so the Transcript's
+// existing rows and diffs work. Any other tool keeps agy's name and arguments.
+fn antigravity_translate_tool_call(
+    name: &str,
+    args: &serde_json::Value,
+) -> (String, serde_json::Value) {
+    let str_opt = |k: &str| args.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
+    match name {
+        "write_file" => {
+            let mut input = serde_json::Map::new();
+            input.insert(
+                "file_path".into(),
+                serde_json::Value::String(str_opt("Path").unwrap_or_default()),
+            );
+            input.insert(
+                "content".into(),
+                serde_json::Value::String(str_opt("Content").unwrap_or_default()),
+            );
+            if args.get("Append").and_then(|v| v.as_bool()) == Some(true) {
+                input.insert("append".into(), serde_json::Value::Bool(true));
+            }
+            ("Write".to_string(), serde_json::Value::Object(input))
+        }
+        "edit_file" => (
+            "Edit".to_string(),
+            serde_json::json!({
+                "file_path": str_opt("Path").unwrap_or_default(),
+                "old_string": str_opt("Target").unwrap_or_default(),
+                "new_string": str_opt("Replacement").unwrap_or_default(),
+            }),
+        ),
+        "run_command" => {
+            let mut input = serde_json::Map::new();
+            input.insert(
+                "command".into(),
+                serde_json::Value::String(str_opt("CommandLine").unwrap_or_default()),
+            );
+            if let Some(desc) = str_opt("toolSummary").filter(|s| !s.trim().is_empty()) {
+                input.insert("description".into(), serde_json::Value::String(desc));
+            }
+            ("Bash".to_string(), serde_json::Value::Object(input))
+        }
+        "read_file" => {
+            let mut input = serde_json::Map::new();
+            input.insert(
+                "file_path".into(),
+                serde_json::Value::String(str_opt("Path").unwrap_or_default()),
+            );
+            let start = args
+                .get("StartLine")
+                .and_then(|v| v.as_u64())
+                .filter(|&n| n > 0);
+            let end = args
+                .get("EndLine")
+                .and_then(|v| v.as_u64())
+                .filter(|&n| n > 0);
+            if let Some(s) = start {
+                input.insert("offset".into(), serde_json::json!(s));
+            }
+            if let Some(e) = end {
+                let s = start.unwrap_or(1);
+                if e >= s {
+                    input.insert("limit".into(), serde_json::json!(e - s + 1));
+                }
+            }
+            ("Read".to_string(), serde_json::Value::Object(input))
+        }
+        _ => (name.to_string(), args.clone()),
+    }
+}
+
+fn antigravity_transcript_jsonl(id: &str, source: &str) -> Result<(String, Vec<String>), String> {
+    let mut output = String::new();
+    let mut unknown = Vec::new();
+    // One GENERIC record follows each call of a response, in order.
+    let mut pending_tool_results = std::collections::VecDeque::new();
+    let mut emit = |record: serde_json::Value| -> Result<(), String> {
+        output.push_str(&serde_json::to_string(&record).map_err(|e| e.to_string())?);
+        output.push('\n');
+        Ok(())
+    };
+    for line in source.lines() {
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let kind = record
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let stamp = record
+            .get("created_at")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        match kind {
+            "USER_INPUT" => {
+                pending_tool_results.clear();
+                let text = antigravity_user_text(
+                    record.get("content").and_then(|v| v.as_str()).unwrap_or(""),
+                );
+                emit(
+                    serde_json::json!({"type":"user","message":{"role":"user","content":text},"timestamp":stamp}),
+                )?;
+            }
+            "PLANNER_RESPONSE" => {
+                // A call with no result (an interrupted turn) must not take
+                // the next response's.
+                pending_tool_results.clear();
+                let mut content = Vec::new();
+                if let Some(text) = record
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    content.push(serde_json::json!({"type":"text","text":text}));
+                }
+                if let Some(thinking) = record
+                    .get("thinking")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                {
+                    content.push(serde_json::json!({"type":"thinking","thinking":thinking}));
+                }
+                if let Some(calls) = record.get("tool_calls").and_then(|v| v.as_array()) {
+                    for (i, call) in calls.iter().enumerate() {
+                        let name = call
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown_tool");
+                        let args = call
+                            .get("args")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!({}));
+                        let (tool_name, tool_input) = antigravity_translate_tool_call(name, &args);
+                        let tool_id = format!(
+                            "agy-{}-{}",
+                            id,
+                            record
+                                .get("step_index")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0)
+                                * 100
+                                + i as u64
+                        );
+                        content.push(serde_json::json!({"type":"tool_use","id":tool_id,"name":tool_name,"input":tool_input}));
+                        pending_tool_results.push_back(tool_id);
+                    }
+                }
+                if content.is_empty() {
+                    content.push(serde_json::json!({"type":"text","text":"(Antigravity produced an empty planner response)"}));
+                }
+                emit(
+                    serde_json::json!({"type":"assistant","message":{"role":"assistant","content":content,"stop_reason":"end_turn"},"timestamp":stamp}),
+                )?;
+            }
+            "GENERIC" => {
+                let text = record.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                if let Some(tool_id) = pending_tool_results.pop_front() {
+                    let result = serde_json::json!({"type":"tool_result","tool_use_id":tool_id,"content":text,"is_error":record.get("status").and_then(|v|v.as_str()) == Some("ERROR")});
+                    emit(
+                        serde_json::json!({"type":"user","message":{"role":"user","content":[result]},"timestamp":stamp}),
+                    )?;
+                } else if !text.is_empty() {
+                    emit(antigravity_note(text, &stamp))?;
+                }
+            }
+            "SYSTEM_MESSAGE" => {
+                let text = record.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                emit(antigravity_note(antigravity_system_message(text), &stamp))?;
+            }
+            // Its content is agy's summary for the model, which can run to
+            // pages. The Transcript above it already holds what it summarizes.
+            "CHECKPOINT" => emit(antigravity_note(
+                "Antigravity compacted this conversation.",
+                &stamp,
+            ))?,
+            other => {
+                unknown.push(other.to_string());
+                let content = record.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                emit(antigravity_note(
+                    &format!("[Antigravity {other} record] {content}"),
+                    &stamp,
+                ))?;
+            }
+        }
+    }
+    Ok((output, unknown))
+}
+
+// Raise the suffix when the projection changes. A session that has finished
+// never changes again, so without a new directory its old export would stay
+// fresh forever. v2: tool results paired, agy's own text as notes; v3: tool
+// calls translated to Claude's names/inputs for Transcript diffs & summaries.
+const ANTIGRAVITY_EXPORT_DIR: &str = "antigravity-sessions-v3";
+const ANTIGRAVITY_RETIRED_EXPORT_DIRS: &[&str] =
+    &["antigravity-sessions", "antigravity-sessions-v2"];
+
+fn retire_stale_antigravity_exports(cache_dir: &Path, encoded_project: &str) {
+    for dir in ANTIGRAVITY_RETIRED_EXPORT_DIRS {
+        let stale = cache_dir.join(dir).join(encoded_project);
+        if stale.exists() {
+            let _ = std::fs::remove_dir_all(&stale);
+        }
+    }
+}
+
+fn antigravity_export_dir<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
+    let root = project_root(Some(app)).ok_or("could not resolve project root")?;
+    let abs = strip_unc_prefix(root.canonicalize().map_err(|e| e.to_string())?);
+    let cache_dir = app.path().app_cache_dir().map_err(|e| e.to_string())?;
+    Ok(cache_dir
+        .join(ANTIGRAVITY_EXPORT_DIR)
+        .join(encode_path_for_filename(&abs)))
+}
+
+fn format_unknown_antigravity_types(unknown: &[String]) -> String {
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    for raw in unknown {
+        let safe: String = raw
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                    c
+                } else {
+                    '?'
+                }
+            })
+            .collect();
+        let key = if safe.is_empty() {
+            "empty".to_string()
+        } else {
+            safe
+        };
+        *counts.entry(key).or_insert(0) += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(k, n)| format!("{k}:{n}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+// The export and its source are different formats, so only their times compare.
+fn antigravity_export_is_fresh(export: &Path, source: &Path) -> bool {
+    let modified = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    match (modified(export), modified(source)) {
+        (Some(exported), Some(written)) => exported >= written,
+        _ => false,
+    }
+}
+
+// Returns Ok(Some(unknown_types)) when `export` was written, or Ok(None) when
+// `export` was already fresh and left untouched on disk.
+fn antigravity_refresh_export(
+    id: &str,
+    source: &Path,
+    export: &Path,
+) -> Result<Option<Vec<String>>, String> {
+    std::fs::metadata(source).map_err(|e| e.to_string())?;
+    if antigravity_export_is_fresh(export, source) {
+        return Ok(None);
+    }
+    let input = std::fs::read_to_string(source).map_err(|e| e.to_string())?;
+    let (text, unknown) = antigravity_transcript_jsonl(id, &input)?;
+    let parent = export.parent().ok_or("export path has no parent")?;
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    atomic_write_text(export, &text)?;
+    Ok(Some(unknown))
+}
+
+fn antigravity_export_path<R: tauri::Runtime>(app: &AppHandle<R>, id: &str) -> Option<PathBuf> {
+    if !session_id_is_safe(id) {
+        return None;
+    }
+    let root = project_root(Some(app))?.canonicalize().ok()?;
+    antigravity_summary_rows(&root.to_string_lossy())
+        .iter()
+        .any(|row| row.0 == id)
+        .then_some(())?;
+    antigravity_export_path_for_project(app, id, &root)
+}
+
+fn antigravity_export_path_for_project<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    id: &str,
+    root: &Path,
+) -> Option<PathBuf> {
+    let source_dir = antigravity_data_dir()?
+        .join("brain")
+        .join(id)
+        .join(".system_generated")
+        .join("logs");
+    let regular = source_dir.join("transcript.jsonl");
+    let full = source_dir.join("transcript_full.jsonl");
+    // `transcript_full.jsonl` holds untruncated records and native JSON tool
+    // args; compact `transcript.jsonl` stringifies every arg, which often makes
+    // it slightly larger on disk despite truncating long steps.
+    let source = match (regular.metadata().ok(), full.metadata().ok()) {
+        (None, None) => return None,
+        (Some(_), None) => regular,
+        (None, Some(_)) => full,
+        (Some(_), Some(b)) if b.len() > 0 => full,
+        (Some(_), Some(_)) => regular,
+    };
+    let export = app
+        .path()
+        .app_cache_dir()
+        .ok()?
+        .join(ANTIGRAVITY_EXPORT_DIR)
+        .join(encode_path_for_filename(&strip_unc_prefix(
+            root.to_path_buf(),
+        )))
+        .join(format!("{id}.jsonl"));
+    if let Some(unknown) = antigravity_refresh_export(id, &source, &export).ok()? {
+        if !unknown.is_empty() && bram_trace_enabled() {
+            append_bram_trace_line(
+                app,
+                "antigravity-sessions",
+                &format!(
+                    "op=unknown-records session={} count={} types={}",
+                    id,
+                    unknown.len(),
+                    format_unknown_antigravity_types(&unknown)
+                ),
+            );
+        }
+    }
+    Some(export)
+}
+
+// An export's change token is in milliseconds (OpenCode's and Antigravity's);
+// the row's date stays in seconds like every other session.
+fn search_row_date(provider: SessionProvider, mtime: i64) -> String {
+    if matches!(
+        provider,
+        SessionProvider::Opencode | SessionProvider::Antigravity
+    ) {
+        (mtime / 1000).to_string()
+    } else {
+        mtime.to_string()
+    }
+}
+
+fn discover_antigravity_sessions<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    limit: Option<usize>,
+) -> Result<Vec<SessionRecord>, String> {
+    let root = project_root(Some(app))
+        .ok_or("could not resolve project root")?
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
+    if let Ok(cache_dir) = app.path().app_cache_dir() {
+        let encoded = encode_path_for_filename(&strip_unc_prefix(root.clone()));
+        retire_stale_antigravity_exports(&cache_dir, &encoded);
+    }
+    let mut rows = antigravity_summary_rows(&root.to_string_lossy());
+    if let Some(limit) = limit {
+        rows.truncate(limit);
+    }
+    let mut sessions = Vec::new();
+    for (id, title, updated) in rows {
+        let Some(path) = antigravity_export_path_for_project(app, &id, &root) else {
+            continue;
+        };
+        let meta = std::fs::metadata(&path).ok();
+        sessions.push(SessionRecord {
+            provider: SessionProvider::Antigravity,
+            id,
+            path,
+            mtime: (updated.max(0) / 1000) as u64,
+            size: meta.map(|m| m.len()).unwrap_or(0),
+            title: Some(title).filter(|t| !t.trim().is_empty()),
+        });
+    }
+    Ok(sessions)
+}
+
+#[cfg(test)]
+mod antigravity_transcript_tests {
+    use super::{
+        antigravity_transcript_jsonl, antigravity_workspace_matches, st_parse_lines_to_turns,
+    };
+
+    #[test]
+    fn pinned_antigravity_records_project_user_assistant_and_tools() {
+        let source =
+            include_str!("../../docs/agent-specimens/antigravity/transcript-record-tools.jsonl");
+        let (jsonl, _) = antigravity_transcript_jsonl("fixture-id", source).unwrap();
+        let turns = st_parse_lines_to_turns(&jsonl);
+        let user_turns: Vec<&serde_json::Value> =
+            turns.iter().filter(|turn| turn["role"] == "user").collect();
+        assert!(!user_turns.is_empty());
+        let first_user = user_turns[0]["text"].as_str().unwrap_or("");
+        assert!(
+            first_user.starts_with("Create tool-probe.txt"),
+            "{first_user}"
+        );
+        assert!(!first_user.contains("USER_REQUEST"), "{first_user}");
+        assert!(!first_user.contains("ADDITIONAL_METADATA"), "{first_user}");
+        assert!(!first_user.contains("USER_SETTINGS_CHANGE"), "{first_user}");
+        assert!(turns.iter().any(|turn| turn["role"] == "assistant"));
+        assert!(turns
+            .iter()
+            .flat_map(|turn| turn["entries"].as_array().into_iter().flatten())
+            .any(|entry| entry["kind"] == "tool"));
+    }
+
+    // agy-session-export-and-search: the shape of a real response making
+    // several calls (session 3c7851eb), where the first call's output used to
+    // go to every call and the rest read as assistant speech.
+    #[test]
+    fn each_tool_call_gets_its_own_result_and_agy_text_is_nobodys_speech() {
+        let source = [
+            r#"{"type":"USER_INPUT","content":"<USER_REQUEST>\napproved: {\"items\":[]}\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: x.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting.\n</USER_SETTINGS_CHANGE>"}"#,
+            r#"{"type":"PLANNER_RESPONSE","step_index":1,"content":"Reading.","tool_calls":[{"name":"read_file","args":{"Path":"/a"}},{"name":"read_file","args":{"Path":"/b"}},{"name":"run_command","args":{"CommandLine":"gh x"}}]}"#,
+            r#"{"type":"GENERIC","status":"DONE","content":"output of a"}"#,
+            r#"{"type":"GENERIC","status":"DONE","content":"output of b"}"#,
+            r#"{"type":"GENERIC","status":"RUNNING","content":"YOU MUST TAKE ONE OF THE FOLLOWING TWO ACTIONS"}"#,
+            r#"{"type":"SYSTEM_MESSAGE","content":"The following is a <SYSTEM_MESSAGE> not actually sent by the user.\n\n<SYSTEM_MESSAGE>\n[Message] task finished: saw <SYSTEM_MESSAGE> in diff\n</SYSTEM_MESSAGE>"}"#,
+            r#"{"type":"PLANNER_RESPONSE","step_index":6,"content":"Interrupted.","tool_calls":[{"name":"read_file","args":{"Path":"/c"}}]}"#,
+            r#"{"type":"PLANNER_RESPONSE","step_index":7,"content":"Next.","tool_calls":[{"name":"read_file","args":{"Path":"/d"}}]}"#,
+            r#"{"type":"GENERIC","status":"DONE","content":"output of d"}"#,
+            r#"{"type":"GENERIC","status":"DONE","content":"output with no call"}"#,
+            r##"{"type":"CHECKPOINT","content":"# Resuming from a compaction\nlong summary"}"##,
+        ]
+        .join("\n");
+        let (jsonl, unknown) = antigravity_transcript_jsonl("x", &source).unwrap();
+        assert!(unknown.is_empty(), "these records are known: {unknown:?}");
+
+        let results: Vec<(String, String)> = jsonl
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .filter_map(|r| r["message"]["content"].as_array().cloned())
+            .flatten()
+            .filter(|c| c["type"] == "tool_result")
+            .map(|c| {
+                (
+                    c["tool_use_id"].as_str().unwrap().to_string(),
+                    c["content"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            results,
+            vec![
+                ("agy-x-100".to_string(), "output of a".to_string()),
+                ("agy-x-101".to_string(), "output of b".to_string()),
+                (
+                    "agy-x-102".to_string(),
+                    "YOU MUST TAKE ONE OF THE FOLLOWING TWO ACTIONS".to_string()
+                ),
+                ("agy-x-700".to_string(), "output of d".to_string()),
+            ]
+        );
+
+        let turns = st_parse_lines_to_turns(&jsonl);
+        let text_of = |role: &str| -> Vec<String> {
+            turns
+                .iter()
+                .filter(|t| t["role"] == role)
+                .map(|t| t["text"].as_str().unwrap_or("").to_string())
+                .collect()
+        };
+        let user = text_of("user");
+        assert_eq!(user.len(), 1, "{user:?}");
+        assert!(user[0].starts_with("approved:"), "{user:?}");
+        assert!(!user[0].contains("ADDITIONAL_METADATA"), "{user:?}");
+        for text in text_of("assistant") {
+            assert!(
+                !text.contains("output") && !text.contains("SYSTEM_MESSAGE"),
+                "{text}"
+            );
+        }
+        let notes = text_of("system").join(" | ");
+        assert!(notes.contains("[Message] task finished"), "{notes}");
+        assert!(!notes.contains("not actually sent"), "{notes}");
+        assert!(!notes.contains("[SYSTEM NOTIFICATION]"), "{notes}");
+        assert!(notes.contains("output with no call"), "{notes}");
+        assert!(notes.contains("compacted this conversation"), "{notes}");
+        assert!(!notes.contains("long summary"), "{notes}");
+    }
+
+    #[test]
+    fn an_export_is_fresh_by_time_whatever_its_size() {
+        use super::{antigravity_export_is_fresh, antigravity_refresh_export};
+        let dir = std::env::temp_dir().join(format!("bram-agy-fresh-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (source, export) = (dir.join("source.jsonl"), dir.join("export.jsonl"));
+        std::fs::write(
+            &source,
+            r#"{"type":"USER_INPUT","content":"<USER_REQUEST>\nhello\n</USER_REQUEST>"}"#,
+        )
+        .unwrap();
+        assert!(!antigravity_export_is_fresh(&export, &source), "no export");
+        let set = |path: &std::path::Path, secs: u64| {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+                .unwrap();
+        };
+        set(&source, 1000);
+        // First export call writes the projected JSONL (different byte length from source).
+        let first = antigravity_refresh_export("s1", &source, &export).unwrap();
+        assert_eq!(first, Some(Vec::new()));
+        assert_ne!(
+            std::fs::metadata(&export).unwrap().len(),
+            std::fs::metadata(&source).unwrap().len()
+        );
+        // Pin a sentinel mtime >= source; a second export call must leave the file untouched.
+        set(&export, 2000);
+        assert!(antigravity_export_is_fresh(&export, &source));
+        let second = antigravity_refresh_export("s1", &source, &export).unwrap();
+        assert_eq!(second, None, "second call must not rewrite a fresh export");
+        assert_eq!(
+            std::fs::metadata(&export).unwrap().modified().unwrap(),
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(2000)
+        );
+        // Once the source advances past the export, refresh rewrites it.
+        set(&source, 3000);
+        assert!(!antigravity_export_is_fresh(&export, &source));
+        assert!(antigravity_refresh_export("s1", &source, &export)
+            .unwrap()
+            .is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_providers_search_dates_are_seconds() {
+        use super::{search_row_date, SessionProvider};
+        let ms = 1_793_518_000_123;
+        for provider in [SessionProvider::Opencode, SessionProvider::Antigravity] {
+            assert_eq!(search_row_date(provider, ms), "1793518000");
+        }
+        assert_eq!(
+            search_row_date(SessionProvider::Claude, 1_793_518_000),
+            "1793518000"
+        );
+    }
+
+    #[test]
+    fn unknown_antigravity_record_gets_visible_stub() {
+        use super::format_unknown_antigravity_types;
+        let (jsonl, unknown) = antigravity_transcript_jsonl(
+            "fixture-id",
+            r#"{"type":"FUTURE_EVENT","content":"future detail"}"#,
+        )
+        .unwrap();
+        assert_eq!(unknown, vec!["FUTURE_EVENT".to_string()]);
+        assert_eq!(format_unknown_antigravity_types(&unknown), "FUTURE_EVENT:1");
+        let turns = st_parse_lines_to_turns(&jsonl);
+        assert!(
+            turns.iter().all(|turn| turn["role"] == "system"),
+            "{turns:?}"
+        );
+        assert!(turns.iter().any(|turn| turn["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Antigravity FUTURE_EVENT record")));
+    }
+
+    #[test]
+    fn antigravity_exports_resolve_provider_and_retire_v1_cache() {
+        use super::{
+            projected_turns_provider_label, retire_stale_antigravity_exports,
+            search_session_hit_provider_and_id, ANTIGRAVITY_EXPORT_DIR,
+        };
+        use std::path::Path;
+
+        let oc_dir = Path::new("/cache/opencode-sessions/-Users-me-bram");
+        let agy_dir = Path::new("/cache")
+            .join(ANTIGRAVITY_EXPORT_DIR)
+            .join("-Users-me-bram");
+        let agy_file = agy_dir.join("3c7851eb-302c-46d7-9da4-19880140bd99.jsonl");
+        assert_eq!(
+            search_session_hit_provider_and_id(
+                &agy_file.to_string_lossy(),
+                Some(oc_dir),
+                Some(&agy_dir)
+            ),
+            (
+                "antigravity".to_string(),
+                "3c7851eb-302c-46d7-9da4-19880140bd99".to_string()
+            )
+        );
+        assert_eq!(
+            search_session_hit_provider_and_id(
+                "/cache/opencode-sessions/-Users-me-bram/ses_1.jsonl",
+                Some(oc_dir),
+                Some(&agy_dir)
+            ),
+            ("opencode".to_string(), "ses_1".to_string())
+        );
+        assert_eq!(projected_turns_provider_label(&agy_file), "antigravity");
+
+        let tmp = std::env::temp_dir().join(format!("bram-agy-retire-{}", uuid::Uuid::new_v4()));
+        let v1_this = tmp.join("antigravity-sessions").join("-Users-me-bram");
+        let v1_other = tmp.join("antigravity-sessions").join("-Users-me-other");
+        let v2_this = tmp.join("antigravity-sessions-v2").join("-Users-me-bram");
+        let v2_other = tmp.join("antigravity-sessions-v2").join("-Users-me-other");
+        let v3_this = tmp.join(ANTIGRAVITY_EXPORT_DIR).join("-Users-me-bram");
+        std::fs::create_dir_all(&v1_this).unwrap();
+        std::fs::create_dir_all(&v1_other).unwrap();
+        std::fs::create_dir_all(&v2_this).unwrap();
+        std::fs::create_dir_all(&v2_other).unwrap();
+        std::fs::create_dir_all(&v3_this).unwrap();
+        std::fs::write(v1_this.join("old.jsonl"), "{}").unwrap();
+        std::fs::write(v1_other.join("keep.jsonl"), "{}").unwrap();
+        std::fs::write(v2_this.join("old2.jsonl"), "{}").unwrap();
+        std::fs::write(v2_other.join("keep2.jsonl"), "{}").unwrap();
+        std::fs::write(v3_this.join("new.jsonl"), "{}").unwrap();
+        retire_stale_antigravity_exports(&tmp, "-Users-me-bram");
+        assert!(
+            !v1_this.exists(),
+            "v1 dir for this project should be removed"
+        );
+        assert!(
+            !v2_this.exists(),
+            "v2 dir for this project should be removed"
+        );
+        assert!(v1_other.exists(), "other project's v1 cache untouched");
+        assert!(v2_other.exists(), "other project's v2 cache untouched");
+        assert!(v3_this.join("new.jsonl").exists(), "v3 export untouched");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn translated_tools_drive_transcript_summaries_diffs_and_current_turn_edits() {
+        use super::compute_current_turn_edits_from_text;
+        let specimen =
+            include_str!("../../docs/agent-specimens/antigravity/transcript-record-tools.jsonl");
+        let (specimen_jsonl, _) = antigravity_transcript_jsonl("spec", specimen).unwrap();
+        let specimen_turns = st_parse_lines_to_turns(&specimen_jsonl);
+        let spec_tools: Vec<&serde_json::Value> = specimen_turns
+            .iter()
+            .flat_map(|t| t["entries"].as_array().into_iter().flatten())
+            .filter(|e| e["kind"] == "tool")
+            .collect();
+        assert_eq!(spec_tools.len(), 4, "{spec_tools:?}");
+        assert_eq!(spec_tools[0]["name"], "Write");
+        assert_eq!(
+            spec_tools[0]["summary"],
+            "<workspace>/tool-probe.txt — wrote 1 line"
+        );
+        assert_eq!(spec_tools[0]["isError"], true);
+        assert_eq!(spec_tools[1]["name"], "Write");
+        assert_eq!(
+            spec_tools[1]["summary"],
+            "<workspace>/tool-probe.txt — wrote 1 line"
+        );
+        assert_eq!(spec_tools[2]["name"], "Edit");
+        assert_eq!(
+            spec_tools[2]["summary"],
+            "<workspace>/tool-probe.txt edited"
+        );
+        let edit_diff = spec_tools[2]["diff"].as_str().expect("Edit row diff");
+        assert!(edit_diff.contains("-FIRST-VALUE"), "{edit_diff}");
+        assert!(edit_diff.contains("+SECOND-VALUE"), "{edit_diff}");
+        assert_eq!(spec_tools[3]["name"], "Bash");
+        assert_eq!(spec_tools[3]["summary"], "echo RUN-COMMAND-7731");
+        assert_eq!(spec_tools[3]["description"], "Echo test command");
+
+        let turn_edits = compute_current_turn_edits_from_text(&specimen_jsonl);
+        let edited_paths: Vec<String> = turn_edits
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v["filePath"].as_str().map(String::from))
+            .collect();
+        assert_eq!(edited_paths, vec!["<workspace>/tool-probe.txt".to_string()]);
+
+        // Read gets Claude's fields, and an untranslated tool keeps agy's.
+        let others = [
+            r#"{"type":"USER_INPUT","content":"<USER_REQUEST>\nrun tools\n</USER_REQUEST>"}"#,
+            r#"{"type":"PLANNER_RESPONSE","step_index":2,"content":"Checking.","tool_calls":[{"name":"read_file","args":{"Path":"/repo/src/lib.rs","StartLine":10,"EndLine":20}},{"name":"send_message","args":{"Recipient":"a","Message":"hi"}}]}"#,
+        ]
+        .join("\n");
+        let (jsonl, _) = antigravity_transcript_jsonl("all", &others).unwrap();
+        let turns = st_parse_lines_to_turns(&jsonl);
+        let tools: Vec<&serde_json::Value> = turns
+            .iter()
+            .flat_map(|t| t["entries"].as_array().into_iter().flatten())
+            .filter(|e| e["kind"] == "tool")
+            .collect();
+        assert_eq!(tools.len(), 2, "{tools:?}");
+        assert_eq!(tools[0]["name"], "Read");
+        assert_eq!(tools[0]["summary"], "/repo/src/lib.rs:10-20");
+        assert_eq!(tools[1]["name"], "send_message");
+    }
+
+    #[test]
+    fn workspace_uris_match_canonical_project_paths() {
+        assert!(antigravity_workspace_matches(
+            "file:///work/project%20one",
+            "/work/project one"
+        ));
+        assert!(!antigravity_workspace_matches(
+            "file:///work/project-two",
+            "/work/project"
+        ));
+    }
+
+    // windows-antigravity-sessions-workspace-match: agy's
+    // `file:///C:/Users/jon/bram` against the `\\?\C:\Users\jon\bram` that
+    // canonicalize() returns, with a percent-encoded space and a case
+    // difference; the home folder must still not match the project.
+    #[cfg(windows)]
+    #[test]
+    fn windows_workspace_uris_match_verbatim_canonical_roots() {
+        assert!(antigravity_workspace_matches(
+            "file:///C:/Users/jon/bram",
+            r"\\?\C:\Users\jon\bram"
+        ));
+        assert!(antigravity_workspace_matches(
+            "file:///C:/Users/Jon%20Udell/bram",
+            r"\\?\C:\Users\Jon Udell\bram"
+        ));
+        assert!(antigravity_workspace_matches(
+            "file:///c:/users/jon/bram",
+            r"C:\Users\jon\bram"
+        ));
+        assert!(!antigravity_workspace_matches(
+            "file:///C:/Users/jon",
+            r"\\?\C:\Users\jon\bram"
+        ));
+    }
+
+    #[test]
+    fn denied_tool_result_is_preserved_as_an_error() {
+        let source =
+            include_str!("../../docs/agent-specimens/antigravity/transcript-record-denied.jsonl");
+        let (jsonl, _) = antigravity_transcript_jsonl("fixture-id", source).unwrap();
+        let turns = st_parse_lines_to_turns(&jsonl);
+        assert!(turns
+            .iter()
+            .flat_map(|turn| turn["entries"].as_array().into_iter().flatten())
+            .any(|entry| entry["kind"] == "tool" && entry["isError"] == true));
+    }
+
+    #[test]
+    fn summary_reader_handles_checkpointed_wal_database_without_sidecars() {
+        use super::antigravity_summary_rows_from_db;
+        use std::path::PathBuf;
+
+        let path = std::env::temp_dir().join(format!(
+            "bram-antigravity-summary-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+            conn.execute_batch(
+                "CREATE TABLE conversation_summaries (
+                    conversation_id TEXT, title TEXT NOT NULL DEFAULT '',
+                    workspace_uris TEXT NOT NULL, last_modified_time TEXT NOT NULL
+                 );
+                 INSERT INTO conversation_summaries
+                 VALUES ('fixture-session', 'Fixture title', '[\"file:///fixture/project\"]',
+                         '2026-10-31 21:17:11.439086+00:00');",
+            )
+            .unwrap();
+        }
+        assert!(!PathBuf::from(format!("{}-wal", path.display())).exists());
+        assert!(!PathBuf::from(format!("{}-shm", path.display())).exists());
+        let rows = antigravity_summary_rows_from_db(&path, "/fixture/project");
+        assert_eq!(
+            rows,
+            vec![(
+                "fixture-session".into(),
+                "Fixture title".into(),
+                1_793_481_431_439
+            )]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    // agy-session-rename: the shapes below are what agy 1.4.12 itself wrote or
+    // read back: `\"` and `\\` escaped, UTF-8 raw.
+    #[test]
+    fn annotation_titles_round_trip_in_agys_format() {
+        use super::{antigravity_annotation_text, antigravity_annotation_title};
+
+        assert_eq!(
+            antigravity_annotation_text("v0.8.3 burndown"),
+            "title:\"v0.8.3 burndown\""
+        );
+        let awkward = "Q \"q\" caf\u{e9} \u{65e5}\u{672c} back\\slash\nline\ttab";
+        assert_eq!(
+            antigravity_annotation_text("Q \"q\" caf\u{e9} back\\slash"),
+            "title:\"Q \\\"q\\\" caf\u{e9} back\\\\slash\""
+        );
+        assert_eq!(
+            antigravity_annotation_title(&antigravity_annotation_text(awkward)).as_deref(),
+            Some(awkward)
+        );
+        // Octal bytes, as a protobuf printer writes non-ASCII.
+        assert_eq!(
+            antigravity_annotation_title("title:\"caf\\303\\251\"\n").as_deref(),
+            Some("caf\u{e9}")
+        );
+    }
+
+    #[test]
+    fn annotation_reader_refuses_what_it_does_not_fully_understand() {
+        use super::antigravity_annotation_title;
+
+        for text in [
+            "",
+            "title:\"unterminated",
+            "title:\"a\" pinned:true",
+            "title:\"a\"\npinned:true",
+            "pinned:true\ntitle:\"a\"",
+            "title:\"bad \\q escape\"",
+            "title:\"\\777\"",
+            "title:\"\\377\"",
+        ] {
+            assert_eq!(antigravity_annotation_title(text), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn set_title_replaces_a_title_and_leaves_an_unknown_file_alone() {
+        use super::{antigravity_annotation_path, antigravity_set_title};
+
+        let dir = std::env::temp_dir().join(format!("bram-agy-title-{}", uuid::Uuid::new_v4()));
+        let missing = antigravity_set_title(&dir, "fixture", "x").unwrap_err();
+        assert!(missing.contains("wasn't found"), "{missing}");
+        std::fs::create_dir_all(dir.join("annotations")).unwrap();
+        let path = antigravity_annotation_path(&dir, "fixture");
+
+        antigravity_set_title(&dir, "fixture", "first").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "title:\"first\"");
+        antigravity_set_title(&dir, "fixture", "second").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "title:\"second\"");
+
+        std::fs::write(&path, "title:\"a\"\npinned:true").unwrap();
+        let refused = antigravity_set_title(&dir, "fixture", "third").unwrap_err();
+        assert!(refused.contains("format"), "{refused}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "title:\"a\"\npinned:true"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn agy_fixture(id: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("bram-agy-del-{}", uuid::Uuid::new_v4()));
+        let brain = dir.join("brain").join(id).join("scratch");
+        std::fs::create_dir_all(&brain).unwrap();
+        for sub in ["conversations", "annotations", "presence"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        std::fs::write(dir.join("conversations").join(format!("{id}.db")), "x").unwrap();
+        std::fs::write(dir.join("conversations/other.db"), "x").unwrap();
+        std::fs::write(
+            dir.join("annotations").join(format!("{id}.pbtxt")),
+            "title:\"t\"",
+        )
+        .unwrap();
+        std::fs::write(dir.join("presence").join(format!("{id}.lock")), "").unwrap();
+        dir
+    }
+
+    // A parallel test forking a child copies an open lock until its exec, so
+    // a lock just released can read as held for a moment.
+    fn retry_past_a_forks_copy_of_the_lock(dir: &std::path::Path, id: &str) {
+        let mut result = super::antigravity_delete_conversation(dir, id);
+        for _ in 0..100 {
+            if result.is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            result = super::antigravity_delete_conversation(dir, id);
+        }
+        result.unwrap();
+    }
+
+    #[test]
+    fn delete_removes_what_f4_removes_and_nothing_else() {
+        use super::antigravity_delete_conversation;
+
+        let dir = agy_fixture("victim");
+        antigravity_delete_conversation(&dir, "victim").unwrap();
+        assert!(!dir.join("conversations/victim.db").exists());
+        assert!(!dir.join("annotations/victim.pbtxt").exists());
+        assert!(!dir.join("brain/victim").exists());
+        assert!(dir.join("conversations/other.db").exists());
+        // Repeating it finds nothing to do.
+        retry_past_a_forks_copy_of_the_lock(&dir, "victim");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // agy holds this lock while the conversation is open anywhere.
+    #[test]
+    fn delete_refuses_a_conversation_open_in_another_agy() {
+        use super::antigravity_delete_conversation;
+
+        let dir = agy_fixture("open");
+        let held = std::fs::File::open(dir.join("presence/open.lock")).unwrap();
+        held.lock().unwrap();
+        let refused = antigravity_delete_conversation(&dir, "open").unwrap_err();
+        assert!(refused.contains("open in Antigravity"), "{refused}");
+        assert!(dir.join("conversations/open.db").exists());
+        assert!(dir.join("annotations/open.pbtxt").exists());
+        assert!(dir.join("brain/open").exists());
+        drop(held);
+        retry_past_a_forks_copy_of_the_lock(&dir, "open");
+        assert!(!dir.join("conversations/open.db").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn delete_refuses_when_the_layout_has_moved() {
+        use super::antigravity_delete_conversation;
+
+        let dir = std::env::temp_dir().join(format!("bram-agy-del-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let refused = antigravity_delete_conversation(&dir, "x").unwrap_err();
+        assert!(refused.contains("wasn't found"), "{refused}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn summary_reader_drops_a_deleted_conversation_but_survives_a_moved_folder() {
+        use super::antigravity_summary_rows_from_db;
+
+        let dir = std::env::temp_dir().join(format!("bram-agy-rows-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("conversation_summaries.db");
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE conversation_summaries (
+                    conversation_id TEXT, title TEXT NOT NULL DEFAULT '',
+                    workspace_uris TEXT NOT NULL, last_modified_time TEXT NOT NULL
+                 );
+                 INSERT INTO conversation_summaries VALUES
+                   ('kept', 'Kept', '[\"file:///p\"]', '2026-10-31 21:17:11+00:00'),
+                   ('gone', 'Gone', '[\"file:///p\"]', '2026-10-31 21:17:10+00:00');",
+            )
+            .unwrap();
+        let ids = || -> Vec<String> {
+            antigravity_summary_rows_from_db(&db, "/p")
+                .into_iter()
+                .map(|row| row.0)
+                .collect()
+        };
+        assert_eq!(ids(), ["kept", "gone"]);
+        std::fs::create_dir_all(dir.join("conversations")).unwrap();
+        std::fs::write(dir.join("conversations/kept.db"), "x").unwrap();
+        assert_eq!(ids(), ["kept"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // The database lagged an annotation written with agy running (2026-11-02);
+    // a file Bram can't read falls back to the database.
+    #[test]
+    fn summary_reader_prefers_the_annotation_file() {
+        use super::{antigravity_annotation_path, antigravity_summary_rows_from_db};
+
+        let dir = std::env::temp_dir().join(format!("bram-agy-rows-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("annotations")).unwrap();
+        let db = dir.join("conversation_summaries.db");
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE conversation_summaries (
+                    conversation_id TEXT, title TEXT NOT NULL DEFAULT '',
+                    workspace_uris TEXT NOT NULL, last_modified_time TEXT NOT NULL
+                 );
+                 INSERT INTO conversation_summaries VALUES
+                   ('renamed', 'Old', '[\"file:///p\"]', '2026-10-31 21:17:11+00:00'),
+                   ('odd', 'Kept', '[\"file:///p\"]', '2026-10-31 21:17:10+00:00'),
+                   ('plain', 'Plain', '[\"file:///p\"]', '2026-10-31 21:17:09+00:00');",
+            )
+            .unwrap();
+        std::fs::write(
+            antigravity_annotation_path(&dir, "renamed"),
+            "title:\"New\"",
+        )
+        .unwrap();
+        std::fs::write(antigravity_annotation_path(&dir, "odd"), "pinned:true").unwrap();
+        let titles: Vec<String> = antigravity_summary_rows_from_db(&db, "/p")
+            .into_iter()
+            .map(|row| row.1)
+            .collect();
+        assert_eq!(titles, ["New", "Kept", "Plain"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn summary_timestamps_parse_space_and_rfc3339_forms() {
+        use super::antigravity_timestamp_ms;
+
+        assert_eq!(
+            antigravity_timestamp_ms("2026-10-31 21:17:11.439086+00:00"),
+            1_793_481_431_439
+        );
+        assert_eq!(
+            antigravity_timestamp_ms("2026-10-31T21:17:11.439086Z"),
+            1_793_481_431_439
+        );
+        assert_eq!(antigravity_timestamp_ms("not a timestamp"), 0);
+    }
+
+    #[test]
+    fn explicit_antigravity_identity_survives_other_writers_and_missing_rows() {
+        use super::resolve_antigravity_live_session_id;
+        let rows = vec![
+            (
+                "other-cli".to_string(),
+                "Other terminal".to_string(),
+                50_000,
+            ),
+            (
+                "outgoing".to_string(),
+                "Late exit write".to_string(),
+                40_000,
+            ),
+            ("resumed".to_string(), "Older".to_string(), 5_000),
+        ];
+        let pin = Some("resumed");
+        assert_eq!(
+            resolve_antigravity_live_session_id(pin, &rows).as_deref(),
+            pin
+        );
+        // A failed query and a successful query that omits the target must
+        // both preserve explicit identity. Neither establishes a new launch.
+        assert_eq!(
+            resolve_antigravity_live_session_id(pin, &[]).as_deref(),
+            pin
+        );
+        assert_eq!(
+            resolve_antigravity_live_session_id(pin, &rows[..2]).as_deref(),
+            pin
+        );
+        assert_eq!(
+            resolve_antigravity_live_session_id(pin, &rows).as_deref(),
+            pin
+        );
+        // An explicit resume replaces the pin; a fresh launch clears it and
+        // lets ordinary discovery find the new session.
+        assert_eq!(
+            resolve_antigravity_live_session_id(Some("outgoing"), &rows).as_deref(),
+            Some("outgoing")
+        );
+        assert_eq!(
+            resolve_antigravity_live_session_id(None, &rows).as_deref(),
+            Some("other-cli")
+        );
+        assert_eq!(resolve_antigravity_live_session_id(None, &[]), None);
+    }
+
+    #[test]
+    fn pinned_antigravity_export_failure_does_not_fall_back_and_recovers() {
+        use super::{
+            antigravity_refresh_export, antigravity_summary_rows_from_db,
+            resolve_antigravity_live_session_id, resolve_antigravity_session_path,
+        };
+        let dir = std::env::temp_dir().join(format!("bram-agy-pin-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.jsonl");
+        let export = dir.join("exports/resumed.jsonl");
+        let other = dir.join("other.jsonl");
+        std::fs::write(&other, "another conversation").unwrap();
+        let rows = vec![
+            ("other".into(), "Newest".into(), 50_000),
+            ("resumed".into(), "Older".into(), 5_000),
+        ];
+        let pin = Some("resumed");
+        let lookup = |id: &str| {
+            if id == "other" {
+                return Some(other.clone());
+            }
+            assert_eq!(id, "resumed");
+            antigravity_refresh_export(id, &source, &export).ok()?;
+            Some(export.clone())
+        };
+        // Source read failure: the available newer export must not be used.
+        assert_eq!(resolve_antigravity_session_path(pin, &rows, lookup), None);
+        // An unavailable database cannot turn a cached explicit identity into
+        // "newest" either; the helper's empty-row failure contract is real.
+        let unavailable = antigravity_summary_rows_from_db(&dir.join("missing.db"), "/fixture");
+        assert!(unavailable.is_empty());
+        assert_eq!(
+            resolve_antigravity_live_session_id(pin, &unavailable).as_deref(),
+            pin
+        );
+        std::fs::write(
+            &source,
+            include_str!("../../docs/agent-specimens/antigravity/transcript-record-tools.jsonl"),
+        )
+        .unwrap();
+        // Export write failure (parent is a file), independent of source/DB.
+        std::fs::write(dir.join("exports"), "blocked").unwrap();
+        assert_eq!(resolve_antigravity_session_path(pin, &rows, lookup), None);
+        std::fs::remove_file(dir.join("exports")).unwrap();
+        // Recovery works even while summary lookup is unavailable. It retries
+        // the same session and leaves newer conversations out of the Transcript.
+        assert_eq!(
+            resolve_antigravity_session_path(pin, &unavailable, lookup),
+            Some(export.clone())
+        );
+        assert!(std::fs::read_to_string(&export)
+            .unwrap()
+            .contains("resumed"));
+        assert_eq!(
+            resolve_antigravity_session_path(pin, &rows, lookup),
+            Some(export.clone())
+        );
+        assert_eq!(
+            resolve_antigravity_session_path(None, &rows, lookup),
+            Some(other)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
 #[cfg(test)]
 mod opencode_rename_tests {
     use super::opencode_set_session_title_in;
@@ -33010,6 +37617,27 @@ mod opencode_rename_tests {
                 .unwrap(),
             0
         );
+    }
+}
+
+#[cfg(test)]
+mod opencode_tool_name_tests {
+    use super::opencode_tool_as_claude;
+
+    // opencode-bash-tool-maps-to-bash: a real `bash` part's input from
+    // opencode.db, and the older `shell` name, both become Claude's Bash.
+    #[test]
+    fn bash_and_shell_both_map_to_bash() {
+        let real = serde_json::json!({ "command": "git status --short" });
+        let (name, input) = opencode_tool_as_claude("bash", &real);
+        assert_eq!(name, "Bash");
+        assert_eq!(input["command"], "git status --short");
+        let with_dir = serde_json::json!({ "command": "ls", "workdir": "/tmp" });
+        assert_eq!(opencode_tool_as_claude("bash", &with_dir).0, "Bash");
+        let old = serde_json::json!({ "command": "ls", "description": "List files" });
+        let (name, input) = opencode_tool_as_claude("shell", &old);
+        assert_eq!(name, "Bash");
+        assert_eq!(input["description"], "List files");
     }
 }
 
@@ -33201,6 +37829,172 @@ fn opencode_live_session_cell() -> &'static Mutex<Option<String>> {
     CELL.get_or_init(|| Mutex::new(None))
 }
 
+// Explicit launch identity, independent of database availability and export
+// success. Only another explicit launch, or the running CLI naming its own
+// session (handle_agent_session), replaces or clears this pin.
+// current-session-from-events: rules 1 and 2 of the session spine
+// (docs/decisions/2026-10-27-bram-chooses-the-session.md) for Claude and Codex.
+// Bram's launch sets this and the CLI's own events replace it. While it is
+// set, file times don't decide; they answer only when nothing has named a
+// session. A named session whose file doesn't exist yet (the CLI writes it at
+// the first message) or can't be found keeps its name, so the next read
+// retries the same session.
+fn named_session_cell() -> &'static Mutex<std::collections::HashMap<&'static str, String>> {
+    static CELL: OnceLock<Mutex<std::collections::HashMap<&'static str, String>>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn named_session(provider: SessionProvider) -> Option<String> {
+    named_session_cell()
+        .lock()
+        .ok()
+        .and_then(|cell| cell.get(session_provider_label(provider)).cloned())
+}
+
+fn set_named_session(provider: SessionProvider, id: Option<&str>) -> Option<String> {
+    if !matches!(provider, SessionProvider::Claude | SessionProvider::Codex) {
+        return None;
+    }
+    let label = session_provider_label(provider);
+    let mut cell = named_session_cell().lock().ok()?;
+    match id {
+        Some(id) => cell.insert(label, id.to_string()),
+        None => cell.remove(label),
+    }
+}
+
+fn antigravity_live_session_cell() -> &'static Mutex<Option<String>> {
+    static CELL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+fn resolve_antigravity_live_session_id(
+    live: Option<&str>,
+    rows: &[(String, String, i64)],
+) -> Option<String> {
+    live.map(str::to_string)
+        .or_else(|| rows.first().map(|(id, _, _)| id.clone()))
+}
+
+// An unavailable pinned transcript must not select someone else's transcript.
+// Keep the identity even if the database temporarily omits it or export fails;
+// the next read can retry the same session. Newest is only an unpinned fallback.
+fn resolve_antigravity_session_path(
+    live: Option<&str>,
+    rows: &[(String, String, i64)],
+    mut export: impl FnMut(&str) -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    match live {
+        Some(id) => export(id),
+        None => rows.iter().find_map(|(id, _, _)| export(id)),
+    }
+}
+
+fn mark_antigravity_session_current<R: tauri::Runtime>(app: &AppHandle<R>, id: &str, source: &str) {
+    if id.is_empty() {
+        return;
+    }
+    let previous = antigravity_live_session_cell()
+        .lock()
+        .ok()
+        .and_then(|mut live| live.replace(id.to_string()));
+    remember_last_active_session(app, SessionProvider::Antigravity, id);
+    if bram_trace_enabled() {
+        append_bram_trace_line(
+            app,
+            "agent-switch",
+            &format!(
+                "op=live-session-set provider=antigravity session={} previous={} source=explicit-resume via={}",
+                id,
+                previous.as_deref().unwrap_or(""),
+                source
+            ),
+        );
+    }
+}
+
+// agy-reads-conversation-id, current-session-from-events: rule 1 of the session
+// spine. The running CLI named its own session, which outranks Bram's launch.
+// Hooks report it repeatedly, so a repeat is a no-op.
+fn handle_agent_session<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    body: &[u8],
+) -> (u16, &'static str, Vec<u8>) {
+    const JSON: &str = "application/json; charset=utf-8";
+    let Some(value) = authenticated_menu_payload(body, menu_session_token()) else {
+        return (403, JSON, b"{\"error\":\"bad token\"}".to_vec());
+    };
+    let provider = value
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .and_then(SessionProvider::from_str)
+        .filter(|p| {
+            matches!(
+                p,
+                SessionProvider::Antigravity | SessionProvider::Claude | SessionProvider::Codex
+            )
+        });
+    let session = value.get("session").and_then(|v| v.as_str()).unwrap_or("");
+    let Some(provider) = provider.filter(|_| session_id_is_safe(session)) else {
+        return (400, JSON, b"{\"error\":\"bad session\"}".to_vec());
+    };
+    if current_provider(app) != Some(provider) {
+        return (200, JSON, b"{\"ok\":true,\"changed\":false}".to_vec());
+    }
+    let previous = if provider == SessionProvider::Antigravity {
+        antigravity_live_session_cell()
+            .lock()
+            .ok()
+            .and_then(|mut live| live.replace(session.to_string()))
+    } else {
+        set_named_session(provider, Some(session))
+    };
+    if previous.as_deref() == Some(session) {
+        return (200, JSON, b"{\"ok\":true,\"changed\":false}".to_vec());
+    }
+    remember_last_active_session(app, provider, session);
+    if bram_trace_enabled() {
+        append_bram_trace_line(
+            app,
+            "agent-switch",
+            &format!(
+                "op=live-session-set provider={} session={} previous={} source=agent-event",
+                session_provider_label(provider),
+                session,
+                previous.as_deref().unwrap_or("")
+            ),
+        );
+    }
+    // agy-session-rename: agy surfaces no session file for the watcher, so its
+    // fresh partner's queued name is claimed here. Left queued, it stays a
+    // `pending-` row in the Sessions list.
+    if matches!(provider, SessionProvider::Antigravity) {
+        apply_pending_session_title(app, provider, session, true);
+    }
+    emit_replayable_signal(app, "sessions-list-changed");
+    emit_talk_session_changed_for_provider(app, Some(provider));
+    (200, JSON, b"{\"ok\":true,\"changed\":true}".to_vec())
+}
+
+fn clear_antigravity_live_session<R: tauri::Runtime>(app: &AppHandle<R>, reason: &str) {
+    let prev = antigravity_live_session_cell()
+        .lock()
+        .ok()
+        .and_then(|mut g| g.take());
+    if let Some(prev) = prev {
+        if bram_trace_enabled() {
+            append_bram_trace_line(
+                app,
+                "agent-switch",
+                &format!(
+                    "op=antigravity-live-session-clear session={} reason={}",
+                    prev, reason
+                ),
+            );
+        }
+    }
+}
+
 fn sessions_for_provider<R: tauri::Runtime>(
     app: &AppHandle<R>,
     preferred: Option<SessionProvider>,
@@ -33212,6 +38006,7 @@ fn sessions_for_provider<R: tauri::Runtime>(
             SessionProvider::Claude => discover_claude_sessions(app, limit)?,
             SessionProvider::Codex => discover_codex_sessions(app, limit)?,
             SessionProvider::Opencode => discover_opencode_sessions(app, limit)?,
+            SessionProvider::Antigravity => discover_antigravity_sessions(app, limit)?,
         };
         return Ok((provider, sessions));
     }
@@ -33222,6 +38017,7 @@ fn sessions_for_provider<R: tauri::Runtime>(
         SessionProvider::Claude => claude,
         SessionProvider::Codex => codex,
         SessionProvider::Opencode => Vec::new(),
+        SessionProvider::Antigravity => discover_antigravity_sessions(app, None)?,
     };
     Ok((provider, sessions))
 }
@@ -33288,6 +38084,7 @@ fn session_meta<R: tauri::Runtime>(
         SessionProvider::Claude => count_claude_sessions(app)?,
         SessionProvider::Codex => count_codex_sessions(app)?,
         SessionProvider::Opencode => discover_opencode_sessions(app, None)?.len(),
+        SessionProvider::Antigravity => discover_antigravity_sessions(app, None)?.len(),
     };
     let discovery_notes = if provider == SessionProvider::Claude && count == 0 {
         claude_sessions_dir_lookup(app)
@@ -34927,10 +39724,10 @@ fn run_search_index_pass_filtered<R: tauri::Runtime>(
     // actually index, since claude_session_title reads the whole file
     // (issue-230-indexer-lazy-claude-titles).
     let discover_started = std::time::Instant::now();
-    let mut files_vec: Vec<(PathBuf, u64, u64, String, SessionProvider)> =
+    let mut files_vec: Vec<(PathBuf, u64, u64, String, Option<String>, SessionProvider)> =
         discover_claude_session_files(app)?
             .into_iter()
-            .map(|(path, mtime, size, id)| (path, mtime, size, id, SessionProvider::Claude))
+            .map(|(path, mtime, size, id)| (path, mtime, size, id, None, SessionProvider::Claude))
             .collect();
     // opencode-sessions-browser: OpenCode's exports are Claude-shaped, so the
     // same extraction indexes them; only the provider label differs.
@@ -34948,7 +39745,30 @@ fn run_search_index_pass_filtered<R: tauri::Runtime>(
             .into_iter()
             .map(|s| {
                 let token = opencode_export_change_token(&s.path).unwrap_or(s.mtime * 1000);
-                (s.path, token, s.size, s.id, SessionProvider::Opencode)
+                (
+                    s.path,
+                    token,
+                    s.size,
+                    s.id,
+                    s.title,
+                    SessionProvider::Opencode,
+                )
+            }),
+    );
+    files_vec.extend(
+        discover_antigravity_sessions(app, None)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| {
+                let token = opencode_export_change_token(&s.path).unwrap_or(s.mtime * 1000);
+                (
+                    s.path,
+                    token,
+                    s.size,
+                    s.id,
+                    s.title,
+                    SessionProvider::Antigravity,
+                )
             }),
     );
     stats.discover_ms = discover_started.elapsed().as_millis();
@@ -34970,8 +39790,16 @@ fn run_search_index_pass_filtered<R: tauri::Runtime>(
     // from the extract/write work below means `report_progress` reflects
     // actual pending work, not the size of the whole corpus, so an ordinary
     // warm pass over hundreds of untouched sessions stays quiet.
-    let mut pending: Vec<(PathBuf, i64, i64, String, bool, SessionProvider)> = Vec::new();
-    for (path, mtime_u, size_u, id, provider) in files_vec {
+    let mut pending: Vec<(
+        PathBuf,
+        i64,
+        i64,
+        String,
+        Option<String>,
+        bool,
+        SessionProvider,
+    )> = Vec::new();
+    for (path, mtime_u, size_u, id, known_title, provider) in files_vec {
         let path_str = path.to_string_lossy().to_string();
         let (mtime, size) = (mtime_u as i64, size_u as i64);
         let forced = force_all
@@ -34994,7 +39822,13 @@ fn run_search_index_pass_filtered<R: tauri::Runtime>(
         // a turn ends or the session is renamed (it is rewritten whole, never
         // appended), so withholding its small final change would leave it
         // stale with no later change to bring the pass back.
-        if needs_index && !forced && provider != SessionProvider::Opencode {
+        if needs_index
+            && !forced
+            && !matches!(
+                provider,
+                SessionProvider::Opencode | SessionProvider::Antigravity
+            )
+        {
             if let Ok(Some((prev_size, indexed_at))) = search_index::indexed_meta(&conn, &path_str)
             {
                 let age = (unix_now_ms() / 1000) - indexed_at;
@@ -35027,22 +39861,27 @@ fn run_search_index_pass_filtered<R: tauri::Runtime>(
             stats.skipped += 1;
             continue;
         }
-        pending.push((path, mtime, size, id, forced, provider));
+        pending.push((path, mtime, size, id, known_title, forced, provider));
     }
     let total_pending = pending.len();
     let report_progress = total_pending > SESSION_PROGRESS_REPORT_THRESHOLD;
     let mut done = 0usize;
-    for (path, mtime, size, id, forced, provider) in pending {
+    for (path, mtime, size, id, known_title, forced, provider) in pending {
         if forced {
             stats.forced += 1;
         }
         let path_str = path.to_string_lossy().to_string();
         let extract_started = std::time::Instant::now();
-        let title = claude_session_title(&path).ok().flatten().unwrap_or(id);
+        let title = known_title
+            .or_else(|| claude_session_title(&path).ok().flatten())
+            .unwrap_or(id);
         // search-index-opencode-sessions: an export is rewritten whole, so
         // earlier records can change while the file grows; the incremental
         // (append-only) extractor would keep stale text. Parse it cold.
-        let extracted = if provider == SessionProvider::Opencode {
+        let extracted = if matches!(
+            provider,
+            SessionProvider::Opencode | SessionProvider::Antigravity
+        ) {
             opencode_session_search_data(&path)
         } else {
             claude_session_search_data(&path)
@@ -35072,11 +39911,7 @@ fn run_search_index_pass_filtered<R: tauri::Runtime>(
             // token is in milliseconds; the row's date stays in seconds like
             // every other session (a ms value read as seconds dated the
             // burndown hit 58793-02-18).
-            date: if provider == SessionProvider::Opencode {
-                (mtime / 1000).to_string()
-            } else {
-                mtime.to_string()
-            },
+            date: search_row_date(provider, mtime),
             // Internal tab route; exact-session deep-link is deferred. The
             // expander derives id from the doc key (file basename) for /__turns.
             link: "/sessions".to_string(),
@@ -36763,7 +41598,7 @@ fn has_project_settings(dir: &Path) -> bool {
 // artifact that actually means "acknowledged". Accepting either is stricter
 // about intent, not looser: running Setup is a deliberate act on this project.
 fn project_is_managed(dir: &Path) -> bool {
-    has_project_settings(dir) || dir.join(WORKLIST_AUTH_REL).exists()
+    has_project_settings(dir) || resource_relative_path(dir, WORKLIST_AUTH_REL).exists()
 }
 
 const REPO_STARTUP_GREETING: &str = "Hello, this is Bram. I just woke up in a repo that I haven't seen before. You can ask me to look around, or click Orient me for a guided tour: an overview and architecture diagrams of this repo, with every claim cited to the code.";
@@ -36978,7 +41813,13 @@ fn append_auto_setup_announcement(text: &str) {
 // switch providers only when the configured CLI is missing AND the other is
 // found; never suppress work because neither was found.
 fn agent_cli_on_path(name: &str) -> bool {
-    let Some(paths) = std::env::var_os("PATH") else {
+    // windows-pty-path-from-registry: on Windows, probe the same PATH the PTY
+    // gets, so a CLI installed after Bram launched is seen here too.
+    #[cfg(windows)]
+    let paths = Some(windows_probe_path());
+    #[cfg(not(windows))]
+    let paths = std::env::var_os("PATH");
+    let Some(paths) = paths else {
         return false;
     };
     for dir in std::env::split_paths(&paths) {
@@ -36994,6 +41835,145 @@ fn agent_cli_on_path(name: &str) -> bool {
         }
     }
     false
+}
+
+// windows-pty-path-from-registry: a Windows process's PATH is a snapshot taken
+// when it started. A CLI installed while Bram runs (or before Bram was
+// launched from an older terminal) lands in the registry's PATH but not in
+// Bram's, so the PTY's PowerShell answered `agy` with CommandNotFound
+// (2026-11-02). portable-pty's CommandBuilder::new already reads the
+// registry's machine and user Path (expanding REG_EXPAND_SZ references with
+// ExpandEnvironmentStringsW) into its base environment, in-process: no
+// reg.exe, no new crate. pty_spawn then overwrote it with the inherited
+// PATH. The merge keeps the inherited entries first, in order, and appends
+// registry entries not already present, so nothing the launching terminal
+// added is lost or reordered. Returns the merged list and how many entries it
+// appended. A registry read failure leaves portable-pty's PATH equal to the
+// inherited one, so the merge adds nothing: fail open.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn merge_path_lists(inherited: &str, registry: &str) -> (String, usize) {
+    fn key(entry: &str) -> String {
+        entry
+            .trim()
+            .trim_matches('"')
+            .trim_end_matches(['\\', '/'])
+            .to_lowercase()
+    }
+    let mut seen: std::collections::HashSet<String> = inherited
+        .split(';')
+        .map(key)
+        .filter(|k| !k.is_empty())
+        .collect();
+    let mut merged = inherited.trim_end_matches(';').to_string();
+    let mut added = 0;
+    for entry in registry.split(';') {
+        let entry = entry.trim();
+        let k = key(entry);
+        if k.is_empty() || !seen.insert(k) {
+            continue;
+        }
+        if !merged.is_empty() {
+            merged.push(';');
+        }
+        merged.push_str(entry);
+        added += 1;
+    }
+    (merged, added)
+}
+
+// The inherited PATH merged with `registry` (portable-pty's base-env PATH).
+// A non-Unicode PATH on either side is left alone: the inherited one wins.
+#[cfg(windows)]
+fn windows_path_with_registry(
+    registry: Option<&std::ffi::OsStr>,
+) -> Option<(std::ffi::OsString, usize)> {
+    let inherited = std::env::var_os("PATH");
+    let inherited_str = match &inherited {
+        Some(v) => v.to_str()?,
+        None => "",
+    };
+    let registry = registry.and_then(|r| r.to_str()).unwrap_or("");
+    let (merged, added) = merge_path_lists(inherited_str, registry);
+    if merged.is_empty() {
+        return None;
+    }
+    Some((merged.into(), added))
+}
+
+// The probe's PATH, cached briefly: installed_agent_flags probes every
+// provider in one call, and each fresh composition re-reads the registry.
+#[cfg(windows)]
+fn windows_probe_path() -> std::ffi::OsString {
+    const TTL: std::time::Duration = std::time::Duration::from_secs(5);
+    static CACHE: OnceLock<Mutex<Option<(std::time::Instant, std::ffi::OsString)>>> =
+        OnceLock::new();
+    let cell = CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = match cell.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some((at, path)) = guard.as_ref() {
+        if at.elapsed() < TTL {
+            return path.clone();
+        }
+    }
+    let base = CommandBuilder::new("cmd.exe");
+    let path = windows_path_with_registry(base.get_env("PATH"))
+        .map(|(p, _)| p)
+        .or_else(|| std::env::var_os("PATH"))
+        .unwrap_or_default();
+    *guard = Some((std::time::Instant::now(), path.clone()));
+    path
+}
+
+#[cfg(test)]
+mod merge_path_lists_tests {
+    use super::merge_path_lists as merge;
+
+    #[test]
+    fn registry_entries_missing_from_the_inherited_path_are_appended() {
+        let (merged, added) = merge(
+            r"C:\Windows\system32;C:\Windows",
+            r"C:\Windows\system32;C:\Windows;C:\Users\jon\AppData\Local\agy\bin",
+        );
+        assert_eq!(
+            merged,
+            r"C:\Windows\system32;C:\Windows;C:\Users\jon\AppData\Local\agy\bin"
+        );
+        assert_eq!(added, 1);
+    }
+
+    #[test]
+    fn inherited_entries_keep_their_order_and_come_first() {
+        let (merged, added) = merge(r"C:\b;C:\a", r"C:\a;C:\c;C:\b");
+        assert_eq!(merged, r"C:\b;C:\a;C:\c");
+        assert_eq!(added, 1);
+    }
+
+    #[test]
+    fn dedupe_ignores_case_trailing_slashes_and_quotes() {
+        let (merged, added) = merge(
+            r"C:\Tools\Bin\;C:\Other",
+            r#"c:\tools\bin;"C:\OTHER\";C:\Tools\Bin\\"#,
+        );
+        assert_eq!(merged, r"C:\Tools\Bin\;C:\Other");
+        assert_eq!(added, 0);
+    }
+
+    #[test]
+    fn registry_duplicates_are_added_once() {
+        let (merged, added) = merge(r"C:\a", r"C:\new;C:\NEW\;C:\new");
+        assert_eq!(merged, r"C:\a;C:\new");
+        assert_eq!(added, 1);
+    }
+
+    #[test]
+    fn empty_and_missing_values_fail_open() {
+        assert_eq!(merge(r"C:\a;C:\b", ""), (r"C:\a;C:\b".to_string(), 0));
+        assert_eq!(merge(r"C:\a;;C:\b;", ";;"), (r"C:\a;;C:\b".to_string(), 0));
+        assert_eq!(merge("", r"C:\a;C:\b"), (r"C:\a;C:\b".to_string(), 2));
+        assert_eq!(merge("", ""), (String::new(), 0));
+    }
 }
 
 // first-run-sequence-greeting-vs-setup: Setup runs automatically, before the
@@ -37065,7 +42045,8 @@ fn auto_setup_before_launch<R: tauri::Runtime>(app: &AppHandle<R>) {
     let claude_needs = status["claudeNeedsSetup"].as_bool().unwrap_or(false);
     let codex_needs = status["codexNeedsSetup"].as_bool().unwrap_or(false);
     let opencode_needs = status["opencodeNeedsSetup"].as_bool().unwrap_or(false);
-    if !claude_needs && !codex_needs && !opencode_needs {
+    let antigravity_needs = status["antigravityNeedsSetup"].as_bool().unwrap_or(false);
+    if !claude_needs && !codex_needs && !opencode_needs && !antigravity_needs {
         append_bram_trace_line(app, "auto-setup", "op=skip reason=current");
         return;
     }
@@ -37079,22 +42060,28 @@ fn auto_setup_before_launch<R: tauri::Runtime>(app: &AppHandle<R>) {
                 app,
                 "auto-setup",
                 &format!(
-                    "op=ran firstRun={} claudeNeeded={} codexNeeded={} opencodeNeeded={} wrote={} skipped={}",
-                    first_run, claude_needs, codex_needs, opencode_needs, wrote, skipped
+                    "op=ran firstRun={} claudeNeeded={} codexNeeded={} opencodeNeeded={} antigravityNeeded={} wrote={} skipped={}",
+                    first_run, claude_needs, codex_needs, opencode_needs, antigravity_needs, wrote, skipped
                 ),
             );
             if first_run && wrote > 0 {
                 // Name the root: on a machine with several managed checkouts,
                 // "which repo did it just set up" is not answerable from the
                 // window alone (#330's Windows validation asked for this).
-                let root_label = project_root(Some(app))
+                let setup_root = project_root(Some(app));
+                let root_label = setup_root
+                    .as_ref()
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| "this repo".to_string());
+                let state_label = setup_root
+                    .as_ref()
+                    .map(|p| format!("{}/", bram_state_dir_name(p)))
+                    .unwrap_or_else(|| "Bram's state folder".to_string());
                 append_auto_setup_announcement(&format!(
                     "I also just set up agent coordination for {} \u{2014} Setup wrote \
-                     .claude/, AGENTS.md and resources/ (all visible in git status). If this \
+                     .claude/, AGENTS.md and {} (all visible in git status). If this \
                      repo shouldn't be managed by Bram, say so and I'll undo it.",
-                    root_label
+                    root_label, state_label
                 ));
             }
             emit_replayable_signal(app, "enhance-status-changed");
@@ -37489,9 +42476,9 @@ fn pending_session_entry<R: tauri::Runtime>(
 ) -> Option<SessionEntry> {
     let rec = read_pending_session_title(app, provider)?;
     Some(SessionEntry {
-        id: rec
-            .session_id
-            .unwrap_or_else(|| format!("pending-{}", rec.created_at_ms.max(0))),
+        id: rec.session_id.unwrap_or_else(|| {
+            format!("{}{}", PENDING_SESSION_ID_PREFIX, rec.created_at_ms.max(0))
+        }),
         mtime: rec.created_at_ms.max(0) as u64 / 1_000,
         size: 0,
         title: Some(rec.title),
@@ -37551,6 +42538,17 @@ fn live_session_id<R: tauri::Runtime>(
                     .ok()
                     .flatten()
                     .and_then(|p| session_id_for_path(SessionProvider::Opencode, &p))
+            }),
+        // Identity survives a temporarily unreadable database or export.
+        SessionProvider::Antigravity => antigravity_live_session_cell()
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .or_else(|| {
+                current_antigravity_session_path(app)
+                    .ok()
+                    .flatten()
+                    .and_then(|p| session_id_for_path(provider, &p))
             }),
     }
 }
@@ -37615,6 +42613,11 @@ fn delete_session<R: tauri::Runtime>(
     // Then the export goes, so the list doesn't show it until the next scan.
     if provider == SessionProvider::Opencode {
         opencode_delete_session(app, id)?;
+        let _ = std::fs::remove_file(&session.path);
+    } else if provider == SessionProvider::Antigravity {
+        // agy-session-delete: `session.path` is only Bram's export.
+        let dir = antigravity_data_dir().ok_or("home directory not found")?;
+        antigravity_delete_conversation(&dir, id)?;
         let _ = std::fs::remove_file(&session.path);
     } else {
         std::fs::remove_file(&session.path).map_err(|e| e.to_string())?;
@@ -37820,6 +42823,14 @@ fn rename_session<R: tauri::Runtime>(
     if trimmed.is_empty() {
         return Err("empty title".to_string());
     }
+    // agy-session-rename: by id, before the list: a session joining a group
+    // on its first turn isn't listed yet (2026-11-02 16:36:39
+    // `session not found`).
+    if matches!(preferred, Some(SessionProvider::Antigravity)) {
+        let dir = antigravity_data_dir().ok_or("home directory not found")?;
+        antigravity_set_title(&dir, id, trimmed)?;
+        return Ok(b"{\"ok\":true}".to_vec());
+    }
     let (provider, sessions) = sessions_for_provider(app, preferred, None)?;
     let session = sessions
         .into_iter()
@@ -37845,6 +42856,11 @@ fn rename_session<R: tauri::Runtime>(
             // database, so the rename is a single UPDATE there.
             opencode_set_session_title(app, &session.id, trimmed)?;
         }
+        // agy-session-rename: no provider named, but the list resolved agy.
+        SessionProvider::Antigravity => {
+            let dir = antigravity_data_dir().ok_or("home directory not found")?;
+            antigravity_set_title(&dir, &session.id, trimmed)?;
+        }
     }
     Ok(b"{\"ok\":true}".to_vec())
 }
@@ -37868,6 +42884,16 @@ fn latest_claude_session_path<R: tauri::Runtime>(
     app: &AppHandle<R>,
 ) -> Result<Option<std::path::PathBuf>, String> {
     let dir = claude_sessions_dir(app)?;
+    if let Some(id) = named_session(SessionProvider::Claude) {
+        let path = dir.join(format!("{}.jsonl", id));
+        if let Ok(mtime) = std::fs::metadata(&path).and_then(|m| m.modified()) {
+            let cache_cell = LIVE_CLAUDE_SESSION.get_or_init(|| Mutex::new(None));
+            if let Ok(mut cached) = cache_cell.lock() {
+                *cached = Some((path.clone(), mtime));
+            }
+            return Ok(Some(path));
+        }
+    }
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -37946,6 +42972,24 @@ fn latest_claude_session_path<R: tauri::Runtime>(
 fn latest_codex_session_path<R: tauri::Runtime>(
     app: &AppHandle<R>,
 ) -> Result<Option<std::path::PathBuf>, String> {
+    // This runs on every poll, and finding a rollout by id walks the sessions
+    // tree, so the id's path is kept until the id changes.
+    static NAMED_PATH: OnceLock<Mutex<Option<(String, PathBuf)>>> = OnceLock::new();
+    if let Some(id) = named_session(SessionProvider::Codex) {
+        let cell = NAMED_PATH.get_or_init(|| Mutex::new(None));
+        let known = cell
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .filter(|(known, path)| *known == id && path.exists())
+            .map(|(_, path)| path);
+        if let Some(path) = known.or_else(|| codex_session_path_for_id(app, &id)) {
+            if let Ok(mut g) = cell.lock() {
+                *g = Some((id, path.clone()));
+            }
+            return Ok(Some(path));
+        }
+    }
     let project = project_root(Some(app)).ok_or("could not resolve project root")?;
     let project_cwd = canonical_path_string(&project);
     let home = home_dir().ok_or("no HOME or USERPROFILE")?;
@@ -37954,10 +42998,10 @@ fn latest_codex_session_path<R: tauri::Runtime>(
     collect_codex_session_paths(&sessions_root, &mut paths)?;
     let mut all: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
     for path in paths {
-        let Some((_, cwd)) = codex_session_meta(&path).map_err(|e| e.to_string())? else {
-            continue;
-        };
-        if canonical_path_string(Path::new(&cwd)) != project_cwd {
+        if codex_main_session_id(&path, &project_cwd)
+            .map_err(|e| e.to_string())?
+            .is_none()
+        {
             continue;
         }
         let Ok(metadata) = path.metadata() else {
@@ -38051,6 +43095,8 @@ fn latest_session_path<R: tauri::Runtime>(
         SessionProvider::Claude => latest_claude_session_path(app)?,
         SessionProvider::Codex => latest_codex_session_path(app)?,
         SessionProvider::Opencode => current_opencode_session_path(app)?,
+        // No session files to compare against the agent hint yet.
+        SessionProvider::Antigravity => latest_session_path_for_provider(app, provider)?,
     };
     let Some(path) = path else {
         return Ok(None);
@@ -38076,7 +43122,31 @@ fn latest_session_path_for_provider<R: tauri::Runtime>(
         SessionProvider::Claude => latest_claude_session_path(app),
         SessionProvider::Codex => latest_codex_session_path(app),
         SessionProvider::Opencode => current_opencode_session_path(app),
+        SessionProvider::Antigravity => current_antigravity_session_path(app),
     }
+}
+
+fn current_antigravity_session_path<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+) -> Result<Option<PathBuf>, String> {
+    let root = project_root(Some(app))
+        .ok_or("could not resolve project root")?
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
+    if let Ok(cache_dir) = app.path().app_cache_dir() {
+        let encoded = encode_path_for_filename(&strip_unc_prefix(root.clone()));
+        retire_stale_antigravity_exports(&cache_dir, &encoded);
+    }
+    let rows = antigravity_summary_rows(&root.to_string_lossy());
+    let live = antigravity_live_session_cell()
+        .lock()
+        .ok()
+        .and_then(|g| g.clone());
+    Ok(resolve_antigravity_session_path(
+        live.as_deref(),
+        &rows,
+        |id| antigravity_export_path_for_project(app, id, &root),
+    ))
 }
 
 // opencode-model-from-database (2026-10-28 07:31Z): "the current OpenCode
@@ -38093,11 +43163,13 @@ fn current_opencode_session_path<R: tauri::Runtime>(
         .lock()
         .ok()
         .and_then(|g| g.clone());
-    if let Some(path) = live.and_then(|id| session_path_for_id(app, SessionProvider::Opencode, &id))
-    {
-        return Ok(Some(path));
+    // opencode-session-own-terminal: rule 3 of the session spine. Newest only
+    // if nothing named a session: a failed export read isn't a change of
+    // session.
+    match live {
+        Some(id) => Ok(session_path_for_id(app, SessionProvider::Opencode, &id)),
+        None => latest_opencode_session_path(app),
     }
-    latest_opencode_session_path(app)
 }
 
 fn system_time_ms(t: std::time::SystemTime) -> Option<i64> {
@@ -38109,6 +43181,7 @@ fn system_time_ms(t: std::time::SystemTime) -> Option<i64> {
 fn start_codex_session_poll_fallback<R: tauri::Runtime>(app_handle: AppHandle<R>) {
     std::thread::spawn(move || {
         let mut last_seen: Option<(PathBuf, std::time::SystemTime)> = None;
+        let mut last_children = Vec::new();
         loop {
             std::thread::sleep(std::time::Duration::from_millis(500));
             let path = match latest_session_path(&app_handle, Some(SessionProvider::Codex)) {
@@ -38119,6 +43192,20 @@ fn start_codex_session_poll_fallback<R: tauri::Runtime>(app_handle: AppHandle<R>
                 }
                 Err(_) => continue,
             };
+            // codex-subagent-refresh-and-completion: chips follow a child from
+            // here, while Codex is the running agent. Fires only on a change.
+            if matches!(current_provider(&app_handle), Some(SessionProvider::Codex)) {
+                let children = codex_children_signature(&path);
+                if children != last_children {
+                    append_bram_trace_line(
+                        &app_handle,
+                        "subagents",
+                        &format!("op=codex-poll children={}", children.len()),
+                    );
+                    last_children = children;
+                    emit_replayable_signal(&app_handle, "subagents-changed");
+                }
+            }
             let mtime = match std::fs::metadata(&path).and_then(|md| md.modified()) {
                 Ok(mtime) => mtime,
                 Err(_) => continue,
@@ -39174,6 +44261,7 @@ fn build_conversation_cache_entry<R: tauri::Runtime>(
         Some(SessionProvider::Claude) => "claude",
         Some(SessionProvider::Codex) => "codex",
         Some(SessionProvider::Opencode) => "opencode",
+        Some(SessionProvider::Antigravity) => "antigravity",
         None => "",
     };
     let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
@@ -39540,6 +44628,7 @@ fn read_conversation_state<R: tauri::Runtime>(
         Some(SessionProvider::Claude) => "claude",
         Some(SessionProvider::Codex) => "codex",
         Some(SessionProvider::Opencode) => "opencode",
+        Some(SessionProvider::Antigravity) => "antigravity",
         None => "",
     };
     let Some((path, mtime_ms, len)) = resolve_conversation_path_meta(app, preferred)? else {
@@ -42753,6 +47842,64 @@ fn st_is_notification_text(text: &str) -> bool {
     tn.starts_with("<task-notification>") || tn.starts_with("[SYSTEM NOTIFICATION")
 }
 
+// transcript-peer-messages-not-you: a queued_command attachment whose
+// origin.kind is "peer" (a subagent's hand-back or another agent's message,
+// delivered while the main agent was mid-turn) as a system note shaped like
+// st_notification_turn's, so the Transcript shows it quietly and Only mine
+// and the message steps skip it. Keyed on the recorded origin, never on the
+// prompt text. The full text stays in the turn's entries.
+fn st_peer_note_turn(att: &serde_json::Value) -> Option<serde_json::Value> {
+    if att.get("type").and_then(|v| v.as_str()) != Some("queued_command") {
+        return None;
+    }
+    let origin = att.get("origin")?;
+    if origin.get("kind").and_then(|v| v.as_str()) != Some("peer") {
+        return None;
+    }
+    let name = origin
+        .get("name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("agent");
+    let handback = origin.get("handback").and_then(|v| v.as_bool()) == Some(true);
+    let body = origin
+        .get("handbackReportText")
+        .and_then(|v| v.as_str())
+        .filter(|_| handback)
+        .or_else(|| origin.get("body").and_then(|v| v.as_str()))
+        .or_else(|| att.get("prompt").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    let body = st_strip_control_chars(body);
+    let first = body
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    let label = if handback {
+        format!("Report from subagent ({})", name)
+    } else {
+        format!("Message from {}", name)
+    };
+    let display = st_cap_chars(
+        &if first.is_empty() {
+            label
+        } else {
+            format!("{}: {}", label, first)
+        },
+        300,
+    );
+    Some(serde_json::json!({
+        "role": "system",
+        "notification": true,
+        "peer": true,
+        "from": origin.get("from").and_then(|v| v.as_str()).unwrap_or(""),
+        "name": name,
+        "text": display,
+        "entries": [ { "kind": "text", "text": body } ],
+        "images": [],
+    }))
+}
+
 fn st_notification_turn(text_joined: &str) -> Option<serde_json::Value> {
     if !st_is_notification_text(text_joined) {
         return None;
@@ -42760,7 +47907,11 @@ fn st_notification_turn(text_joined: &str) -> Option<serde_json::Value> {
     let tn = text_joined.trim_start();
     let summary = st_tag_value(tn, "summary");
     let display = if summary.is_empty() {
-        st_cap_chars(tn, 300)
+        let stripped = tn
+            .strip_prefix("[SYSTEM NOTIFICATION]")
+            .map(str::trim_start)
+            .unwrap_or(tn);
+        st_cap_chars(stripped, 300)
     } else {
         summary.clone()
     };
@@ -43010,6 +48161,7 @@ fn st_parse_lines_to_turns(jsonl_text: &str) -> Vec<serde_json::Value> {
     // expansion can explain what it is actually monitoring.
     let mut codex_background_commands: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    let mut pending_compact_meta: Option<serde_json::Value> = None;
     for line in jsonl_text.lines() {
         if line.is_empty() {
             continue;
@@ -43018,6 +48170,27 @@ fn st_parse_lines_to_turns(jsonl_text: &str) -> Vec<serde_json::Value> {
             continue;
         };
         let typ = r.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        // issue-470: Claude Code writes a `system` record with subtype
+        // `compact_boundary` (its `compactMetadata` carries trigger and
+        // token counts) just before the `isCompactSummary` user record that
+        // holds the summary. Remember the metadata; it never becomes a turn.
+        if typ == "system" {
+            if r.get("subtype").and_then(|v| v.as_str()) == Some("compact_boundary") {
+                pending_compact_meta = Some(
+                    r.get("compactMetadata")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                );
+            }
+            continue;
+        }
+        let compact_summary =
+            typ == "user" && r.get("isCompactSummary").and_then(|v| v.as_bool()) == Some(true);
+        let compact_meta = if compact_summary {
+            pending_compact_meta.take()
+        } else {
+            None
+        };
         // isMeta user records are CLI machinery, not user turns — e.g. the
         // Read-tool image companion ("[Image: original 3212x704, displayed
         // at…]") written beside every image tool_result. Claude Code's own
@@ -43205,6 +48378,14 @@ fn st_parse_lines_to_turns(jsonl_text: &str) -> Vec<serde_json::Value> {
             // note. Neither is sufficient alone. Pinned by
             // `task_notification_attachment_is_a_system_note`.
             if let Some(att) = r.get("attachment") {
+                // transcript-peer-messages-not-you: a message from another
+                // agent (a subagent's hand-back, a teammate) delivered
+                // mid-turn carries origin.kind "peer". It is never the
+                // user's, so it becomes a quiet system note, not a You turn.
+                if let Some(note) = st_peer_note_turn(att) {
+                    turns.push(note);
+                    continue;
+                }
                 if att.get("type").and_then(|v| v.as_str()) == Some("queued_command") {
                     if let Some(prompt) = att.get("prompt").and_then(|v| v.as_str()) {
                         let prompt = st_strip_control_chars(prompt);
@@ -43533,12 +48714,42 @@ fn st_parse_lines_to_turns(jsonl_text: &str) -> Vec<serde_json::Value> {
             continue;
         }
 
-        turns.push(serde_json::json!({
+        let mut turn = serde_json::json!({
             "role": role,
             "text": text_joined,
             "entries": entries,
             "images": images,
-        }));
+        });
+        // log-rows-baseline-and-spacing: when the record was written (Claude
+        // and Codex both stamp a top-level ISO timestamp), so a Log entry can
+        // link to the Transcript at its moment (/transcript?at=<ms>).
+        if let Some(ts) = r.get("timestamp").and_then(|v| v.as_str()) {
+            if let Some(obj) = turn.as_object_mut() {
+                obj.insert("ts".to_string(), serde_json::Value::String(ts.to_string()));
+            }
+        }
+        if compact_summary {
+            if let Some(obj) = turn.as_object_mut() {
+                obj.insert("compactSummary".to_string(), serde_json::Value::Bool(true));
+                if let Some(meta) = compact_meta.as_ref() {
+                    if let Some(t) = meta.get("trigger").and_then(|v| v.as_str()) {
+                        obj.insert(
+                            "compactTrigger".to_string(),
+                            serde_json::Value::String(t.to_string()),
+                        );
+                    }
+                    for (src, dst) in [
+                        ("preTokens", "compactPreTokens"),
+                        ("postTokens", "compactPostTokens"),
+                    ] {
+                        if let Some(n) = meta.get(src).filter(|v| v.is_number()) {
+                            obj.insert(dst.to_string(), n.clone());
+                        }
+                    }
+                }
+            }
+        }
+        turns.push(turn);
     }
     turns
 }
@@ -44032,21 +49243,45 @@ mod subagent_state_tests {
     }
 }
 
+// How far into a subagent sidecar st_subagent_model reads for the first
+// assistant record. Until Claude Code 2.1.316 the dispatch prompt was the
+// only record ahead of it and 128 KB was plenty. From 2.1.316 the dispatch
+// record is followed by `attachment` records (one measured at 245 KB) and
+// `api-request-shape` / `api-request-blob` / `api-request` records (~200 KB
+// together), so the first assistant record sat at ~512 KB in all three
+// sidecars examined (subagent-model-read-past-attachments). 8 MB leaves
+// generous headroom while still bounding a pathological file.
+const SUBAGENT_MODEL_SCAN_BYTES: u64 = 8 * 1024 * 1024;
+
 // Model a subagent ran on: the first assistant record's message.model in
-// its transcript. Head-bounded read — the dispatch prompt (first user
-// record) is KBs, so 128 KB comfortably reaches the first assistant line.
+// its transcript. Reads line by line, up to SUBAGENT_MODEL_SCAN_BYTES.
 fn st_subagent_model(jsonl_path: &Path) -> String {
-    use std::io::Read;
+    st_subagent_model_bounded(jsonl_path, SUBAGENT_MODEL_SCAN_BYTES)
+}
+
+fn st_subagent_model_bounded(jsonl_path: &Path, max_bytes: u64) -> String {
+    use std::io::{BufRead, Read};
     let Ok(f) = std::fs::File::open(jsonl_path) else {
         return String::new();
     };
-    let mut buf = Vec::new();
-    let _ = f.take(128 * 1024).read_to_end(&mut buf);
-    let text = String::from_utf8_lossy(&buf);
-    for line in text.lines() {
+    let mut reader = std::io::BufReader::new(f.take(max_bytes));
+    let mut line: Vec<u8> = Vec::new();
+    const NEEDLE: &[u8] = b"\"assistant\"";
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        // Cheap prefilter: a line that never mentions "assistant" can't be
+        // an assistant record, so the large attachment / api-request
+        // records skip the JSON parse. The parse below is the real test.
+        if !line.windows(NEEDLE.len()).any(|w| w == NEEDLE) {
+            continue;
+        }
         // The last line may be truncated by the byte cap; parse failures
         // just skip.
-        let Ok(r) = serde_json::from_str::<serde_json::Value>(line) else {
+        let Ok(r) = serde_json::from_slice::<serde_json::Value>(&line) else {
             continue;
         };
         if r.get("type").and_then(|v| v.as_str()) == Some("assistant") {
@@ -44054,12 +49289,76 @@ fn st_subagent_model(jsonl_path: &Path) -> String {
                 .get("message")
                 .and_then(|m| m.get("model"))
                 .and_then(|v| v.as_str())
+                .filter(|m| !m.is_empty())
             {
                 return m.to_string();
             }
         }
     }
     String::new()
+}
+
+#[cfg(test)]
+mod subagent_model_tests {
+    use super::{st_subagent_model, st_subagent_model_bounded};
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn temp_sidecar(label: &str) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "bram-subagent-model-test-{}-{}-{}",
+            label,
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("agent-test.jsonl")
+    }
+
+    // A sidecar in Claude Code 2.1.316's shape: dispatch, a large
+    // attachment, a large api-request-blob, then the first assistant record.
+    fn write_2_1_316_sidecar(path: &PathBuf) {
+        let mut f = std::fs::File::create(path).unwrap();
+        let dispatch = serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": "do the thing"},
+        });
+        let attachment = serde_json::json!({
+            "type": "attachment",
+            "attachment": {"content": "a".repeat(300 * 1024)},
+        });
+        let blob = serde_json::json!({
+            "type": "api-request-blob",
+            "blob": "b".repeat(250 * 1024),
+        });
+        let assistant = serde_json::json!({
+            "type": "assistant",
+            "message": {"role": "assistant", "model": "claude-test-model", "content": []},
+        });
+        for r in [dispatch, attachment, blob, assistant] {
+            writeln!(f, "{}", serde_json::to_string(&r).unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn finds_model_past_large_attachment_and_request_records() {
+        let path = temp_sidecar("found");
+        write_2_1_316_sidecar(&path);
+        assert_eq!(st_subagent_model(&path), "claude-test-model");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn empty_when_no_assistant_record_within_bound() {
+        let path = temp_sidecar("bounded");
+        write_2_1_316_sidecar(&path);
+        // The assistant record starts past 512 KB; a 400 KB bound stops
+        // inside the blob record.
+        assert_eq!(st_subagent_model_bounded(&path, 400 * 1024), "");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
 }
 
 // Tag Agent/Task tool entries in the MAIN projection with the agentId of
@@ -44102,6 +49401,18 @@ fn st_tag_agent_tool_entries(session_path: &Path, turns: &mut [serde_json::Value
     }
 }
 
+// A Codex child's chip label: the last segment of its agent path, the name its
+// parent gave it ("/root/list_files" -> "list_files").
+fn codex_child_label(child: &CodexChildMeta) -> String {
+    child
+        .agent_path
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&child.nickname)
+        .to_string()
+}
+
 // /__turns?agent=<agentId> — project one subagent's transcript under the
 // ACTIVE session. Same parse + projection pass as the main route; the
 // response adds the meta.json label fields and a `finished` flag. No
@@ -44123,6 +49434,33 @@ fn read_subagent_turns<R: tauri::Runtime>(
     let Some(session_path) = active_session_path(app)? else {
         return empty();
     };
+    if jsonl_completion_provider_for_path(&session_path) == Some(JsonlCompletionProvider::Codex) {
+        let Some((_, path, child)) = codex_child_rollouts(&session_path)
+            .into_iter()
+            .find(|(id, _, _)| id == agent_id)
+        else {
+            return empty();
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return empty();
+        };
+        let mut turns = st_parse_lines_to_turns(codex_child_own_records(&text));
+        let finished = codex_child_is_idle(&text);
+        project_user_turns(app, &mut turns);
+        apply_describe_overlay(&mut turns, &describe_overlay_snapshot(app));
+        apply_menu_answer_overlay(&mut turns, &menu_answer_overlay_snapshot());
+        let body = serde_json::json!({
+            "sid": session_path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+            "agentId": agent_id,
+            "agentType": child.nickname,
+            "description": codex_child_label(&child),
+            "toolUseId": "",
+            "model": st_last_session_model(&path),
+            "turns": turns,
+            "finished": finished,
+        });
+        return serde_json::to_vec(&body).map_err(|e| e.to_string());
+    }
     // subagent-discovery-workflow-dirs: resolve the agent id across both
     // layouts (flat Task subagents and nested Workflow run dirs).
     let Some(sf) = st_subagent_files(&session_path)
@@ -44220,6 +49558,7 @@ fn read_subagent_roster<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<Vec<u8>
             "sid": sid,
             "agents": [],
             "mainModel": main_session_model(app, &session_path),
+            "mainProvider": projected_turns_provider_label(&session_path),
         }))
         .map_err(|e| e.to_string())
     };
@@ -44228,6 +49567,37 @@ fn read_subagent_roster<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<Vec<u8>
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0)
     };
+    if jsonl_completion_provider_for_path(&session_path) == Some(JsonlCompletionProvider::Codex) {
+        let now_ms = to_ms(std::time::SystemTime::now());
+        let mut agents: Vec<serde_json::Value> = Vec::new();
+        for (id, path, child) in codex_child_rollouts(&session_path) {
+            let Ok(md) = std::fs::metadata(&path) else {
+                continue;
+            };
+            let updated_at_ms = md.modified().map(to_ms).unwrap_or(0);
+            let state = codex_child_state(&path, updated_at_ms, now_ms);
+            agents.push(serde_json::json!({
+                "agentId": id,
+                "agentType": child.nickname,
+                "description": codex_child_label(&child),
+                "toolUseId": "",
+                "workflowId": "",
+                "model": st_last_session_model(&path),
+                "state": state,
+                "finished": state == "finished",
+                "startedAtMs": md.created().map(to_ms).unwrap_or(updated_at_ms),
+                "updatedAtMs": updated_at_ms,
+            }));
+        }
+        agents.sort_by_key(|a| a.get("startedAtMs").and_then(|v| v.as_i64()).unwrap_or(0));
+        let body = serde_json::json!({
+            "sid": sid,
+            "agents": agents,
+            "mainModel": main_session_model(app, &session_path),
+            "mainProvider": projected_turns_provider_label(&session_path),
+        });
+        return serde_json::to_vec(&body).map_err(|e| e.to_string());
+    }
     let files = st_subagent_files(&session_path);
     if files.is_empty() {
         return empty_session();
@@ -44275,6 +49645,7 @@ fn read_subagent_roster<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<Vec<u8>
         "sid": sid,
         "agents": agents,
         "mainModel": main_session_model(app, &session_path),
+        "mainProvider": projected_turns_provider_label(&session_path),
     });
     serde_json::to_vec(&body).map_err(|e| e.to_string())
 }
@@ -44313,6 +49684,7 @@ fn read_session_size<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<Vec<u8>, S
         Some(SessionProvider::Codex) => "codex",
         Some(SessionProvider::Claude) => "claude",
         Some(SessionProvider::Opencode) => "opencode",
+        Some(SessionProvider::Antigravity) => "antigravity",
         None => "unknown",
     };
     // session-size-note-not-warning (Jon, 2026-10-04): size is information,
@@ -44396,10 +49768,8 @@ fn session_size_status_row<R: tauri::Runtime>(app: &AppHandle<R>) -> serde_json:
 
 // Outbound turn envelope — the persistence contract (schema v1). One JSON
 // file per Bram-authored user turn under resources/outbound-turns/. The
-// send path starts WRITING these in a later phase (doc step 6); the
-// projection resolves them now so history authored by the archived
-// 2026-07-02 attempt renders correctly and the write switch needs no
-// reader changes.
+// send path writes these (doc step 6, 69f027bd); the projection also
+// resolves history authored by the archived 2026-07-02 attempt.
 //
 //   {
 //     "schema": 1,
@@ -44649,7 +50019,11 @@ fn frame_outbound_turn<R: tauri::Runtime>(
         frame.push_str("skip-worklist: ");
     }
     frame.push_str(OUTBOUND_TURN_FRAME_PREFIX);
-    frame.push_str(&format!("resources/outbound-turns/{}.json", id));
+    let root = project_root(Some(app))?;
+    frame.push_str(&bram_state_rel(
+        &root,
+        &format!("outbound-turns/{}.json", id),
+    ));
     for img in &images {
         frame.push_str(&format!(" @{}", img));
     }
@@ -44909,6 +50283,13 @@ fn stale_terminal_input_clear_for_provider(
     match provider {
         Some(SessionProvider::Codex) => ("\x15", "ctrl-u"),
         Some(SessionProvider::Opencode) => (OPENCODE_INPUT_CLEAR, "select-delete"),
+        // Antigravity CLI 1.4.12, captured 2026-10-31 at 120x40: Ctrl-U empties
+        // a one-line box, and is the only key tried that does. Esc leaves the
+        // text in place. A lone Ctrl-C leaves the text AND swaps the footer for
+        // "press ctrl+c again to exit", so the next Ctrl-C — this caller's
+        // retry, or a user's — would quit agy. Sent once, unlike OpenCode's
+        // two-write form.
+        Some(SessionProvider::Antigravity) => ("\x15", "ctrl-u"),
         _ => ("\x03", "ctrl-c"),
     }
 }
@@ -44939,6 +50320,16 @@ mod stale_terminal_input_clear_tests {
         assert_eq!(clear(Some(SessionProvider::Claude)), ("\x03", "ctrl-c"));
         assert_eq!(clear(Some(SessionProvider::Codex)), ("\x15", "ctrl-u"));
         assert_eq!(clear(None), ("\x03", "ctrl-c"));
+    }
+
+    #[test]
+    fn antigravity_clears_with_ctrl_u_and_never_a_lone_ctrl_c() {
+        // Captured from agy 1.4.12 on 2026-10-31: Ctrl-U emptied the box, Esc
+        // left the text, and a lone Ctrl-C left the text while arming
+        // "press ctrl+c again to exit" — so a second one would quit agy.
+        let (bytes, key) = clear(Some(SessionProvider::Antigravity));
+        assert_eq!((bytes, key), ("\x15", "ctrl-u"));
+        assert!(!bytes.contains('\x03'), "{bytes:?}");
     }
 }
 
@@ -45954,7 +51345,7 @@ fn append_strand_forensics_line<R: tauri::Runtime>(app: &AppHandle<R>, body: &st
     let Some(root) = project_root(Some(app)) else {
         return;
     };
-    let dir = root.join("resources").join("bram-traces");
+    let dir = resource_relative_path(&root, "bram-traces");
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("strand-forensics.log");
     if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -46089,7 +51480,7 @@ fn append_audit_record<R: tauri::Runtime>(app: &AppHandle<R>, record: serde_json
     };
     let line = audit_record_line(&record, unix_now_ms());
     let _guard = audit_ledger_cell().lock();
-    let dir = root.join("resources");
+    let dir = bram_state_dir(&root);
     if let Err(e) = std::fs::create_dir_all(&dir) {
         eprintln!("[audit-ledger] create {} failed: {}", dir.display(), e);
         return;
@@ -47424,6 +52815,14 @@ fn shell_marker_scan<R: tauri::Runtime>(app: &AppHandle<R>, chunk: &[u8]) {
         }
         markers
     };
+    // delegated-work-action-gates: a prompt edge means the shell has its
+    // foreground back, so the agent that spawned any bound subagent has
+    // exited and no SubagentStop will come. Tool shells are non-interactive
+    // and emit no markers, so this is the agent's own exit (or Bram's
+    // relaunch typing over it). One stat of the bindings file per prompt edge.
+    if markers.iter().any(|m| matches!(m, ShellMarker::Prompt(_))) {
+        delegated_release_on_shell_prompt(app);
+    }
     if !bram_trace_enabled() {
         return;
     }
@@ -47554,7 +52953,7 @@ mod project_managed_tests {
         // the search indexer held forever on a project the user had set up.
         let d = scratch("marker");
         assert!(!project_is_managed(&d), "bare dir must not read as managed");
-        let auth = d.join(WORKLIST_AUTH_REL);
+        let auth = super::resource_relative_path(&d, WORKLIST_AUTH_REL);
         std::fs::create_dir_all(auth.parent().unwrap()).unwrap();
         std::fs::write(&auth, "{}\n").unwrap();
         assert!(!has_project_settings(&d), "no settings file was written");
@@ -47809,6 +53208,8 @@ fn prompt_shape_for_provider(
             provider == Some(SessionProvider::Codex)
         } else if opencode_only_prompt_shape(shape) {
             provider == Some(SessionProvider::Opencode)
+        } else if shape.starts_with("antigravity-") {
+            provider == Some(SessionProvider::Antigravity)
         } else {
             true
         }
@@ -47842,7 +53243,22 @@ fn pane_input_blocking_prompt(
                 | "opencode-dialog"
                 | "opencode-permission"
                 | "opencode-question"
+                | "antigravity-login"
+                | "antigravity-folder-trust"
+                | "antigravity-resume-picker"
+                | "antigravity-permission"
         )
+    })
+}
+
+fn pane_input_blocking_prompt_or_osc(
+    stripped_tail: &str,
+    provider: Option<SessionProvider>,
+    agy_permission_blocked: bool,
+) -> Option<&'static str> {
+    pane_input_blocking_prompt(stripped_tail, provider).or_else(|| {
+        (provider == Some(SessionProvider::Antigravity) && agy_permission_blocked)
+            .then_some("antigravity-permission")
     })
 }
 
@@ -48475,9 +53891,11 @@ fn maybe_submit_nudge<R: tauri::Runtime>(app: &AppHandle<R>) {
     // answers it: at hooks-trust it chose "Review hooks", at folder-trust
     // "Trust and continue", at codex-update "Update now". The pane-send guard
     // already refuses sends at these shapes; the nudge had no such check.
-    let prompt_shape = pane_input_blocking_prompt(
+    let live_provider = current_provider(app);
+    let prompt_shape = pane_input_blocking_prompt_or_osc(
         &pty_tail_snippet(TERMINAL_ATTENTION_TAIL_CHARS),
-        current_provider(app),
+        live_provider,
+        antigravity_permission_blocked_since_launch(live_provider),
     );
     if agent_boot_hold_active()
         || prompt_shape.is_some()
@@ -49116,6 +54534,9 @@ fn update_send_ledger_from_slice<R: tauri::Runtime>(
     // sweep, for the second-candidate search below.
     let mut inject_session_texts: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    // antigravity-error-state-surfaced: read once per sweep, and only when an
+    // entry needs it.
+    let mut antigravity_current: Option<bool> = None;
     if let Ok(mut ledger) = send_ledger_cell().lock() {
         for entry in ledger.iter_mut() {
             if entry.state != "injected" {
@@ -49183,6 +54604,34 @@ fn update_send_ledger_from_slice<R: tauri::Runtime>(
                 inject_candidate,
                 anchor,
             );
+            // antigravity-error-state-surfaced: agy's own report of the send.
+            // A turn it opened after the inject means it took the send, even
+            // when no transcript Bram can read records it (a fresh partner's
+            // conversation is named only after a completed turn, so on
+            // 2026-11-03 the search ran against the Claude transcript and
+            // called two sends agy had refused on quota `stranded`); an error
+            // in that turn means it took the send and refused.
+            let osc_landing = if delivered.is_none() {
+                let is_antigravity = *antigravity_current.get_or_insert_with(|| {
+                    current_provider(app) == Some(SessionProvider::Antigravity)
+                });
+                if is_antigravity {
+                    antigravity_osc_landing(
+                        entry.injected_at_ms,
+                        ANTIGRAVITY_LAST_TURN_START_MS.load(std::sync::atomic::Ordering::SeqCst),
+                        antigravity_error_at_ms(),
+                    )
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let delivered = if osc_landing.is_some() {
+                Some(false)
+            } else {
+                delivered
+            };
             // issue-335 phase 1: classified against the PRIMARY candidate only.
             // When the session re-anchored, `search_text` is the current
             // session and the inject session was searched as a fallback, so
@@ -49196,14 +54645,22 @@ fn update_send_ledger_from_slice<R: tauri::Runtime>(
                 entry.state = "landed";
                 entry.resolved_at_ms = now;
                 entry.via_queue = via_queue;
+                if osc_landing == Some("osc-error") {
+                    entry.cause = "agent-error";
+                }
                 // A landing proves the composer path delivered clean —
                 // drop any stale-input latch from an earlier abort.
                 set_stale_terminal_input_latched_at(0);
                 transitions.push(format!(
-                    "op=transition id={} state=landed via_queue={} elapsed_ms={}",
+                    "op=transition id={} state=landed via_queue={} elapsed_ms={}{}",
                     entry.id,
                     entry.via_queue,
                     now - entry.injected_at_ms,
+                    match osc_landing {
+                        Some("osc-error") => " via=osc-error cause=agent-error",
+                        Some(_) => " via=osc-working",
+                        None => "",
+                    },
                 ));
                 // issue-305 phase 2a: this send's absence was transient — it
                 // landed after all, so the would-notice is withdrawn. These
@@ -49761,7 +55218,7 @@ fn send_ledger_status_rows() -> Vec<serde_json::Value> {
     for entry in ledger.iter().rev().take(5) {
         let age_s = (now - entry.injected_at_ms) / 1000;
         let mut state_label = entry.state.to_string();
-        if entry.state == "stranded" && !entry.cause.is_empty() {
+        if (entry.state == "stranded" || entry.cause == "agent-error") && !entry.cause.is_empty() {
             state_label = format!("{} ({})", state_label, entry.cause);
         }
         if entry.via_queue {
@@ -51212,6 +56669,53 @@ fn projected_turns_body<R: tauri::Runtime>(
     serialized
 }
 
+fn projected_turns_provider_label(path: &Path) -> &'static str {
+    if path.components().any(|c| c.as_os_str() == ".codex") {
+        "codex"
+    } else if path
+        .components()
+        .any(|c| c.as_os_str() == "opencode-sessions")
+    {
+        // opencode-sessions-browser: Bram's export of an OpenCode session.
+        "opencode"
+    } else if path
+        .components()
+        .any(|c| c.as_os_str() == ANTIGRAVITY_EXPORT_DIR)
+    {
+        "antigravity"
+    } else {
+        "claude"
+    }
+}
+
+fn search_session_hit_provider_and_id(
+    key: &str,
+    opencode_dir: Option<&Path>,
+    antigravity_dir: Option<&Path>,
+) -> (String, String) {
+    let path = std::path::Path::new(key);
+    let stem_id = || {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    if opencode_dir.is_some_and(|dir| is_opencode_export_path(path, dir)) {
+        ("opencode".to_string(), stem_id())
+    } else if antigravity_dir.is_some_and(|dir| is_opencode_export_path(path, dir)) {
+        ("antigravity".to_string(), stem_id())
+    } else if key.contains("/.codex/") || path.components().any(|c| c.as_os_str() == ".codex") {
+        let id = codex_session_meta(path)
+            .ok()
+            .flatten()
+            .map(|(id, _)| id)
+            .unwrap_or_default();
+        ("codex".to_string(), id)
+    } else {
+        ("claude".to_string(), stem_id())
+    }
+}
+
 // /__turns[?provider=claude|codex][&id=<session-id>][&latest=N] — the
 // projection route. No id: freshest session (provider-scoped when
 // given). With id: that session, resolved the same way
@@ -51317,17 +56821,7 @@ fn read_projected_turns<R: tauri::Runtime>(
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
-    let provider_label = if path.components().any(|c| c.as_os_str() == ".codex") {
-        "codex"
-    } else if path
-        .components()
-        .any(|c| c.as_os_str() == "opencode-sessions")
-    {
-        // opencode-sessions-browser: Bram's export of an OpenCode session.
-        "opencode"
-    } else {
-        "claude"
-    };
+    let provider_label = projected_turns_provider_label(&path);
     let serialize_started = std::time::Instant::now();
     let bytes = projected_turns_body(
         app,
@@ -51472,53 +56966,58 @@ fn mime_for(path: &std::path::Path) -> &'static str {
 // folders as dynamic rows whose contents load on expand
 // (/__repo/tree/dir), because listing them up front would add ~15,750 rows
 // (worklist-history alone is 11,560) to a 272-row tree.
-const BRAM_STATE_FILES: &[&str] = &["resources/worklist.json"];
-const BRAM_STATE_DIRS: &[&str] = &[
-    "resources/worklist-drafts",
-    "resources/worklist-history",
-    "resources/feedback-drafts",
-    "resources/feedback-history",
-    "resources/session-digests",
-    "resources/handoffs",
-    "resources/outbound-turns",
-    "resources/bram-traces",
-];
-// The state the content search also covers: everything but the traces
-// (1.4 GB of logs). History was first left out on a guess that it would be
-// slow; measured, the three history folders (~123 MB) grep in 0.21-0.27 s
-// warm, and the tab searches on Enter, not per keystroke. Jon's first
-// search, for an event name, matched only in worklist-history.
+//
+// The lists (bram_state_files, bram_state_dirs, bram_state_grep) are the
+// `files_tab` and `grep_rank` projections of BRAM_OWNED_ENTRIES, relative to
+// Bram's state folder; bram_state_rel turns them into the repo-relative
+// paths git and the tree use.
+//
+// The content search covers everything but the traces (1.4 GB of logs).
+// History was first left out on a guess that it would be slow; measured,
+// the three history folders (~123 MB) grep in 0.21-0.27 s warm, and the tab
+// searches on Enter, not per keystroke. Jon's first search, for an event
+// name, matched only in worklist-history.
 //
 // Order is priority: results are capped (REPO_GREP_CAP), so the current
 // state comes before the histories. bram_state_grep_ordered sorts by it.
-const BRAM_STATE_GREP: &[&str] = &[
-    "resources/worklist.json",
-    "resources/worklist-drafts",
-    "resources/feedback-drafts",
-    "resources/session-digests",
-    "resources/handoffs",
-    "resources/worklist-history",
-    "resources/feedback-history",
-    "resources/outbound-turns",
-];
+//
 // Each history entry is a .json and .md pair. The .json is a snapshot of the
 // whole board after the change, so a term in one long-lived item matches
 // every snapshot taken while it existed (on the demo board,
 // "talk-session-changed" hit 273 .json files and 119 .md). The .md records
 // what changed, which is what a search is looking for.
-const BRAM_STATE_GREP_EXCLUDE: &[&str] = &[":(exclude)resources/worklist-history/*.json"];
+// Globs relative to the state folder, each passed as `:(exclude)<state>/<glob>`.
+const BRAM_STATE_GREP_EXCLUDE: &[&str] = &["worklist-history/*.json"];
+
+// The pathspecs for the state search: bram_state_grep, then the excludes.
+fn bram_state_grep_pathspecs(root: &Path) -> Vec<String> {
+    let mut specs: Vec<String> = bram_state_grep()
+        .into_iter()
+        .map(|r| bram_state_rel(root, r))
+        .collect();
+    specs.extend(
+        BRAM_STATE_GREP_EXCLUDE
+            .iter()
+            .map(|g| format!(":(exclude){}", bram_state_rel(root, g))),
+    );
+    specs
+}
 
 // Reorder `git grep -n -z` output from the state search before the cap:
-// files grouped by the BRAM_STATE_GREP root they fall under (in that
+// files grouped by the bram_state_grep root they fall under (in that
 // order), and within a root, timestamp-named files (names starting with a
 // digit) newest first, others alphabetically. git grep lists by path, which
 // put the OLDEST history first, so a capped search showed only stale lines.
-fn bram_state_grep_ordered(out: &str) -> String {
+fn bram_state_grep_ordered(root: &Path, out: &str) -> String {
+    let roots: Vec<String> = bram_state_grep()
+        .into_iter()
+        .map(|r| bram_state_rel(root, r))
+        .collect();
     let rank = |path: &str| {
-        BRAM_STATE_GREP
+        roots
             .iter()
-            .position(|r| path == *r || path.starts_with(&format!("{}/", r)))
-            .unwrap_or(BRAM_STATE_GREP.len())
+            .position(|r| path == r || path.starts_with(&format!("{}/", r)))
+            .unwrap_or(roots.len())
     };
     // Records are "path\0line\0text\n", contiguous per file.
     let mut files: Vec<(String, String)> = Vec::new();
@@ -51546,16 +57045,17 @@ fn bram_state_grep_ordered(out: &str) -> String {
 
 // May /__repo/tree/dir list this path? Only a state folder or a folder
 // beneath one, with no `..`, `.` or empty segments.
-fn bram_state_dir_allowed(dir: &str) -> bool {
+fn bram_state_dir_allowed(root: &Path, dir: &str) -> bool {
     if dir
         .split('/')
         .any(|s| s.is_empty() || s == "." || s == "..")
     {
         return false;
     }
-    BRAM_STATE_DIRS
-        .iter()
-        .any(|d| dir == *d || dir.starts_with(&format!("{}/", d)))
+    let Some(dir) = bram_state_rel_strip(root, dir) else {
+        return false;
+    };
+    bram_state_dirs().any(|d| dir == d || dir.starts_with(&format!("{}/", d)))
 }
 
 // Rows for one state folder's immediate children: subfolders first (dynamic,
@@ -51593,15 +57093,13 @@ fn bram_state_dir_rows(dir: &str, subdirs: &[String], files: &[String]) -> Vec<s
 // The state entries that exist under `root`: files to list as rows, and
 // folders to show collapsed.
 fn bram_state_present(root: &Path) -> (Vec<String>, Vec<String>) {
-    let files = BRAM_STATE_FILES
-        .iter()
-        .filter(|f| root.join(f).is_file())
-        .map(|f| f.to_string())
+    let files = bram_state_files()
+        .filter(|f| resource_relative_path(root, f).is_file())
+        .map(|f| bram_state_rel(root, f))
         .collect();
-    let dirs = BRAM_STATE_DIRS
-        .iter()
-        .filter(|d| root.join(d).is_dir())
-        .map(|d| d.to_string())
+    let dirs = bram_state_dirs()
+        .filter(|d| resource_relative_path(root, d).is_dir())
+        .map(|d| bram_state_rel(root, d))
         .collect();
     (files, dirs)
 }
@@ -51723,29 +57221,30 @@ mod repo_files_tests {
         bram_state_dir_allowed, bram_state_dir_rows, bram_state_grep_ordered, repo_grep_hits,
         repo_tree_rows_with_lazy,
     };
+    use crate::{test_state_rel as st, test_state_root};
 
     // files-tab-lists-bram-state-in-resources
     #[test]
     fn lazy_state_folders_are_dynamic_rows_with_their_ancestors() {
         let rows = repo_tree_rows_with_lazy(
-            &[
-                "resources/up.svg".to_string(),
-                "resources/worklist.json".to_string(),
-            ],
-            &["resources/worklist-history".to_string()],
+            &[st("up.svg"), st("worklist.json")],
+            &[st("worklist-history")],
         );
-        let ids: Vec<&str> = rows.iter().map(|r| r["id"].as_str().unwrap()).collect();
+        let ids: Vec<String> = rows
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect();
         assert_eq!(
             ids,
             vec![
-                "resources",
-                "resources/worklist-history",
-                "resources/up.svg",
-                "resources/worklist.json"
+                st(""),
+                st("worklist-history"),
+                st("up.svg"),
+                st("worklist.json")
             ]
         );
         assert_eq!(rows[1]["dynamic"], true);
-        assert_eq!(rows[1]["parentId"], "resources");
+        assert_eq!(rows[1]["parentId"], st(""));
         assert!(rows[0].get("dynamic").is_none());
         // A lazy folder the listing already fills is an ordinary folder.
         let filled = repo_tree_rows_with_lazy(&["a/b/c.txt".to_string()], &["a/b".to_string()]);
@@ -51754,47 +57253,47 @@ mod repo_files_tests {
 
     #[test]
     fn state_grep_puts_current_state_first_and_history_newest_first() {
-        let out = "resources/worklist-history/1700000000000.md\u{0}3\u{0}old\n\
-                   resources/worklist-history/1700000000000.md\u{0}9\u{0}old2\n\
-                   resources/worklist-history/1790000000000.md\u{0}1\u{0}new\n\
-                   resources/worklist-drafts/b.md\u{0}2\u{0}draft\n";
-        let ordered = bram_state_grep_ordered(out);
+        let old = st("worklist-history/1700000000000.md");
+        let new = st("worklist-history/1790000000000.md");
+        let draft = st("worklist-drafts/b.md");
+        let out = format!(
+            "{old}\u{0}3\u{0}old\n{old}\u{0}9\u{0}old2\n{new}\u{0}1\u{0}new\n{draft}\u{0}2\u{0}draft\n"
+        );
+        let ordered = bram_state_grep_ordered(test_state_root(), &out);
         let paths: Vec<&str> = ordered
             .lines()
             .map(|l| l.split('\u{0}').next().unwrap())
             .collect();
         assert_eq!(
             paths,
-            vec![
-                "resources/worklist-drafts/b.md",
-                "resources/worklist-history/1790000000000.md",
-                "resources/worklist-history/1700000000000.md",
-                "resources/worklist-history/1700000000000.md",
-            ]
+            vec![draft.as_str(), new.as_str(), old.as_str(), old.as_str()]
         );
         // A file's lines stay together and in order.
-        assert!(ordered.ends_with(
-            "\u{0}3\u{0}old\nresources/worklist-history/1700000000000.md\u{0}9\u{0}old2\n"
-        ));
+        assert!(ordered.ends_with(&format!("\u{0}3\u{0}old\n{old}\u{0}9\u{0}old2\n")));
     }
 
     #[test]
     fn state_dir_route_only_lists_state_folders() {
-        assert!(bram_state_dir_allowed("resources/worklist-history"));
-        assert!(bram_state_dir_allowed("resources/bram-traces/archive"));
-        assert!(!bram_state_dir_allowed("resources"));
-        assert!(!bram_state_dir_allowed("src-tauri"));
+        let root = test_state_root();
+        assert!(bram_state_dir_allowed(root, &st("worklist-history")));
+        assert!(bram_state_dir_allowed(root, &st("bram-traces/archive")));
+        assert!(!bram_state_dir_allowed(root, &st("")));
+        assert!(!bram_state_dir_allowed(root, "src-tauri"));
         assert!(!bram_state_dir_allowed(
-            "resources/worklist-history/../../etc"
+            root,
+            &st("worklist-history/../../etc")
         ));
-        assert!(!bram_state_dir_allowed("resources/worklist-historyX"));
-        assert!(!bram_state_dir_allowed("/resources/worklist-history"));
+        assert!(!bram_state_dir_allowed(root, &st("worklist-historyX")));
+        assert!(!bram_state_dir_allowed(
+            root,
+            &format!("/{}", st("worklist-history"))
+        ));
     }
 
     #[test]
     fn state_dir_rows_list_timestamps_newest_first() {
         let rows = bram_state_dir_rows(
-            "resources/worklist-history",
+            &st("worklist-history"),
             &["sub".to_string()],
             &[
                 "1791757368337.md".to_string(),
@@ -51813,12 +57312,9 @@ mod repo_files_tests {
             ]
         );
         assert_eq!(rows[0]["dynamic"], true);
-        assert_eq!(
-            rows[1]["id"],
-            "resources/worklist-history/1791828392077.json"
-        );
+        assert_eq!(rows[1]["id"], st("worklist-history/1791828392077.json"));
         let drafts = bram_state_dir_rows(
-            "resources/worklist-drafts",
+            &st("worklist-drafts"),
             &[],
             &["b-item.md".to_string(), "A-item.md".to_string()],
         );
@@ -51913,6 +57409,15 @@ const ENHANCE_SIDECAR_REL: &str = ".claude/bram-conventions.md";
 // filename so projects that haven't re-run Setup still register as
 // Bram-managed during the transition.
 const ENHANCE_SIDECAR_LEGACY_REL: &str = ".claude/xmlui-desktop-conventions.md";
+// agents-md-block-agent-neutral: the `AGENTS.md` block and its template keep
+// their Codex names, but every AGENTS.md reader loads the block: Codex,
+// OpenCode, and Antigravity (an always-on rule). So the template addresses
+// them all, and labels Codex's own mechanics (the filesystem channel) as
+// Codex's. Renaming would churn paths with no change in behaviour. The
+// opening "This repo is driven through Bram. The canonical worklist gate" is
+// load-bearing: codex_startup_context_text and the transcript bootstrap
+// markers recognize Bram's text by it, and agents_md_has_worklist_gate_intro
+// keys on its first sentence and `resources/worklist.json`.
 const ENHANCE_CODEX_AGENTS_REL: &str = "AGENTS.md";
 const ENHANCE_CODEX_BUNDLE_REL: &str = "shell/codex-startup-instructions.md";
 const ENHANCE_HOOK_SCRIPT_REL: &str = ".claude/hooks/claude-worklist-guard.py";
@@ -51973,8 +57478,9 @@ Use the worklist for material file/code changes unless the user explicitly \
 opts out in a way the runtime guard allows. Mutations outside approved items \
 are blocked by a PreToolUse hook installed under ~/.bram. On approved:, drop:, \
 or iterate: turns, drive the Bram lifecycle through the filesystem channel: \
-write resources/.worklist-intent.json ({nonce, route, body}) and read the \
-host's reply from resources/.worklist-result.json, matching your nonce. Do \
+write .worklist-intent.json ({nonce, route, body}) in Bram's state folder \
+(.bram/ if it exists, else resources/) and read the host's reply from \
+.worklist-result.json in Bram's state folder, matching your nonce. Do \
 not silently continue after a missing result or an ok:false reply. The gate is \
 two-stage: an approved: on a proposed (TO APPLY) item means make the edits, \
 then advance via route worklist-mutate with body {op:advance, ids, \
@@ -51985,13 +57491,15 @@ not prune by hand. The exact routes, intent/result shapes, opt-out, and \
 transition rules are canonical in .claude/bram-conventions.md (relative to the \
 project root). Do not duplicate or guess those details from this abbreviated \
 instruction.";
-const WORKLIST_AUTH_REL: &str = "resources/.worklist-authorization.json";
+// This and the *_REL consts below are relative to Bram's state folder
+// (resource_relative_path / project_resource_path), not the project root.
+const WORKLIST_AUTH_REL: &str = ".worklist-authorization.json";
 // Codex filesystem lifecycle channel (#130). Codex writes the intent file;
 // the host watcher drains it and writes the result file. Coordination
 // dot-files, polled/written like the others above — not tracked changes.
-const WORKLIST_INTENT_REL: &str = "resources/.worklist-intent.json";
-const WORKLIST_RESULT_REL: &str = "resources/.worklist-result.json";
-const WORKLIST_PUSH_MIRROR_REL: &str = "resources/.worklist-push-mirror.json";
+const WORKLIST_INTENT_REL: &str = ".worklist-intent.json";
+const WORKLIST_RESULT_REL: &str = ".worklist-result.json";
+const WORKLIST_PUSH_MIRROR_REL: &str = ".worklist-push-mirror.json";
 // Host-managed inflight sentinel (#84). Written when /__worklist/resolve
 // serves an approved or drop record, OR when /__iterate/begin is
 // called. Approved/drop sentinels clear at host silence-detected
@@ -51999,12 +57507,12 @@ const WORKLIST_PUSH_MIRROR_REL: &str = "resources/.worklist-push-mirror.json";
 // Iterate sentinels clear via /__iterate/end. The iframe derives its
 // spinner state from this file and the [inflight-sentinel] trace makes
 // the lifecycle verifiable.
-const INFLIGHT_CLAIM_REL: &str = "resources/.inflight-claim.json";
+const INFLIGHT_CLAIM_REL: &str = ".inflight-claim.json";
 // Right-pane pty-intent relay (#86). Append-only JSONL queue persisted
 // to disk so right-pane clicks (toShell / toTurn / sendKeys / menuAnswer)
 // survive an iframe-reload-mid-click. Drained synchronously by queue_pty_intent;
 // startup cleanup deletes any stale queue from a prior session.
-const PTY_INTENT_REL: &str = "resources/.pty-intent.jsonl";
+const PTY_INTENT_REL: &str = ".pty-intent.jsonl";
 // Permission-menu surfacing hook (menus.hookDriven). Installed and registered
 // the same way as the worklist guard: bundle copied to
 // .claude/hooks/claude-permission-menu-hook.py, registered as PermissionRequest +
@@ -52403,6 +57911,10 @@ fn settings_has_permission_menu_hook(
         && event_has_menu_hook("PostToolUse")
         && event_has_menu_hook("PermissionDenied")
         && event_has_menu_hook("PreToolUse")
+        && event_has_menu_hook("SessionStart")
+        && event_has_menu_hook("UserPromptSubmit")
+        && event_has_menu_hook("SubagentStart")
+        && event_has_menu_hook("SubagentStop")
 }
 
 // Remove any PreToolUse hook entries whose `command` contains
@@ -52813,6 +58325,13 @@ fn merge_guard_menu_hook_into_settings(
         ("PostToolUse", ".*"),
         ("PermissionDenied", ".*"),
         ("PreToolUse", "AskUserQuestion"),
+        // current-session-from-events: the guard reports the session id.
+        ("SessionStart", ".*"),
+        ("UserPromptSubmit", ".*"),
+        // delegated-work-action-gates: the guard reports subagent start and
+        // stop so the host can bind and release delegated claims.
+        ("SubagentStart", ".*"),
+        ("SubagentStop", ".*"),
     ] {
         changed |= merge_command_hook_into_event(hooks_obj, event, matcher, shadow_command, marker);
     }
@@ -52961,11 +58480,15 @@ mod guard_shadow_registration_tests {
     const MENU_AUTHORITY: &str =
         "\"/Users/x/.bram/bram-guard\" guard claude-permission-menu --authority";
     const MENU_PY: &str = "\"$CLAUDE_PROJECT_DIR/.claude/hooks/claude-permission-menu-hook.py\"";
-    const MENU_EVENTS: [&str; 4] = [
+    const MENU_EVENTS: [&str; 8] = [
         "PermissionRequest",
         "PostToolUse",
         "PermissionDenied",
         "PreToolUse",
+        "SessionStart",
+        "UserPromptSubmit",
+        "SubagentStart",
+        "SubagentStop",
     ];
 
     fn events_with_command(path: &Path, command: &str) -> Vec<String> {
@@ -53012,6 +58535,39 @@ mod guard_shadow_registration_tests {
         assert!(merge_guard_menu_hook_into_settings(&path, MENU_SHADOW).unwrap());
         assert_eq!(events_with_command(&path, MENU_SHADOW), want);
         assert!(events_with_command(&path, MENU_AUTHORITY).is_empty());
+    }
+
+    #[test]
+    fn menu_hook_currentness_requires_the_subagent_events() {
+        // delegated-work-action-gates: an install registered before
+        // SubagentStart/SubagentStop existed must read as not current, or it
+        // would never re-merge and the host would never hear subagents.
+        let marker = "guard claude-permission-menu";
+        let mut hooks = serde_json::Map::new();
+        for ev in MENU_EVENTS.iter().filter(|e| !e.starts_with("Subagent")) {
+            hooks.insert(
+                ev.to_string(),
+                serde_json::json!([
+                    { "matcher": ".*", "hooks": [{ "type": "command", "command": MENU_AUTHORITY }] }
+                ]),
+            );
+        }
+        let seeded = serde_json::json!({ "hooks": hooks });
+        let path = temp_settings("menu-subagent-current", Some(&seeded.to_string()));
+        assert!(!settings_has_permission_menu_hook(
+            &path,
+            marker,
+            Some(MENU_AUTHORITY)
+        ));
+        assert!(merge_guard_menu_hook_into_settings(&path, MENU_AUTHORITY).unwrap());
+        assert!(settings_has_permission_menu_hook(
+            &path,
+            marker,
+            Some(MENU_AUTHORITY)
+        ));
+        let events = events_with_command(&path, MENU_AUTHORITY);
+        assert!(events.contains(&"SubagentStart".to_string()));
+        assert!(events.contains(&"SubagentStop".to_string()));
     }
 
     #[test]
@@ -53330,6 +58886,153 @@ fn collect_opencode_context_files<R: tauri::Runtime>(app: &AppHandle<R>) -> Vec<
     out
 }
 
+// antigravity-context-files: what agy 1.4.12 loads from a project, per the
+// rules spike (docs/agent-specimens/antigravity/rules-and-transport.md §1):
+// AGENTS.md and GEMINI.md at the root, .agents/AGENTS.md, and
+// .agents/rules/*.md, but a rule only with `trigger: always_on` frontmatter.
+// agy skips any other rule (it logs "Invalid rule trigger" and nothing else),
+// so those are listed with a note. Plus the hook config Bram seeds. Nothing
+// global: no per-user file under ~/.gemini was captured, so none is claimed.
+fn collect_antigravity_context_files<R: tauri::Runtime>(app: &AppHandle<R>) -> Vec<ContextFile> {
+    match project_root(Some(app)) {
+        Some(root) => antigravity_context_files_in(&root),
+        None => Vec::new(),
+    }
+}
+
+fn antigravity_context_files_in(proj_root: &Path) -> Vec<ContextFile> {
+    let mut out: Vec<ContextFile> = Vec::new();
+    let mut push = |category: &'static str, path: PathBuf, display: String| {
+        if path.is_file() {
+            out.push(ContextFile {
+                category,
+                path,
+                display,
+                kind: Some("antigravity"),
+            });
+        }
+    };
+    for rel in ["AGENTS.md", "GEMINI.md", ".agents/AGENTS.md"] {
+        push("project", proj_root.join(rel), rel.to_string());
+    }
+    let mut rules: Vec<PathBuf> = std::fs::read_dir(proj_root.join(".agents").join("rules"))
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "md"))
+        .collect();
+    rules.sort();
+    for path in rules {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let loaded = std::fs::read_to_string(&path)
+            .map(|text| antigravity_rule_is_always_on(&text))
+            .unwrap_or(false);
+        let display = if loaded {
+            format!(".agents/rules/{name}")
+        } else {
+            format!(".agents/rules/{name} (not loaded: no always_on trigger)")
+        };
+        push("rules", path, display);
+    }
+    push(
+        "hooks",
+        proj_root.join(ENHANCE_ANTIGRAVITY_HOOKS_REL),
+        ENHANCE_ANTIGRAVITY_HOOKS_REL.to_string(),
+    );
+    out
+}
+
+// Whether agy loads a rule: a leading `---` frontmatter block holding
+// `trigger: always_on` (quoted or not).
+fn antigravity_rule_is_always_on(text: &str) -> bool {
+    let mut lines = text.trim_start_matches('\u{feff}').lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return false;
+    }
+    for line in lines {
+        let line = line.trim();
+        if line == "---" {
+            return false;
+        }
+        if let Some(value) = line.strip_prefix("trigger:") {
+            return value.trim().trim_matches(['"', '\'']) == "always_on";
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod antigravity_context_files_tests {
+    use super::{antigravity_context_files_in, antigravity_rule_is_always_on};
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("bram-agy-context-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn lists_what_agy_loads_and_notes_skipped_rules() {
+        let dir = scratch("lists");
+        let root = dir.as_path();
+        std::fs::create_dir_all(root.join(".agents/rules")).unwrap();
+        std::fs::write(root.join("AGENTS.md"), "a").unwrap();
+        std::fs::write(root.join("GEMINI.md"), "g").unwrap();
+        std::fs::write(root.join(".agents/AGENTS.md"), "inner").unwrap();
+        std::fs::write(root.join(".agents/hooks.json"), "{}").unwrap();
+        let rules = root.join(".agents/rules");
+        std::fs::write(rules.join("b-on.md"), "---\ntrigger: always_on\n---\nbody").unwrap();
+        std::fs::write(rules.join("a-bare.md"), "no frontmatter").unwrap();
+        std::fs::write(rules.join("c-manual.md"), "---\ntrigger: manual\n---\n").unwrap();
+        std::fs::write(rules.join("notes.txt"), "not a rule").unwrap();
+        let got: Vec<(&str, String)> = antigravity_context_files_in(root)
+            .into_iter()
+            .map(|f| (f.category, f.display))
+            .collect();
+        let want = vec![
+            ("project", "AGENTS.md".to_string()),
+            ("project", "GEMINI.md".to_string()),
+            ("project", ".agents/AGENTS.md".to_string()),
+            (
+                "rules",
+                ".agents/rules/a-bare.md (not loaded: no always_on trigger)".to_string(),
+            ),
+            ("rules", ".agents/rules/b-on.md".to_string()),
+            (
+                "rules",
+                ".agents/rules/c-manual.md (not loaded: no always_on trigger)".to_string(),
+            ),
+            ("hooks", ".agents/hooks.json".to_string()),
+        ];
+        assert_eq!(got, want);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_project_lists_nothing() {
+        let dir = scratch("empty");
+        assert!(antigravity_context_files_in(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn brams_own_rule_header_reads_as_always_on() {
+        assert!(antigravity_rule_is_always_on(
+            &super::antigravity_rule_header(1, 2)
+        ));
+        assert!(antigravity_rule_is_always_on(
+            "---\ndescription: x\ntrigger: \"always_on\"\n---\n"
+        ));
+        assert!(!antigravity_rule_is_always_on("trigger: always_on\n"));
+        assert!(!antigravity_rule_is_always_on(
+            "---\n---\ntrigger: always_on\n"
+        ));
+    }
+}
+
 fn collect_context_files<R: tauri::Runtime>(
     app: &AppHandle<R>,
     preferred: Option<SessionProvider>,
@@ -53338,6 +59041,7 @@ fn collect_context_files<R: tauri::Runtime>(
         SessionProvider::Claude => collect_claude_context_files(app),
         SessionProvider::Codex => collect_codex_context_files(app),
         SessionProvider::Opencode => collect_opencode_context_files(app),
+        SessionProvider::Antigravity => collect_antigravity_context_files(app),
     }
 }
 
@@ -53508,6 +59212,15 @@ fn context_list<R: tauri::Runtime>(
                 json!({ "key": "settings", "label": "Settings", "items": settings }),
             ],
         ),
+        SessionProvider::Antigravity => (
+            "antigravity",
+            "Antigravity Context shows what `agy` loads from this project: `AGENTS.md`, `GEMINI.md` and `.agents/AGENTS.md`, the rules in `.agents/rules/` (only those with `trigger: always_on` load), and the `.agents/hooks.json` configuration. Per-user files under `~/.gemini` aren't listed.",
+            vec![
+                json!({ "key": "project", "label": "Project", "items": project }),
+                json!({ "key": "rules", "label": "Rules", "items": rules }),
+                json!({ "key": "hooks", "label": "Hooks", "items": hooks }),
+            ],
+        ),
     };
     json!({ "provider": provider_name, "summary": summary, "sections": sections })
 }
@@ -53613,6 +59326,149 @@ fn sidecar_matches_seeded<R: tauri::Runtime>(app: &AppHandle<R>, on_disk: &Path)
 // silently never reach a managed project.
 const ENHANCE_REFERENCE_DIR_REL: &str = ".claude/bram-reference";
 const ENHANCE_REFERENCE_BUNDLE_DIR: &str = "__shell/reference";
+
+const ORIENTATION_MARKER: &str = "bram-managed: orientation engine";
+const ORIENTATION_EDIT_START: &str =
+    "  // ---- Edit this block, and nothing else in this file. -------------------";
+const ORIENTATION_EDIT_END: &str =
+    "  // ------------------------------------------------------------------------";
+const ORIENTATION_TEMPLATE_DIR: &str = "__shell/reference/orientation-template";
+const ORIENTATION_TITLE_PREFIX: &str = "<PageMetaTitle value=\"";
+
+// Refresh an orientation site's engine file from the template, keeping the
+// site's own content (arch.js edit block; Main.xmlui page title).
+fn orientation_refreshed(file: &str, site: &str, template: &str) -> Result<String, &'static str> {
+    if !site.contains(ORIENTATION_MARKER) {
+        return Err("unmarked");
+    }
+    match file {
+        "arch.js" => {
+            let block = |s: &str| -> Option<(usize, usize)> {
+                let a = s.find(ORIENTATION_EDIT_START)?;
+                let b = a + s[a..].find(ORIENTATION_EDIT_END)?;
+                Some((a, b))
+            };
+            let (Some((sa, sb)), Some((ta, tb))) = (block(site), block(template)) else {
+                return Err("no-edit-block");
+            };
+            Ok(format!(
+                "{}{}{}",
+                &template[..ta],
+                &site[sa..sb],
+                &template[tb..]
+            ))
+        }
+        "Main.xmlui" => {
+            let title = |s: &str| -> Option<(usize, usize)> {
+                let a = s.find(ORIENTATION_TITLE_PREFIX)? + ORIENTATION_TITLE_PREFIX.len();
+                let b = a + s[a..].find('"')?;
+                Some((a, b))
+            };
+            let Some((sa, sb)) = title(site) else {
+                return Ok(template.to_string());
+            };
+            let Some((ta, tb)) = title(template) else {
+                return Ok(template.to_string());
+            };
+            Ok(format!(
+                "{}{}{}",
+                &template[..ta],
+                &site[sa..sb],
+                &template[tb..]
+            ))
+        }
+        _ => Err("unknown"),
+    }
+}
+
+fn find_orientation_site_dirs(root: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+        if let Ok(s) = std::fs::read_to_string(dir.join("arch.js")) {
+            if s.contains(ORIENTATION_MARKER) {
+                out.push(dir.to_path_buf());
+            }
+        }
+        if depth >= 4 {
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let Ok(ft) = e.file_type() else { continue };
+            if !ft.is_dir() || ft.is_symlink() {
+                continue;
+            }
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with('.')
+                || matches!(name.as_str(), "node_modules" | "target" | "vendor")
+            {
+                continue;
+            }
+            walk(&e.path(), depth + 1, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, 0, &mut out);
+    out.sort();
+    out
+}
+
+fn refresh_orientation_sites<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    proj: &Path,
+    wrote: &mut Vec<String>,
+) -> Vec<(String, &'static str)> {
+    let mut results = Vec::new();
+    let mut templates: Vec<(&str, String)> = Vec::new();
+    for name in ["arch.js", "Main.xmlui"] {
+        let Some((bytes, _)) =
+            serve_app_file(Some(app), &format!("{}/{}", ORIENTATION_TEMPLATE_DIR, name))
+        else {
+            return results;
+        };
+        let Ok(text) = String::from_utf8(bytes) else {
+            return results;
+        };
+        templates.push((name, text));
+    }
+    // In Bram's own repo the template itself carries the marker; it is the
+    // source, not a site.
+    let template_dir = proj.join("app").join(ORIENTATION_TEMPLATE_DIR);
+    for dir in find_orientation_site_dirs(proj) {
+        if dir == template_dir {
+            continue;
+        }
+        for (name, template) in &templates {
+            let path = dir.join(name);
+            if !path.is_file() {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(proj)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let Ok(current) = std::fs::read_to_string(&path) else {
+                results.push((rel, "unreadable"));
+                continue;
+            };
+            match orientation_refreshed(name, &current, template) {
+                Err(e) => results.push((rel, e)),
+                Ok(new) if new == current => results.push((rel, "unchanged")),
+                Ok(new) => {
+                    if atomic_write_text(&path, &new).is_ok() {
+                        wrote.push(path.display().to_string());
+                        results.push((rel, "refreshed"));
+                    } else {
+                        results.push((rel, "write-failed"));
+                    }
+                }
+            }
+        }
+    }
+    results
+}
 
 // new-repo-orientation: the set is the top-level *.md docs plus every file
 // in a subfolder (the orientation template: a static site the playbook has
@@ -53771,8 +59627,11 @@ fn extract_marker_block<'a>(disk: &'a str, start: &str, end: &str) -> Option<&'a
 // to be hardcoded past in codex_agents_block_current's `is_source_repo`
 // branch, and that codex_agents_has_marker widens for in
 // compute_seed_currency_checks).
+const AGENTS_MD_INTRO_WORKLIST_PATH: &str = "resources/worklist.json"; // state-dir: literal ok (matches hand-authored AGENTS.md text)
+
 fn agents_md_has_worklist_gate_intro(disk: &str) -> bool {
-    disk.contains("This repo is driven through Bram") && disk.contains("resources/worklist.json")
+    disk.contains("This repo is driven through Bram")
+        && disk.contains(AGENTS_MD_INTRO_WORKLIST_PATH)
 }
 
 // issue-303: pure predicate, same reasoning as
@@ -54135,14 +59994,14 @@ fn record_own_guard_target<R: tauri::Runtime>(app: &AppHandle<R>) {
     let Some(root) = project_root(Some(app)) else {
         return;
     };
-    if !root.join("resources").is_dir() {
+    if !bram_state_dir(&root).is_dir() {
         return;
     }
     let Some(guard_bin) = guard::own_guard_binary() else {
         return;
     };
     let want = format!("{}\n", guard_bin.display());
-    let path = root.join(guard::GUARD_TARGET_REL);
+    let path = resource_relative_path(&root, GUARD_TARGET_STATE_REL);
     if std::fs::read_to_string(&path).ok().as_deref() == Some(want.as_str()) {
         return;
     }
@@ -54567,6 +60426,153 @@ fn trace_codex_hooks_untrusted<R: tauri::Runtime>(app: &AppHandle<R>, events: &[
     }
 }
 
+// issue-465: why the Setup banner is up, as stable codes computed beside the
+// verdict so the banner and an agent read the same answer. One entry per
+// check that feeds a provider's needs-setup flag, scoped to the providers
+// provider_needs_setup_for consults (the active one, or all when none is).
+#[derive(Clone, Copy, Default)]
+struct SetupReasonInputs {
+    core_installed: bool,
+    claude_hook_registered: bool,
+    claude_menu_hook_registered: bool,
+    claude_docs_current: bool,
+    codex_hook_block_current: bool,
+    codex_instr_current: bool,
+    codex_docs_current: bool,
+    opencode_wanted: bool,
+    opencode_plugin_ok: bool,
+    opencode_instructions_current: bool,
+    antigravity_wanted: bool,
+    antigravity_hooks_ok: bool,
+    antigravity_rules_current: bool,
+    is_source_repo: bool,
+}
+
+fn setup_reasons(active: Option<SessionProvider>, i: SetupReasonInputs) -> Vec<&'static str> {
+    let claude = matches!(active, None | Some(SessionProvider::Claude));
+    let codex = matches!(active, None | Some(SessionProvider::Codex));
+    let opencode = matches!(active, None | Some(SessionProvider::Opencode));
+    let antigravity = matches!(active, None | Some(SessionProvider::Antigravity));
+    let mut out = Vec::new();
+    // core_installed gates every provider's verdict (OpenCode and Antigravity
+    // only where wanted).
+    if !i.core_installed
+        && (claude
+            || codex
+            || (opencode && i.opencode_wanted)
+            || (antigravity && i.antigravity_wanted))
+    {
+        out.push("not-installed");
+    }
+    if claude {
+        if !i.claude_hook_registered {
+            out.push("claude-hook-missing");
+        }
+        if !i.claude_menu_hook_registered {
+            out.push("claude-menu-hook-missing");
+        }
+        if !i.is_source_repo && !i.claude_docs_current {
+            out.push("claude-instructions-stale");
+        }
+    }
+    if codex {
+        if !i.codex_hook_block_current {
+            out.push("codex-hook-missing");
+        }
+        if !i.codex_instr_current {
+            out.push("codex-developer-instructions-missing");
+        }
+        if !i.is_source_repo && !i.codex_docs_current {
+            out.push("codex-instructions-stale");
+        }
+    }
+    if opencode && i.opencode_wanted {
+        if !i.opencode_plugin_ok {
+            out.push("opencode-plugin-missing");
+        }
+        if !i.opencode_instructions_current {
+            out.push("opencode-instructions-missing");
+        }
+    }
+    if antigravity && i.antigravity_wanted {
+        if !i.antigravity_hooks_ok {
+            out.push("antigravity-hook-missing");
+        }
+        if !i.antigravity_rules_current {
+            out.push("antigravity-rules-stale");
+        }
+    }
+    out
+}
+
+// Numeric dotted-version compare ("0.10.0" > "0.9.9"); a pre-release or
+// build suffix on a component is ignored. None when either side is unparsable.
+fn parse_version_parts(v: &str) -> Option<Vec<u64>> {
+    let core = v.trim().trim_start_matches('v');
+    let core = core.split(['-', '+']).next()?;
+    let parts: Option<Vec<u64>> = core.split('.').map(|p| p.parse::<u64>().ok()).collect();
+    parts.filter(|p| !p.is_empty())
+}
+
+fn version_is_older(running: &str, other: &str) -> bool {
+    let (Some(mut a), Some(mut b)) = (parse_version_parts(running), parse_version_parts(other))
+    else {
+        return false;
+    };
+    let n = a.len().max(b.len());
+    a.resize(n, 0);
+    b.resize(n, 0);
+    a < b
+}
+
+// The `version` of the [package] table in a Cargo.toml's text.
+fn parse_cargo_package_version(text: &str) -> Option<String> {
+    let mut in_package = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_package = t == "[package]";
+            continue;
+        }
+        if in_package {
+            if let Some(rest) = t.strip_prefix("version") {
+                let rest = rest.trim_start();
+                if let Some(rest) = rest.strip_prefix('=') {
+                    let v = rest.trim().trim_matches('"');
+                    if !v.is_empty() && !rest.contains("workspace") {
+                        return Some(v.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+// The checkout's version: src-tauri/Cargo.toml beside the on-disk app/ root
+// serve_app_file resolves. None when serving the embedded tree (an installed
+// bundle), which cannot disagree with its own version.
+fn checkout_version<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<String> {
+    let root = resolve_app_root(Some(app))?;
+    let text = std::fs::read_to_string(checkout_cargo_toml_for_app_root(&root)?).ok()?;
+    parse_cargo_package_version(&text)
+}
+
+// windows-checkout-version-through-junction: the checkout's Cargo.toml for a
+// served app root. On Windows the disk-serving launch reaches `app/` through
+// a directory junction (`target\<triple>\debug\app` -> `<repo>\app`), so the
+// root's lexical parent is `...\debug` and `checkoutVersion` read as null.
+// Resolve the junction first (canonicalize, then drop the `\\?\` prefix as
+// the rest of the host does), falling back to the lexical path when the
+// resolve fails. On macOS/Linux the `./bram` symlink already lands the
+// parent at the checkout, and canonicalizing `<repo>/app` leaves it there.
+fn checkout_cargo_toml_for_app_root(root: &std::path::Path) -> Option<PathBuf> {
+    let resolved = std::fs::canonicalize(root)
+        .map(strip_unc_prefix)
+        .unwrap_or_else(|_| root.to_path_buf());
+    Some(resolved.parent()?.join("src-tauri").join("Cargo.toml"))
+}
+
 fn enhance_status<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<Vec<u8>, String> {
     use serde_json::json;
     let proj = project_root(Some(app)).ok_or("no project root")?;
@@ -54574,7 +60580,7 @@ fn enhance_status<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<Vec<u8>, Stri
     let codex_agents = proj.join(ENHANCE_CODEX_AGENTS_REL);
     let sidecar = proj.join(ENHANCE_SIDECAR_REL);
     let settings = claude_hook_settings_path(&proj);
-    let worklist_auth = proj.join(WORKLIST_AUTH_REL);
+    let worklist_auth = resource_relative_path(&proj, WORKLIST_AUTH_REL);
     let active_provider = current_provider(app);
     let is_source_repo = proj.join(ENHANCE_SOURCE_BUNDLE_REL).exists();
     // issue-303: every branch below now runs its real, unbypassed check —
@@ -54671,16 +60677,64 @@ fn enhance_status<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<Vec<u8>, Stri
         && (!core_installed
             || !(opencode_plugin_current || opencode_plugin_custom)
             || !opencode_instructions_current);
+    // antigravity-worklist-guard: agy's install is Bram's group in
+    // .agents/hooks.json, wherever agy can run. A file that isn't JSON raises
+    // no banner: Setup leaves it alone, so no Setup run could clear it (the
+    // reasoning for OpenCode's unparseable config). The self-test still fails
+    // it, since agy then runs without the guard.
+    let antigravity_wanted = antigravity_hooks_wanted(app, &proj);
+    let antigravity_hooks = antigravity_hooks_state(&proj);
+    // antigravity-signature-and-conventions: and the conventions' rule
+    // slices, which Setup rewrites whenever the conventions change.
+    let antigravity_rules_current = seeded_conventions_bytes(app)
+        .map(|c| antigravity_rules_current(&proj, &c))
+        .unwrap_or(false);
+    let antigravity_hooks_ok = !matches!(
+        antigravity_hooks,
+        AntigravityHooksState::Missing | AntigravityHooksState::Stale
+    );
+    let antigravity_needs_setup = antigravity_wanted
+        && (!core_installed || !antigravity_rules_current || !antigravity_hooks_ok);
     let provider_needs_setup = provider_needs_setup_for(
         active_provider,
         claude_needs_setup,
         codex_needs_setup,
         opencode_needs_setup,
+        antigravity_needs_setup,
     );
+    let setup_reasons_list = setup_reasons(
+        active_provider,
+        SetupReasonInputs {
+            core_installed,
+            claude_hook_registered: hook_registered,
+            claude_menu_hook_registered: menu_hook_registered,
+            claude_docs_current,
+            codex_hook_block_current,
+            codex_instr_current,
+            codex_docs_current,
+            opencode_wanted: opencode_plugin_wanted(app, &proj),
+            opencode_plugin_ok: opencode_plugin_current || opencode_plugin_custom,
+            opencode_instructions_current,
+            antigravity_wanted,
+            antigravity_hooks_ok,
+            antigravity_rules_current,
+            is_source_repo,
+        },
+    );
+    // issue-465: a process older than the checkout it reads cannot match the
+    // checkout's seeded text; Setup there would stamp the old version on the
+    // new text, so the remedy is a restart, not Setup.
+    let running_version = env!("CARGO_PKG_VERSION");
+    let checkout_version_str = checkout_version(app);
+    let process_older_than_checkout = checkout_version_str
+        .as_deref()
+        .map(|c| version_is_older(running_version, c))
+        .unwrap_or(false);
     let active_provider_json = match active_provider {
         Some(SessionProvider::Claude) => json!("claude"),
         Some(SessionProvider::Codex) => json!("codex"),
         Some(SessionProvider::Opencode) => json!("opencode"),
+        Some(SessionProvider::Antigravity) => json!("antigravity"),
         None => serde_json::Value::Null,
     };
     // Mis-launch signals. Bram manages whatever directory it is started from,
@@ -54777,13 +60831,12 @@ fn enhance_status<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<Vec<u8>, Stri
         "opencodePluginCurrent": opencode_plugin_current,
         "opencodePluginCustom": opencode_plugin_custom,
         "opencodeInstructionsCurrent": opencode_instructions_current,
+        "antigravityNeedsSetup": antigravity_needs_setup,
+        "antigravityWanted": antigravity_wanted,
+        "antigravityHooks": antigravity_hooks.as_str(),
+        "antigravityRulesCurrent": antigravity_rules_current,
         "providerNeedsSetup": provider_needs_setup,
         "codexInstallStaleOnly": codex_install_stale_only,
-        "providerSetupKind": if matches!(active_provider, Some(SessionProvider::Codex)) && codex_install_stale_only {
-            "codex-hook-refresh"
-        } else {
-            "repo-setup"
-        },
         "claudeMd": claude_md_has_marker,
         "codexAgents": codex_agents_has_marker,
         "sidecar": sidecar_exists,
@@ -54799,6 +60852,22 @@ fn enhance_status<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<Vec<u8>, Stri
         "settingsPath": settings.display().to_string(),
         "worklistAuthPath": worklist_auth.display().to_string(),
     });
+    // issue-465: inserted after the literal -- the json! macro above is at
+    // its recursion limit.
+    let mut body = body;
+    body["claudeDocsCurrent"] = json!(claude_docs_current);
+    body["menuHookRegistered"] = json!(menu_hook_registered);
+    body["setupReasons"] = json!(setup_reasons_list);
+    body["runningVersion"] = json!(running_version);
+    body["checkoutVersion"] = json!(checkout_version_str);
+    body["processOlderThanCheckout"] = json!(process_older_than_checkout);
+    body["providerSetupKind"] = if process_older_than_checkout && provider_needs_setup {
+        json!("restart-older-process")
+    } else if matches!(active_provider, Some(SessionProvider::Codex)) && codex_install_stale_only {
+        json!("codex-hook-refresh")
+    } else {
+        json!("repo-setup")
+    };
     serde_json::to_vec(&body).map_err(|e| e.to_string())
 }
 
@@ -55079,8 +61148,13 @@ fn stray_home_scaffold_marker(home: &Path, root: &Path) -> Option<PathBuf> {
     if path_is_home_dir(root, home) {
         return None;
     }
-    let marker = home.join(WORKLIST_AUTH_REL);
-    marker.exists().then_some(marker)
+    // Not resource_relative_path: `~/.bram/` always exists (the guard link
+    // lives there), so the resolver would never look at the `~/resources/`
+    // scaffold this check exists to find. Either name's marker counts.
+    [BRAM_STATE_DIR_LEGACY, BRAM_STATE_DIR_NEW]
+        .iter()
+        .map(|d| home.join(d).join(WORKLIST_AUTH_REL))
+        .find(|m| m.exists())
 }
 
 // issue-445: Claude Code loads every ancestor CLAUDE.md, so a legacy
@@ -55177,7 +61251,7 @@ mod home_scaffold_tests {
         // No marker → nothing to report.
         assert!(stray_home_scaffold_marker(&home, &proj).is_none());
 
-        let marker = home.join(WORKLIST_AUTH_REL);
+        let marker = super::resource_relative_path(&home, WORKLIST_AUTH_REL);
         std::fs::create_dir_all(marker.parent().unwrap()).expect("create resources");
         std::fs::write(&marker, "{}").expect("write marker");
 
@@ -55275,7 +61349,7 @@ fn run_enhance<R: tauri::Runtime>(app: &AppHandle<R>, force: bool) -> Result<Vec
     // latest structured `approved:` / `drop:` payload here so the desktop-side
     // watcher can enforce the two-stage worklist policy even when the active
     // provider has no native pre-tool hook support.
-    let worklist_auth_path = proj.join(WORKLIST_AUTH_REL);
+    let worklist_auth_path = resource_relative_path(&proj, WORKLIST_AUTH_REL);
     if let Some(parent) = worklist_auth_path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("create {}: {}", parent.display(), e))?;
@@ -55499,6 +61573,52 @@ fn run_enhance<R: tauri::Runtime>(app: &AppHandle<R>, force: bool) -> Result<Vec
     seed_opencode_plugin(app, &proj, &mut wrote, &mut skipped)?;
     if opencode_plugin_wanted(app, &proj) {
         seed_opencode_instructions(&proj, is_source_repo, &mut wrote, &mut skipped)?;
+        apply_self_ignore(
+            app,
+            &proj,
+            ".opencode",
+            is_source_repo,
+            &mut wrote,
+            &mut skipped,
+        );
+    }
+    // antigravity-worklist-guard: agy's guard registration, Bram's group in
+    // .agents/hooks.json. Runs on the source repo too, as OpenCode's plugin
+    // does. The link exists here: Setup refused above if it couldn't make it.
+    // antigravity-signature-and-conventions: the conventions as always-on
+    // rules, under the same "wanted" rule. The source repo gets them too, cut
+    // from app/__shell/conventions.md (its .gitignore covers them), as
+    // OpenCode's `instructions` there name that file.
+    if antigravity_hooks_wanted(app, &proj) {
+        if let Some(command) = expected_antigravity_guard_command() {
+            seed_antigravity_hooks(&proj, &command, &mut wrote, &mut skipped)?;
+        }
+        let conventions = seeded_conventions_bytes(app)
+            .ok_or_else(|| "conventions template not found".to_string())?;
+        seed_antigravity_rules(&proj, &conventions, &mut wrote, &mut skipped)?;
+        apply_self_ignore(
+            app,
+            &proj,
+            ".agents",
+            is_source_repo,
+            &mut wrote,
+            &mut skipped,
+        );
+    }
+
+    // Orientation sites marked `bram-managed: orientation engine`: refresh
+    // their engine files from the template. Runs in the source repo too.
+    for (path, outcome) in refresh_orientation_sites(app, &proj, &mut wrote) {
+        if bram_trace_enabled() {
+            append_bram_trace_line(
+                app,
+                "setup",
+                &format!(
+                    "op=orientation-scaffolding path={} outcome={}",
+                    path, outcome
+                ),
+            );
+        }
     }
 
     // issue-227: surface stale legacy-hook references in user-global settings.
@@ -55541,6 +61661,345 @@ fn run_enhance<R: tauri::Runtime>(app: &AppHandle<R>, force: bool) -> Result<Vec
         "codexHookNeedsTrust": codex_hook_install.installed,
     });
     serde_json::to_vec(&body).map_err(|e| e.to_string())
+}
+
+// judell/bram#469 decision 7: Setup's files in `.opencode/` and `.agents/`
+// are ignored by a `.gitignore` inside each folder. Both loaders were checked
+// to ignore it: OpenCode 2.1.4 still loads the plugin, Antigravity 1.4.12
+// still loads the rules
+// (resources/worklist-drafts/issue-469-self-ignore-opencode-agents.md).
+// These folders are shared with the user (their own rules, plugins, hooks),
+// unlike `.bram/`, so the file names only Setup's entries, generated from
+// BRAM_OWNED_ENTRIES (self_ignore_bytes): a user's own file there stays
+// visible to git. Left alone: a `.gitignore` already there, byte for byte and
+// even when it lacks Bram's lines (a hand-written one is never overwritten,
+// and a second Setup changes no bytes); a folder the project tracks files in
+// (it keeps its own config in git); and the source repo, whose root
+// .gitignore covers both. One rule for both folders, so they can't drift.
+
+// The folder's ignore file: one anchored line per root-relative table entry
+// under `folder`, plus the file's own line, sorted, newline-terminated.
+fn self_ignore_bytes(folder: &str) -> Vec<u8> {
+    let prefix = format!("{}/", folder);
+    let mut lines: Vec<String> = BRAM_OWNED_ENTRIES
+        .iter()
+        .filter(|e| e.root_relative)
+        .filter_map(|e| {
+            let rest = e.rel.strip_prefix(prefix.as_str())?;
+            Some(match e.kind {
+                OwnedKind::Dir => format!("/{}/", rest),
+                _ => format!("/{}", rest),
+            })
+        })
+        .collect();
+    lines.push("/.gitignore".to_string());
+    lines.sort();
+    lines.dedup();
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out.into_bytes()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelfIgnoreOutcome {
+    Written,
+    AlreadyPresent,
+    TrackedSkip,
+    SourceRepoSkip,
+    Error,
+}
+
+impl SelfIgnoreOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            SelfIgnoreOutcome::Written => "written",
+            SelfIgnoreOutcome::AlreadyPresent => "already-present",
+            SelfIgnoreOutcome::TrackedSkip => "tracked-skip",
+            SelfIgnoreOutcome::SourceRepoSkip => "source-repo-skip",
+            SelfIgnoreOutcome::Error => "error",
+        }
+    }
+}
+
+// `git ls-files -- <folder>` from the root. Not a repo, or no git, reads as
+// nothing tracked: there is no index for an ignore file to disturb.
+fn folder_has_tracked_files(root: &Path, folder: &str) -> bool {
+    std::process::Command::new("git")
+        .current_dir(root)
+        .args(["ls-files", "--", folder])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .is_some_and(|out| !out.stdout.iter().all(|b| b.is_ascii_whitespace()))
+}
+
+fn seed_self_ignore(root: &Path, folder: &str, is_source_repo: bool) -> SelfIgnoreOutcome {
+    if is_source_repo {
+        return SelfIgnoreOutcome::SourceRepoSkip;
+    }
+    let dir = root.join(folder);
+    let path = dir.join(".gitignore");
+    // Any existing file is kept as it is, Bram's lines or not.
+    if path.exists() {
+        return SelfIgnoreOutcome::AlreadyPresent;
+    }
+    if folder_has_tracked_files(root, folder) {
+        return SelfIgnoreOutcome::TrackedSkip;
+    }
+    if std::fs::create_dir_all(&dir).is_err() {
+        return SelfIgnoreOutcome::Error;
+    }
+    // create_new: a file that appeared since the check is kept, not truncated.
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            use std::io::Write;
+            match file.write_all(&self_ignore_bytes(folder)) {
+                Ok(()) => SelfIgnoreOutcome::Written,
+                Err(_) => SelfIgnoreOutcome::Error,
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            SelfIgnoreOutcome::AlreadyPresent
+        }
+        Err(_) => SelfIgnoreOutcome::Error,
+    }
+}
+
+// Setup's call: one trace line per folder, the written file in `wrote`, a
+// failure named in `skipped` (it never fails Setup).
+fn apply_self_ignore<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    root: &Path,
+    folder: &str,
+    is_source_repo: bool,
+    wrote: &mut Vec<String>,
+    skipped: &mut Vec<String>,
+) {
+    let outcome = seed_self_ignore(root, folder, is_source_repo);
+    let path = root.join(folder).join(".gitignore");
+    match outcome {
+        SelfIgnoreOutcome::Written => wrote.push(path.display().to_string()),
+        SelfIgnoreOutcome::Error => skipped.push(format!(
+            "{} (could not write the folder's self-ignore file)",
+            path.display()
+        )),
+        _ => {}
+    }
+    append_bram_trace_line(
+        app,
+        "setup",
+        &format!(
+            "op=self-ignore folder={} outcome={}",
+            folder,
+            outcome.as_str()
+        ),
+    );
+}
+
+#[cfg(test)]
+mod self_ignore_tests {
+    use super::{seed_self_ignore, SelfIgnoreOutcome};
+    use std::path::{Path, PathBuf};
+
+    const OPENCODE_BYTES: &[u8] = b"/.gitignore\n/opencode.json\n/plugins/bram.js\n";
+    const AGENTS_BYTES: &[u8] = b"/.gitignore\n/hooks.json\n/rules/bram-conventions-*.md\n";
+
+    fn write(dir: &Path, rel: &str, text: &str) {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    // `git check-ignore -q <rel>`: true when ignored (exit 0), false on 1.
+    fn ignored(dir: &Path, rel: &str) -> bool {
+        let code = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["check-ignore", "-q", rel])
+            .status()
+            .unwrap()
+            .code();
+        assert!(
+            matches!(code, Some(0) | Some(1)),
+            "check-ignore {}: {:?}",
+            rel,
+            code
+        );
+        code == Some(0)
+    }
+
+    // A fresh scratch folder, removed when dropped.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Scratch {
+            let dir = std::env::temp_dir().join(format!(
+                "bram-self-ignore-test-{}-{}",
+                tag,
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Scratch(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+            .args(args)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {:?} failed", args);
+    }
+
+    fn repo(tag: &str) -> Scratch {
+        let dir = Scratch::new(tag);
+        git(dir.path(), &["init", "-q"]);
+        dir
+    }
+
+    #[test]
+    fn writes_opencode_entries_then_is_already_present() {
+        let dir = repo("fresh-opencode");
+        write(dir.path(), ".opencode/plugins/bram.js", "x");
+        assert_eq!(
+            seed_self_ignore(dir.path(), ".opencode", false),
+            SelfIgnoreOutcome::Written
+        );
+        let path = dir.path().join(".opencode/.gitignore");
+        assert_eq!(std::fs::read(&path).unwrap(), OPENCODE_BYTES);
+        // A second Setup changes nothing.
+        assert_eq!(
+            seed_self_ignore(dir.path(), ".opencode", false),
+            SelfIgnoreOutcome::AlreadyPresent
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), OPENCODE_BYTES);
+    }
+
+    #[test]
+    fn writes_agents_entries() {
+        let dir = repo("fresh-agents");
+        write(dir.path(), ".agents/hooks.json", "{}");
+        assert_eq!(
+            seed_self_ignore(dir.path(), ".agents", false),
+            SelfIgnoreOutcome::Written
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(".agents/.gitignore")).unwrap(),
+            AGENTS_BYTES
+        );
+    }
+
+    // The folders are shared: a user's own rule or plugin stays visible.
+    #[test]
+    fn ignores_bram_files_but_not_the_users() {
+        let dir = repo("users-files");
+        write(dir.path(), ".agents/rules/bram-conventions-1.md", "slice");
+        write(dir.path(), ".agents/rules/mine.md", "my rule");
+        write(dir.path(), ".opencode/plugins/bram.js", "x");
+        write(dir.path(), ".opencode/plugins/mine.js", "mine");
+        for folder in [".agents", ".opencode"] {
+            assert_eq!(
+                seed_self_ignore(dir.path(), folder, false),
+                SelfIgnoreOutcome::Written
+            );
+        }
+        assert!(ignored(dir.path(), ".agents/rules/bram-conventions-1.md"));
+        assert!(ignored(dir.path(), ".agents/.gitignore"));
+        assert!(ignored(dir.path(), ".opencode/plugins/bram.js"));
+        assert!(!ignored(dir.path(), ".agents/rules/mine.md"));
+        assert!(!ignored(dir.path(), ".opencode/plugins/mine.js"));
+    }
+
+    // Kept byte for byte even though it lacks Bram's lines.
+    #[test]
+    fn keeps_an_existing_gitignore_byte_for_byte() {
+        let dir = repo("existing");
+        std::fs::create_dir_all(dir.path().join(".agents/rules")).unwrap();
+        let path = dir.path().join(".agents/.gitignore");
+        std::fs::write(&path, "hooks.json\n# mine\n").unwrap();
+        assert_eq!(
+            seed_self_ignore(dir.path(), ".agents", false),
+            SelfIgnoreOutcome::AlreadyPresent
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"hooks.json\n# mine\n");
+    }
+
+    #[test]
+    fn skips_a_folder_the_project_tracks() {
+        let dir = repo("tracked");
+        std::fs::create_dir_all(dir.path().join(".agents/rules")).unwrap();
+        std::fs::write(dir.path().join(".agents/rules/team.md"), "team rule\n").unwrap();
+        git(dir.path(), &["add", ".agents/rules/team.md"]);
+        git(dir.path(), &["commit", "-q", "-m", "track a rule"]);
+        assert_eq!(
+            seed_self_ignore(dir.path(), ".agents", false),
+            SelfIgnoreOutcome::TrackedSkip
+        );
+        assert!(!dir.path().join(".agents/.gitignore").exists());
+    }
+
+    #[test]
+    fn skips_the_source_repo() {
+        let dir = repo("source");
+        std::fs::create_dir_all(dir.path().join(".opencode")).unwrap();
+        assert_eq!(
+            seed_self_ignore(dir.path(), ".opencode", true),
+            SelfIgnoreOutcome::SourceRepoSkip
+        );
+        assert!(!dir.path().join(".opencode/.gitignore").exists());
+    }
+
+    #[test]
+    fn not_a_repo_reads_as_untracked() {
+        let dir = Scratch::new("not-a-repo");
+        std::fs::create_dir_all(dir.path().join(".opencode")).unwrap();
+        assert_eq!(
+            seed_self_ignore(dir.path(), ".opencode", false),
+            SelfIgnoreOutcome::Written
+        );
+    }
+
+    #[test]
+    fn outcome_names() {
+        let names: Vec<&str> = [
+            SelfIgnoreOutcome::Written,
+            SelfIgnoreOutcome::AlreadyPresent,
+            SelfIgnoreOutcome::TrackedSkip,
+            SelfIgnoreOutcome::SourceRepoSkip,
+            SelfIgnoreOutcome::Error,
+        ]
+        .iter()
+        .map(|o| o.as_str())
+        .collect();
+        assert_eq!(
+            names,
+            [
+                "written",
+                "already-present",
+                "tracked-skip",
+                "source-repo-skip",
+                "error"
+            ]
+        );
+    }
 }
 
 // opencode-worklist-guard: seed the plugin only where OpenCode can run (its
@@ -55847,6 +62306,869 @@ mod opencode_instructions_tests {
         assert_eq!(
             instructions(&dir),
             vec!["app/__shell/conventions.md", "docs/developing-bram.md"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// antigravity-worklist-guard: agy's guard registration is a named group in the
+// project's .agents/hooks.json, the workspace hooks file agy reads (as do the
+// Antigravity App and IDE). The file maps group names to their events, so
+// Bram owns one group and a user's own groups are kept. The global
+// ~/.gemini/config/hooks.json was rejected: it applies to every project, and
+// the guard must know which project a call belongs to. agy has no untracked
+// local hooks file, so in a project that tracks .agents/hooks.json, Setup's
+// group (an absolute path to the guard) changes a tracked file, as OpenCode's
+// `instructions` entry does.
+const ENHANCE_ANTIGRAVITY_HOOKS_REL: &str = ".agents/hooks.json";
+const ANTIGRAVITY_HOOKS_GROUP: &str = "bram-worklist-guard";
+// The tools that change files in agy 1.4.12 (PreToolUse.jsonl in the specimen
+// pack), plus `call_mcp_tool`, the tool name captured for MCP server calls on
+// both global and plugin MCP servers (agy-guard-mcp-coverage). `write_file`
+// also takes `Append` and `run_command` also takes `IsDaemon`. The other tools
+// `agy -p` listed on 2026-10-31 are manage_task, read_file, ask_question,
+// search_web, invoke_subagent, define_subagent, manage_subagents, send_message
+// and schedule. That list wasn't complete (it left out `call_mcp_tool`).
+// Subagents need no matcher of their own: their writes reach this hook as
+// `write_file` (docs/agent-specimens/antigravity/hooks/failure-posture/posture.md).
+const ANTIGRAVITY_GUARD_MATCHER: &str = "^(write_file|edit_file|run_command|call_mcp_tool)$";
+// agy kills a hook at its timeout and blocks the call (the 2026-10-31 spike),
+// so this only bounds a hung guard. Codex's registration uses 10 s too.
+const ANTIGRAVITY_GUARD_TIMEOUT_SECS: u64 = 10;
+
+fn expected_antigravity_guard_command() -> Option<String> {
+    guard_link_if_installed().map(|link| antigravity_guard_command(&link))
+}
+
+// What agy runs. agy lets a tool call through when its hook exits 0 with
+// empty output (the 2026-10-31 spike), and that is exactly what a guard that
+// doesn't know `antigravity-worklist` does: Bram 0.8.1's prints
+// "unknown hook" to stderr and exits 0. ~/.bram/bram-guard follows whichever
+// running Bram re-pointed it last, so with an older Bram running beside this
+// one, agy's writes would pass unchecked. The wrapper turns no decision into
+// a deny that says why, as OpenCode's plugin does with any non-decision.
+// agy runs hook commands through a shell (the spike's quoted `printf` hooks
+// worked). On Windows that shell is cmd.exe, reached through Go's
+// exec.Command, which backslash-escapes every `"` in the command string; cmd
+// then sees `\"C:\…\bram-guard.exe\"` and reports it "is not recognized as an
+// internal or external command" (agy 1.4.12's own log, captured in
+// docs/agent-specimens/antigravity/hooks/windows-cmd-shell.md). So the
+// Windows command carries no quotes at all, and no wrapper: with agy failing
+// closed on a non-zero exit, a quoting mistake blocks every tool call.
+fn antigravity_guard_command(link: &Path) -> String {
+    #[cfg(windows)]
+    {
+        return format!(
+            "{} guard antigravity-worklist",
+            windows_unquoted_hook_path(link)
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        let bare = guard::guard_hook_command(link, "antigravity-worklist");
+        format!(
+            "out=$({}); if [ -n \"$out\" ]; then printf '%s\\n' \"$out\"; else printf '%s\\n' '{}'; fi",
+            bare, ANTIGRAVITY_NO_DECISION_DENY
+        )
+    }
+}
+
+// An unquoted path cmd.exe can run: the path as is, or its 8.3 short name
+// when it contains a space (a user profile like `C:\Users\Jon Udell`). The
+// short name comes from cmd's own `%~s` expansion at seed time, so no extra
+// Windows API binding is needed; if that lookup fails the long path is kept,
+// which only loses the space case, and the seeded file shows it.
+#[cfg(windows)]
+fn windows_unquoted_hook_path(link: &Path) -> String {
+    let long = link.display().to_string();
+    if !long.contains(' ') {
+        return long;
+    }
+    let out = std::process::Command::new("cmd")
+        .args([
+            "/d",
+            "/c",
+            &format!("for %I in (\"{}\") do @echo %~sI", long),
+        ])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            let short = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !short.is_empty() && !short.contains(' ') {
+                short
+            } else {
+                long
+            }
+        }
+        _ => long,
+    }
+}
+
+// The guard link inside a registered command, whichever shape it has: quoted
+// (`"/Users/x/.bram/bram-guard" guard …`, Unix) or bare up to the first
+// ` guard ` (Windows).
+fn antigravity_guard_link(guard_command: &str) -> &str {
+    let command = guard_command.trim_start_matches("out=$(");
+    if let Some(rest) = command.strip_prefix('"') {
+        return rest.split('"').next().unwrap_or("");
+    }
+    command.split(" guard ").next().unwrap_or("")
+}
+
+// Single-quoted in the shell, so no apostrophes. Unix only: the Windows
+// command has no wrapper (see antigravity_guard_command).
+#[cfg(not(windows))]
+const ANTIGRAVITY_NO_DECISION_DENY: &str = r#"{"decision":"deny","reason":"Blocked: the Bram worklist guard gave no decision. The guard ~/.bram/bram-guard reaches is probably from an older Bram that predates Antigravity support. Update or relaunch every running Bram, then retry."}"#;
+
+// agy-reads-conversation-id: reports the running conversation at each model
+// invocation. It shares the guard's link, so it's cut from the guard command.
+// Never the guard's wrapper: that turns empty output into a deny, and empty
+// is this hook's normal answer. agy blocks on a failing hook, so nothing here
+// can fail: an older guard's "unknown hook" exits 0 with no output too.
+fn antigravity_session_hook_command(guard_command: &str) -> String {
+    let link = antigravity_guard_link(guard_command);
+    #[cfg(windows)]
+    {
+        // Already unquoted (and short-named if needed) by the guard command.
+        return format!("{} guard antigravity-session", link);
+    }
+    #[cfg(not(windows))]
+    {
+        let bare = guard::guard_hook_command(Path::new(link), "antigravity-session");
+        format!("{} >/dev/null 2>&1; exit 0", bare)
+    }
+}
+
+fn antigravity_hooks_group(command: &str) -> serde_json::Value {
+    serde_json::json!({
+        "PreInvocation": [{
+            "type": "command",
+            "command": antigravity_session_hook_command(command),
+            "timeout": ANTIGRAVITY_GUARD_TIMEOUT_SECS,
+        }],
+        "PreToolUse": [{
+            "matcher": ANTIGRAVITY_GUARD_MATCHER,
+            "hooks": [{
+                "type": "command",
+                "command": command,
+                "timeout": ANTIGRAVITY_GUARD_TIMEOUT_SECS,
+            }],
+        }],
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AntigravityHooksState {
+    // No file, or no Bram group in it.
+    Missing,
+    Current,
+    // Bram's group differs from what Setup writes (an older command, or no
+    // guard link to compare with).
+    Stale,
+    // Not a JSON object. Setup leaves it alone and names it in `skipped`.
+    Unparseable,
+}
+
+impl AntigravityHooksState {
+    fn as_str(self) -> &'static str {
+        match self {
+            AntigravityHooksState::Missing => "missing",
+            AntigravityHooksState::Current => "current",
+            AntigravityHooksState::Stale => "stale",
+            AntigravityHooksState::Unparseable => "unparseable",
+        }
+    }
+}
+
+fn antigravity_hooks_state_of(text: Option<&str>, command: Option<&str>) -> AntigravityHooksState {
+    let Some(text) = text else {
+        return AntigravityHooksState::Missing;
+    };
+    let Some(value) = serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .filter(|v| v.is_object())
+    else {
+        return AntigravityHooksState::Unparseable;
+    };
+    match (value.get(ANTIGRAVITY_HOOKS_GROUP), command) {
+        (None, _) => AntigravityHooksState::Missing,
+        (Some(group), Some(cmd)) if *group == antigravity_hooks_group(cmd) => {
+            AntigravityHooksState::Current
+        }
+        (Some(_), _) => AntigravityHooksState::Stale,
+    }
+}
+
+fn antigravity_hooks_state(proj: &Path) -> AntigravityHooksState {
+    let text = std::fs::read_to_string(proj.join(ENHANCE_ANTIGRAVITY_HOOKS_REL)).ok();
+    antigravity_hooks_state_of(
+        text.as_deref(),
+        expected_antigravity_guard_command().as_deref(),
+    )
+}
+
+// As for OpenCode's plugin: where agy can run (its CLI on the host's PATH) or
+// where Bram's group is already installed and so kept current. Projects whose
+// users never run agy get no .agents/hooks.json. The active agent counts too
+// (antigravity-provider-switch): the host PATH probe can miss a CLI the PTY's
+// login shell finds, and a user who picked Antigravity in the switcher has
+// asked for it by name.
+fn antigravity_hooks_wanted<R: tauri::Runtime>(app: &AppHandle<R>, proj: &Path) -> bool {
+    matches!(
+        antigravity_hooks_state(proj),
+        AntigravityHooksState::Current | AntigravityHooksState::Stale
+    ) || agent_cli_on_path("agy")
+        || current_provider(app) == Some(SessionProvider::Antigravity)
+}
+
+// Writes Bram's group into .agents/hooks.json, creating the file when it is
+// absent and keeping every other group (keys may be re-sorted on rewrite, as
+// with .opencode/opencode.json). A file that isn't a JSON object is left
+// alone and reported in `skipped`. The caller decides whether agy is wanted.
+fn seed_antigravity_hooks(
+    proj: &Path,
+    command: &str,
+    wrote: &mut Vec<String>,
+    skipped: &mut Vec<String>,
+) -> Result<(), String> {
+    let path = proj.join(ENHANCE_ANTIGRAVITY_HOOKS_REL);
+    let mut value = match std::fs::read_to_string(&path) {
+        Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(v) if v.is_object() => v,
+            _ => {
+                skipped.push(path.display().to_string());
+                return Ok(());
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(format!("read {}: {}", path.display(), e)),
+    };
+    let group = antigravity_hooks_group(command);
+    let Some(root) = value.as_object_mut() else {
+        return Ok(());
+    };
+    if root.get(ANTIGRAVITY_HOOKS_GROUP) == Some(&group) {
+        return Ok(());
+    }
+    root.insert(ANTIGRAVITY_HOOKS_GROUP.to_string(), group);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create {}: {}", parent.display(), e))?;
+    }
+    let text = serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?;
+    std::fs::write(&path, format!("{}\n", text))
+        .map_err(|e| format!("write {}: {}", path.display(), e))?;
+    wrote.push(path.display().to_string());
+    Ok(())
+}
+
+#[cfg(test)]
+mod antigravity_hooks_tests {
+    use super::{
+        antigravity_guard_command, antigravity_hooks_group, antigravity_hooks_state_of,
+        seed_antigravity_hooks, AntigravityHooksState::*, ANTIGRAVITY_GUARD_MATCHER,
+        ANTIGRAVITY_HOOKS_GROUP, ENHANCE_ANTIGRAVITY_HOOKS_REL,
+    };
+
+    const CMD: &str = "\"/Users/example/.bram/bram-guard\" guard antigravity-worklist";
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("bram-agy-hooks-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    // The registered command, run the way agy runs it (a shell), against
+    // fake guards. The silent one is Bram 0.8.1's answer to a hook it
+    // doesn't know: "unknown hook" on stderr, exit 0, nothing on stdout.
+    #[cfg(unix)]
+    #[test]
+    fn wrapper_turns_no_decision_into_a_deny() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Command, Stdio};
+        let dir = scratch("wrapper");
+        let fake = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{}\n", body)).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+        let run = |guard: &std::path::Path| -> serde_json::Value {
+            let mut child = Command::new("sh")
+                .arg("-c")
+                .arg(antigravity_guard_command(guard))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(br#"{"toolCall":{"name":"write_file","args":{}}}"#)
+                .unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success());
+            serde_json::from_slice(&out.stdout).unwrap()
+        };
+        let silent = fake(
+            "silent",
+            "cat > /dev/null; echo \"bram guard: unknown hook 'antigravity-worklist'\" >&2",
+        );
+        let v = run(&silent);
+        assert_eq!(v["decision"], "deny");
+        assert!(v["reason"].as_str().unwrap().contains("older Bram"), "{v}");
+        // The payload reaches the guard, and a decision passes through as is.
+        let reader = fake(
+            "reader",
+            r#"grep -q write_file && echo '{"decision":"deny","reason":"saw write_file"}'"#,
+        );
+        assert_eq!(
+            run(&reader),
+            serde_json::json!({ "decision": "deny", "reason": "saw write_file" })
+        );
+        let allow = fake("allow", r#"cat > /dev/null; echo '{"decision":"allow"}'"#);
+        assert_eq!(run(&allow), serde_json::json!({ "decision": "allow" }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_hook_shares_the_guard_link_and_cannot_block() {
+        let wrapped = antigravity_guard_command(std::path::Path::new("/b/bram-guard"));
+        for guard in [CMD, wrapped.as_str()] {
+            let session = super::antigravity_session_hook_command(guard);
+            assert!(session.contains(" guard antigravity-session"), "{session}");
+            assert!(!session.contains("worklist"), "{session}");
+            assert!(!session.contains("deny"), "{session}");
+            #[cfg(not(windows))]
+            assert!(session.ends_with("exit 0"), "{session}");
+        }
+    }
+
+    // The link is read back from either registered shape.
+    #[test]
+    fn guard_link_is_read_from_either_command_shape() {
+        use super::antigravity_guard_link;
+        assert_eq!(
+            antigravity_guard_link(CMD),
+            "/Users/example/.bram/bram-guard"
+        );
+        assert_eq!(
+            antigravity_guard_link(r"C:\Users\jon\.bram\bram-guard.exe guard antigravity-worklist"),
+            r"C:\Users\jon\.bram\bram-guard.exe"
+        );
+        assert_eq!(
+            antigravity_guard_link(
+                "out=$(\"/b/bram-guard\" guard antigravity-worklist); if [ -n \"$out\" ]; then echo; fi"
+            ),
+            "/b/bram-guard"
+        );
+    }
+
+    // windows-antigravity-hook-command-under-cmd: agy runs hooks through
+    // cmd.exe with every `"` escaped, so the Windows commands carry none
+    // (agy 1.4.12's log: `'\"C:\…\bram-guard.exe\"' is not recognized`).
+    #[cfg(windows)]
+    #[test]
+    fn windows_commands_carry_no_quotes() {
+        let link = std::path::Path::new(r"C:\Users\jon\.bram\bram-guard.exe");
+        let guard = antigravity_guard_command(link);
+        assert_eq!(
+            guard,
+            r"C:\Users\jon\.bram\bram-guard.exe guard antigravity-worklist"
+        );
+        let session = super::antigravity_session_hook_command(&guard);
+        assert_eq!(
+            session,
+            r"C:\Users\jon\.bram\bram-guard.exe guard antigravity-session"
+        );
+        for c in [&guard, &session] {
+            assert!(!c.contains('"'), "{c}");
+            assert!(!c.contains("out=$("), "{c}");
+        }
+        // A path with a space is replaced by a short name with none, or kept.
+        let spaced = antigravity_guard_command(std::path::Path::new(
+            r"C:\Users\Jon Udell\.bram\bram-guard.exe",
+        ));
+        assert!(!spaced.contains('"'), "{spaced}");
+        assert!(spaced.ends_with(" guard antigravity-worklist"), "{spaced}");
+    }
+
+    #[test]
+    fn state_reads_only_brams_group() {
+        let current = serde_json::json!({ ANTIGRAVITY_HOOKS_GROUP: antigravity_hooks_group(CMD) })
+            .to_string();
+        assert_eq!(antigravity_hooks_state_of(None, Some(CMD)), Missing);
+        assert_eq!(
+            antigravity_hooks_state_of(Some(r#"{"mine":{}}"#), Some(CMD)),
+            Missing
+        );
+        assert_eq!(
+            antigravity_hooks_state_of(Some(&current), Some(CMD)),
+            Current
+        );
+        let older = current.replace("antigravity-worklist", "antigravity-old");
+        assert_eq!(antigravity_hooks_state_of(Some(&older), Some(CMD)), Stale);
+        // No guard link: nothing to call Bram's group current against.
+        assert_eq!(antigravity_hooks_state_of(Some(&current), None), Stale);
+        assert_eq!(
+            antigravity_hooks_state_of(Some("not json"), Some(CMD)),
+            Unparseable
+        );
+        assert_eq!(
+            antigravity_hooks_state_of(Some("[]"), Some(CMD)),
+            Unparseable
+        );
+    }
+
+    #[test]
+    fn seed_merges_and_is_idempotent() {
+        let dir = scratch("merge");
+        let path = dir.join(ENHANCE_ANTIGRAVITY_HOOKS_REL);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let users = serde_json::json!({
+            "my-logger": { "Stop": [{ "type": "command", "command": "echo done" }] }
+        });
+        std::fs::write(&path, users.to_string()).unwrap();
+        let (mut wrote, mut skipped) = (Vec::new(), Vec::new());
+        seed_antigravity_hooks(&dir, CMD, &mut wrote, &mut skipped).unwrap();
+        assert_eq!(wrote.len(), 1);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            v["my-logger"], users["my-logger"],
+            "the user's group is kept"
+        );
+        assert_eq!(v[ANTIGRAVITY_HOOKS_GROUP], antigravity_hooks_group(CMD));
+        assert_eq!(antigravity_hooks_state_of(Some(&text), Some(CMD)), Current);
+        // A second run changes nothing.
+        let (mut wrote2, mut skipped2) = (Vec::new(), Vec::new());
+        seed_antigravity_hooks(&dir, CMD, &mut wrote2, &mut skipped2).unwrap();
+        assert!(wrote2.is_empty() && skipped2.is_empty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seed_creates_the_file_and_leaves_unparseable_alone() {
+        let dir = scratch("create");
+        let path = dir.join(ENHANCE_ANTIGRAVITY_HOOKS_REL);
+        let (mut wrote, mut skipped) = (Vec::new(), Vec::new());
+        seed_antigravity_hooks(&dir, CMD, &mut wrote, &mut skipped).unwrap();
+        assert_eq!(wrote.len(), 1);
+        assert!(path.is_file());
+        std::fs::write(&path, "{ not json").unwrap();
+        let (mut wrote2, mut skipped2) = (Vec::new(), Vec::new());
+        seed_antigravity_hooks(&dir, CMD, &mut wrote2, &mut skipped2).unwrap();
+        assert!(wrote2.is_empty());
+        assert_eq!(skipped2.len(), 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn matcher_covers_every_pinned_pre_tool_use_specimen_and_marks_pre_mcp_stale() {
+        let alts: Vec<&str> = ANTIGRAVITY_GUARD_MATCHER
+            .strip_prefix("^(")
+            .and_then(|s| s.strip_suffix(")$"))
+            .expect("anchored alternation")
+            .split('|')
+            .collect();
+        assert!(alts.contains(&"call_mcp_tool"), "{alts:?}");
+        assert!(!alts.contains(&"read_file"), "{alts:?}");
+        let specimens =
+            include_str!("../../docs/agent-specimens/antigravity/hooks/payloads/PreToolUse.jsonl");
+        for line in specimens.lines().filter(|l| !l.trim().is_empty()) {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            let name = v["toolCall"]["name"].as_str().unwrap();
+            assert!(
+                alts.contains(&name),
+                "ANTIGRAVITY_GUARD_MATCHER missing specimen tool {name}"
+            );
+        }
+        let pre_mcp = serde_json::json!({
+            ANTIGRAVITY_HOOKS_GROUP: antigravity_hooks_group(CMD)
+        })
+        .to_string()
+        .replace(
+            ANTIGRAVITY_GUARD_MATCHER,
+            "^(write_file|edit_file|run_command)$",
+        );
+        assert_eq!(antigravity_hooks_state_of(Some(&pre_mcp), Some(CMD)), Stale);
+    }
+}
+
+// antigravity-signature-and-conventions: agy's always-on instruction channel.
+// agy 1.4.12 loads AGENTS.md, GEMINI.md and each `.agents/rules/*.md` whose
+// frontmatter says `trigger: always_on`; a rule without frontmatter is
+// rejected ("Invalid rule trigger"). It truncates a rule past 24,000 bytes of
+// what follows the frontmatter, silently but for a warning in its own log.
+// The seeded conventions are about 45 KB, so Setup cuts them at heading
+// boundaries into `.agents/rules/bram-conventions-<n>.md`. AGENTS.md's pointer
+// alone was rejected, as for OpenCode: following it is left to the model.
+// Evidence: docs/agent-specimens/antigravity/rules-and-transport.md.
+//
+// All always-on text shares a budget of about 60,000 bytes. Past it agy drops
+// the largest rule first, which is usually one of these slices; Bram's set
+// (the slices plus its AGENTS.md block) leaves about 8 KB for the user's own
+// always-on rules. Losing a slice costs guidance, not enforcement: the guard
+// in .agents/hooks.json still decides every write.
+const ENHANCE_ANTIGRAVITY_RULES_DIR_REL: &str = ".agents/rules";
+const ANTIGRAVITY_RULE_STEM: &str = "bram-conventions-";
+// Ownership, as for OpenCode's plugin: Setup rewrites or removes only slice
+// files carrying it, and a user's same-named rule is kept.
+const ANTIGRAVITY_RULE_MARKER: &str = "bram-managed";
+// agy's per-rule limit. Checked against the whole file, frontmatter included,
+// although agy counts only what follows the frontmatter. agy 1.4.12 expands
+// no `@` mention inside a rule (five forms tried), so a slice's size on disk
+// is the size agy loads.
+const ANTIGRAVITY_RULE_MAX_BYTES: usize = 24_000;
+// Two slices hold the conventions under their 45,000-character budget; more
+// are cut only if two can't each fit.
+const ANTIGRAVITY_RULE_MAX_SLICES: usize = 4;
+
+// Six lines: the frontmatter, a blank line, the marker, a blank line. The
+// setup harness strips them by count to reassemble the conventions.
+fn antigravity_rule_header(part: usize, parts: usize) -> String {
+    format!(
+        "---\ntrigger: always_on\n---\n\n<!-- {}: part {} of {} of Bram's conventions, cut to fit Antigravity's 24,000-byte rule limit. Setup rewrites this file; don't edit it. -->\n\n",
+        ANTIGRAVITY_RULE_MARKER, part, parts
+    )
+}
+
+// The rule files for the seeded conventions, whole (header and slice). Cuts
+// fall at the `##` / `###` heading nearest each equal share, never inside a
+// fenced block, so the slices concatenate back to `seeded` exactly. None when
+// no cut into ANTIGRAVITY_RULE_MAX_SLICES or fewer fits.
+fn antigravity_rule_slices(seeded: &[u8]) -> Option<Vec<Vec<u8>>> {
+    if seeded.is_empty() {
+        return None;
+    }
+    let mut cuts: Vec<usize> = Vec::new();
+    let mut fenced = false;
+    let mut off = 0;
+    for line in seeded.split_inclusive(|b| *b == b'\n') {
+        if line.starts_with(b"```") {
+            fenced = !fenced;
+        } else if !fenced && off > 0 && (line.starts_with(b"## ") || line.starts_with(b"### ")) {
+            cuts.push(off);
+        }
+        off += line.len();
+    }
+    for n in 1..=ANTIGRAVITY_RULE_MAX_SLICES {
+        let mut bounds = vec![0usize];
+        for k in 1..n {
+            let target = seeded.len() * k / n;
+            let last = *bounds.last().unwrap_or(&0);
+            if let Some(&cut) = cuts
+                .iter()
+                .filter(|&&c| c > last)
+                .min_by_key(|&&c| c.abs_diff(target))
+            {
+                bounds.push(cut);
+            }
+        }
+        bounds.push(seeded.len());
+        let parts = bounds.len() - 1;
+        let slices: Vec<Vec<u8>> = bounds
+            .windows(2)
+            .enumerate()
+            .map(|(i, w)| {
+                let mut out = antigravity_rule_header(i + 1, parts).into_bytes();
+                out.extend_from_slice(&seeded[w[0]..w[1]]);
+                out
+            })
+            .collect();
+        if slices.iter().all(|s| s.len() <= ANTIGRAVITY_RULE_MAX_BYTES) {
+            return Some(slices);
+        }
+    }
+    None
+}
+
+fn antigravity_rule_path(proj: &Path, part: usize) -> PathBuf {
+    proj.join(ENHANCE_ANTIGRAVITY_RULES_DIR_REL)
+        .join(format!("{}{}.md", ANTIGRAVITY_RULE_STEM, part))
+}
+
+// The header's marker line, not a mention anywhere: the conventions' own text
+// names the skills' `bram-managed` marker, and so might a user's rule.
+fn antigravity_rule_is_bram_managed(bytes: &[u8]) -> bool {
+    let prefix = format!(
+        "---\ntrigger: always_on\n---\n\n<!-- {}:",
+        ANTIGRAVITY_RULE_MARKER
+    );
+    bytes.starts_with(prefix.as_bytes())
+}
+
+// Bram's slice files numbered past `parts`, left by a release that cut more.
+fn antigravity_stale_rule_files(proj: &Path, parts: usize) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(proj.join(ENHANCE_ANTIGRAVITY_RULES_DIR_REL)) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            name.strip_prefix(ANTIGRAVITY_RULE_STEM)
+                .and_then(|r| r.strip_suffix(".md"))
+                .and_then(|d| d.parse::<usize>().ok())
+                .is_some_and(|k| {
+                    name == format!("{}{}.md", ANTIGRAVITY_RULE_STEM, k) && (k == 0 || k > parts)
+                })
+        })
+        .map(|e| e.path())
+        .filter(|p| {
+            std::fs::read(p)
+                .map(|b| antigravity_rule_is_bram_managed(&b))
+                .unwrap_or(false)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+// A user's rule under a slice's name counts as current, since Setup keeps it
+// and no Setup run could change it (the reasoning for OpenCode's custom
+// plugin). So does conventions text that can't be cut: Setup names it in
+// `skipped` instead.
+fn antigravity_rules_current(proj: &Path, seeded: &[u8]) -> bool {
+    let Some(slices) = antigravity_rule_slices(seeded) else {
+        return true;
+    };
+    slices.iter().enumerate().all(|(i, want)| {
+        match std::fs::read(antigravity_rule_path(proj, i + 1)) {
+            Ok(have) => have == *want || !antigravity_rule_is_bram_managed(&have),
+            Err(_) => false,
+        }
+    }) && antigravity_stale_rule_files(proj, slices.len()).is_empty()
+}
+
+// Writes each slice, refreshing Bram's own files and keeping a user's
+// same-named rule (reported in `skipped`), then removes Bram's slices
+// numbered past the current count. The caller decides whether agy is wanted.
+fn seed_antigravity_rules(
+    proj: &Path,
+    seeded: &[u8],
+    wrote: &mut Vec<String>,
+    skipped: &mut Vec<String>,
+) -> Result<(), String> {
+    let Some(slices) = antigravity_rule_slices(seeded) else {
+        skipped.push(format!(
+            "{}: the conventions can't be cut into {} or fewer rules of at most {} bytes, \
+             so Antigravity loads none of them",
+            ENHANCE_ANTIGRAVITY_RULES_DIR_REL,
+            ANTIGRAVITY_RULE_MAX_SLICES,
+            ANTIGRAVITY_RULE_MAX_BYTES
+        ));
+        return Ok(());
+    };
+    for (i, want) in slices.iter().enumerate() {
+        let path = antigravity_rule_path(proj, i + 1);
+        match std::fs::read(&path) {
+            Ok(have) if have == *want => continue,
+            Ok(have) if !antigravity_rule_is_bram_managed(&have) => {
+                skipped.push(path.display().to_string());
+                continue;
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("read {}: {}", path.display(), e)),
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create {}: {}", parent.display(), e))?;
+        }
+        std::fs::write(&path, want).map_err(|e| format!("write {}: {}", path.display(), e))?;
+        wrote.push(path.display().to_string());
+    }
+    for stale in antigravity_stale_rule_files(proj, slices.len()) {
+        std::fs::remove_file(&stale).map_err(|e| format!("remove {}: {}", stale.display(), e))?;
+        wrote.push(format!(
+            "deleted stale Antigravity rule {}",
+            stale.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod antigravity_rules_tests {
+    use super::{
+        antigravity_rule_header, antigravity_rule_path, antigravity_rule_slices,
+        antigravity_rules_current, seed_antigravity_rules, ANTIGRAVITY_RULE_MAX_BYTES,
+    };
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("bram-agy-rules-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    // What seeded_conventions_bytes produces: the version stamp, then the
+    // bundled conventions.
+    fn seeded_bundle() -> Vec<u8> {
+        let path: std::path::PathBuf = [
+            env!("CARGO_MANIFEST_DIR"),
+            "..",
+            "app",
+            "__shell",
+            "conventions.md",
+        ]
+        .iter()
+        .collect();
+        let mut out = format!("<!-- bram v{} -->\n", env!("CARGO_PKG_VERSION")).into_bytes();
+        out.extend_from_slice(&std::fs::read(path).unwrap());
+        out
+    }
+
+    // A synthetic document: `sections` headed sections of `size` bytes each.
+    fn doc(sections: usize, size: usize) -> Vec<u8> {
+        let mut out = b"# Title\n\n".to_vec();
+        for s in 0..sections {
+            out.extend_from_slice(format!("## Section {}\n\n", s).as_bytes());
+            let line = format!("words for section {} that pad it out to size.\n", s);
+            let start = out.len();
+            while out.len() - start < size {
+                out.extend_from_slice(line.as_bytes());
+            }
+        }
+        out
+    }
+
+    fn body<'a>(slice: &'a [u8], part: usize, parts: usize) -> &'a [u8] {
+        let header = antigravity_rule_header(part, parts);
+        assert!(
+            slice.starts_with(header.as_bytes()),
+            "slice {} header",
+            part
+        );
+        &slice[header.len()..]
+    }
+
+    // The plan's checks, against the conventions Setup actually seeds: two
+    // always-on rules, each within agy's limit, cut at headings, and nothing
+    // dropped or added when the slices are put back together.
+    #[test]
+    fn bundled_conventions_cut_into_two_rules_that_reassemble() {
+        let seeded = seeded_bundle();
+        let slices = antigravity_rule_slices(&seeded).expect("the conventions cut");
+        assert_eq!(
+            slices.len(),
+            2,
+            "the docs and the setup harness expect bram-conventions-1.md and -2.md"
+        );
+        let mut joined: Vec<u8> = Vec::new();
+        for (i, s) in slices.iter().enumerate() {
+            assert!(
+                s.len() <= ANTIGRAVITY_RULE_MAX_BYTES,
+                "slice {} is {} bytes, over agy's {}-byte rule limit",
+                i + 1,
+                s.len(),
+                ANTIGRAVITY_RULE_MAX_BYTES
+            );
+            assert!(s.starts_with(b"---\ntrigger: always_on\n---\n"));
+            let b = body(s, i + 1, slices.len());
+            if i > 0 {
+                assert!(
+                    b.starts_with(b"## ") || b.starts_with(b"### "),
+                    "slice {} starts at a heading",
+                    i + 1
+                );
+            }
+            joined.extend_from_slice(b);
+        }
+        assert_eq!(joined, seeded, "the slices reassemble the conventions");
+    }
+
+    #[test]
+    fn cuts_balance_and_skip_fenced_headings() {
+        let small = doc(3, 100);
+        assert_eq!(antigravity_rule_slices(&small).unwrap().len(), 1);
+        // A heading-shaped line inside a fence, right at the midpoint, is
+        // never a cut.
+        let mut fenced = doc(4, 7_000);
+        let mid = fenced.len() / 2;
+        let at = mid + fenced[mid..].iter().position(|b| *b == b'\n').unwrap() + 1;
+        fenced.splice(at..at, b"```\n## not a heading\n```\n".iter().copied());
+        let slices = antigravity_rule_slices(&fenced).unwrap();
+        assert_eq!(slices.len(), 2);
+        assert!(body(&slices[1], 2, 2).starts_with(b"## Section 2\n"));
+        // Too big for two: three, each within the limit.
+        let big = doc(9, 5_500);
+        let slices = antigravity_rule_slices(&big).unwrap();
+        assert_eq!(slices.len(), 3);
+        assert!(slices.iter().all(|s| s.len() <= ANTIGRAVITY_RULE_MAX_BYTES));
+        // One section too big to fit any rule: no cut.
+        assert!(antigravity_rule_slices(&doc(1, 30_000)).is_none());
+    }
+
+    #[test]
+    fn seed_writes_then_is_idempotent() {
+        let dir = scratch("seed");
+        let seeded = doc(4, 7_000);
+        assert!(!antigravity_rules_current(&dir, &seeded));
+        let (mut wrote, mut skipped) = (Vec::new(), Vec::new());
+        seed_antigravity_rules(&dir, &seeded, &mut wrote, &mut skipped).unwrap();
+        assert_eq!(wrote.len(), 2);
+        assert!(skipped.is_empty());
+        assert!(antigravity_rules_current(&dir, &seeded));
+        let first = std::fs::read(antigravity_rule_path(&dir, 1)).unwrap();
+        let (mut wrote2, mut skipped2) = (Vec::new(), Vec::new());
+        seed_antigravity_rules(&dir, &seeded, &mut wrote2, &mut skipped2).unwrap();
+        assert!(
+            wrote2.is_empty() && skipped2.is_empty(),
+            "second Setup writes nothing"
+        );
+        assert_eq!(
+            std::fs::read(antigravity_rule_path(&dir, 1)).unwrap(),
+            first
+        );
+        // New conventions make the slices stale until Setup runs.
+        let newer = doc(4, 7_100);
+        assert!(!antigravity_rules_current(&dir, &newer));
+        let (mut wrote3, mut skipped3) = (Vec::new(), Vec::new());
+        seed_antigravity_rules(&dir, &newer, &mut wrote3, &mut skipped3).unwrap();
+        assert_eq!(wrote3.len(), 2);
+        assert!(antigravity_rules_current(&dir, &newer));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_users_rule_is_kept_and_brams_extra_slices_go() {
+        let dir = scratch("owned");
+        let rules = dir.join(".agents/rules");
+        std::fs::create_dir_all(&rules).unwrap();
+        // Mentioning the marker in its body doesn't make a rule Bram's.
+        let mine = "---\ntrigger: always_on\n---\n\nmy own rule, about a bram-managed skill\n";
+        std::fs::write(rules.join("bram-conventions-2.md"), mine).unwrap();
+        // Left by a release that cut three: Bram's goes, a user's stays.
+        std::fs::write(
+            rules.join("bram-conventions-3.md"),
+            antigravity_rule_header(3, 3),
+        )
+        .unwrap();
+        std::fs::write(rules.join("bram-conventions-4.md"), mine).unwrap();
+        let seeded = doc(4, 7_000);
+        let (mut wrote, mut skipped) = (Vec::new(), Vec::new());
+        seed_antigravity_rules(&dir, &seeded, &mut wrote, &mut skipped).unwrap();
+        assert_eq!(skipped.len(), 1, "the user's -2 is reported, not rewritten");
+        assert_eq!(
+            std::fs::read_to_string(rules.join("bram-conventions-2.md")).unwrap(),
+            mine
+        );
+        assert!(!rules.join("bram-conventions-3.md").exists());
+        assert!(rules.join("bram-conventions-4.md").exists());
+        assert_eq!(wrote.len(), 2, "-1 written, -3 removed");
+        assert!(
+            antigravity_rules_current(&dir, &seeded),
+            "a kept user rule raises no banner"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -56391,7 +63713,7 @@ fn worklist_drafts_dir<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<PathBuf>
 }
 
 fn worklist_auth_file<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
-    project_relative_path(app, WORKLIST_AUTH_REL)
+    project_resource_path(app, WORKLIST_AUTH_REL)
 }
 
 // issue-352: direct-edit grants live in their OWN sidecar. The shared
@@ -56400,14 +63722,14 @@ fn worklist_auth_file<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<PathBuf> 
 // mid-window (op=clobber prior_kind=direct-edit, ~20s into a 1h TTL, the
 // authorized edit denied 25s later). The guards read this file first and
 // honor a legacy-located record for one release.
-const WORKLIST_DIRECT_EDIT_REL: &str = "resources/.worklist-direct-edit.json";
+const WORKLIST_DIRECT_EDIT_REL: &str = ".worklist-direct-edit.json";
 
 fn worklist_direct_edit_file<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
-    project_relative_path(app, WORKLIST_DIRECT_EDIT_REL)
+    project_resource_path(app, WORKLIST_DIRECT_EDIT_REL)
 }
 
 fn worklist_push_mirror_file<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
-    project_relative_path(app, WORKLIST_PUSH_MIRROR_REL)
+    project_resource_path(app, WORKLIST_PUSH_MIRROR_REL)
 }
 
 fn feedback_drafts_dir<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
@@ -56418,15 +63740,1315 @@ fn feedback_history_dir<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<PathBuf
     project_resource_path(app, "feedback-history")
 }
 
-fn project_relative_path<R: tauri::Runtime, P: AsRef<Path>>(
-    app: &AppHandle<R>,
-    rel: P,
-) -> Option<PathBuf> {
-    project_root(Some(app)).map(|p| p.join(rel))
+// Bram's per-project state folder (judell/bram#469). The one place the host
+// names it: `.bram/` when that directory exists at the project root, else
+// the legacy `resources/`. Computed per root and per call, not cached, so a
+// nested instance can get a different answer from its parent and a folder
+// created mid-run is picked up. Every other site reaches the folder through
+// bram_state_dir / resource_relative_path / project_resource_path, or, for
+// repo-relative path strings, bram_state_rel / bram_state_rel_strip.
+// `state_dir_literals_go_through_the_resolver` keeps it that way.
+const BRAM_STATE_DIR_NEW: &str = ".bram";
+const BRAM_STATE_DIR_LEGACY: &str = "resources";
+
+// The guard-routing record (guard.rs's GUARD_TARGET_REL, which still spells
+// the legacy folder), relative to the state folder.
+const GUARD_TARGET_STATE_REL: &str = ".bram-guard-target";
+
+// `~/.bram` is the machine folder (it holds the bram-guard link), never a
+// project's state folder, so a root at the home directory resolves the
+// legacy name (the guard's guard_policy::state_dir rule, the same answer).
+fn bram_state_dir_name(root: &Path) -> &'static str {
+    if root.join(BRAM_STATE_DIR_NEW).is_dir()
+        && !home_dir().is_some_and(|home| path_is_home_dir(root, &home))
+    {
+        BRAM_STATE_DIR_NEW
+    } else {
+        BRAM_STATE_DIR_LEGACY
+    }
+}
+
+fn bram_state_dir(root: &Path) -> PathBuf {
+    root.join(bram_state_dir_name(root))
+}
+
+// Repo-relative, forward-slash path of `rel` inside the state folder
+// (resources/worklist.json today). An empty `rel` names the folder itself.
+fn bram_state_rel(root: &Path, rel: &str) -> String {
+    let name = bram_state_dir_name(root);
+    if rel.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}/{}", name, rel)
+    }
+}
+
+// The part of a repo-relative, forward-slash path below the state folder,
+// or None when the path is not inside it.
+fn bram_state_rel_strip<'a>(root: &Path, rel: &'a str) -> Option<&'a str> {
+    rel.strip_prefix(bram_state_dir_name(root))
+        .and_then(|r| r.strip_prefix('/'))
 }
 
 fn resource_relative_path<P: AsRef<Path>>(root: &Path, rel: P) -> PathBuf {
-    root.join("resources").join(rel)
+    bram_state_dir(root).join(rel)
+}
+
+// Everything Bram writes into a project, in one table (judell/bram#469).
+// is_bram_owned_path (the untracked-file counter) and the Files tab's state
+// rows read it; `owned_entries_cover_every_state_write` checks that every
+// literal state path in this file is on it, and
+// `repo_gitignore_covers_machine_state_entries` that this repo's .gitignore
+// ignores every machine-state entry. The 0.8.4 mover reads it to decide what
+// moves and what to report as foreign.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OwnedKind {
+    File,
+    Dir,
+    // Every dotfile directly under the state folder (`rel` is empty).
+    DotfilesUnderStateRoot,
+    // Files matching `rel`, one `*` in its last segment standing for any run
+    // without a `/` (gitignore's meaning, so the line can be written as is).
+    Glob,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OwnedClass {
+    // Per-machine, per-session state: never committed.
+    MachineState,
+    // What Setup seeds for agents to read.
+    SeededContent,
+    // On the Files tab only: Bram writes none of it, so it is not Bram-owned
+    // (is_bram_owned_path) and not expected in .gitignore.
+    Shown,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OwnedEntry {
+    rel: &'static str,
+    kind: OwnedKind,
+    class: OwnedClass,
+    // `rel` is relative to the project root, not the state folder.
+    root_relative: bool,
+    // Shown on the Files tab (a row for a file, a lazy folder for a dir).
+    files_tab: bool,
+    // Position in the Files tab's content search, which is capped, so the
+    // current state comes before the histories (bram_state_grep_ordered).
+    grep_rank: Option<u8>,
+}
+
+const fn owned(rel: &'static str, kind: OwnedKind) -> OwnedEntry {
+    OwnedEntry {
+        rel,
+        kind,
+        class: OwnedClass::MachineState,
+        root_relative: false,
+        files_tab: false,
+        grep_rank: None,
+    }
+}
+
+const fn owned_tab(rel: &'static str, kind: OwnedKind, grep_rank: Option<u8>) -> OwnedEntry {
+    OwnedEntry {
+        files_tab: true,
+        grep_rank,
+        ..owned(rel, kind)
+    }
+}
+
+const fn seeded(rel: &'static str, kind: OwnedKind) -> OwnedEntry {
+    OwnedEntry {
+        class: OwnedClass::SeededContent,
+        root_relative: true,
+        ..owned(rel, kind)
+    }
+}
+
+const BRAM_OWNED_ENTRIES: &[OwnedEntry] = {
+    use OwnedKind::{Dir, DotfilesUnderStateRoot, File, Glob};
+    &[
+        owned_tab("worklist.json", File, Some(0)),
+        owned_tab("worklist-drafts", Dir, Some(1)),
+        owned_tab("worklist-history", Dir, Some(5)),
+        owned_tab("feedback-drafts", Dir, Some(2)),
+        owned_tab("feedback-history", Dir, Some(6)),
+        owned_tab("session-digests", Dir, Some(3)),
+        // Agents' handoff notes; no host writer.
+        OwnedEntry {
+            class: OwnedClass::Shown,
+            ..owned_tab("handoffs", Dir, Some(4))
+        },
+        owned_tab("outbound-turns", Dir, Some(7)),
+        // Left out of the search: 1.4 GB of logs.
+        owned_tab("bram-traces", Dir, None),
+        owned("message-drafts", Dir),
+        owned("queue-drafts", Dir),
+        owned("audit-ledger.jsonl", File),
+        // Written by scripts/build.sh, in the source repo only.
+        owned("build-log.jsonl", File),
+        // Written by scripts/codex-permission-capture.py.
+        owned("codex-permission-hook-capture.jsonl", File),
+        // Startup forensics dumps; nothing writes them today.
+        owned("startup-traces", Dir),
+        owned("", DotfilesUnderStateRoot),
+        owned("settings.json", File),
+        owned(".settings-note", File),
+        owned(".bram-port", File),
+        owned(".bram-port.json", File),
+        owned(".bram-guard-target", File),
+        owned(".bram-queue.json", File),
+        owned(".bram-message-draft.json", File),
+        owned(".inflight-claim.json", File),
+        owned(".delegated-bindings.json", File),
+        owned(".claim-intervals.json", File),
+        owned(".pty-intent.jsonl", File),
+        owned(".worklist-authorization.json", File),
+        owned(".worklist-intent.json", File),
+        owned(".worklist-result.json", File),
+        owned(".worklist-push-mirror.json", File),
+        owned(".worklist-issue-close.json", File),
+        owned(".worklist-plan.json", File),
+        owned(".worklist-direct-edit.json", File),
+        owned(".codex-reload-target.json", File),
+        owned(".pending-session-title.json", File),
+        owned(".host-notes.json", File),
+        owned(".needs-you-dismissed.json", File),
+        owned(".turn-context.json", File),
+        owned(".target-server-pid", File),
+        // The mixed-folder answer (STATE_MOVE_REL), read by the next startup.
+        owned(".state-move", File),
+        seeded(".claude/bram-conventions.md", File),
+        seeded(".claude/bram-reference", Dir),
+        seeded(".claude/settings.json", File),
+        seeded(".claude/settings.local.json", File),
+        seeded(".claude/skills", Dir),
+        // OpenCode's guard plugin and config (seed_opencode_plugin,
+        // seed_opencode_instructions), Antigravity's hooks and the
+        // conventions cut into rules (antigravity_rule_path names them
+        // bram-conventions-1.md, -2.md, ...), and each folder's self-ignore
+        // file, which self_ignore_bytes builds from these entries.
+        seeded(".opencode/plugins/bram.js", File),
+        seeded(".opencode/opencode.json", File),
+        seeded(".opencode/.gitignore", File),
+        seeded(".agents/hooks.json", File),
+        seeded(".agents/rules/bram-conventions-*.md", Glob),
+        seeded(".agents/.gitignore", File),
+    ]
+};
+
+// Does `entry` cover `rel` (forward-slash, relative to the entry's base)? A
+// state-folder file entry also covers its temp and backup siblings
+// (worklist.json.tmp.N), which the old `worklist` prefix rule caught.
+fn owned_entry_covers(entry: &OwnedEntry, rel: &str) -> bool {
+    match entry.kind {
+        OwnedKind::File => {
+            rel == entry.rel
+                || (!entry.root_relative
+                    && rel
+                        .strip_prefix(entry.rel)
+                        .is_some_and(|r| r.starts_with('.')))
+        }
+        OwnedKind::Dir => {
+            rel == entry.rel
+                || rel
+                    .strip_prefix(entry.rel)
+                    .is_some_and(|r| r.starts_with('/'))
+        }
+        OwnedKind::DotfilesUnderStateRoot => rel.starts_with('.') && !rel.contains('/'),
+        OwnedKind::Glob => entry.rel.split_once('*').is_some_and(|(pre, suf)| {
+            rel.len() >= pre.len() + suf.len()
+                && rel.starts_with(pre)
+                && rel.ends_with(suf)
+                && !rel[pre.len()..rel.len() - suf.len()].contains('/')
+        }),
+    }
+}
+
+// The Files tab's state rows, relative to the state folder.
+fn bram_state_files() -> impl Iterator<Item = &'static str> {
+    BRAM_OWNED_ENTRIES
+        .iter()
+        .filter(|e| e.files_tab && e.kind == OwnedKind::File)
+        .map(|e| e.rel)
+}
+
+fn bram_state_dirs() -> impl Iterator<Item = &'static str> {
+    BRAM_OWNED_ENTRIES
+        .iter()
+        .filter(|e| e.files_tab && e.kind == OwnedKind::Dir)
+        .map(|e| e.rel)
+}
+
+// The state the Files tab's content search covers, in priority order.
+fn bram_state_grep() -> Vec<&'static str> {
+    let mut ranked: Vec<(u8, &'static str)> = BRAM_OWNED_ENTRIES
+        .iter()
+        .filter_map(|e| e.grep_rank.map(|r| (r, e.rel)))
+        .collect();
+    ranked.sort_by_key(|(r, _)| *r);
+    ranked.into_iter().map(|(_, rel)| rel).collect()
+}
+
+const STATE_DIR_PLAN_NOTE: &str = "Bram moves this folder at startup only when nothing in it is tracked or foreign and no claim is live.";
+const STATE_DIR_PLAN_TRACKED_CAP: usize = 200;
+
+fn owned_kind_label(kind: OwnedKind) -> &'static str {
+    match kind {
+        OwnedKind::File => "file",
+        OwnedKind::Dir => "dir",
+        OwnedKind::DotfilesUnderStateRoot => "dotfile",
+        OwnedKind::Glob => "glob",
+    }
+}
+
+// The inventory entry a top-level name in the state folder falls under: a
+// named entry first, then the dotfiles rule. Root-relative (seeded) entries
+// never live in the state folder.
+fn state_dir_entry_for(name: &str) -> Option<&'static OwnedEntry> {
+    let state = || BRAM_OWNED_ENTRIES.iter().filter(|e| !e.root_relative);
+    state()
+        .filter(|e| e.kind != OwnedKind::DotfilesUnderStateRoot)
+        .find(|e| owned_entry_covers(e, name))
+        .or_else(|| {
+            state()
+                .filter(|e| e.kind == OwnedKind::DotfilesUnderStateRoot)
+                .find(|e| owned_entry_covers(e, name))
+        })
+}
+
+// Whether an inflight claim names ids, or an authorization record is still
+// usable: the same claim file the Status tab's "Current claim" row reads, and
+// the record's freshness under worklist_auth_freshness_ok (the TTL mutate
+// and commit apply).
+//
+// state-move-ignores-finished-authorization: the record is single-slot and
+// outlives its work, so a fresh record counts only while at least one of its
+// ids is still an item on the board. A committed or dropped item has been
+// pruned; an approval whose agent is mid-edit still names a board item.
+// consumedAtMs is no test: resolve sets it on first read and the commit route
+// ignores it (same-turn resolve -> commit). An unreadable board keeps the
+// record live. The fourth value is true when a fresh record was set aside.
+fn state_dir_live_claim(root: &Path, now_ms: i64) -> (bool, Vec<String>, Option<String>, bool) {
+    let claim_ids: Vec<String> =
+        std::fs::read_to_string(resource_relative_path(root, INFLIGHT_CLAIM_REL))
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .and_then(|v| {
+                v.get("ids").and_then(|ids| ids.as_array()).map(|arr| {
+                    arr.iter()
+                        .filter_map(|id| id.as_str().map(String::from))
+                        .collect()
+                })
+            })
+            .unwrap_or_default();
+    let fresh_auth = std::fs::read_to_string(resource_relative_path(root, WORKLIST_AUTH_REL))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .filter(|v| {
+            let kind = v.get("kind").and_then(|k| k.as_str()).unwrap_or("none");
+            let issued = v.get("issuedAtMs").and_then(|i| i.as_i64()).unwrap_or(0);
+            kind != "none"
+                && issued > 0
+                && worklist_auth_freshness_ok(v, now_ms, WorklistAuthUse::Reconcile).is_ok()
+        });
+    let mut stale_authorization = false;
+    let auth_kind = fresh_auth.and_then(|v| {
+        let board_ids: Option<std::collections::HashSet<String>> =
+            std::fs::read_to_string(resource_relative_path(root, "worklist.json"))
+                .ok()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                .and_then(|w| {
+                    w.get("items").and_then(|i| i.as_array()).map(|arr| {
+                        arr.iter()
+                            .filter_map(|it| it.get("id").and_then(|id| id.as_str()))
+                            .map(String::from)
+                            .collect()
+                    })
+                });
+        let on_board = match &board_ids {
+            None => true,
+            Some(board) => v
+                .get("ids")
+                .and_then(|ids| ids.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|id| id.as_str())
+                        .any(|id| board.contains(id))
+                })
+                .unwrap_or(false),
+        };
+        if !on_board {
+            stale_authorization = true;
+            return None;
+        }
+        v.get("kind").and_then(|k| k.as_str()).map(String::from)
+    });
+    (
+        !claim_ids.is_empty() || auth_kind.is_some(),
+        claim_ids,
+        auth_kind,
+        stale_authorization,
+    )
+}
+
+// Subfolders (depth <= 3) holding another Bram instance's state, which that
+// instance migrates itself (#469 plan decision 8). The walk stops at each one.
+fn state_dir_nested(root: &Path, state_name: &str) -> Vec<serde_json::Value> {
+    const SKIP: &[&str] = &[".git", "node_modules", "target"];
+    const MARKERS: &[&str] = &[".bram-port", "worklist.json"];
+    let mut found = Vec::new();
+    let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(read) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in read.flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if !ft.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if SKIP.contains(&name.as_str()) || (depth == 0 && name == state_name) {
+                continue;
+            }
+            let sub = entry.path();
+            let marked = [BRAM_STATE_DIR_LEGACY, BRAM_STATE_DIR_NEW]
+                .iter()
+                .find(|d| MARKERS.iter().any(|m| sub.join(d).join(m).is_file()));
+            if let Some(d) = marked {
+                let rel = sub
+                    .strip_prefix(root)
+                    .map(|p| p.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_default();
+                found.push(serde_json::json!({ "path": rel, "stateDir": d }));
+            } else if depth + 1 < 3 {
+                stack.push((sub, depth + 1));
+            }
+        }
+    }
+    found.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+    found
+}
+
+// judell/bram#469: what the state-folder move would do for `root`, read-only.
+// The startup mover (migrate_state_dir) decides from this; state_dir_plan
+// serializes it for GET /__state-dir/plan and `bram --state-dir-plan`.
+struct StateDirPlan {
+    state_name: &'static str,
+    state_dir_exists: bool,
+    // (top-level name, inventory entry, is a directory)
+    would_move: Vec<(String, &'static OwnedEntry, bool)>,
+    foreign: Vec<(String, bool)>,
+    // None: the git query failed, so nobody knows what is tracked. The dry
+    // run reports that; the mover refuses on it (Codex review, 2026-11-04:
+    // a corrupt index let `rev-parse` pass while `ls-files` failed).
+    tracked: Option<Vec<String>>,
+    live_claim: bool,
+    claim_ids: Vec<String>,
+    auth_kind: Option<String>,
+    stale_authorization: bool,
+}
+
+fn state_dir_plan_core(root: &Path, now_ms: i64) -> StateDirPlan {
+    let state_name = bram_state_dir_name(root);
+    let state_dir = bram_state_dir(root);
+    let mut would_move = Vec::new();
+    let mut foreign = Vec::new();
+    if let Ok(read) = std::fs::read_dir(&state_dir) {
+        let mut names: Vec<(String, bool)> = read
+            .flatten()
+            .map(|e| {
+                (
+                    e.file_name().to_string_lossy().into_owned(),
+                    e.file_type().map(|t| t.is_dir()).unwrap_or(false),
+                )
+            })
+            .collect();
+        names.sort();
+        for (name, is_dir) in names {
+            match state_dir_entry_for(&name) {
+                Some(e) if e.class == OwnedClass::SeededContent => {}
+                Some(e) => would_move.push((name, e, is_dir)),
+                None => foreign.push((name, is_dir)),
+            }
+        }
+    }
+    let tracked: Option<Vec<String>> = std::process::Command::new("git")
+        .current_dir(root)
+        .args(["ls-files", "-z", "--", state_name])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            o.stdout
+                .split(|b| *b == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8_lossy(s).into_owned())
+                .collect()
+        });
+    let (live_claim, claim_ids, auth_kind, stale_authorization) =
+        state_dir_live_claim(root, now_ms);
+    StateDirPlan {
+        state_name,
+        state_dir_exists: state_dir.is_dir(),
+        would_move,
+        foreign,
+        tracked,
+        live_claim,
+        claim_ids,
+        auth_kind,
+        stale_authorization,
+    }
+}
+
+// The root `.bram.json`, for the dry run: whether it exists, is tracked, and
+// which top-level keys it holds, so an agent can spot a tracked file full of
+// personal keys at acceptance (#469 0.8.4). Read-only.
+fn state_dir_root_settings(root: &Path) -> serde_json::Value {
+    let keys: Option<Vec<String>> = std::fs::read(root.join(".bram.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v.as_object().map(|m| m.keys().cloned().collect()));
+    let tracked = std::process::Command::new("git")
+        .current_dir(root)
+        .args(["ls-files", "--error-unmatch", "--", ".bram.json"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    serde_json::json!({
+        "exists": root.join(".bram.json").is_file(),
+        "tracked": tracked,
+        "keys": keys.unwrap_or_default(),
+        // tracked-bram-json-cleanup-offered: the tracked file differs from HEAD.
+        "dirty": tracked && root_settings_signature(root).is_some(),
+    })
+}
+
+// tracked-bram-json-cleanup-offered: once the folder has moved, Bram never
+// writes the root .bram.json, but personal keys an earlier Bram wrote into a
+// tracked one stay until something takes them out. The host never edits a
+// tracked file, so it asks the agent, once per distinct state of the file.
+const SETTINGS_NOTE_KIND: &str = "tracked-settings-dirty";
+const SETTINGS_NOTE_REL: &str = ".settings-note";
+// settings-note-says-finish-with-drop: the recipe depends on what HEAD's
+// .bram.json holds. Team settings only (`server`): restore to HEAD, which
+// leaves nothing to commit, so the item ends in Drop (community-calendar,
+// 2026-11-04). Personal keys in HEAD: restoring would keep them tracked, so
+// they come out in a real commit, and other clones must copy theirs first
+// (Bram's own repo, 2026-11-04, 5d4f1a0). Unreadable HEAD: the agent decides.
+const SETTINGS_NOTE_TEAM_KEYS: &[&str] = &["server"];
+const SETTINGS_NOTE_HEAD: &str =
+    "This project's tracked .bram.json differs from HEAD. Since 0.8.4 \
+Bram keeps personal settings in .bram/settings.json and never writes the root file.";
+
+// The personal (non-team) top-level keys in HEAD's .bram.json; None when
+// HEAD's copy can't be read or parsed.
+fn head_settings_personal_keys(root: &Path) -> Option<Vec<String>> {
+    let out = std::process::Command::new("git")
+        .current_dir(root)
+        .args(["show", "HEAD:.bram.json"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    Some(
+        v.as_object()?
+            .keys()
+            .filter(|k| !SETTINGS_NOTE_TEAM_KEYS.contains(&k.as_str()))
+            .cloned()
+            .collect(),
+    )
+}
+
+// (recipe for the trace, note text).
+fn settings_note_text(head_personal: Option<&[String]>) -> (&'static str, String) {
+    match head_personal {
+        Some([]) => (
+            "restore",
+            format!(
+                "{} Propose a worklist item that copies the personal keys (not team settings \
+such as `server`) into .bram/settings.json, keeping their values, and restores .bram.json to \
+HEAD. This leaves nothing to commit (.bram/ ignores itself), so say so when proposing, and \
+when the files are in place recommend Drop.",
+                SETTINGS_NOTE_HEAD
+            ),
+        ),
+        Some(keys) => (
+            "remove",
+            format!(
+                "{} HEAD's .bram.json itself holds personal keys ({}), so restoring it would \
+keep them tracked. Propose a worklist item that copies every personal key from the working file \
+into .bram/settings.json, keeping their values, then removes them from .bram.json: delete the \
+file if only personal keys remain, else keep just the team settings such as `server`. That is a \
+real commit. Its message should tell other clones to copy their own .bram.json keys into their \
+.bram/settings.json before pulling it.",
+                SETTINGS_NOTE_HEAD,
+                keys.join(", ")
+            ),
+        ),
+        None => (
+            "unknown",
+            format!(
+                "{} Propose a worklist item that copies the personal keys (not team settings \
+such as `server`) into .bram/settings.json, keeping their values, and takes them out of the \
+tracked .bram.json: restore it to HEAD if HEAD holds only team settings (nothing to commit; \
+recommend Drop), otherwise remove them in a commit.",
+                SETTINGS_NOTE_HEAD
+            ),
+        ),
+    }
+}
+
+// "<HEAD blob> <working blob>" when the tracked root .bram.json differs from
+// HEAD, else None (untracked, clean, absent, or git unavailable).
+fn root_settings_signature(root: &Path) -> Option<String> {
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    let head = git(&["rev-parse", "HEAD:.bram.json"])?;
+    let work = git(&["hash-object", "--", ".bram.json"])?;
+    (head != work).then(|| format!("{} {}", head, work))
+}
+
+// untracked-root-bram-json-folds-into-state: 0.8.3 wrote personal keys to the
+// root `.bram.json`. Where the repo neither tracks nor ignores it, the move
+// left it stageable at the root (#469, Windows acceptance: `?? .bram.json` in
+// Studio and XMLUI). At every startup once the state folder is `.bram/`, an
+// untracked, unignored root file is folded into `.bram/settings.json`: renamed
+// into place when there is none, else deep-merged under it (settings.json
+// wins, the reader's rule) and removed. A `.bram.json~` beside it moves to
+// `.bram/.bram.json~`. Tracked (the settings note's case), ignored (kept
+// locally on purpose) and unparseable files stay. Returns the trace line, or
+// None when there is no root file or the folder hasn't moved.
+fn fold_untracked_root_settings(root: &Path) -> Option<String> {
+    if bram_state_dir_name(root) != BRAM_STATE_DIR_NEW {
+        return None;
+    }
+    let root_file = root.join(".bram.json");
+    if !root_file.is_file() {
+        return None;
+    }
+    let git_code = |args: &[&str]| {
+        std::process::Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()
+            .and_then(|s| s.code())
+    };
+    let skipped = |reason: &str| Some(format!("op=settings-fold-skipped reason={}", reason));
+    match git_code(&["ls-files", "--error-unmatch", "--", ".bram.json"]) {
+        Some(0) => return skipped("tracked"),
+        Some(1) => {}
+        _ => return skipped("git-unknown"),
+    }
+    match git_code(&["check-ignore", "-q", "--", ".bram.json"]) {
+        Some(0) => return skipped("ignored"),
+        Some(1) => {}
+        _ => return skipped("git-unknown"),
+    }
+    let root_value = match std::fs::read(&root_file)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+    {
+        Some(v) if v.is_object() => v,
+        _ => return skipped("unparseable"),
+    };
+    let keys: Vec<String> = root_value
+        .as_object()
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    let state = bram_state_dir(root);
+    let target = state.join("settings.json");
+    let how = if target.exists() {
+        let current = match std::fs::read(&target)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        {
+            Some(v) if v.is_object() => v,
+            _ => return skipped("unparseable"),
+        };
+        let merged = merge_settings_into_config(root_value, &current);
+        let tmp = state.join(".settings.json.fold-tmp");
+        let bytes = match serde_json::to_vec_pretty(&merged) {
+            Ok(b) => b,
+            Err(_) => return skipped("write-failed"),
+        };
+        if std::fs::write(&tmp, &bytes).is_err() || std::fs::rename(&tmp, &target).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return skipped("write-failed");
+        }
+        if std::fs::remove_file(&root_file).is_err() {
+            return skipped("write-failed");
+        }
+        "merge"
+    } else {
+        if std::fs::rename(&root_file, &target).is_err() {
+            return skipped("write-failed");
+        }
+        "rename"
+    };
+    let backup_file = root.join(".bram.json~");
+    let backup = if backup_file.is_file()
+        && git_code(&["ls-files", "--error-unmatch", "--", ".bram.json~"]) == Some(1)
+        && git_code(&["check-ignore", "-q", "--", ".bram.json~"]) == Some(1)
+        && std::fs::rename(&backup_file, state.join(".bram.json~")).is_ok()
+    {
+        "moved"
+    } else {
+        "none"
+    };
+    Some(format!(
+        "op=settings-folded how={} keys={} backup={}",
+        how,
+        keys.join(","),
+        backup
+    ))
+}
+
+// Called at startup after the trace log opens. Returns the trace line, and
+// queues the note only for a state of the file it hasn't asked about yet.
+fn state_settings_note<R: tauri::Runtime>(app: &AppHandle<R>, root: &Path) -> String {
+    if bram_state_dir_name(root) != BRAM_STATE_DIR_NEW {
+        return "op=settings-note skipped reason=not-moved".to_string();
+    }
+    let Some(sig) = root_settings_signature(root) else {
+        return "op=settings-note skipped reason=clean-or-untracked".to_string();
+    };
+    let marker = root.join(BRAM_STATE_DIR_NEW).join(SETTINGS_NOTE_REL);
+    if std::fs::read_to_string(&marker)
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        == Some(sig.as_str())
+    {
+        return "op=settings-note skipped reason=already-asked".to_string();
+    }
+    let head_personal = head_settings_personal_keys(root);
+    let (recipe, text) = settings_note_text(head_personal.as_deref());
+    queue_host_note(app, SETTINGS_NOTE_KIND, text);
+    let _ = std::fs::write(&marker, format!("{}\n", sig));
+    format!("op=settings-note queued recipe={}", recipe)
+}
+
+fn state_dir_plan(root: &Path) -> serde_json::Value {
+    let p = state_dir_plan_core(root, unix_now_ms());
+    let would_move: Vec<serde_json::Value> = p
+        .would_move
+        .iter()
+        .map(|(name, e, is_dir)| {
+            serde_json::json!({
+                "path": format!("{}/{}", p.state_name, name),
+                "kind": owned_kind_label(e.kind),
+                "isDir": is_dir,
+            })
+        })
+        .collect();
+    let foreign: Vec<serde_json::Value> = p
+        .foreign
+        .iter()
+        .map(|(name, is_dir)| serde_json::json!({ "name": name, "isDir": is_dir }))
+        .collect();
+    serde_json::json!({
+        "stateDir": p.state_name,
+        "stateDirExists": p.state_dir_exists,
+        "wouldMove": would_move,
+        "foreign": foreign,
+        "tracked": {
+            "known": p.tracked.is_some(),
+            "count": p.tracked.as_ref().map_or(0, |t| t.len()),
+            "paths": p.tracked.iter().flatten().take(STATE_DIR_PLAN_TRACKED_CAP).collect::<Vec<_>>(),
+            "truncated": p.tracked.as_ref().map_or(false, |t| t.len() > STATE_DIR_PLAN_TRACKED_CAP),
+        },
+        "rootSettings": state_dir_root_settings(root),
+        "liveClaim": p.live_claim,
+        "liveClaimDetail": {
+            "claimIds": p.claim_ids,
+            "authorization": p.auth_kind,
+            "staleAuthorization": p.stale_authorization,
+        },
+        "nested": state_dir_nested(root, p.state_name),
+        "note": STATE_DIR_PLAN_NOTE,
+        // The mixed-folder banner (issue-469-mixed-folder-dialog).
+        "pending": state_dir_pending(&p),
+        "decision": state_move_decision(root).filter(|_| p.state_name == BRAM_STATE_DIR_LEGACY),
+        // status-reports-a-completed-move: after a move, the dry run above
+        // describes the new folder; Status shows what happened instead.
+        "migrated": state_dir_migrated(root, p.state_name),
+        "leftBehind": state_dir_left_behind(root, p.state_name),
+    })
+}
+
+// `.bram/.migrated-from` is "<old path> <ISO time>[ <how>]", how being
+// `selective` or `demo-hydrate`. Null until a move has happened.
+fn state_dir_migrated(root: &Path, state_name: &str) -> Option<serde_json::Value> {
+    if state_name != BRAM_STATE_DIR_NEW {
+        return None;
+    }
+    let text = std::fs::read_to_string(root.join(BRAM_STATE_DIR_NEW).join(STATE_MIGRATED_FROM_REL))
+        .ok()?;
+    parse_migrated_from(&text)
+}
+
+fn parse_migrated_from(text: &str) -> Option<serde_json::Value> {
+    let mut tokens: Vec<&str> = text.split_whitespace().collect();
+    let how = match tokens.last() {
+        Some(t) if !t.ends_with('Z') => tokens.pop(),
+        _ => None,
+    };
+    let at = tokens.pop()?;
+    if tokens.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({
+        "from": tokens.join(" "),
+        "at": at,
+        "selective": how == Some("selective"),
+        "how": how,
+    }))
+}
+
+// What is still in the old folder after a move: the foreign and tracked
+// entries a selective move leaves. Empty when the old folder is gone.
+fn state_dir_left_behind(root: &Path, state_name: &str) -> Vec<String> {
+    if state_name != BRAM_STATE_DIR_NEW {
+        return Vec::new();
+    }
+    let mut names: Vec<String> = std::fs::read_dir(root.join(BRAM_STATE_DIR_LEGACY))
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+// judell/bram#469: the user's answer to the mixed-folder banner, kept in the
+// old folder (the only one while the question stands). Written by POST
+// /__state-dir/decision, read by the next startup's mover, deleted after a
+// selective move. `.bram-moving` is that move's staging folder.
+const STATE_MOVE_REL: &str = ".state-move";
+const STATE_MOVE_STAGING: &str = ".bram-moving";
+
+fn state_move_decision(root: &Path) -> Option<serde_json::Value> {
+    std::fs::read(root.join(BRAM_STATE_DIR_LEGACY).join(STATE_MOVE_REL))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .filter(|v| matches!(v["choice"].as_str(), Some("move" | "not-now")))
+}
+
+// Entries a selective move leaves in the old folder: its own ignore rules
+// (they may cover what stays) and the answer itself (deleted after).
+fn state_move_keeps(name: &str) -> bool {
+    name == ".gitignore" || name == STATE_MOVE_REL
+}
+
+// A tracked path whose top-level entry the selective move would take.
+fn state_dir_tracked_is_owned(path: &str, state_name: &str) -> bool {
+    path.strip_prefix(state_name)
+        .and_then(|r| r.strip_prefix('/'))
+        .and_then(|r| r.split('/').next())
+        .is_some_and(|top| !state_move_keeps(top) && state_dir_entry_for(top).is_some())
+}
+
+// Why the whole-folder move can't run, when a selective move (the user's
+// choice) could: foreign entries ("mixed"), or tracked ones that are all
+// foreign ("tracked"). None when the plain move applies, the folder already
+// moved, or something Bram owns is tracked (a worklist item handles that).
+fn state_dir_pending(p: &StateDirPlan) -> Option<&'static str> {
+    let tracked = p.tracked.as_ref()?;
+    if p.state_name != BRAM_STATE_DIR_LEGACY
+        || tracked
+            .iter()
+            .any(|t| state_dir_tracked_is_owned(t, p.state_name))
+    {
+        return None;
+    }
+    if !tracked.is_empty() {
+        Some("tracked")
+    } else if !p.foreign.is_empty() {
+        Some("mixed")
+    } else {
+        None
+    }
+}
+
+// POST /__state-dir/decision `{"choice":"move"|"not-now"}`: the banner's (or
+// the Status tab's) answer, acted on at the next startup, never on click.
+// Pane-called with no token, like the other pane POSTs: the common loopback
+// gate (loopback_gate_refusal) covers it.
+fn handle_state_move_decision(
+    root: &Path,
+    body: &[u8],
+    now_ms: i64,
+) -> (u16, &'static str, Vec<u8>) {
+    const JSON: &str = "application/json; charset=utf-8";
+    let choice = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v["choice"].as_str().map(String::from))
+        .filter(|c| c == "move" || c == "not-now");
+    let Some(choice) = choice else {
+        return (
+            400,
+            JSON,
+            b"{\"error\":\"choice must be move or not-now\"}".to_vec(),
+        );
+    };
+    if root.join(BRAM_STATE_DIR_NEW).exists() || !root.join(BRAM_STATE_DIR_LEGACY).is_dir() {
+        return (
+            409,
+            JSON,
+            b"{\"error\":\"no old state folder to move\"}".to_vec(),
+        );
+    }
+    let rec = serde_json::json!({ "choice": choice, "atMs": now_ms }).to_string();
+    match std::fs::write(root.join(BRAM_STATE_DIR_LEGACY).join(STATE_MOVE_REL), &rec) {
+        Ok(()) => (200, JSON, rec.into_bytes()),
+        Err(e) => (
+            500,
+            JSON,
+            serde_json::json!({ "error": e.to_string() })
+                .to_string()
+                .into_bytes(),
+        ),
+    }
+}
+
+// judell/bram#469 0.8.4: the startup move, `resources/` -> `.bram/`, for this
+// root only (nested instances move themselves). One rename or nothing: a
+// blocked rename (any open handle under the folder on Windows, #474) is
+// retried, then this run stays on the old folder and the next startup tries
+// again. Never entry by entry, which would split state across two folders.
+#[derive(Debug, PartialEq, Eq)]
+enum StateMigrateOutcome {
+    Moved {
+        entries: usize,
+        ms: u128,
+        marker_written: bool,
+    },
+    Blocked {
+        os_error: Option<i32>,
+        attempts: u32,
+        restored: bool,
+    },
+    // Eligibility changed between rename attempts (a claim, a foreign or
+    // tracked entry appeared), so the run stopped without moving.
+    Abandoned {
+        reason: &'static str,
+        attempts: u32,
+        restored: bool,
+    },
+    // The user chose "Move Bram's files" for a mixed folder: only inventory
+    // entries moved; `left` entries stayed in the old folder.
+    MovedSelective {
+        entries: usize,
+        left: usize,
+        marker_written: bool,
+    },
+    // A selective move stopped at `entry` after `moved` entries, which were
+    // moved back (rolled_back) so the old folder is as found.
+    SelectiveFailed {
+        reason: &'static str,
+        os_error: Option<i32>,
+        entry: String,
+        moved: usize,
+        rolled_back: bool,
+    },
+    Skipped(&'static str),
+}
+
+// Why a rename loop stopped: the OS kept refusing, or eligibility changed
+// while it waited.
+enum RenameStop {
+    Blocked(Option<i32>),
+    Abandoned(&'static str),
+}
+
+// One rename, retried while blocked; `recheck` runs before every retry.
+fn state_migrate_rename(
+    rename: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
+    from: &Path,
+    to: &Path,
+    attempts: u32,
+    pause: std::time::Duration,
+    recheck: &dyn Fn() -> Result<(), &'static str>,
+) -> Result<(), (RenameStop, u32)> {
+    let mut tried = 0;
+    loop {
+        tried += 1;
+        let err = match rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        if tried >= attempts {
+            return Err((RenameStop::Blocked(err.raw_os_error()), tried));
+        }
+        std::thread::sleep(pause);
+        if let Err(reason) = recheck() {
+            return Err((RenameStop::Abandoned(reason), tried));
+        }
+    }
+}
+
+const STATE_MIGRATE_ATTEMPTS: u32 = 10;
+const STATE_MIGRATE_PAUSE: std::time::Duration = std::time::Duration::from_millis(200);
+const STATE_MIGRATED_FROM_REL: &str = ".migrated-from";
+
+fn migrate_state_dir(root: &Path) -> StateMigrateOutcome {
+    migrate_state_dir_with(
+        root,
+        unix_now_ms(),
+        &mut |from, to| std::fs::rename(from, to),
+        STATE_MIGRATE_ATTEMPTS,
+        STATE_MIGRATE_PAUSE,
+    )
+}
+
+// Why the mover must not run now, or the plan it would act on. Checked
+// before the first rename and again before every retry: a running instance
+// or agent can create a claim, a foreign entry or tracked content while a
+// blocked rename waits (Codex review, 2026-11-04).
+fn state_migrate_eligibility(root: &Path, now_ms: i64) -> Result<StateDirPlan, &'static str> {
+    if root.join(BRAM_STATE_DIR_NEW).exists() {
+        return Err("already-moved");
+    }
+    if !root.join(BRAM_STATE_DIR_LEGACY).is_dir() {
+        return Err("no-old-folder");
+    }
+    let plan = state_dir_plan_core(root, now_ms);
+    match plan.tracked.as_ref() {
+        None => return Err("tracked-unknown"),
+        Some(t) if !t.is_empty() => return Err("tracked"),
+        Some(_) => {}
+    }
+    if !plan.foreign.is_empty() {
+        return Err("mixed");
+    }
+    if plan.live_claim {
+        return Err("live-claim");
+    }
+    Ok(plan)
+}
+
+fn migrate_state_dir_with(
+    root: &Path,
+    now_ms: i64,
+    rename: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
+    attempts: u32,
+    pause: std::time::Duration,
+) -> StateMigrateOutcome {
+    let old = root.join(BRAM_STATE_DIR_LEGACY);
+    let new = root.join(BRAM_STATE_DIR_NEW);
+    let plan = match state_migrate_eligibility(root, now_ms) {
+        Ok(plan) => plan,
+        // Foreign or tracked entries: the user's answer decides.
+        Err(reason @ ("tracked" | "mixed")) => {
+            let choice =
+                state_move_decision(root).and_then(|d| d["choice"].as_str().map(String::from));
+            return match choice.as_deref() {
+                Some("move") => migrate_state_dir_selective(root, now_ms, rename, attempts, pause),
+                Some(_) => StateMigrateOutcome::Skipped("declined"),
+                None => StateMigrateOutcome::Skipped(reason),
+            };
+        }
+        Err(reason) => return StateMigrateOutcome::Skipped(reason),
+    };
+    let started = std::time::Instant::now();
+    // Written before the rename and carried by it, so the new folder is never
+    // stageable. A `.gitignore` here is a state-root dotfile (Bram-owned) and
+    // untracked, or eligibility would have refused. A prior one is discarded
+    // on success: `*` is the only rule `.bram/` needs. One that exists but
+    // can't be read stops the run, so a rollback never deletes what it
+    // couldn't restore.
+    let ignore = old.join(".gitignore");
+    let prior_ignore = match std::fs::read(&ignore) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return StateMigrateOutcome::Skipped("ignore-unreadable"),
+    };
+    // Without the `*` rule the moved folder would be stageable: don't move.
+    if std::fs::write(&ignore, "*\n").is_err() {
+        return StateMigrateOutcome::Skipped("ignore-write-failed");
+    }
+    // Leave the old folder as it was found; report whether that worked.
+    let restore = |prior: &Option<Vec<u8>>| match prior {
+        Some(bytes) => std::fs::write(&ignore, bytes).is_ok(),
+        None => std::fs::remove_file(&ignore).is_ok(),
+    };
+    let recheck = || state_migrate_eligibility(root, now_ms).map(|_| ());
+    match state_migrate_rename(rename, &old, &new, attempts, pause, &recheck) {
+        Ok(()) => {}
+        Err((RenameStop::Blocked(os_error), tried)) => {
+            return StateMigrateOutcome::Blocked {
+                os_error,
+                attempts: tried,
+                restored: restore(&prior_ignore),
+            }
+        }
+        Err((RenameStop::Abandoned(reason), tried)) => {
+            return StateMigrateOutcome::Abandoned {
+                reason,
+                attempts: tried,
+                restored: restore(&prior_ignore),
+            }
+        }
+    }
+    // The marker is what stops a second run, so a failed write is traced.
+    let marker_written = std::fs::write(
+        new.join(STATE_MIGRATED_FROM_REL),
+        format!("{} {}\n", old.display(), format_iso_utc(now_ms)),
+    )
+    .is_ok();
+    // An answer given while the folder was mixed is moot once it moved whole.
+    let _ = std::fs::remove_file(new.join(STATE_MOVE_REL));
+    StateMigrateOutcome::Moved {
+        entries: plan.would_move.len(),
+        ms: started.elapsed().as_millis(),
+        marker_written,
+    }
+}
+
+// The selective move's preconditions on the old folder (the resolver reads it
+// until the staged folder is renamed into place): no unknown or Bram-owned
+// tracked content, no live claim. Checked first and before every retry.
+fn state_migrate_selective_check(root: &Path, now_ms: i64) -> Result<StateDirPlan, &'static str> {
+    let plan = state_dir_plan_core(root, now_ms);
+    match &plan.tracked {
+        None => Err("tracked-unknown"),
+        Some(t)
+            if t.iter()
+                .any(|p| state_dir_tracked_is_owned(p, plan.state_name)) =>
+        {
+            Err("tracked-owned")
+        }
+        _ if plan.live_claim => Err("live-claim"),
+        _ => Ok(plan),
+    }
+}
+
+// issue-469-mixed-folder-dialog: the user chose "Move Bram's files" for a
+// folder holding foreign or tracked entries. Inventory entries are moved one
+// by one into a staging folder whose `*` ignore file is written first, then
+// the staging folder is renamed to `.bram/` in one step, then the marker.
+// Staging rather than building `.bram/` in place: the resolver switches to
+// `.bram/` the moment it exists, so a failure partway would leave the board
+// reading a half-filled folder while the rest sat unread in `resources/`
+// (the split the plain mover refuses). Here a failure moves the entries back
+// and removes the staging folder, so the old folder is as found and the next
+// startup tries again (the answer is kept). Foreign, tracked, `.gitignore`
+// and the answer itself stay in `resources/`.
+fn migrate_state_dir_selective(
+    root: &Path,
+    now_ms: i64,
+    rename: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
+    attempts: u32,
+    pause: std::time::Duration,
+) -> StateMigrateOutcome {
+    let old = root.join(BRAM_STATE_DIR_LEGACY);
+    let new = root.join(BRAM_STATE_DIR_NEW);
+    let staging = root.join(STATE_MOVE_STAGING);
+    let plan = match state_migrate_selective_check(root, now_ms) {
+        Ok(plan) => plan,
+        Err(reason) => return StateMigrateOutcome::Skipped(reason),
+    };
+    // A staging folder left by a crash holds state: leave it for a person.
+    if staging.exists() {
+        return StateMigrateOutcome::Skipped("staging-exists");
+    }
+    if std::fs::create_dir(&staging)
+        .and_then(|()| std::fs::write(staging.join(".gitignore"), "*\n"))
+        .is_err()
+    {
+        let _ = std::fs::remove_dir(&staging);
+        return StateMigrateOutcome::Skipped("ignore-write-failed");
+    }
+    let recheck = || state_migrate_selective_check(root, now_ms).map(|_| ());
+    let mut moved: Vec<&str> = Vec::new();
+    let mut stop = None;
+    for (name, _, _) in plan
+        .would_move
+        .iter()
+        .filter(|(n, _, _)| !state_move_keeps(n))
+    {
+        match state_migrate_rename(
+            rename,
+            &old.join(name),
+            &staging.join(name),
+            attempts,
+            pause,
+            &recheck,
+        ) {
+            Ok(()) => moved.push(name),
+            Err((s, _)) => {
+                stop = Some((s, name.as_str()));
+                break;
+            }
+        }
+    }
+    if stop.is_none() {
+        if let Err((s, _)) =
+            state_migrate_rename(rename, &staging, &new, attempts, pause, &|| Ok(()))
+        {
+            stop = Some((s, STATE_MOVE_STAGING));
+        }
+    }
+    if let Some((s, entry)) = stop {
+        let mut rolled_back = true;
+        for name in moved.iter().rev() {
+            rolled_back &= std::fs::rename(staging.join(name), old.join(name)).is_ok();
+        }
+        rolled_back &= std::fs::remove_file(staging.join(".gitignore")).is_ok()
+            && std::fs::remove_dir(&staging).is_ok();
+        let (reason, os_error) = match s {
+            RenameStop::Blocked(os) => ("blocked", os),
+            RenameStop::Abandoned(r) => (r, None),
+        };
+        return StateMigrateOutcome::SelectiveFailed {
+            reason,
+            os_error,
+            entry: entry.to_string(),
+            moved: moved.len(),
+            rolled_back,
+        };
+    }
+    let marker_written = std::fs::write(
+        new.join(STATE_MIGRATED_FROM_REL),
+        format!("{} {} selective\n", old.display(), format_iso_utc(now_ms)),
+    )
+    .is_ok();
+    let _ = std::fs::remove_file(old.join(STATE_MOVE_REL));
+    StateMigrateOutcome::MovedSelective {
+        entries: moved.len(),
+        left: std::fs::read_dir(&old).map_or(0, |r| r.count()),
+        marker_written,
+    }
+}
+
+// A session resumed after a move may hold `resources/` paths from its earlier
+// turns, so a startup that moved queues this note for its next plain turn.
+const STATE_MOVED_NOTE_KIND: &str = "state-folder-moved";
+const STATE_MOVED_NOTE: &str = "Bram's state folder moved from `resources/` to `.bram/` (0.8.4). \
+Paths under `resources/` in earlier turns of this session now live under `.bram/`.";
+
+fn state_migrate_moved(outcome: &StateMigrateOutcome) -> bool {
+    matches!(
+        outcome,
+        StateMigrateOutcome::Moved { .. } | StateMigrateOutcome::MovedSelective { .. }
+    )
+}
+
+fn ok_failed(ok: bool) -> &'static str {
+    if ok {
+        "ok"
+    } else {
+        "failed"
+    }
+}
+
+// The mover runs before the trace log opens (an open log handle under the
+// folder would block the rename), so its lines are returned for the caller
+// to write once prepare_bram_trace_log has run.
+fn state_migrate_trace_lines(outcome: &StateMigrateOutcome) -> Vec<String> {
+    match outcome {
+        StateMigrateOutcome::Skipped(reason) => vec![format!("op=skipped reason={}", reason)],
+        StateMigrateOutcome::Moved {
+            entries,
+            ms,
+            marker_written,
+        } => vec![
+            "op=start".to_string(),
+            format!(
+                "op=moved entries={} ms={} marker={}",
+                entries,
+                ms,
+                ok_failed(*marker_written)
+            ),
+        ],
+        StateMigrateOutcome::Blocked {
+            os_error,
+            attempts,
+            restored,
+        } => vec![
+            "op=start".to_string(),
+            format!(
+                "op=blocked os_error={} attempts={} restored={}",
+                os_error.map_or("none".to_string(), |n| n.to_string()),
+                attempts,
+                ok_failed(*restored)
+            ),
+        ],
+        StateMigrateOutcome::Abandoned {
+            reason,
+            attempts,
+            restored,
+        } => vec![
+            "op=start".to_string(),
+            format!(
+                "op=abandoned reason={} attempts={} restored={}",
+                reason,
+                attempts,
+                ok_failed(*restored)
+            ),
+        ],
+        StateMigrateOutcome::MovedSelective {
+            entries,
+            left,
+            marker_written,
+        } => vec![
+            "op=start".to_string(),
+            format!(
+                "op=moved-selective entries={} left={} marker={}",
+                entries,
+                left,
+                ok_failed(*marker_written)
+            ),
+        ],
+        StateMigrateOutcome::SelectiveFailed {
+            reason,
+            os_error,
+            entry,
+            moved,
+            rolled_back,
+        } => vec![
+            "op=start".to_string(),
+            format!(
+                "op=selective-failed reason={} os_error={} entry={} moved={} rolled_back={}",
+                reason,
+                os_error.map_or("none".to_string(), |n| n.to_string()),
+                entry,
+                moved,
+                ok_failed(*rolled_back)
+            ),
+        ],
+    }
+}
+
+// Tests that need a repo-relative state path as fixture data: a root with no
+// `.bram/`, so the answer is today's legacy folder.
+#[cfg(test)]
+fn test_state_root() -> &'static Path {
+    Path::new("/nonexistent-bram-469-root")
+}
+
+#[cfg(test)]
+fn test_state_rel(rel: &str) -> String {
+    bram_state_rel(test_state_root(), rel)
 }
 
 fn project_resource_path<R: tauri::Runtime, P: AsRef<Path>>(
@@ -56607,7 +65229,7 @@ fn worklist_history_dir<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<PathBuf
 }
 
 fn inflight_claim_file<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
-    project_relative_path(app, INFLIGHT_CLAIM_REL)
+    project_resource_path(app, INFLIGHT_CLAIM_REL)
 }
 
 #[derive(Clone, Default)]
@@ -56653,17 +65275,18 @@ fn current_turn_completion_monitor() -> TurnCompletionMonitor {
 }
 
 fn worklist_intent_file<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
-    project_relative_path(app, WORKLIST_INTENT_REL)
+    project_resource_path(app, WORKLIST_INTENT_REL)
 }
 
 fn worklist_result_file<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
-    project_relative_path(app, WORKLIST_RESULT_REL)
+    project_resource_path(app, WORKLIST_RESULT_REL)
 }
 
 // Write the inflight sentinel (#84). Atomic via .tmp + rename so the
 // file is either absent or contains valid JSON. Caller has verified
 // `ids` is non-empty. `kind` is one of "approved", "drop", "iterate".
-const CLAIM_INTERVALS_REL: &str = "resources/.claim-intervals.json";
+// Relative to Bram's state folder.
+const CLAIM_INTERVALS_REL: &str = ".claim-intervals.json";
 
 // issue-327 claim-interval snapshots. Attribution needs BOUNDARIES, not writes.
 // Bram is single-claimant by construction (#269 -- a second claim write
@@ -56801,17 +65424,11 @@ fn record_claim_interval<R: tauri::Runtime>(
     };
     // Same refusal-to-create discipline the hook breadcrumbs apply: never
     // bring `resources/` into existence in a project Setup has not touched.
-    if !root.join("resources").is_dir() {
+    if !bram_state_dir(&root).is_dir() {
         return;
     }
-    let prior: Vec<String> = inflight_claim_ids_and_claimed_at(app)
-        .map(|(p, _)| p)
-        .unwrap_or_default();
-    let mut a: Vec<&str> = prior.iter().map(|s| s.as_str()).collect();
-    let mut b: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
-    a.sort_unstable();
-    b.sort_unstable();
-    if a == b {
+    let prior: Vec<String> = read_inflight_claim(app).map(|c| c.ids).unwrap_or_default();
+    if sorted_id_set(&prior) == sorted_id_set(ids) {
         append_bram_trace_line(app, "claim-interval", "op=skip-unchanged-ids");
         return;
     }
@@ -56845,7 +65462,7 @@ fn record_claim_interval<R: tauri::Runtime>(
         append_bram_trace_line(app, "claim-interval", "op=ref-failed");
         return;
     }
-    let sidecar = root.join(CLAIM_INTERVALS_REL);
+    let sidecar = resource_relative_path(&root, CLAIM_INTERVALS_REL);
     let mut doc = std::fs::read_to_string(&sidecar)
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
@@ -57174,7 +65791,8 @@ fn claim_interval_diff<R: tauri::Runtime>(
     let Some(root) = project_root(Some(app)) else {
         return empty;
     };
-    let Ok(text) = std::fs::read_to_string(root.join(CLAIM_INTERVALS_REL)) else {
+    let Ok(text) = std::fs::read_to_string(resource_relative_path(&root, CLAIM_INTERVALS_REL))
+    else {
         return empty;
     };
     let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) else {
@@ -57307,6 +65925,16 @@ fn interval_build_patch<R: tauri::Runtime>(
     let mut committed: Vec<String> = Vec::new();
     for id in ids {
         for path in item_files.get(id).cloned().unwrap_or_default() {
+            // gate-names-the-outside-commit-that-strands-an-item: a verified
+            // re-anchor replaces the window patch for this path (see
+            // reanchor_override_patch; a stale record falls through).
+            if let Some(p) = reanchor_override_patch(app, id, &path) {
+                patch.push_str(&p);
+                if !committed.contains(&path) {
+                    committed.push(path);
+                }
+                continue;
+            }
             let d = claim_interval_diff(app, id, &path);
             let Some(p) = d.get("patch").and_then(|v| v.as_str()) else {
                 continue;
@@ -57437,6 +66065,419 @@ mod issue_430_tests {
         assert!(patch_creates_file(create));
         let modify = "diff --git a/s.sh b/s.sh\n--- a/s.sh\n+++ b/s.sh\n@@ -1 +1 @@\n-x\n+y\n";
         assert!(!patch_creates_file(modify));
+    }
+}
+
+// gate-names-the-outside-commit-that-strands-an-item: when an entangled
+// item's interval patch no longer applies to HEAD, the cause is not always
+// another begun item's uncommitted work (issue-430's dependency case). On
+// 2026-11-02 two direct commits (skip-worklist turns, their own lines staged)
+// changed files two applied items had already changed; each item's patch then
+// failed against HEAD, the host blamed the other item (`commitDependsOn`), and
+// the pane drew a loop with every Commit dim ("I can't find any way to light
+// up a commit button"). These helpers name the commits that stranded the
+// item: commits since it began, touching the failing paths, that the
+// Worklist's gate did not make.
+#[derive(Clone, Debug, PartialEq)]
+struct StrandingCommit {
+    sha: String,
+    subject: String,
+    paths: Vec<String>,
+}
+
+// Pure attribution over `git log --format=%x00%H%x09%s --name-only` output:
+// one NUL-led record per commit, its touched paths under the header. A commit
+// counts when it touched one of `paths` (a declared directory covers its
+// files) and `is_gate` says the Worklist did not make it. Newest first, as
+// git lists them.
+fn stranding_commits_from_log(
+    log: &str,
+    paths: &[String],
+    is_gate: &dyn Fn(&str) -> bool,
+) -> Vec<StrandingCommit> {
+    let mut out = Vec::new();
+    for record in log.split('\0').filter(|r| !r.trim().is_empty()) {
+        let mut lines = record.lines();
+        let Some(head) = lines.next() else { continue };
+        let Some((sha, subject)) = head.split_once('\t') else {
+            continue;
+        };
+        let sha = sha.trim();
+        if sha.is_empty() || is_gate(sha) {
+            continue;
+        }
+        let touched: Vec<String> = lines
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty() && paths.iter().any(|p| declared_covers(p, l)))
+            .collect();
+        if touched.is_empty() {
+            continue;
+        }
+        out.push(StrandingCommit {
+            sha: sha.to_string(),
+            subject: subject.trim().to_string(),
+            paths: touched,
+        });
+    }
+    out
+}
+
+fn outside_commits_touching<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    since_ms: i64,
+    paths: &[String],
+) -> Vec<StrandingCommit> {
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    let since = format!("--since=@{}", since_ms / 1000);
+    let mut args = vec![
+        "log",
+        "--format=%x00%H%x09%s",
+        "--name-only",
+        since.as_str(),
+        "--",
+    ];
+    args.extend(paths.iter().map(|p| p.as_str()));
+    let Ok(out) = git_run(app, &args) else {
+        return Vec::new();
+    };
+    stranding_commits_from_log(&out, paths, &|sha| is_gate_sha(app, sha))
+}
+
+fn stranding_json(list: &[StrandingCommit]) -> serde_json::Value {
+    serde_json::Value::Array(
+        list.iter()
+            .map(|c| {
+                serde_json::json!({
+                    "sha": c.sha,
+                    "short": c.sha.chars().take(7).collect::<String>(),
+                    "subject": c.subject,
+                    "paths": c.paths,
+                })
+            })
+            .collect(),
+    )
+}
+
+// Per item, keyed on HEAD, the item's start and the failing paths: the board
+// is served many times a minute and this answer moves only when a commit
+// lands or the failing set changes.
+fn stranded_by_cached<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    id: &str,
+    begun_ms: i64,
+    paths: &[String],
+    head: &str,
+) -> Vec<StrandingCommit> {
+    static CACHE: std::sync::OnceLock<
+        Mutex<std::collections::HashMap<String, (String, Vec<StrandingCommit>)>>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(Default::default()));
+    let key = format!("{}|{}|{}", head, begun_ms, paths.join(","));
+    if let Ok(g) = cache.lock() {
+        if let Some((k, r)) = g.get(id) {
+            if *k == key {
+                return r.clone();
+            }
+        }
+    }
+    let r = outside_commits_touching(app, begun_ms, paths);
+    if bram_trace_enabled() {
+        append_bram_trace_line(
+            app,
+            "worklist-commit",
+            &format!(
+                "op=stranded-by item={} commits={} paths={}",
+                id,
+                r.iter()
+                    .map(|c| c.sha.chars().take(7).collect::<String>())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                paths.join(",")
+            ),
+        );
+    }
+    if let Ok(mut g) = cache.lock() {
+        g.insert(id.to_string(), (key, r.clone()));
+    }
+    r
+}
+
+// Re-anchor (`POST /__worklist/reanchor`): a stranded item's way back to a
+// commit of its own, without rewriting history. A record under `reanchors` in
+// the claim-intervals sidecar says: for this item and path, at this HEAD and
+// this file content, `git diff HEAD -- path` IS the item's patch. The handler
+// writes one only when membership credits the path's every uncommitted line
+// to the item alone (`reanchor_refusal_reason`), which is exactly when that
+// diff carries nobody else's work. `interval_build_patch` uses the record in
+// place of the window patch while HEAD and the file's bytes still match; a
+// later commit or edit makes it stale and the window patch is used again
+// (the status quo, never a wrong take). Prune drops records of pruned items.
+const REANCHORS_KEY: &str = "reanchors";
+static REANCHOR_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn claim_intervals_doc<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+) -> Option<(std::path::PathBuf, serde_json::Value)> {
+    let root = project_root(Some(app))?;
+    let sidecar = resource_relative_path(&root, CLAIM_INTERVALS_REL);
+    let text = std::fs::read_to_string(&sidecar).ok()?;
+    let doc = serde_json::from_str::<serde_json::Value>(&text).ok()?;
+    Some((sidecar, doc))
+}
+
+fn write_claim_intervals_doc(sidecar: &Path, doc: &serde_json::Value) -> bool {
+    let Ok(body) = serde_json::to_string_pretty(doc) else {
+        return false;
+    };
+    let tmp = sidecar.with_extension("json.tmp");
+    std::fs::write(&tmp, format!("{}\n", body)).is_ok() && std::fs::rename(&tmp, sidecar).is_ok()
+}
+
+fn prune_reanchor_records(
+    doc: &mut serde_json::Value,
+    live: &std::collections::HashSet<String>,
+) -> usize {
+    let Some(arr) = doc.get_mut(REANCHORS_KEY).and_then(|v| v.as_array_mut()) else {
+        return 0;
+    };
+    let before = arr.len();
+    arr.retain(|r| {
+        r.get("id")
+            .and_then(|v| v.as_str())
+            .map(|id| live.contains(id))
+            .unwrap_or(false)
+    });
+    before - arr.len()
+}
+
+// Pure, and only a courtesy: when membership credits another begun item with
+// lines on the path, name it, since the way out is then a joint commit, not a
+// re-anchor. The soundness decision itself is `reanchor_verified_blob`, not
+// membership. Membership's removed-line attribution is computed against
+// HEAD, and the outside commit that strands an item moves HEAD, so in
+// exactly the stranded case it reports the item's own deletions as unowned
+// (the first live probe: `unowned-lines:+0-3` on a file only the item had
+// touched).
+fn reanchor_refusal_reason(b: &MembershipPathBuckets, id: &str) -> Option<String> {
+    let others: Vec<&str> = b
+        .owners
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|o| *o != id)
+        .collect();
+    if !others.is_empty() {
+        return Some(format!("other-owners:{}", others.join("+")));
+    }
+    None
+}
+
+// The proof that `git diff HEAD -- path` is exactly this item's work: the
+// item's own window patch for the path, applied to HEAD's copy of the file,
+// must reproduce the worktree file byte for byte. Then the worktree differs
+// from HEAD on that path by the item's windows and nothing else: no other
+// item's lines, no unowned lines, no drift. The apply is tried with normal
+// context, then one line, then none: the stranding commit changed the lines
+// around the item's hunks, so the context is what fails, and line numbers
+// still place the hunks; a misplacement cannot pass the equality. Returns
+// the blob the item's work produced on HEAD (equal to the worktree's) or
+// None with a reason.
+fn reanchor_verified_blob<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    path: &str,
+    own_patch: &str,
+    worktree_blob: &str,
+) -> Result<String, String> {
+    let root = project_root(Some(app)).ok_or_else(|| "no project root".to_string())?;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let idx = std::env::temp_dir().join(format!(
+        "bram-reanchor-index-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let pfile = idx.with_extension("patch");
+    if std::fs::write(&pfile, own_patch).is_err() {
+        return Err("patch-write-failed".to_string());
+    }
+    let git_idx = |args: &[&str]| -> Result<String, String> {
+        let out = std::process::Command::new("git")
+            .current_dir(&root)
+            .env("GIT_INDEX_FILE", &idx)
+            .args(args)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let pfile_s = pfile.to_string_lossy().to_string();
+    let mut last = String::from("apply-failed");
+    let mut found: Option<String> = None;
+    for ctx in [None, Some("-C1"), Some("-C0")] {
+        let _ = std::fs::remove_file(&idx);
+        if git_idx(&["read-tree", "HEAD"]).is_err() {
+            last = "scratch-index-failed".to_string();
+            break;
+        }
+        let mut args: Vec<&str> = vec!["apply", "--cached"];
+        if let Some(c) = ctx {
+            args.push(c);
+        }
+        args.push(&pfile_s);
+        if git_idx(&args).is_err() {
+            continue;
+        }
+        // "100644 <blob> 0	<path>"
+        let staged = git_idx(&["ls-files", "--stage", "--", path]).unwrap_or_default();
+        let blob = staged.split_whitespace().nth(1).unwrap_or("").to_string();
+        if blob == worktree_blob {
+            found = Some(blob);
+            break;
+        }
+        last = "not-only-this-items-work".to_string();
+    }
+    let _ = std::fs::remove_file(&idx);
+    let _ = std::fs::remove_file(&pfile);
+    found.ok_or(last)
+}
+
+fn reanchor_override_patch<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    id: &str,
+    path: &str,
+) -> Option<String> {
+    let (_, doc) = claim_intervals_doc(app)?;
+    let rec = doc
+        .get(REANCHORS_KEY)
+        .and_then(|v| v.as_array())?
+        .iter()
+        .find(|r| {
+            r.get("id").and_then(|v| v.as_str()) == Some(id)
+                && r.get("path").and_then(|v| v.as_str()) == Some(path)
+        })?
+        .clone();
+    let head_rec = rec.get("head").and_then(|v| v.as_str())?.to_string();
+    let blob_rec = rec.get("blob").and_then(|v| v.as_str())?.to_string();
+    let head = git_run(app, &["rev-parse", "HEAD"])
+        .ok()?
+        .trim()
+        .to_string();
+    if head != head_rec {
+        append_bram_trace_line(
+            app,
+            "worklist-commit",
+            &format!("op=reanchor-stale id={} path={} reason=head", id, path),
+        );
+        return None;
+    }
+    let blob = git_run(app, &["hash-object", "--", path])
+        .ok()?
+        .trim()
+        .to_string();
+    if blob != blob_rec {
+        append_bram_trace_line(
+            app,
+            "worklist-commit",
+            &format!("op=reanchor-stale id={} path={} reason=blob", id, path),
+        );
+        return None;
+    }
+    let mut patch = git_run(app, &["diff", "--no-color", "HEAD", "--", path]).ok()?;
+    if patch.trim().is_empty() {
+        return None;
+    }
+    if !patch.ends_with('\n') {
+        patch.push('\n');
+    }
+    append_bram_trace_line(
+        app,
+        "worklist-commit",
+        &format!("op=reanchor-used id={} path={}", id, path),
+    );
+    Some(patch)
+}
+
+#[cfg(test)]
+mod stranding_tests {
+    use super::{
+        prune_reanchor_records, reanchor_refusal_reason, stranding_commits_from_log,
+        MembershipPathBuckets, StrandingCommit,
+    };
+
+    const LOG: &str = "\0aaaa111\tDirect commit to arch\n\norientation/arch.js\nREADME.md\n\
+                       \0bbbb222\tGate commit of a sibling\n\norientation/arch.js\n\
+                       \0cccc333\tUnrelated\n\ndocs/x.md\n";
+
+    #[test]
+    fn names_outside_commits_and_skips_gate_commits() {
+        let paths = vec!["orientation/arch.js".to_string()];
+        let got = stranding_commits_from_log(LOG, &paths, &|sha| sha == "bbbb222");
+        assert_eq!(
+            got,
+            vec![StrandingCommit {
+                sha: "aaaa111".to_string(),
+                subject: "Direct commit to arch".to_string(),
+                paths: vec!["orientation/arch.js".to_string()],
+            }]
+        );
+    }
+
+    #[test]
+    fn a_declared_directory_covers_its_files() {
+        let paths = vec!["orientation".to_string()];
+        let got = stranding_commits_from_log(LOG, &paths, &|_| false);
+        let shas: Vec<&str> = got.iter().map(|c| c.sha.as_str()).collect();
+        assert_eq!(shas, vec!["aaaa111", "bbbb222"]);
+        assert_eq!(got[0].paths, vec!["orientation/arch.js".to_string()]);
+    }
+
+    #[test]
+    fn no_touching_commit_means_a_genuine_dependency() {
+        let paths = vec!["src/other.rs".to_string()];
+        assert!(stranding_commits_from_log(LOG, &paths, &|_| false).is_empty());
+    }
+
+    fn bucket(owners: &[&str]) -> MembershipPathBuckets {
+        let mut b = MembershipPathBuckets::default();
+        for o in owners {
+            b.owners.insert(o.to_string());
+        }
+        b
+    }
+
+    #[test]
+    fn reanchor_names_other_owners_and_nothing_else() {
+        assert_eq!(reanchor_refusal_reason(&bucket(&["a"]), "a"), None);
+        // Membership's own-line counts are not consulted: in the stranded
+        // case they misreport the item's deletions as unowned.
+        let mut partial = bucket(&["a"]);
+        partial.per_item.insert(vec!["a".to_string()], (3, 0));
+        partial.universe = (3, 3);
+        assert_eq!(reanchor_refusal_reason(&partial, "a"), None);
+        assert_eq!(
+            reanchor_refusal_reason(&bucket(&["a", "b"]), "a").as_deref(),
+            Some("other-owners:b")
+        );
+        assert_eq!(reanchor_refusal_reason(&bucket(&[]), "a"), None);
+    }
+
+    #[test]
+    fn prune_drops_records_of_items_no_longer_on_the_board() {
+        let mut doc = serde_json::json!({
+            "intervals": [],
+            "reanchors": [
+                {"id": "live", "path": "a.txt"},
+                {"id": "gone", "path": "b.txt"},
+                {"path": "no-id.txt"}
+            ]
+        });
+        let live: std::collections::HashSet<String> = ["live".to_string()].into_iter().collect();
+        assert_eq!(prune_reanchor_records(&mut doc, &live), 2);
+        assert_eq!(doc["reanchors"].as_array().map(|a| a.len()), Some(1));
+        let mut none = serde_json::json!({"intervals": []});
+        assert_eq!(prune_reanchor_records(&mut none, &live), 0);
     }
 }
 
@@ -57669,14 +66710,15 @@ fn interval_stage_commit<R: tauri::Runtime>(
     // commit-tree ignores the index (it takes a tree + parent), so no
     // GIT_INDEX_FILE — it must use the real repo, and it never touches the
     // worktree or the real index.
-    let sha = match git_run(app, &["commit-tree", &tree, "-p", &head, "-m", message]) {
-        Ok(s) => s.trim().to_string(),
-        Err(e) => {
-            cleanup();
-            return Err(format!("commit-tree failed: {}", e));
-        }
-    };
-    if let Err(e) = git_run(app, &["update-ref", "HEAD", &sha]) {
+    let sha =
+        match worklist_git_lock_retry(app, &["commit-tree", &tree, "-p", &head, "-m", message]) {
+            Ok(s) => s.trim().to_string(),
+            Err(e) => {
+                cleanup();
+                return Err(format!("commit-tree failed: {}", e));
+            }
+        };
+    if let Err(e) = worklist_git_lock_retry(app, &["update-ref", "HEAD", &sha]) {
         cleanup();
         return Err(format!("update-ref failed: {}", e));
     }
@@ -57694,7 +66736,7 @@ fn interval_stage_commit<R: tauri::Runtime>(
     {
         let mut args: Vec<&str> = vec!["reset", "-q", "--"];
         args.extend(committed.iter().map(|s| s.as_str()));
-        if let Err(e) = git_run(app, &args) {
+        if let Err(e) = worklist_git_lock_retry(app, &args) {
             append_bram_trace_line(
                 app,
                 "worklist-commit",
@@ -59027,7 +68069,8 @@ fn membership_partition_engine_keyed<R: tauri::Runtime>(
             .collect();
         roster.sort();
         let intervals_raw =
-            std::fs::read_to_string(root.join(CLAIM_INTERVALS_REL)).unwrap_or_default();
+            std::fs::read_to_string(resource_relative_path(&root, CLAIM_INTERVALS_REL))
+                .unwrap_or_default();
         let mut hasher = DefaultHasher::new();
         head.hash(&mut hasher);
         diff.hash(&mut hasher);
@@ -59200,7 +68243,8 @@ fn membership_partition_engine_keyed<R: tauri::Runtime>(
         trace_fail(app, spawns.get(), started, "now-tree-empty", None);
         return None;
     }
-    let intervals_raw = std::fs::read_to_string(root.join(CLAIM_INTERVALS_REL)).unwrap_or_default();
+    let intervals_raw = std::fs::read_to_string(resource_relative_path(&root, CLAIM_INTERVALS_REL))
+        .unwrap_or_default();
     let (steps, holders) = membership_step_chain(&intervals_raw, &now_tree);
     let universe_paths: Vec<String> = universe.keys().cloned().collect();
     let credits = if steps.is_empty() {
@@ -61374,7 +70418,8 @@ fn claim_interval_independence<R: tauri::Runtime>(
     let Some(root) = project_root(Some(app)) else {
         return empty;
     };
-    let Ok(text) = std::fs::read_to_string(root.join(CLAIM_INTERVALS_REL)) else {
+    let Ok(text) = std::fs::read_to_string(resource_relative_path(&root, CLAIM_INTERVALS_REL))
+    else {
         return empty;
     };
     let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) else {
@@ -61549,7 +70594,7 @@ fn prune_claim_intervals<R: tauri::Runtime>(app: &AppHandle<R>) {
     let Some(root) = project_root(Some(app)) else {
         return;
     };
-    let sidecar = root.join(CLAIM_INTERVALS_REL);
+    let sidecar = resource_relative_path(&root, CLAIM_INTERVALS_REL);
     // Three outcomes, deliberately traced differently. NO sidecar is the honest
     // "nothing recorded yet" state: it fires on every prune in a project that
     // has never captured a boundary, so a line there would be noise forever in
@@ -61587,7 +70632,15 @@ fn prune_claim_intervals<R: tauri::Runtime>(app: &AppHandle<R>) {
         })
         .unwrap_or_default();
     let (keep, retire) = claim_intervals_partition(&intervals, &live);
+    let reanchors_dropped = prune_reanchor_records(&mut doc, &live);
     if retire.is_empty() {
+        if reanchors_dropped > 0 && write_claim_intervals_doc(&sidecar, &doc) {
+            append_bram_trace_line(
+                app,
+                "claim-interval",
+                &format!("op=prune-reanchors removed={}", reanchors_dropped),
+            );
+        }
         // The ORDINARY steady state, not a fault: every boundary still bounds a
         // live interval. Emitted so that the presence of a prune line means "the
         // sweep ran" -- silence here was indistinguishable from the sweep never
@@ -61651,106 +70704,126 @@ fn write_inflight_claim_sentinel_inner<R: tauri::Runtime>(
     kind: &str,
     snapshot: bool,
 ) {
-    let Some(path) = inflight_claim_file(app) else {
+    let Some(files) = claim_files(app) else {
         return;
     };
+    let g = claim_lock();
+    write_claim_locked(&g, &files, app, ids, kind, snapshot);
+}
+
+// The claim and the bindings are written under one lock (claim_lock), so a
+// write can't land between a release and the reconciliation that follows it.
+// A new claim written while a subagent is still bound keeps the bound ids in
+// it, so the subagent's later writes stay credited to its items (joint with
+// the new claim's, which errs safe). Not on the no-snapshot path: the
+// drop-policy validator writes and immediately clears by its own ids.
+fn write_claim_locked(
+    _g: &ClaimGuard,
+    files: &ClaimFiles,
+    fx: &dyn ClaimEffects,
+    ids: &[String],
+    kind: &str,
+    snapshot: bool,
+) -> Vec<String> {
+    let bound = if snapshot {
+        read_delegated_bindings_at(&files.bindings).union_ids()
+    } else {
+        Vec::new()
+    };
+    let ids: Vec<String> = if bound.is_empty() {
+        ids.to_vec()
+    } else {
+        fx.trace(
+            "delegated",
+            &format!(
+                "op=union-on-write new={} bound={}",
+                ids_json_str(ids),
+                ids_json_str(&bound)
+            ),
+        );
+        sorted_id_set(ids.iter().chain(bound.iter()))
+    };
     if snapshot {
-        record_claim_interval(app, ids, kind, unix_now_ms());
+        fx.boundary(&ids, kind);
     }
     // subagent-worklist-collision-observability: capture the prior claim
     // (if any) BEFORE it is overwritten, so a write that displaces a still-
     // live claim can be traced. Only read when tracing is enabled — this
     // must not add I/O on the default path.
-    let prior_claim = if bram_trace_enabled() {
-        inflight_claim_ids_and_claimed_at(app).and_then(|(prior_ids, claimed_at)| {
-            if prior_ids.is_empty() {
-                None
-            } else {
-                let prior_kind = std::fs::read_to_string(&path)
-                    .ok()
-                    .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
-                    .and_then(|v| v.get("kind").and_then(|k| k.as_str().map(String::from)))
-                    .unwrap_or_default();
-                Some((prior_ids, prior_kind, claimed_at))
-            }
-        })
+    let prior = if fx.tracing() {
+        read_inflight_claim_at(&files.claim).filter(|c| !c.ids.is_empty())
     } else {
         None
     };
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = files.claim.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let written_at_ms = unix_now_ms();
-    let payload = serde_json::json!({
-        "ids": ids,
-        "claimedAt": written_at_ms,
-        "kind": kind,
-    });
-    let body = match serde_json::to_string_pretty(&payload) {
-        Ok(s) => s,
-        Err(_) => return,
+    let claim = InflightClaim {
+        ids,
+        claimed_at: unix_now_ms(),
+        kind: kind.to_string(),
     };
-    let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, format!("{}\n", body)).is_err() {
-        return;
+    if !write_inflight_claim_at(&files.claim, &claim) {
+        return claim.ids;
     }
-    let _ = std::fs::rename(&tmp, &path);
     // state-mirror-store-and-ledger: mirror the write we just made. Trace-
     // only on failure — never blocks or alters the file path above.
-    {
-        let ids = ids.to_vec();
-        let kind = kind.to_string();
-        worklist_state_apply(app, "claim-write", move |conn| {
-            worklist_state::mirror_claim_write(
-                conn,
-                written_at_ms,
-                &kind,
-                &ids,
-                "inflight-claim-sentinel",
-            )
-        });
-    }
-    if bram_trace_enabled() {
-        let extra = match &prior_claim {
-            Some((prior_ids, prior_kind, claimed_at)) => format!(
-                " prior_ids={} prior_kind={} prior_age_ms={}",
-                serde_json::to_string(prior_ids).unwrap_or_else(|_| "[]".to_string()),
-                prior_kind,
-                unix_now_ms() - claimed_at
-            ),
-            None => String::new(),
-        };
-        append_bram_trace_line(
-            app,
-            "inflight-sentinel",
-            &format!(
-                "op=write kind={} ids={}{}",
-                kind,
-                serde_json::to_string(ids).unwrap_or_else(|_| "[]".to_string()),
-                extra
-            ),
-        );
-    }
-    emit_replayable_signal(app, "inflight-claim-changed");
+    fx.mirror_write(claim.claimed_at, kind, &claim.ids);
+    let extra = match &prior {
+        Some(p) => format!(
+            " prior_ids={} prior_kind={} prior_age_ms={}",
+            ids_json_str(&p.ids),
+            p.kind,
+            unix_now_ms() - p.claimed_at
+        ),
+        None => String::new(),
+    };
+    fx.trace(
+        "inflight-sentinel",
+        &format!(
+            "op=write kind={} ids={}{}",
+            kind,
+            ids_json_str(&claim.ids),
+            extra
+        ),
+    );
+    fx.signal("inflight-claim-changed");
+    claim.ids
+}
+
+// The live claim, as written by write_claim_locked. The one reader: the older
+// tuple readers below are views of it.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+struct InflightClaim {
+    #[serde(default)]
+    ids: Vec<String>,
+    #[serde(rename = "claimedAt", default)]
+    claimed_at: i64,
+    #[serde(default)]
+    kind: String,
+}
+
+fn read_inflight_claim_at(path: &Path) -> Option<InflightClaim> {
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn read_inflight_claim<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<InflightClaim> {
+    read_inflight_claim_at(&inflight_claim_file(app)?)
+}
+
+fn write_inflight_claim_at(path: &Path, claim: &InflightClaim) -> bool {
+    let Ok(body) = serde_json::to_string_pretty(claim) else {
+        return false;
+    };
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, format!("{}\n", body)).is_ok() && std::fs::rename(&tmp, path).is_ok()
 }
 
 fn inflight_claim_ids_and_claimed_at<R: tauri::Runtime>(
     app: &AppHandle<R>,
 ) -> Option<(Vec<String>, i64)> {
-    let path = inflight_claim_file(app)?;
-    let content = std::fs::read_to_string(&path).ok()?;
-    let claim: serde_json::Value = serde_json::from_str(&content).ok()?;
-    let ids: Vec<String> = claim
-        .get("ids")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    let claimed_at = claim.get("claimedAt").and_then(|v| v.as_i64()).unwrap_or(0);
-    Some((ids, claimed_at))
+    read_inflight_claim(app).map(|c| (c.ids, c.claimed_at))
 }
 
 // rethink-activity-indicators: the current claim's kind, consulted by the
@@ -61762,10 +70835,9 @@ fn inflight_claim_ids_and_claimed_at<R: tauri::Runtime>(
 // iterate-end, explicit PTY interrupts, startup stale-claim cleanup)
 // clear regardless of kind.
 fn inflight_claim_kind<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<String> {
-    let path = inflight_claim_file(app)?;
-    let content = std::fs::read_to_string(&path).ok()?;
-    let claim: serde_json::Value = serde_json::from_str(&content).ok()?;
-    claim.get("kind").and_then(|v| v.as_str()).map(String::from)
+    read_inflight_claim(app)
+        .map(|c| c.kind)
+        .filter(|k| !k.is_empty())
 }
 
 // Clear the inflight sentinel (#84). Conditions: a sentinel exists,
@@ -61783,89 +70855,151 @@ fn inflight_claim_fully_covered(claimed_ids: &[String], mutated_ids: &[String]) 
             .all(|cid| mutated_ids.iter().any(|mid| mid == cid))
 }
 
-// Returns true iff a covering sentinel was found, removed, and the
-// inflight-claim-changed signal emitted; false on every early return (no file,
-// parse failure, empty/uncovered claim). A caller that reaches a completion
-// point without a prior sentinel (refs #133) uses the false return to emit its
-// own reconcile signal so the iframe still clears optimistic `submitting`.
+// The all-or-nothing clear. `via` names the caller on the trace. Ids a live
+// subagent binding holds are retained (delegated-work-action-gates): the
+// claim shrinks to them instead of clearing, whoever the caller is.
 fn clear_inflight_claim_sentinel<R: tauri::Runtime>(
     app: &AppHandle<R>,
     mutated_ids: &[String],
-) -> bool {
-    let Some(path) = inflight_claim_file(app) else {
-        return false;
+    via: &str,
+) {
+    let Some(files) = claim_files(app) else {
+        return;
     };
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return false;
-    };
-    let claim: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    let claimed_ids: Vec<String> = claim
-        .get("ids")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    if !inflight_claim_fully_covered(&claimed_ids, mutated_ids) {
-        if bram_trace_enabled() {
-            let remaining: Vec<String> = claimed_ids
-                .iter()
-                .filter(|cid| !mutated_ids.iter().any(|mid| mid == *cid))
-                .cloned()
-                .collect();
-            append_bram_trace_line(
-                app,
-                "inflight-sentinel",
-                &format!(
-                    "op=clear-partial claimed={} requested={} remaining={}",
-                    serde_json::to_string(&claimed_ids).unwrap_or_else(|_| "[]".to_string()),
-                    serde_json::to_string(mutated_ids).unwrap_or_else(|_| "[]".to_string()),
-                    serde_json::to_string(&remaining).unwrap_or_else(|_| "[]".to_string())
-                ),
-            );
-        }
-        return false;
+    let g = claim_lock();
+    retire_claim_locked(&g, &files, app, mutated_ids, Retire::Clear, via);
+}
+
+// Which ids stay in a claim when `requested` retire, and which of those stay
+// only because a live binding holds them. None: an all-or-nothing clear
+// that doesn't cover the claim.
+fn plan_claim_retire(
+    claimed: &[String],
+    requested: &[String],
+    bound: &[String],
+    mode: Retire,
+) -> Option<(Vec<String>, Vec<String>)> {
+    if mode == Retire::Clear && !inflight_claim_fully_covered(claimed, requested) {
+        return None;
     }
-    // issue-273: cut an UNOWNED boundary before the claim disappears. Without
-    // this, whatever interval this claim opened stays open forever, and any
-    // later direct edit made with no claim live lands inside it and is
-    // credited to this claim's owner. An empty-ids capture is the honest
-    // "nobody owns what follows from here" boundary — the same mechanism
-    // record_claim_interval already uses for owner-to-owner handoffs, just
-    // with an empty destination set. Called BEFORE the file is removed so
-    // the read inside record_claim_interval still sees the PRIOR (this)
-    // claim as the boundary's left edge.
-    record_claim_interval(app, &[], "cleared", unix_now_ms());
-    let _ = std::fs::remove_file(&path);
-    // state-mirror-store-and-ledger: mirror the clear. Trace-only on
-    // failure — never blocks or alters the file path above.
-    {
-        let ids = claimed_ids.clone();
-        let at_ms = unix_now_ms();
-        worklist_state_apply(app, "claim-clear", move |conn| {
-            worklist_state::mirror_claim_clear(conn, &ids, at_ms, "inflight-claim-sentinel")
-        });
-    }
-    if bram_trace_enabled() {
-        append_bram_trace_line(
-            app,
+    let keep = claimed
+        .iter()
+        .filter(|id| !requested.contains(id) || bound.contains(id))
+        .cloned()
+        .collect();
+    let retained = claimed
+        .iter()
+        .filter(|id| requested.contains(id) && bound.contains(id))
+        .cloned()
+        .collect();
+    Some((keep, retained))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Retire {
+    /// Clear only when the requested ids cover the claim (turn ends, cancels).
+    Clear,
+    /// Retire exactly the requested ids (lifecycle routes that know them).
+    Shrink,
+}
+
+// The one place a claim loses ids. Every clear and shrink comes through here,
+// so retention of bound ids can't be skipped by a caller.
+fn retire_claim_locked(
+    _g: &ClaimGuard,
+    files: &ClaimFiles,
+    fx: &dyn ClaimEffects,
+    requested: &[String],
+    mode: Retire,
+    via: &str,
+) -> ClaimShrink {
+    let Some(mut claim) = read_inflight_claim_at(&files.claim) else {
+        return ClaimShrink::NoClaim;
+    };
+    let bound = read_delegated_bindings_at(&files.bindings).union_ids();
+    let Some((keep, retained)) = plan_claim_retire(&claim.ids, requested, &bound, mode) else {
+        let remaining: Vec<String> = claim
+            .ids
+            .iter()
+            .filter(|cid| !requested.contains(cid))
+            .cloned()
+            .collect();
+        fx.trace(
             "inflight-sentinel",
             &format!(
-                "op=clear ids={}",
-                serde_json::to_string(&claimed_ids).unwrap_or_else(|_| "[]".to_string())
+                "op=clear-partial claimed={} requested={} remaining={}",
+                ids_json_str(&claim.ids),
+                ids_json_str(requested),
+                ids_json_str(&remaining)
             ),
         );
+        return ClaimShrink::Uncovered;
+    };
+    if !retained.is_empty() {
+        fx.trace(
+            "delegated",
+            &format!("op=retain ids={} via={}", ids_json_str(&retained), via),
+        );
     }
-    emit_replayable_signal(app, "inflight-claim-changed");
+    let mirror_source = match mode {
+        Retire::Clear => "inflight-claim-sentinel",
+        Retire::Shrink => "inflight-claim-sentinel-shrink",
+    };
+    if keep.is_empty() {
+        // issue-273: cut an UNOWNED boundary before the claim disappears.
+        // Without this, whatever interval this claim opened stays open
+        // forever, and any later direct edit made with no claim live lands
+        // inside it and is credited to this claim's owner. Called BEFORE the
+        // file is removed so the read inside record_claim_interval still sees
+        // the PRIOR (this) claim as the boundary's left edge.
+        fx.boundary(&[], "cleared");
+        let _ = std::fs::remove_file(&files.claim);
+        fx.mirror_clear(&claim.ids, mirror_source);
+        fx.trace(
+            "inflight-sentinel",
+            &format!("op=clear ids={}", ids_json_str(&claim.ids)),
+        );
+        fx.signal("inflight-claim-changed");
+        fx.cleared();
+        return ClaimShrink::Cleared;
+    }
+    if keep.len() == claim.ids.len() {
+        // Nothing retired (every requested id was bound, or none was
+        // claimed). The pane still refetches: the caller acted.
+        fx.signal("inflight-claim-changed");
+        return ClaimShrink::Shrunk { remaining: keep };
+    }
+    // issue-273: cut a boundary owned by whoever REMAINS, before the claim
+    // file is rewritten. Rewritten in place, so claimedAt and kind survive
+    // (the soft clears' freshness gates read claimedAt).
+    fx.boundary(&keep, "shrunk");
+    let resolved: Vec<String> = claim
+        .ids
+        .iter()
+        .filter(|c| !keep.contains(c))
+        .cloned()
+        .collect();
+    claim.ids = keep.clone();
+    if !write_inflight_claim_at(&files.claim, &claim) {
+        return ClaimShrink::NoClaim;
+    }
+    fx.mirror_shrink(&resolved, &keep, mirror_source);
+    fx.trace(
+        "inflight-sentinel",
+        &format!(
+            "op=clear-shrink resolved={} remaining={}",
+            ids_json_str(&resolved),
+            ids_json_str(&keep)
+        ),
+    );
+    fx.signal("inflight-claim-changed");
+    ClaimShrink::Shrunk { remaining: keep }
+}
 
-    // Flush a deferred tools-pane-reload if one was queued during the
-    // cycle (refs #93). Atomic swap-to-false; the previous value tells
-    // us whether to fire.
+// Flush a deferred tools-pane-reload if one was queued during the cycle
+// (refs #93), once the claim has cleared.
+fn flush_deferred_tools_reload<R: tauri::Runtime>(app: &AppHandle<R>) {
+    // Atomic swap-to-false; the previous value tells us whether to fire.
     if PENDING_TOOLS_RELOAD.swap(false, std::sync::atomic::Ordering::SeqCst) {
         let forced = PENDING_TOOLS_RELOAD_FORCED.swap(false, std::sync::atomic::Ordering::SeqCst);
         if forced || tools_pane_hot_reload_enabled(app) {
@@ -61884,7 +71018,6 @@ fn clear_inflight_claim_sentinel<R: tauri::Runtime>(
             );
         }
     }
-    true
 }
 
 // Outcome of an incremental claim retirement (see shrink_inflight_claim_sentinel).
@@ -61892,6 +71025,8 @@ fn clear_inflight_claim_sentinel<R: tauri::Runtime>(
 enum ClaimShrink {
     /// No claim on disk, or it could not be read.
     NoClaim,
+    /// An all-or-nothing clear that didn't cover the claim (op=clear-partial).
+    Uncovered,
     /// Some ids are still in flight; the claim was rewritten with the rest.
     Shrunk { remaining: Vec<String> },
     /// Nothing left in flight; the claim file was removed.
@@ -61922,137 +71057,26 @@ enum ClaimShrink {
 // `op=clear-shrink` is a distinct op on purpose. If shrinking were traced as
 // `clear-partial`, that line would stop meaning "collision" and start meaning
 // "collision OR normal progress" -- an instrument quietly losing its edge.
+//
+// Ids a live subagent binding holds are retained here too (see
+// retire_claim_locked), so advancing a bound id leaves it claimed.
 fn shrink_inflight_claim_sentinel<R: tauri::Runtime>(
     app: &AppHandle<R>,
     resolved_ids: &[String],
+    via: &str,
 ) -> ClaimShrink {
-    let Some(path) = inflight_claim_file(app) else {
+    let Some(files) = claim_files(app) else {
         return ClaimShrink::NoClaim;
     };
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return ClaimShrink::NoClaim;
-    };
-    let mut claim: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(_) => return ClaimShrink::NoClaim,
-    };
-    let claimed_ids: Vec<String> = claim
-        .get("ids")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    let remaining: Vec<String> = claimed_ids
-        .iter()
-        .filter(|cid| !resolved_ids.iter().any(|rid| rid == *cid))
-        .cloned()
-        .collect();
-
-    if remaining.is_empty() {
-        // issue-273: same unowned-boundary cut as the full clear path above —
-        // a shrink that empties the claim is a full clear by another route,
-        // and without this the open interval never closes.
-        record_claim_interval(app, &[], "cleared", unix_now_ms());
-        let _ = std::fs::remove_file(&path);
-        // state-mirror-store-and-ledger: mirror the clear. Trace-only on
-        // failure — never blocks or alters the file path above.
-        {
-            let ids = claimed_ids.clone();
-            let at_ms = unix_now_ms();
-            worklist_state_apply(app, "claim-clear", move |conn| {
-                worklist_state::mirror_claim_clear(
-                    conn,
-                    &ids,
-                    at_ms,
-                    "inflight-claim-sentinel-shrink",
-                )
-            });
-        }
-        if bram_trace_enabled() {
-            append_bram_trace_line(
-                app,
-                "inflight-sentinel",
-                &format!(
-                    "op=clear ids={}",
-                    serde_json::to_string(&claimed_ids).unwrap_or_else(|_| "[]".to_string())
-                ),
-            );
-        }
-        emit_replayable_signal(app, "inflight-claim-changed");
-        return ClaimShrink::Cleared;
-    }
-
-    // issue-273: cut a boundary owned by whoever REMAINS, before the claim
-    // file is rewritten. The ids that resolved out are no longer covered by
-    // the open interval from here forward; the ids still in flight are.
-    record_claim_interval(app, &remaining, "shrunk", unix_now_ms());
-    // Rewrite in place so every other field (claimedAt, kind, ...) survives.
-    if let Some(obj) = claim.as_object_mut() {
-        obj.insert("ids".into(), serde_json::json!(remaining));
-    }
-    let Ok(body) = serde_json::to_string_pretty(&claim) else {
-        return ClaimShrink::NoClaim;
-    };
-    let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, format!("{}\n", body)).is_err() {
-        return ClaimShrink::NoClaim;
-    }
-    if std::fs::rename(&tmp, &path).is_err() {
-        return ClaimShrink::NoClaim;
-    }
-    // state-mirror-store-and-ledger: mirror the shrink. Trace-only on
-    // failure — never blocks or alters the file path above.
-    {
-        let resolved = resolved_ids.to_vec();
-        let remaining_ids = remaining.clone();
-        let at_ms = unix_now_ms();
-        worklist_state_apply(app, "claim-shrink", move |conn| {
-            worklist_state::mirror_claim_shrink(
-                conn,
-                &resolved,
-                &remaining_ids,
-                at_ms,
-                "inflight-claim-sentinel-shrink",
-            )
-        });
-    }
-    if bram_trace_enabled() {
-        append_bram_trace_line(
-            app,
-            "inflight-sentinel",
-            &format!(
-                "op=clear-shrink resolved={} remaining={}",
-                serde_json::to_string(resolved_ids).unwrap_or_else(|_| "[]".to_string()),
-                serde_json::to_string(&remaining).unwrap_or_else(|_| "[]".to_string())
-            ),
-        );
-    }
-    emit_replayable_signal(app, "inflight-claim-changed");
-    ClaimShrink::Shrunk { remaining }
+    let g = claim_lock();
+    retire_claim_locked(&g, &files, app, resolved_ids, Retire::Shrink, via)
 }
 
 // True iff resources/.inflight-claim.json exists, parses, and lists at
 // least one claimed id. Used by the watcher to decide whether to emit
 // tools-pane-reload now or defer it until the cycle clears (refs #93).
 fn inflight_sentinel_is_active<R: tauri::Runtime>(app: &AppHandle<R>) -> bool {
-    let Some(path) = inflight_claim_file(app) else {
-        return false;
-    };
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return false;
-    };
-    let claim: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    claim
-        .get("ids")
-        .and_then(|v| v.as_array())
-        .map(|arr| !arr.is_empty())
-        .unwrap_or(false)
+    read_inflight_claim(app).map_or(false, |c| !c.ids.is_empty())
 }
 
 // Emit tools-pane-reload, OR defer it if a cycle is currently active
@@ -62124,8 +71148,9 @@ fn clear_active_sentinel<R: tauri::Runtime>(app: &AppHandle<R>) {
     // cleared at turn end, never spanning agent silence. The re-arm is
     // deliberately untouched — it is what keeps a legitimate multi-turn apply
     // attributed (#286).
+    // This function's one caller is the PTY-silence turn-end path.
     if let Some((ids, _claimed_at)) = inflight_claim_ids_and_claimed_at(app) {
-        clear_inflight_claim_sentinel(app, &ids);
+        clear_inflight_claim_sentinel(app, &ids, "silence");
     }
 }
 
@@ -62150,8 +71175,11 @@ fn clear_active_sentinel_with_reason<R: tauri::Runtime>(app: &AppHandle<R>, reas
         unix_now_ms(),
         claimed_after,
     );
+    // delegated-work-action-gates: a foreground cancel (permission reject,
+    // Escape) is no evidence a background subagent stopped; its ids are
+    // retained by the clear.
     if let Some((ids, _claimed_at)) = active_claim {
-        clear_inflight_claim_sentinel(app, &ids);
+        clear_inflight_claim_sentinel(app, &ids, reason);
     } else {
         if bram_trace_enabled() {
             append_bram_trace_line(
@@ -63224,6 +72252,129 @@ fn is_own_subagent_transcript_path(path: &Path, sessions_dir: Option<&Path>) -> 
     is_subagent_transcript_path(path) && sessions_dir.map_or(false, |sd| path.starts_with(sd))
 }
 
+#[cfg(test)]
+mod codex_subagent_tests {
+    use super::{
+        canonical_path_string, codex_child_is_idle, codex_child_label, codex_child_meta,
+        codex_child_own_records, codex_child_rollouts_in, codex_main_session_id,
+        codex_session_is_subagent,
+    };
+    use std::path::{Path, PathBuf};
+
+    const CHILD: &str =
+        include_str!("../../docs/agent-specimens/codex/subagent-session-meta-record.jsonl");
+    const MAIN: &str = include_str!("../../docs/agent-specimens/codex/session-meta-record.jsonl");
+
+    fn rollout(dir: &Path, name: &str, specimen: &str) -> PathBuf {
+        let path = dir.join(name);
+        // JSON-encoded: a Windows path's backslashes would make invalid JSON.
+        let cwd = serde_json::to_string(&canonical_path_string(dir)).unwrap();
+        std::fs::write(&path, specimen.replace("\"<workspace>\"", &cwd)).unwrap();
+        path
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("bram-{}-{}", name, std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_child_is_not_a_main_session_of_its_parents_project() {
+        let dir = scratch("codex-child");
+        let cwd = canonical_path_string(&dir);
+        let child = rollout(&dir, "child.jsonl", CHILD);
+        assert!(codex_session_is_subagent(&child).unwrap());
+        assert_eq!(codex_main_session_id(&child, &cwd).unwrap(), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_parent_finds_its_children_in_any_date_directory() {
+        let dir = scratch("codex-roster");
+        let today = dir.join("2026").join("10").join("30");
+        std::fs::create_dir_all(&today).unwrap();
+        let child = rollout(&today, "rollout-child.jsonl", CHILD);
+        let parent_id = "01a185dd-483e-77a2-96e8-500da7e1f28d";
+        let found = codex_child_rollouts_in(&dir, parent_id);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, "01a185dd-7608-7633-bf83-a90ee4131cb4");
+        assert_eq!(found[0].1, child);
+        assert_eq!(codex_child_label(&found[0].2), "pong");
+        assert!(codex_child_rollouts_in(&dir, "someone-else").is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_child_takes_its_fields_from_thread_spawn_when_flat_ones_are_absent() {
+        let dir = scratch("codex-spawn-only");
+        let path = dir.join("r.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"type":"session_meta","payload":{"id":"c","cwd":"/w","source":{"subagent":{"thread_spawn":{"parent_thread_id":"p","agent_path":"/root/a/b","agent_nickname":"Bohr"}}}}}"#,
+        )
+        .unwrap();
+        let child = codex_child_meta(&path).unwrap().unwrap();
+        assert_eq!(child.parent_id, "p");
+        assert_eq!(child.nickname, "Bohr");
+        assert_eq!(codex_child_label(&child), "b");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn spawn_note() -> String {
+        r#"{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"You are now a newly spawned child agent. The"}]}}"#.to_string() + "\n"
+    }
+
+    #[test]
+    fn a_childs_transcript_starts_after_the_replayed_parent() {
+        let replay = "{\"replayed\":1}\n";
+        let own = "{\"own\":1}\n";
+        let text = format!("{replay}{}{own}", spawn_note());
+        assert_eq!(codex_child_own_records(&text), own);
+        // A grandchild replays its parent's spawn note first.
+        let text = format!("{replay}{}{replay}{}{own}", spawn_note(), spawn_note());
+        assert_eq!(codex_child_own_records(&text), own);
+    }
+
+    #[test]
+    fn quoting_the_marker_does_not_cut_the_transcript() {
+        let quoted = r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"You are now a newly spawned child agent"}]}}"#;
+        let text = format!("{quoted}\n{{\"own\":1}}\n");
+        assert_eq!(codex_child_own_records(&text), text);
+        assert_eq!(codex_child_own_records("{\"a\":1}\n"), "{\"a\":1}\n");
+    }
+
+    fn event(kind: &str) -> String {
+        format!(r#"{{"type":"event_msg","payload":{{"type":"{kind}"}}}}"#)
+    }
+
+    #[test]
+    fn a_child_is_idle_between_turns_and_running_within_one() {
+        let other = r#"{"type":"response_item","payload":{"type":"message"}}"#;
+        let (start, end) = (event("task_started"), event("task_complete"));
+        assert!(!codex_child_is_idle(&format!("{start}\n{other}\n")));
+        assert!(codex_child_is_idle(&format!("{start}\n{end}\n{other}\n")));
+        // A follow-up from the parent reopens it.
+        assert!(!codex_child_is_idle(&format!("{start}\n{end}\n{start}\n")));
+        assert!(codex_child_is_idle(&format!(
+            "{start}\n{}\n",
+            event("turn_aborted")
+        )));
+        assert!(!codex_child_is_idle(other));
+    }
+
+    #[test]
+    fn a_main_rollout_in_this_project_keeps_its_id() {
+        let dir = scratch("codex-main");
+        let cwd = canonical_path_string(&dir);
+        let main = rollout(&dir, "main.jsonl", MAIN);
+        assert!(!codex_session_is_subagent(&main).unwrap());
+        assert!(codex_main_session_id(&main, &cwd).unwrap().is_some());
+        assert_eq!(codex_main_session_id(&main, "/elsewhere").unwrap(), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
 // JSONL-driven turn-end detection (#91 follow-up, broadened by #153).
 // Durable session output is the primary independent completion signal:
 // Claude writes assistant `stop_reason:"end_turn"`; Codex writes
@@ -63257,6 +72408,7 @@ fn check_jsonl_for_turn_end<R: tauri::Runtime>(app: &AppHandle<R>, path: &std::p
             Some(SessionProvider::Claude) => "claude",
             Some(SessionProvider::Codex) => "codex",
             Some(SessionProvider::Opencode) => "opencode",
+            Some(SessionProvider::Antigravity) => "antigravity",
             None => "none",
         };
         if active != provider_label {
@@ -63367,7 +72519,12 @@ fn check_jsonl_for_turn_end<R: tauri::Runtime>(app: &AppHandle<R>, path: &std::p
     // claim in 9 ms, locking the row while the parent was idle. Keep this
     // gate before BOTH the status updates and claim handling: working-status
     // transitions can themselves call rearm_claim_for_live_authorization.
-    if is_subagent_transcript_path(path) {
+    // A Codex child's path looks like any rollout's, and its task_complete
+    // would otherwise finish the parent's turn, so its session_meta decides.
+    if is_subagent_transcript_path(path)
+        || (provider == JsonlCompletionProvider::Codex
+            && codex_session_is_subagent(path).unwrap_or(false))
+    {
         if bram_trace_enabled() {
             append_bram_trace_line(
                 app,
@@ -63738,6 +72895,9 @@ fn check_jsonl_for_turn_end<R: tauri::Runtime>(app: &AppHandle<R>, path: &std::p
     // Authorization is the durable half and is untouched here: `advance` and
     // `worklist-commit` read the auth record, not the claim, so a later turn
     // completes the lifecycle exactly as before.
+    //
+    // delegated-work-action-gates: ids a subagent is still bound to survive
+    // the clear (retire_claim_locked retains them).
     if bram_trace_enabled() {
         append_bram_trace_line(
             app,
@@ -63749,24 +72909,1367 @@ fn check_jsonl_for_turn_end<R: tauri::Runtime>(app: &AppHandle<R>, path: &std::p
             ),
         );
     }
-    clear_inflight_claim_sentinel(app, &claimed_ids);
+    clear_inflight_claim_sentinel(app, &claimed_ids, "turn-end");
 }
 
 // Startup cleanup. Removes any stale inflight sentinel from a prior
 // session that didn't complete (Bram killed mid-cycle, agent crashed
 // before mutate, etc.).
 fn cleanup_stale_inflight_claim<R: tauri::Runtime>(app: &AppHandle<R>) {
-    let Some(path) = inflight_claim_file(app) else {
-        return;
-    };
-    if !path.exists() {
-        return;
-    }
-    let _ = std::fs::remove_file(&path);
-    if bram_trace_enabled() {
+    if bram_trace_enabled() && inflight_claim_file(app).map_or(false, |p| p.exists()) {
         append_bram_trace_line(app, "inflight-sentinel", "op=stale-startup-clear");
     }
-    emit_replayable_signal(app, "inflight-claim-changed");
+    // delegated-work-action-gates: a restart starts with no bindings (their
+    // subagents died with the session that spawned them), and the stale
+    // claim clears through the choke point, which cuts the unowned boundary
+    // removing the file bare never did: the dead claim's interval stayed
+    // open, crediting every edit after the restart to it. The boundary is a
+    // scoped temp-index capture, run only when a stale claim exists, and
+    // fails open: no git, no repo, or a failed capture records nothing.
+    delegated_release_all_and_clear(app, "restart");
+}
+
+// --- delegated-work-action-gates ---------------------------------------------
+//
+// Decision: docs/decisions/2026-11-04-delegated-work-binds-to-the-spawning-claim.md.
+// Claude only. A subagent inherits the claim it was spawned under: on
+// `SubagentStart` (reported by the guard's menu hook to /__agent/subagent) the
+// host binds the subagent's agent_id to the live claim's item ids. The
+// bindings are a reference count on that one claim, not a second claim. While
+// any binding is live:
+//   - the claim keeps the bound ids through every clear and shrink
+//     (retire_claim_locked retains them, `op=retain`), so the subagent's
+//     writes stay inside an interval owned by its items;
+//   - commit, drop and prune refuse the bound ids (409 refuse-delegated-live).
+// "Held by delegation" is derived, never stored: held_by_delegation_at.
+// A binding is released only on evidence: SubagentStop, the spawning session
+// ending (PTY replaced, or the agent exiting to the shell prompt), a Bram
+// restart, or a manual Release. Never on a timeout. Only those session-level
+// releases may clear the claim regardless of bindings
+// (delegated_release_all_and_clear).
+//
+// agent_id format: Claude's hook `agent_id` is the bare id (specimen
+// docs/agent-specimens/claude/hooks/SubagentStop.json: "ae3fb2df9de52ea71",
+// beside agent_transcript_path .../subagents/agent-ae3fb2df9de52ea71.jsonl),
+// which is exactly the roster's `agentId` (the transcript filename minus
+// `agent-` and `.jsonl`). normalize_delegated_agent_id strips an `agent-`
+// prefix anyway, so either spelling keys the same binding.
+const DELEGATED_BINDINGS_REL: &str = ".delegated-bindings.json";
+
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+struct DelegatedBinding {
+    #[serde(default)]
+    ids: Vec<String>,
+    #[serde(rename = "boundAtMs", default)]
+    bound_at_ms: i64,
+    #[serde(rename = "sessionId", default)]
+    session_id: String,
+    #[serde(rename = "agentType", default)]
+    agent_type: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+struct DelegatedBindings {
+    #[serde(default)]
+    bindings: std::collections::BTreeMap<String, DelegatedBinding>,
+}
+
+// The one id-set helper: sorted, deduplicated. Two id lists name the same
+// set iff their sorted_id_set values are equal.
+fn sorted_id_set<'a>(ids: impl IntoIterator<Item = &'a String>) -> Vec<String> {
+    let set: std::collections::BTreeSet<String> = ids.into_iter().cloned().collect();
+    set.into_iter().collect()
+}
+
+// One lock over the claim file and the bindings file. Every claim write and
+// retirement, and every binding change with the claim reconciliation that
+// follows it, runs under it, so two releases (or a release and a clear) can't
+// interleave and resurrect a cleared claim. Not reentrant: the *_locked
+// functions take the held guard instead of locking again.
+type ClaimGuard = std::sync::MutexGuard<'static, ()>;
+
+fn claim_lock() -> ClaimGuard {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+struct ClaimFiles {
+    claim: PathBuf,
+    bindings: PathBuf,
+}
+
+fn claim_files<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<ClaimFiles> {
+    Some(ClaimFiles {
+        claim: inflight_claim_file(app)?,
+        bindings: delegated_bindings_file(app)?,
+    })
+}
+
+// What a claim transition does besides its two files: the attribution
+// boundary, the state mirror, the trace and the pane signal. The host's
+// AppHandle implements it; the unit tests stub it, which is what lets the
+// *_locked transactions run against temp files.
+trait ClaimEffects {
+    fn boundary(&self, ids: &[String], kind: &str);
+    fn mirror_write(&self, at_ms: i64, kind: &str, ids: &[String]);
+    fn mirror_clear(&self, ids: &[String], source: &'static str);
+    fn mirror_shrink(&self, resolved: &[String], remaining: &[String], source: &'static str);
+    fn tracing(&self) -> bool;
+    fn trace(&self, category: &str, detail: &str);
+    fn signal(&self, name: &str);
+    // The claim cleared: flush what waited on it.
+    fn cleared(&self);
+    fn main_turn_open(&self) -> bool;
+}
+
+impl<R: tauri::Runtime> ClaimEffects for AppHandle<R> {
+    fn boundary(&self, ids: &[String], kind: &str) {
+        record_claim_interval(self, ids, kind, unix_now_ms());
+    }
+    fn mirror_write(&self, at_ms: i64, kind: &str, ids: &[String]) {
+        let (kind, ids) = (kind.to_string(), ids.to_vec());
+        worklist_state_apply(self, "claim-write", move |conn| {
+            worklist_state::mirror_claim_write(conn, at_ms, &kind, &ids, "inflight-claim-sentinel")
+        });
+    }
+    fn mirror_clear(&self, ids: &[String], source: &'static str) {
+        let (ids, at_ms) = (ids.to_vec(), unix_now_ms());
+        worklist_state_apply(self, "claim-clear", move |conn| {
+            worklist_state::mirror_claim_clear(conn, &ids, at_ms, source)
+        });
+    }
+    fn mirror_shrink(&self, resolved: &[String], remaining: &[String], source: &'static str) {
+        let (resolved, remaining, at_ms) = (resolved.to_vec(), remaining.to_vec(), unix_now_ms());
+        worklist_state_apply(self, "claim-shrink", move |conn| {
+            worklist_state::mirror_claim_shrink(conn, &resolved, &remaining, at_ms, source)
+        });
+    }
+    fn tracing(&self) -> bool {
+        bram_trace_enabled()
+    }
+    fn trace(&self, category: &str, detail: &str) {
+        if bram_trace_enabled() {
+            append_bram_trace_line(self, category, detail);
+        }
+    }
+    fn signal(&self, name: &str) {
+        emit_replayable_signal(self, name);
+    }
+    fn cleared(&self) {
+        flush_deferred_tools_reload(self);
+    }
+    fn main_turn_open(&self) -> bool {
+        main_turn_open()
+    }
+}
+
+// Whether the main agent turn is running, from the host's turn state (the
+// `[turn-state]` phase): working, or paused on a permission menu.
+fn turn_phase_open(phase: &str) -> bool {
+    phase == "working" || phase == "waiting-for-permission"
+}
+
+fn main_turn_open() -> bool {
+    turn_state_cell()
+        .lock()
+        .map(|t| turn_phase_open(&t.phase))
+        .unwrap_or(false)
+}
+
+fn ids_subset(ids: &[String], of: &[String]) -> bool {
+    ids.iter().all(|id| of.contains(id))
+}
+
+// The claim survives only because subagents are bound to it: every claimed id
+// is bound, and no main turn is running. Derived on every read, so no claim
+// writer can forget to set it.
+fn held_by_delegation_at(
+    claim: Option<&InflightClaim>,
+    bound: &[String],
+    main_turn_open: bool,
+) -> bool {
+    !main_turn_open && claim.map_or(false, |c| !c.ids.is_empty() && ids_subset(&c.ids, bound))
+}
+
+fn held_by_delegation<R: tauri::Runtime>(app: &AppHandle<R>) -> bool {
+    held_by_delegation_at(
+        read_inflight_claim(app).as_ref(),
+        &delegated_bound_ids_union(app),
+        main_turn_open(),
+    )
+}
+
+// A turn start re-arms its authorization's claim unless a claim of a running
+// turn is already live. A claim of bound ids only is not one: the re-arm
+// proceeds, and write_claim_locked unions the bound ids back in.
+fn rearm_blocked(claim: Option<&InflightClaim>, bound: &[String]) -> bool {
+    claim.map_or(false, |c| c.ids.is_empty() || !ids_subset(&c.ids, bound))
+}
+
+// The bound ids at the start of the current main turn (taken when the turn
+// opens). They belong to subagents of an EARLIER turn, so a subagent this
+// turn spawns doesn't inherit them: a chat turn's research subagent must not
+// bind to an item another subagent holds. Ids this turn's own subagents bind
+// are not in it, so parallel subagents of one turn all bind.
+fn turn_start_bound_cell() -> &'static Mutex<Vec<String>> {
+    static CELL: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+// The main turn opened or closed. Snapshot the bound ids at the open, and
+// tell the pane: heldByDelegation depends on the turn state.
+fn delegated_note_turn_edge<R: tauri::Runtime>(app: &AppHandle<R>, opened: bool) {
+    let bound = delegated_bound_ids_union(app);
+    if opened {
+        if let Ok(mut g) = turn_start_bound_cell().lock() {
+            *g = bound.clone();
+        }
+    }
+    if !bound.is_empty() {
+        emit_replayable_signal(app, "inflight-claim-changed");
+    }
+}
+
+// The claim ids a subagent spawned now inherits: the claim minus ids bound
+// before this turn began.
+fn delegated_inheritable_ids(claim: &[String], turn_start_bound: &[String]) -> Vec<String> {
+    claim
+        .iter()
+        .filter(|id| !turn_start_bound.contains(id))
+        .cloned()
+        .collect()
+}
+
+impl DelegatedBindings {
+    fn is_empty(&self) -> bool {
+        self.bindings.is_empty()
+    }
+
+    // Returns true when the store changed. An empty id set binds nothing.
+    fn bind(
+        &mut self,
+        agent: &str,
+        ids: &[String],
+        now_ms: i64,
+        session_id: &str,
+        agent_type: &str,
+    ) -> bool {
+        if agent.is_empty() || ids.is_empty() {
+            return false;
+        }
+        let next = DelegatedBinding {
+            ids: sorted_id_set(ids.iter()),
+            bound_at_ms: now_ms,
+            session_id: session_id.to_string(),
+            agent_type: agent_type.to_string(),
+        };
+        if self.bindings.get(agent).map(|b| &b.ids) == Some(&next.ids) {
+            return false;
+        }
+        self.bindings.insert(agent.to_string(), next);
+        true
+    }
+
+    fn release(&mut self, agent: &str) -> Option<DelegatedBinding> {
+        self.bindings.remove(agent)
+    }
+
+    fn union_ids(&self) -> Vec<String> {
+        sorted_id_set(self.bindings.values().flat_map(|b| b.ids.iter()))
+    }
+
+    // The requested ids a live binding holds, and the agents holding them.
+    // None when nothing requested is bound.
+    fn refusal(&self, requested: &[String]) -> Option<(Vec<String>, Vec<String>)> {
+        let mut ids: Vec<String> = Vec::new();
+        let mut agents: Vec<String> = Vec::new();
+        for (agent, b) in &self.bindings {
+            let mut hit = false;
+            for id in requested {
+                if b.ids.iter().any(|x| x == id) {
+                    hit = true;
+                    if !ids.contains(id) {
+                        ids.push(id.clone());
+                    }
+                }
+            }
+            if hit {
+                agents.push(agent.clone());
+            }
+        }
+        if ids.is_empty() {
+            return None;
+        }
+        ids.sort();
+        Some((ids, agents))
+    }
+}
+
+fn normalize_delegated_agent_id(raw: &str) -> String {
+    let t = raw.trim();
+    t.strip_prefix("agent-").unwrap_or(t).to_string()
+}
+
+// The id becomes a JSON key and a trace token, never a path, but keep it to
+// the shape Claude emits so nothing odd rides through.
+fn delegated_agent_id_is_safe(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+fn read_delegated_bindings_at(path: &Path) -> DelegatedBindings {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<DelegatedBindings>(&s).ok())
+        .unwrap_or_default()
+}
+
+// Atomic write; an empty store removes the file, so "no file" is the common
+// idle state and the hot-path reads below cost one failed open. Never creates
+// the state folder: a binding needs a live claim, whose file already put it
+// there.
+fn write_delegated_bindings_at(path: &Path, bindings: &DelegatedBindings) -> bool {
+    if bindings.is_empty() {
+        return match std::fs::remove_file(path) {
+            Ok(()) => true,
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+        };
+    }
+    let Ok(body) = serde_json::to_string_pretty(&serde_json::json!({
+        "version": 1,
+        "bindings": bindings.bindings,
+    })) else {
+        return false;
+    };
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, format!("{}\n", body)).is_err() {
+        return false;
+    }
+    std::fs::rename(&tmp, path).is_ok()
+}
+
+fn delegated_bindings_file<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
+    project_resource_path(app, DELEGATED_BINDINGS_REL)
+}
+
+fn read_delegated_bindings<R: tauri::Runtime>(app: &AppHandle<R>) -> DelegatedBindings {
+    delegated_bindings_file(app)
+        .map(|p| read_delegated_bindings_at(&p))
+        .unwrap_or_default()
+}
+
+fn delegated_bound_ids_union<R: tauri::Runtime>(app: &AppHandle<R>) -> Vec<String> {
+    read_delegated_bindings(app).union_ids()
+}
+
+fn ids_json_str(ids: &[String]) -> String {
+    serde_json::to_string(ids).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn trace_token(s: &str) -> String {
+    let t: String = s
+        .trim()
+        .chars()
+        .map(|c| if c.is_whitespace() { '_' } else { c })
+        .collect();
+    if t.is_empty() {
+        "-".to_string()
+    } else {
+        t
+    }
+}
+
+// SubagentStart: bind to the ids of the live claim this turn may hand on
+// (delegated_inheritable_ids). A subagent spawned with no claim, or under a
+// claim whose ids were all bound before this turn began (a chat turn while
+// another subagent works), binds to nothing.
+fn bind_locked(
+    _g: &ClaimGuard,
+    files: &ClaimFiles,
+    fx: &dyn ClaimEffects,
+    agent: &str,
+    agent_type: &str,
+    session_id: &str,
+    turn_start_bound: &[String],
+) -> Option<Vec<String>> {
+    let skipped = |reason: &str| {
+        fx.trace(
+            "delegated",
+            &format!("op=bind-skipped agent={} reason={}", agent, reason),
+        );
+        None
+    };
+    let claim = read_inflight_claim_at(&files.claim).unwrap_or_default();
+    if claim.ids.is_empty() {
+        return skipped("no-claim");
+    }
+    let ids = delegated_inheritable_ids(&claim.ids, turn_start_bound);
+    if ids.is_empty() {
+        return skipped("held-claim-only");
+    }
+    let mut b = read_delegated_bindings_at(&files.bindings);
+    let changed = b.bind(agent, &ids, unix_now_ms(), session_id, agent_type);
+    if changed && !write_delegated_bindings_at(&files.bindings, &b) {
+        return skipped("write-failed");
+    }
+    fx.trace(
+        "delegated",
+        &format!(
+            "op=bind agent={} ids={} type={}",
+            agent,
+            ids_json_str(&ids),
+            trace_token(agent_type)
+        ),
+    );
+    if changed {
+        fx.signal("inflight-claim-changed");
+        fx.signal("worklist-changed");
+    }
+    Some(ids)
+}
+
+// Which bindings a release removes.
+enum ReleaseScope<'a> {
+    Agents(&'a [String]),
+    All,
+}
+
+// Release bindings and reconcile the claim, as one transaction. Returns how
+// many bindings were released.
+//
+// The reconcile rule: once no main turn is running and the claim consisted
+// only of bound ids before this release, the ids no binding holds any more
+// retire through retire_claim_locked (which keeps the still-bound ones), and
+// the last release clears it. A claim with ids of its own belongs to a
+// running or starting turn and is left alone; that turn's end retires it, and
+// retention keeps whatever is still bound then. So a main claim never loses
+// ids mid-turn because a subagent stopped.
+//
+// `clear_claim` is the force variant, for session-level evidence (PTY
+// replaced, the agent exited, a restart): with every binding released, the
+// claim clears whatever the turn state.
+fn release_locked(
+    g: &ClaimGuard,
+    files: &ClaimFiles,
+    fx: &dyn ClaimEffects,
+    scope: ReleaseScope,
+    reason: &str,
+    clear_claim: bool,
+) -> usize {
+    let mut b = read_delegated_bindings_at(&files.bindings);
+    let before = b.union_ids();
+    let released: Vec<(String, DelegatedBinding)> = match scope {
+        ReleaseScope::All => std::mem::take(&mut b.bindings).into_iter().collect(),
+        ReleaseScope::Agents(agents) => agents
+            .iter()
+            .filter_map(|a| match b.release(a) {
+                Some(rel) => Some((a.clone(), rel)),
+                None => {
+                    fx.trace(
+                        "delegated",
+                        &format!("op=release-miss agent={} reason={}", a, reason),
+                    );
+                    None
+                }
+            })
+            .collect(),
+    };
+    if !released.is_empty() {
+        let _ = write_delegated_bindings_at(&files.bindings, &b);
+    }
+    for (agent, rel) in &released {
+        fx.trace(
+            "delegated",
+            &format!(
+                "op=release agent={} reason={} ids={}",
+                agent,
+                reason,
+                ids_json_str(&rel.ids)
+            ),
+        );
+    }
+    let claim = read_inflight_claim_at(&files.claim).unwrap_or_default();
+    if clear_claim {
+        if !claim.ids.is_empty() {
+            retire_claim_locked(g, files, fx, &claim.ids, Retire::Clear, reason);
+        }
+    } else if !released.is_empty()
+        && !claim.ids.is_empty()
+        && !fx.main_turn_open()
+        && ids_subset(&claim.ids, &before)
+    {
+        retire_claim_locked(g, files, fx, &claim.ids, Retire::Shrink, reason);
+    }
+    if !released.is_empty() {
+        fx.signal("inflight-claim-changed");
+        fx.signal("worklist-changed");
+    }
+    released.len()
+}
+
+fn delegated_release<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    scope: ReleaseScope,
+    reason: &str,
+) -> usize {
+    let Some(files) = claim_files(app) else {
+        return 0;
+    };
+    let g = claim_lock();
+    release_locked(&g, &files, app, scope, reason, false)
+}
+
+// The force variant: release every binding and clear the claim. Only for
+// evidence the spawning session is gone.
+fn delegated_release_all_and_clear<R: tauri::Runtime>(app: &AppHandle<R>, reason: &str) {
+    let Some(files) = claim_files(app) else {
+        return;
+    };
+    let g = claim_lock();
+    release_locked(&g, &files, app, ReleaseScope::All, reason, true);
+}
+
+// The 409 a lifecycle route returns for ids a live binding holds. `category`
+// is the trace category of the refusing route.
+fn delegated_refusal_response<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    requested: &[String],
+    category: &str,
+) -> Option<(u16, &'static str, Vec<u8>)> {
+    let bindings = read_delegated_bindings(app);
+    let (ids, agents) = bindings.refusal(requested)?;
+    if bram_trace_enabled() {
+        append_bram_trace_line(
+            app,
+            category,
+            &format!(
+                "op=refuse-delegated-live ids={} agents={}",
+                ids_json_str(&ids),
+                ids_json_str(&agents)
+            ),
+        );
+    }
+    Some((
+        409,
+        "application/json; charset=utf-8",
+        serde_json::json!({
+            "error": format!(
+                "a subagent is still working on {}; wait for it to finish or Release it from the row",
+                ids.join(", ")
+            ),
+            "op": "refuse-delegated-live",
+            "ids": ids,
+            "agents": agents,
+        })
+        .to_string()
+        .into_bytes(),
+    ))
+}
+
+// The agent exited to the shell: the session that spawned the bindings is
+// gone, and nothing will send their SubagentStop.
+// Called from the PTY read path, so the common case (no bindings) is one
+// failed stat, and the release itself -- whose claim clear may run a git
+// capture -- moves off that thread.
+fn delegated_release_on_shell_prompt<R: tauri::Runtime>(app: &AppHandle<R>) {
+    if !delegated_bindings_file(app).map_or(false, |p| p.exists()) {
+        return;
+    }
+    let app = app.clone();
+    std::thread::spawn(move || delegated_release_all_and_clear(&app, "session-end"));
+}
+
+// /__inflight's `delegated` array: one row per live binding, labelled from
+// the subagent's meta.json sidecar, found the way the roster finds it
+// (st_subagent_files, so workflow-nested agents are labelled too).
+fn delegated_inflight_rows<R: tauri::Runtime>(app: &AppHandle<R>) -> Vec<serde_json::Value> {
+    let bindings = read_delegated_bindings(app);
+    if bindings.is_empty() {
+        return Vec::new();
+    }
+    let sessions_dir = claude_sessions_dir_lookup(app).ok().map(|l| l.chosen);
+    bindings
+        .bindings
+        .iter()
+        .map(|(agent, b)| {
+            let meta = sessions_dir.as_ref().and_then(|dir| {
+                if b.session_id.is_empty() || !session_id_is_safe(&b.session_id) {
+                    return None;
+                }
+                let session = dir.join(format!("{}.jsonl", b.session_id));
+                let file = st_subagent_files(&session)
+                    .into_iter()
+                    .find(|f| &f.agent_id == agent)?;
+                st_read_subagent_meta(&file.dir, agent)
+            });
+            let description = meta
+                .as_ref()
+                .and_then(|m| m.get("description"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let agent_type = if b.agent_type.is_empty() {
+                meta.as_ref()
+                    .and_then(|m| m.get("agentType"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            } else {
+                b.agent_type.clone()
+            };
+            serde_json::json!({
+                "agentId": agent,
+                "ids": b.ids,
+                "agentType": agent_type,
+                "description": description,
+                "boundAtMs": b.bound_at_ms,
+            })
+        })
+        .collect()
+}
+
+// POST /__agent/subagent — the guard's SubagentStart / SubagentStop report.
+// Token-checked exactly like /__agent/session. Always answers 200 for a
+// well-formed authenticated report: the hook is fail-open and reads nothing.
+// The background work a SubagentStop is still waiting on, and a `type:status`
+// summary of every entry for the trace. Claude Code's hooks reference (Stop
+// input) describes each entry as an in-flight task with `type` and `status`.
+// A `subagent` entry never counts: subagents can't spawn subagents, and on
+// 2026-11-04 a finished subagent's own final stop still listed one task,
+// itself, so counting every entry kept its row held forever. An entry whose
+// status reads as finished doesn't count either.
+fn pending_background_tasks(tasks: Option<&serde_json::Value>) -> (usize, String) {
+    let Some(list) = tasks.and_then(|v| v.as_array()) else {
+        return (0, String::new());
+    };
+    let mut pending = 0;
+    let mut seen = Vec::new();
+    for t in list {
+        let kind = t.get("type").and_then(|v| v.as_str()).unwrap_or("?");
+        let status = t.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+        seen.push(format!("{}:{}", trace_token(kind), trace_token(status)));
+        let finished = matches!(
+            status.to_ascii_lowercase().as_str(),
+            "completed"
+                | "complete"
+                | "done"
+                | "failed"
+                | "killed"
+                | "stopped"
+                | "cancelled"
+                | "canceled"
+                | "exited"
+        );
+        if kind != "subagent" && !finished {
+            pending += 1;
+        }
+    }
+    (pending, seen.join(","))
+}
+
+// delegated-stop-counts-only-the-subagents-own-tasks: `background_tasks` is
+// session-wide (2026-11-04 20:56: a finished subagent's final stop listed the
+// orchestrator's own watcher shell). Returns (pending_any, pending_own, seen):
+// an unfinished non-subagent entry is "own" only when its `id` appears in the
+// stopping subagent's own transcript. `transcript` is that file's text; None
+// means unreadable, and then own is 0: holding errs toward a stuck row (the
+// failure being fixed), releasing errs toward unowned lines, which commits
+// disclose as `unownedTaken`.
+fn pending_own_background_tasks(
+    tasks: Option<&serde_json::Value>,
+    transcript: Option<&str>,
+) -> (usize, usize, String) {
+    let (pending_any, seen) = pending_background_tasks(tasks);
+    let Some(text) = transcript else {
+        return (pending_any, 0, seen);
+    };
+    let mut own = 0;
+    for t in tasks.and_then(|v| v.as_array()).into_iter().flatten() {
+        let kind = t.get("type").and_then(|v| v.as_str()).unwrap_or("?");
+        let status = t.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+        if kind == "subagent" || background_status_finished(status) {
+            continue;
+        }
+        if let Some(id) = t.get("id").and_then(|v| v.as_str()) {
+            if !id.is_empty() && text.contains(id) {
+                own += 1;
+            }
+        }
+    }
+    (pending_any, own, seen)
+}
+
+fn background_status_finished(status: &str) -> bool {
+    matches!(
+        status.to_ascii_lowercase().as_str(),
+        "completed"
+            | "complete"
+            | "done"
+            | "failed"
+            | "killed"
+            | "stopped"
+            | "cancelled"
+            | "canceled"
+            | "exited"
+    )
+}
+
+fn handle_agent_subagent<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    body: &[u8],
+) -> (u16, &'static str, Vec<u8>) {
+    const JSON: &str = "application/json; charset=utf-8";
+    let Some(value) = authenticated_menu_payload(body, menu_session_token()) else {
+        return (403, JSON, b"{\"error\":\"bad token\"}".to_vec());
+    };
+    let field = |k: &str| {
+        value
+            .get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let event = field("event");
+    let agent = normalize_delegated_agent_id(&field("agent_id"));
+    if !delegated_agent_id_is_safe(&agent) {
+        return (400, JSON, b"{\"error\":\"bad agent_id\"}".to_vec());
+    }
+    let agent_type = field("agent_type");
+    let session = field("session_id");
+    match event.as_str() {
+        "SubagentStart" => {
+            let turn_start_bound = turn_start_bound_cell()
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or_default();
+            let bound = claim_files(app)
+                .and_then(|files| {
+                    let g = claim_lock();
+                    bind_locked(
+                        &g,
+                        &files,
+                        app,
+                        &agent,
+                        &agent_type,
+                        &session,
+                        &turn_start_bound,
+                    )
+                })
+                .unwrap_or_default();
+            (
+                200,
+                JSON,
+                serde_json::json!({ "ok": true, "bound": bound })
+                    .to_string()
+                    .into_bytes(),
+            )
+        }
+        "SubagentStop" => {
+            // A stop with background tasks still pending is a pause, not the
+            // end: the subagent resumes when they finish and keeps writing.
+            // Keep the binding; its final stop (no pending tasks) releases it.
+            // Seen live 2026-11-04: a subagent backgrounded `sleep 600`, ended
+            // its turn, and the binding was released ten minutes early.
+            // delegated-stop-counts-only-the-subagents-own-tasks: defer on
+            // `own`, the tasks whose ids appear in this subagent's transcript.
+            let tasks = value.get("background_tasks");
+            let (pending_any, _, _) = pending_own_background_tasks(tasks, None);
+            let transcript = if pending_any > 0 {
+                value
+                    .get("agent_transcript_path")
+                    .and_then(|v| v.as_str())
+                    .filter(|p| !p.is_empty())
+                    .and_then(|p| std::fs::read_to_string(expand_tilde(p)).ok())
+            } else {
+                None
+            };
+            let (pending_any, pending, seen) =
+                pending_own_background_tasks(tasks, transcript.as_deref());
+            if bram_trace_enabled() && !seen.is_empty() {
+                append_bram_trace_line(
+                    app,
+                    "delegated",
+                    &format!(
+                        "op=stop-tasks agent={} pending={} own={} transcript={} seen=[{}]",
+                        agent,
+                        pending_any,
+                        pending,
+                        if transcript.is_some() {
+                            "ok"
+                        } else if pending_any == 0 {
+                            // Nothing unfinished: the transcript wasn't read.
+                            "skipped"
+                        } else {
+                            "unreadable"
+                        },
+                        seen
+                    ),
+                );
+            }
+            if pending > 0 {
+                // Only a bound agent's pause is a deferral; another agent's
+                // (one spawned with no claim) is traced as the miss it is.
+                let bound = read_delegated_bindings(app).bindings.contains_key(&agent);
+                if bram_trace_enabled() {
+                    let line = if bound {
+                        format!("op=stop-deferred agent={} tasks={}", agent, pending)
+                    } else {
+                        format!("op=release-miss agent={} reason=stop-paused", agent)
+                    };
+                    append_bram_trace_line(app, "delegated", &line);
+                }
+                return (
+                    200,
+                    JSON,
+                    serde_json::json!({ "ok": true, "released": false, "deferred": pending })
+                        .to_string()
+                        .into_bytes(),
+                );
+            }
+            let released = delegated_release(app, ReleaseScope::Agents(&[agent]), "stop") > 0;
+            (
+                200,
+                JSON,
+                serde_json::json!({ "ok": true, "released": released })
+                    .to_string()
+                    .into_bytes(),
+            )
+        }
+        _ => (400, JSON, b"{\"error\":\"unknown event\"}".to_vec()),
+    }
+}
+
+// POST /__agent/subagent/release — the row's Release control: `{agentIds:[…]}`
+// (the selection's agents, released in one transaction), `{agentId}` or
+// `{all:true}`. Pane-called, so it carries no token; like the other pane POST
+// routes it is protected by the common loopback gate (loopback_gate_refusal:
+// loopback Host, no foreign Origin). Traced reason=manual.
+fn handle_agent_subagent_release<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    body: &[u8],
+) -> (u16, &'static str, Vec<u8>) {
+    const JSON: &str = "application/json; charset=utf-8";
+    let Ok(req) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return (400, JSON, b"{\"error\":\"invalid JSON\"}".to_vec());
+    };
+    let released = if req.get("all").and_then(|v| v.as_bool()) == Some(true) {
+        delegated_release(app, ReleaseScope::All, "manual")
+    } else {
+        let mut agents = worklist_json_ids(&req, "agentIds");
+        agents.extend(
+            req.get("agentId")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+        );
+        let agents: Vec<String> = agents
+            .iter()
+            .map(|a| normalize_delegated_agent_id(a))
+            .collect();
+        if agents.is_empty() || !agents.iter().all(|a| delegated_agent_id_is_safe(a)) {
+            return (
+                400,
+                JSON,
+                b"{\"error\":\"agentIds, agentId or all:true required\"}".to_vec(),
+            );
+        }
+        delegated_release(app, ReleaseScope::Agents(&agents), "manual")
+    };
+    (
+        200,
+        JSON,
+        serde_json::json!({ "ok": true, "released": released })
+            .to_string()
+            .into_bytes(),
+    )
+}
+
+#[cfg(test)]
+mod delegated_binding_tests {
+    use super::*;
+
+    #[test]
+    fn a_stop_waits_only_on_real_background_work() {
+        // The 2026-11-04 demo: a paused subagent (its shell sleep plus itself),
+        // then its final stop still listing itself.
+        let paused = serde_json::json!([
+            { "id": "b2slumspb", "type": "shell", "status": "running" },
+            { "id": "a0204c4a", "type": "subagent", "status": "running" }
+        ]);
+        let (n, seen) = pending_background_tasks(Some(&paused));
+        assert_eq!(n, 1);
+        assert_eq!(seen, "shell:running,subagent:running");
+        let final_stop = serde_json::json!([
+            { "id": "a0204c4a", "type": "subagent", "status": "running" }
+        ]);
+        assert_eq!(pending_background_tasks(Some(&final_stop)).0, 0);
+        // A finished shell no longer holds the binding.
+        let done = serde_json::json!([{ "type": "shell", "status": "completed" }]);
+        assert_eq!(pending_background_tasks(Some(&done)).0, 0);
+        // No list, or an empty one: nothing pending, nothing to trace.
+        assert_eq!(pending_background_tasks(None), (0, String::new()));
+        assert_eq!(pending_background_tasks(Some(&serde_json::json!([]))).0, 0);
+    }
+
+    // delegated-stop-counts-only-the-subagents-own-tasks
+    #[test]
+    fn a_stop_counts_only_the_subagents_own_tasks() {
+        // The 2026-11-04 20:56 case: the shell is the orchestrator's watcher.
+        let tasks = serde_json::json!([
+            { "type": "shell", "status": "running", "id": "bsess123" },
+            { "type": "subagent", "status": "running", "id": "a1" }
+        ]);
+        let (any, own, _) = pending_own_background_tasks(Some(&tasks), Some("no such id here"));
+        assert_eq!((any, own), (1, 0));
+        // The sleep-600 case: the subagent's transcript names its shell.
+        let sleep =
+            serde_json::json!([{ "type": "shell", "status": "running", "id": "b2slumspb" }]);
+        let (_, own, _) =
+            pending_own_background_tasks(Some(&sleep), Some("task b2slumspb started"));
+        assert_eq!(own, 1);
+        // Unreadable transcript releases.
+        assert_eq!(pending_own_background_tasks(Some(&sleep), None).1, 0);
+        // A finished task never counts.
+        let done =
+            serde_json::json!([{ "type": "shell", "status": "completed", "id": "b2slumspb" }]);
+        assert_eq!(
+            pending_own_background_tasks(Some(&done), Some("b2slumspb")).1,
+            0
+        );
+    }
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    fn temp_bindings_path(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("bram-delegated-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(DELEGATED_BINDINGS_REL)
+    }
+
+    #[test]
+    fn bind_on_start_with_a_claim_records_its_ids() {
+        let mut b = DelegatedBindings::default();
+        assert!(b.bind("a1", &s(&["x", "y"]), 10, "sess", "general-purpose"));
+        assert_eq!(b.union_ids(), s(&["x", "y"]));
+        let got = &b.bindings["a1"];
+        assert_eq!(got.bound_at_ms, 10);
+        assert_eq!(got.session_id, "sess");
+        // A repeat with the same ids is not a change.
+        assert!(!b.bind("a1", &s(&["y", "x"]), 20, "sess", "general-purpose"));
+    }
+
+    #[test]
+    fn bind_without_a_claim_binds_nothing() {
+        let mut b = DelegatedBindings::default();
+        assert!(!b.bind("a1", &[], 10, "sess", "t"));
+        assert!(b.is_empty());
+        assert!(b.union_ids().is_empty());
+    }
+
+    #[test]
+    fn release_on_stop_removes_only_that_agent() {
+        let mut b = DelegatedBindings::default();
+        b.bind("a1", &s(&["x"]), 1, "", "");
+        b.bind("a2", &s(&["y"]), 2, "", "");
+        assert_eq!(b.release("a1").map(|r| r.ids), Some(s(&["x"])));
+        assert_eq!(b.union_ids(), s(&["y"]));
+        assert!(b.release("a1").is_none());
+    }
+
+    // ---- the claim transactions, over temp files --------------------------
+
+    // Stubs the host side of a claim transition. `open` is the main turn's
+    // state. With `pause`, the first "shrunk" boundary blocks between the two
+    // barriers, holding the claim lock, so a test can try to interleave.
+    #[derive(Default)]
+    struct Fx {
+        open: bool,
+        pause: Option<(
+            std::sync::Arc<std::sync::Barrier>,
+            std::sync::Arc<std::sync::Barrier>,
+        )>,
+        paused: std::sync::atomic::AtomicBool,
+    }
+
+    impl ClaimEffects for Fx {
+        fn boundary(&self, _ids: &[String], kind: &str) {
+            if let Some((entered, resume)) = &self.pause {
+                if kind == "shrunk" && !self.paused.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    entered.wait();
+                    resume.wait();
+                }
+            }
+        }
+        fn mirror_write(&self, _: i64, _: &str, _: &[String]) {}
+        fn mirror_clear(&self, _: &[String], _: &'static str) {}
+        fn mirror_shrink(&self, _: &[String], _: &[String], _: &'static str) {}
+        fn tracing(&self) -> bool {
+            false
+        }
+        fn trace(&self, _: &str, _: &str) {}
+        fn signal(&self, _: &str) {}
+        fn cleared(&self) {}
+        fn main_turn_open(&self) -> bool {
+            self.open
+        }
+    }
+
+    fn temp_files(name: &str) -> ClaimFiles {
+        let bindings = temp_bindings_path(name);
+        ClaimFiles {
+            claim: bindings.with_file_name(".inflight-claim.json"),
+            bindings,
+        }
+    }
+
+    // A claim on `ids` and one binding per (agent, ids), as a turn that
+    // started them and spawned the subagents would leave them.
+    fn seed(files: &ClaimFiles, ids: &[&str], bindings: &[(&str, &[&str])]) {
+        let claim = InflightClaim {
+            ids: s(ids),
+            claimed_at: 1,
+            kind: "approved".into(),
+        };
+        assert!(write_inflight_claim_at(&files.claim, &claim));
+        let mut b = DelegatedBindings::default();
+        for (agent, ids) in bindings {
+            b.bind(agent, &s(ids), 2, "sess", "general-purpose");
+        }
+        assert!(write_delegated_bindings_at(&files.bindings, &b));
+    }
+
+    fn claim_ids(files: &ClaimFiles) -> Option<Vec<String>> {
+        read_inflight_claim_at(&files.claim).map(|c| c.ids)
+    }
+
+    fn held(files: &ClaimFiles, open: bool) -> bool {
+        held_by_delegation_at(
+            read_inflight_claim_at(&files.claim).as_ref(),
+            &read_delegated_bindings_at(&files.bindings).union_ids(),
+            open,
+        )
+    }
+
+    fn retire(files: &ClaimFiles, ids: &[&str], mode: Retire) -> ClaimShrink {
+        let g = claim_lock();
+        retire_claim_locked(&g, files, &Fx::default(), &s(ids), mode, "test")
+    }
+
+    fn release(files: &ClaimFiles, agents: &[&str], fx: &Fx) -> usize {
+        let g = claim_lock();
+        release_locked(
+            &g,
+            files,
+            fx,
+            ReleaseScope::Agents(&s(agents)),
+            "stop",
+            false,
+        )
+    }
+
+    #[test]
+    fn retire_plan_keeps_bound_ids() {
+        // Clear covering the claim: the bound id stays.
+        assert_eq!(
+            plan_claim_retire(&s(&["a", "b"]), &s(&["a", "b"]), &s(&["b"]), Retire::Clear),
+            Some((s(&["b"]), s(&["b"])))
+        );
+        // A clear that doesn't cover the claim is still refused.
+        assert_eq!(
+            plan_claim_retire(&s(&["a", "b"]), &s(&["a"]), &[], Retire::Clear),
+            None
+        );
+        // A shrink retires only what it names, and not a bound id.
+        assert_eq!(
+            plan_claim_retire(&s(&["a", "b"]), &s(&["a"]), &s(&["a"]), Retire::Shrink),
+            Some((s(&["a", "b"]), s(&["a"])))
+        );
+        assert_eq!(
+            plan_claim_retire(&s(&["a", "b"]), &s(&["a"]), &[], Retire::Shrink),
+            Some((s(&["b"]), vec![]))
+        );
+    }
+
+    // Codex §10: a foreground cancel (permission reject, Escape) clears with
+    // every claimed id; a still-bound subagent's ids must survive it.
+    #[test]
+    fn cancellation_clear_retains_a_bound_claim() {
+        let files = temp_files("cancel");
+        seed(&files, &["a"], &[("s1", &["a"])]);
+        retire(&files, &["a"], Retire::Clear);
+        assert_eq!(claim_ids(&files), Some(s(&["a"])));
+        assert!(held(&files, false));
+        // A claim with an unbound id loses only that one.
+        seed(&files, &["a", "b"], &[("s1", &["a"])]);
+        retire(&files, &["a", "b"], Retire::Clear);
+        assert_eq!(claim_ids(&files), Some(s(&["a"])));
+    }
+
+    // Antigravity §1: advance shrinks by the advanced ids; a bound id stays.
+    #[test]
+    fn advance_shrink_retains_a_bound_id() {
+        let files = temp_files("advance");
+        seed(&files, &["a", "b"], &[("s1", &["b"])]);
+        assert_eq!(
+            retire(&files, &["b"], Retire::Shrink),
+            ClaimShrink::Shrunk {
+                remaining: s(&["a", "b"])
+            }
+        );
+        assert_eq!(
+            retire(&files, &["a"], Retire::Shrink),
+            ClaimShrink::Shrunk {
+                remaining: s(&["b"])
+            }
+        );
+        assert_eq!(claim_ids(&files), Some(s(&["b"])));
+    }
+
+    // OpenCode §8: an explicit end naming only bound ids leaves the claim
+    // held, and the final stop clears it.
+    #[test]
+    fn iterate_end_with_every_id_bound_holds_until_the_last_stop() {
+        let files = temp_files("end");
+        seed(&files, &["a"], &[("s1", &["a"])]);
+        retire(&files, &["a"], Retire::Shrink);
+        assert_eq!(claim_ids(&files), Some(s(&["a"])));
+        assert!(held(&files, false));
+        assert!(!held(&files, true), "a running main turn is not a hold");
+        assert_eq!(release(&files, &["s1"], &Fx::default()), 1);
+        assert_eq!(claim_ids(&files), None);
+        assert!(read_delegated_bindings_at(&files.bindings).is_empty());
+    }
+
+    // A release while a main turn runs leaves that turn's claim alone; the
+    // turn's own end clears it, with nothing bound by then.
+    #[test]
+    fn release_during_a_main_turn_leaves_the_claim_to_the_turn_end() {
+        let files = temp_files("release-open");
+        seed(&files, &["a"], &[("s1", &["a"])]);
+        let open = Fx {
+            open: true,
+            ..Fx::default()
+        };
+        assert_eq!(release(&files, &["s1"], &open), 1);
+        assert_eq!(claim_ids(&files), Some(s(&["a"])));
+        retire(&files, &["a"], Retire::Clear);
+        assert_eq!(claim_ids(&files), None);
+    }
+
+    // Codex §11: dropping an unrelated item writes a drop claim (unioned with
+    // the bound ids) and prunes it; the claim must read as held afterwards,
+    // and the final stop must clear it.
+    #[test]
+    fn drop_of_an_unrelated_item_keeps_the_hold() {
+        let files = temp_files("drop");
+        seed(&files, &["a"], &[("s1", &["a"])]);
+        {
+            let g = claim_lock();
+            let written = write_claim_locked(&g, &files, &Fx::default(), &s(&["b"]), "drop", true);
+            assert_eq!(written, s(&["a", "b"]));
+        }
+        retire(&files, &["b"], Retire::Shrink);
+        assert_eq!(claim_ids(&files), Some(s(&["a"])));
+        assert!(held(&files, false));
+        release(&files, &["s1"], &Fx::default());
+        assert_eq!(claim_ids(&files), None);
+    }
+
+    // Antigravity §2: a chat turn while a subagent holds `a` re-arms `a`'s
+    // live authorization. The re-arm isn't blocked by the held claim, keeps
+    // the bound id, and a subagent this chat turn spawns binds to nothing.
+    #[test]
+    fn chat_turn_rearm_keeps_the_hold_and_binds_nothing_new() {
+        let files = temp_files("rearm");
+        seed(&files, &["a"], &[("s1", &["a"])]);
+        let bound = read_delegated_bindings_at(&files.bindings).union_ids();
+        let claim = read_inflight_claim_at(&files.claim);
+        assert!(!rearm_blocked(claim.as_ref(), &bound));
+        // The turn opened with `a` already bound.
+        let turn_start_bound = bound.clone();
+        let g = claim_lock();
+        write_claim_locked(&g, &files, &Fx::default(), &s(&["a"]), "approved", true);
+        assert_eq!(claim_ids(&files), Some(s(&["a"])));
+        let fx = Fx {
+            open: true,
+            ..Fx::default()
+        };
+        assert_eq!(
+            bind_locked(&g, &files, &fx, "s2", "Explore", "sess", &turn_start_bound),
+            None
+        );
+        drop(g);
+        assert!(!read_delegated_bindings_at(&files.bindings)
+            .bindings
+            .contains_key("s2"));
+        // A main turn's own claim does block a re-arm.
+        let own = InflightClaim {
+            ids: s(&["c"]),
+            ..InflightClaim::default()
+        };
+        assert!(rearm_blocked(Some(&own), &bound));
+        assert!(!rearm_blocked(None, &bound));
+    }
+
+    // The turn that starts `a` may spawn several subagents; each binds.
+    #[test]
+    fn parallel_subagents_of_one_turn_all_bind() {
+        let files = temp_files("parallel");
+        seed(&files, &["a"], &[]);
+        let fx = Fx {
+            open: true,
+            ..Fx::default()
+        };
+        let g = claim_lock();
+        assert_eq!(
+            bind_locked(&g, &files, &fx, "s1", "t", "sess", &[]),
+            Some(s(&["a"]))
+        );
+        assert_eq!(
+            bind_locked(&g, &files, &fx, "s2", "t", "sess", &[]),
+            Some(s(&["a"]))
+        );
+        // A turn starting `b` while `a` is held hands on only `b`.
+        assert_eq!(
+            delegated_inheritable_ids(&s(&["a", "b"]), &s(&["a"])),
+            s(&["b"])
+        );
+    }
+
+    // Antigravity §3: a held claim is not stranded.
+    #[test]
+    fn stranded_skips_a_held_claim() {
+        let held_claim = InflightClaim {
+            ids: s(&["a"]),
+            ..InflightClaim::default()
+        };
+        assert!(!claim_can_strand(&held_claim, &s(&["a"]), false));
+        assert!(claim_can_strand(&held_claim, &[], false));
+        // While a main turn runs it is that turn's claim, and can strand.
+        assert!(claim_can_strand(&held_claim, &s(&["a"]), true));
+        assert!(!claim_can_strand(&InflightClaim::default(), &[], false));
+    }
+
+    // Codex §9: two releases close together. Release A pauses inside its
+    // claim reconciliation, holding the lock; release B must wait for it, and
+    // the end state has no bindings and no claim (B used to clear the claim
+    // first and A then wrote back a stale [b]).
+    #[test]
+    fn interleaved_releases_leave_no_claim() {
+        let files = std::sync::Arc::new(temp_files("interleave"));
+        seed(&files, &["a", "b"], &[("sa", &["a"]), ("sb", &["b"])]);
+        let entered = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let a = {
+            let files = files.clone();
+            let fx = Fx {
+                pause: Some((entered.clone(), resume.clone())),
+                ..Fx::default()
+            };
+            std::thread::spawn(move || release(&files, &["sa"], &fx))
+        };
+        entered.wait();
+        let b = {
+            let files = files.clone();
+            std::thread::spawn(move || release(&files, &["sb"], &Fx::default()))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        // B is blocked on the lock: its binding is still there.
+        assert!(read_delegated_bindings_at(&files.bindings)
+            .bindings
+            .contains_key("sb"));
+        resume.wait();
+        assert_eq!(a.join().unwrap(), 1);
+        assert_eq!(b.join().unwrap(), 1);
+        assert!(read_delegated_bindings_at(&files.bindings).is_empty());
+        assert_eq!(claim_ids(&files), None);
+    }
+
+    #[test]
+    fn force_release_clears_the_claim_whatever_the_turn_state() {
+        let files = temp_files("force");
+        seed(&files, &["a", "b"], &[("s1", &["a"])]);
+        let open = Fx {
+            open: true,
+            ..Fx::default()
+        };
+        let g = claim_lock();
+        assert_eq!(
+            release_locked(&g, &files, &open, ReleaseScope::All, "session-end", true),
+            1
+        );
+        assert_eq!(claim_ids(&files), None);
+    }
+
+    #[test]
+    fn id_sets_compare_sorted_and_deduplicated() {
+        assert_eq!(
+            sorted_id_set(s(&["new"]).iter().chain(s(&["bound", "new"]).iter())),
+            s(&["bound", "new"])
+        );
+        assert_eq!(
+            sorted_id_set(&s(&["b", "a"])),
+            sorted_id_set(&s(&["a", "b", "a"]))
+        );
+    }
+
+    #[test]
+    fn release_all_empties_the_store_and_removes_the_file() {
+        let path = temp_bindings_path("release-all");
+        let mut b = DelegatedBindings::default();
+        b.bind("a1", &s(&["x"]), 1, "s", "t");
+        b.bind("a2", &s(&["y", "z"]), 2, "s", "t");
+        assert!(write_delegated_bindings_at(&path, &b));
+        let back = read_delegated_bindings_at(&path);
+        assert_eq!(back, b);
+        assert_eq!(back.union_ids(), s(&["x", "y", "z"]));
+        assert!(write_delegated_bindings_at(
+            &path,
+            &DelegatedBindings::default()
+        ));
+        assert!(!path.exists());
+        assert!(read_delegated_bindings_at(&path).is_empty());
+        // Removing an absent file is still success.
+        assert!(write_delegated_bindings_at(
+            &path,
+            &DelegatedBindings::default()
+        ));
+    }
+
+    #[test]
+    fn refusal_names_the_bound_ids_and_their_agents() {
+        let mut b = DelegatedBindings::default();
+        b.bind("a1", &s(&["x", "y"]), 1, "", "");
+        b.bind("a2", &s(&["z"]), 2, "", "");
+        let (ids, agents) = b.refusal(&s(&["y", "free", "x"])).unwrap();
+        assert_eq!(ids, s(&["x", "y"]));
+        assert_eq!(agents, s(&["a1"]));
+        assert!(b.refusal(&s(&["free"])).is_none());
+        assert!(DelegatedBindings::default().refusal(&s(&["x"])).is_none());
+    }
+
+    #[test]
+    fn agent_ids_normalize_to_the_roster_form() {
+        assert_eq!(
+            normalize_delegated_agent_id("agent-ae3fb2df9de52ea71"),
+            "ae3fb2df9de52ea71"
+        );
+        assert_eq!(
+            normalize_delegated_agent_id("ae3fb2df9de52ea71"),
+            "ae3fb2df9de52ea71"
+        );
+        assert!(delegated_agent_id_is_safe("ae3fb2df9de52ea71"));
+        assert!(!delegated_agent_id_is_safe(""));
+        assert!(!delegated_agent_id_is_safe("../x y"));
+    }
 }
 
 // Delete any leftover Codex lifecycle intent/result files from a prior
@@ -63792,7 +74295,7 @@ fn cleanup_stale_worklist_intent<R: tauri::Runtime>(app: &AppHandle<R>) {
 }
 
 fn pty_intent_file<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
-    project_relative_path(app, PTY_INTENT_REL)
+    project_resource_path(app, PTY_INTENT_REL)
 }
 
 // Serializes append + drain in queue_pty_intent so concurrent calls
@@ -64043,7 +74546,11 @@ fn resolve_worklist_record_items<R: tauri::Runtime>(
     }
 }
 
-fn base_worklist_doc_from_parsed(parsed_doc: Option<serde_json::Value>) -> serde_json::Value {
+// `worklist_rel` is the repo-relative worklist path the message names.
+fn base_worklist_doc_from_parsed(
+    parsed_doc: Option<serde_json::Value>,
+    worklist_rel: &str,
+) -> serde_json::Value {
     use serde_json::json;
 
     match parsed_doc {
@@ -64052,13 +74559,13 @@ fn base_worklist_doc_from_parsed(parsed_doc: Option<serde_json::Value>) -> serde
             "description": "",
             "items": [],
             "schemaError": "root-array",
-            "schemaErrorMessage": "resources/worklist.json must be an object with { \"description\": string, \"items\": [] }, not a bare JSON array",
+            "schemaErrorMessage": format!("{} must be an object with {{ \"description\": string, \"items\": [] }}, not a bare JSON array", worklist_rel),
         }),
         Some(_) => json!({
             "description": "",
             "items": [],
             "schemaError": "root-non-object",
-            "schemaErrorMessage": "resources/worklist.json must be a JSON object with { \"description\": string, \"items\": [] } at the root",
+            "schemaErrorMessage": format!("{} must be a JSON object with {{ \"description\": string, \"items\": [] }} at the root", worklist_rel),
         }),
         None => json!({ "description": "", "items": [] }),
     }
@@ -64079,7 +74586,10 @@ fn worklist_doc<R: tauri::Runtime>(app: &AppHandle<R>) -> serde_json::Value {
         .as_ref()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|raw| serde_json::from_str(&raw).ok());
-    let mut doc = base_worklist_doc_from_parsed(parsed_doc);
+    let worklist_rel = project_root(Some(app))
+        .map(|r| bram_state_rel(&r, "worklist.json"))
+        .unwrap_or_else(|| "worklist.json".to_string());
+    let mut doc = base_worklist_doc_from_parsed(parsed_doc, &worklist_rel);
     if let Some(obj) = doc.as_object_mut() {
         obj.insert("exists".to_string(), serde_json::Value::Bool(exists));
         obj.insert(
@@ -65009,35 +75519,23 @@ const UNTRACKED_UNDECLARED_WARN: usize = 1000;
 // outbound turns and drafts), so counting them would trip the .gitignore
 // suggestion for files the user never created. NOT all of resources/: a
 // project keeps its own content there too (tau tracks resources/review/...).
-fn is_bram_owned_path(path: &str) -> bool {
-    if let Some(rest) = path.strip_prefix("resources/") {
-        // Every dotfile directly under resources/ is a Bram sidecar.
-        if rest.starts_with('.') && !rest.contains('/') {
-            return true;
-        }
-        return [
-            "bram-traces/",
-            "outbound-turns/",
-            "message-drafts/",
-            "session-digests/",
-            "worklist",
-            "feedback-",
-        ]
+// The list is BRAM_OWNED_ENTRIES.
+fn is_bram_owned_path(root: &Path, path: &str) -> bool {
+    let owned = BRAM_OWNED_ENTRIES
         .iter()
-        .any(|p| rest.starts_with(p));
+        .filter(|e| e.class != OwnedClass::Shown);
+    match bram_state_rel_strip(root, path) {
+        Some(rest) => owned
+            .filter(|e| !e.root_relative)
+            .any(|e| owned_entry_covers(e, rest)),
+        None => owned
+            .filter(|e| e.root_relative)
+            .any(|e| owned_entry_covers(e, path)),
     }
-    [
-        ".claude/bram-conventions.md",
-        ".claude/bram-reference/",
-        ".claude/settings.json",
-        ".claude/settings.local.json",
-        ".claude/skills/",
-    ]
-    .iter()
-    .any(|p| path == *p || (p.ends_with('/') && path.starts_with(p)))
 }
 
 fn untracked_undeclared_summary(
+    root: &Path,
     untracked: &[String],
     declared: &std::collections::HashMap<String, Vec<String>>,
 ) -> (usize, Vec<(String, usize)>, usize) {
@@ -65045,7 +75543,7 @@ fn untracked_undeclared_summary(
     let mut count = 0usize;
     let mut bram_owned = 0usize;
     for path in untracked {
-        if is_bram_owned_path(path) {
+        if is_bram_owned_path(root, path) {
             bram_owned += 1;
             continue;
         }
@@ -65317,8 +75815,9 @@ fn coordination_status<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<Vec<u8>,
                     .collect()
             })
             .unwrap_or_default();
+        let state_root = project_root_path.clone().unwrap_or_default();
         let (count, top, bram_owned) =
-            untracked_undeclared_summary(&untracked, &worklist_declared_files(app));
+            untracked_undeclared_summary(&state_root, &untracked, &worklist_declared_files(app));
         untracked_undeclared_row(count, &top, bram_owned)
     };
     let applied_integrity_row = if applied_items.is_empty() {
@@ -65340,7 +75839,7 @@ fn coordination_status<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<Vec<u8>,
     };
     let port_file = project_root_path
         .as_ref()
-        .map(|p| p.join("resources/.bram-port"));
+        .map(|p| resource_relative_path(p, ".bram-port"));
     let port_meta_file = port_file.as_ref().map(|p| bram_port_metadata_path(p));
     let bound_port = LOOPBACK_PORT.get().copied();
     let file_port = port_file
@@ -67923,6 +78422,49 @@ mod session_turn_tests {
         assert_eq!(super::outbound_turn_id_from_frame("hello"), None);
     }
 
+    // issue-470: shape from Claude Code's own JSONL (session 6b0e2dba…,
+    // trimmed): a `compact_boundary` system record, then the
+    // `isCompactSummary` user record holding the summary.
+    #[test]
+    fn compact_summary_turn_carries_boundary_metadata() {
+        let boundary = r#"{"type":"system","subtype":"compact_boundary","content":"Conversation compacted","level":"info","compactMetadata":{"trigger":"auto","preTokens":969184,"postTokens":7372}}"#;
+        let summary = r#"{"type":"user","isCompactSummary":true,"isVisibleInTranscriptOnly":true,"message":{"role":"user","content":"This session is being continued from a previous conversation that ran out of context.\n\nSummary:\n1. stuff"}}"#;
+        let after = r#"{"type":"user","message":{"role":"user","content":"next prompt"}}"#;
+        let turns = st_parse_lines_to_turns(&format!("{boundary}\n{summary}\n{after}"));
+        assert_eq!(turns.len(), 2, "the boundary record is not a turn");
+        let t = &turns[0];
+        assert_eq!(t["role"], "user");
+        assert_eq!(t["compactSummary"], true);
+        assert_eq!(t["compactTrigger"], "auto");
+        assert_eq!(t["compactPreTokens"], 969184);
+        assert_eq!(t["compactPostTokens"], 7372);
+        assert!(t["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("This session is being continued"));
+        // The metadata is used once: an ordinary turn after it gets none.
+        assert!(turns[1].get("compactSummary").is_none());
+        assert!(turns[1].get("compactTrigger").is_none());
+    }
+
+    #[test]
+    fn compact_summary_without_boundary_is_flagged_without_metadata() {
+        let summary = r#"{"type":"user","isCompactSummary":true,"message":{"role":"user","content":"This session is being continued from a previous conversation."}}"#;
+        let turns = st_parse_lines_to_turns(summary);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0]["compactSummary"], true);
+        assert!(turns[0].get("compactTrigger").is_none());
+        assert!(turns[0].get("compactPreTokens").is_none());
+        assert!(turns[0].get("compactPostTokens").is_none());
+        // A boundary not followed by a summary leaves later turns untouched.
+        let boundary = r#"{"type":"system","subtype":"compact_boundary","compactMetadata":{"trigger":"manual","preTokens":5,"postTokens":1}}"#;
+        let plain = r#"{"type":"user","message":{"role":"user","content":"hello"}}"#;
+        let turns = st_parse_lines_to_turns(&format!("{boundary}\n{plain}"));
+        assert_eq!(turns.len(), 1);
+        assert!(turns[0].get("compactSummary").is_none());
+        assert!(turns[0].get("compactTrigger").is_none());
+    }
+
     #[test]
     fn queued_command_attachment_becomes_user_turn() {
         // A message sent while the assistant is mid-turn is recorded as a
@@ -67973,6 +78515,37 @@ mod session_turn_tests {
             "the summary reaches the pane, not the envelope: {}",
             text
         );
+    }
+
+    // transcript-peer-messages-not-you: the shape Claude Code records when a
+    // subagent's hand-back arrives mid-turn (2026-11-07, this repo's own
+    // session): origin.kind "peer", handback true, isMeta true.
+    #[test]
+    fn peer_handback_attachment_is_a_system_note() {
+        let content = r#"{"type":"attachment","attachment":{"type":"queued_command","commandMode":"prompt","isMeta":true,"prompt":"<agent-message from=\"aad2\">\n[Subagent hand-back] ...\n</agent-message>","origin":{"kind":"peer","from":"aad2","senderTaskId":"aad2","name":"general-purpose","body":"[Subagent hand-back] The text below is the final report...","handback":true,"handbackReportText":"Both edits are in and node --check passes.\n\n**Files changed**"}}}"#;
+        let turns = st_parse_lines_to_turns(content);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0]["role"], "system", "never attributed to the user");
+        assert_eq!(turns[0]["notification"], true);
+        assert_eq!(turns[0]["peer"], true);
+        assert_eq!(
+            turns[0]["text"],
+            "Report from subagent (general-purpose): Both edits are in and node --check passes."
+        );
+        assert!(turns[0]["entries"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Files changed"));
+    }
+
+    // The human mid-turn message stays a You turn.
+    #[test]
+    fn human_queued_command_stays_a_user_turn() {
+        let content = r#"{"type":"attachment","attachment":{"type":"queued_command","commandMode":"prompt","prompt":"meanwhile, a question","origin":{"kind":"human"}}}"#;
+        let turns = st_parse_lines_to_turns(content);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0]["role"], "user");
+        assert_eq!(turns[0]["text"], "meanwhile, a question");
     }
 
     #[test]
@@ -68052,9 +78625,12 @@ mod worklist_doc_tests {
 
     #[test]
     fn bare_array_root_sets_schema_error() {
-        let doc = base_worklist_doc_from_parsed(Some(json!([
-            { "id": "x", "file": "foo.txt", "before": "", "after": "" }
-        ])));
+        let doc = base_worklist_doc_from_parsed(
+            Some(json!([
+                { "id": "x", "file": "foo.txt", "before": "", "after": "" }
+            ])),
+            &crate::test_state_rel("worklist.json"),
+        );
 
         assert_eq!(
             doc.get("schemaError").and_then(|v| v.as_str()),
@@ -68069,7 +78645,10 @@ mod worklist_doc_tests {
 
     #[test]
     fn scalar_root_sets_non_object_schema_error() {
-        let doc = base_worklist_doc_from_parsed(Some(json!("oops")));
+        let doc = base_worklist_doc_from_parsed(
+            Some(json!("oops")),
+            &crate::test_state_rel("worklist.json"),
+        );
 
         assert_eq!(
             doc.get("schemaError").and_then(|v| v.as_str()),
@@ -68568,6 +79147,117 @@ fn needs_you_replier_phrase(author: &str, first_line: &str) -> Option<String> {
         return Some(format!("{} posted", speaker));
     }
     Some(format!("{} replied", author))
+}
+
+// alerts-show-whats-new-and-what-was-said: the comment's own words, for the
+// row to show under its title. The first line of real content: a Bram forge
+// signature line (agent or worklist-mirror form), blank lines, and bare
+// Markdown marks are skipped; leading heading/quote/emphasis marks are
+// stripped from the line kept. Whitespace is collapsed and the length capped
+// (in chars, with an ellipsis). Untrusted text: the pane renders it as plain
+// Text, never Markdown. Empty when the comment holds nothing but a signature.
+const NEEDS_YOU_EXCERPT_MAX_CHARS: usize = 160;
+
+fn needs_you_excerpt(body: &str) -> String {
+    for raw in body.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let bare =
+            line.trim_start_matches(|ch: char| matches!(ch, '_' | '*' | '>' | '#' | '-' | ' '));
+        if guard_policy::parse_agent_signature(bare).is_some()
+            || worklist_mirror_signature_speaker(bare).is_some()
+        {
+            continue;
+        }
+        let text = line
+            .trim_start_matches(|ch: char| matches!(ch, '#' | '>' | ' '))
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if text.is_empty()
+            || text
+                .chars()
+                .all(|ch| matches!(ch, '-' | '*' | '_' | '=' | '`'))
+        {
+            continue;
+        }
+        let text = strip_markdown_escapes(&text);
+        if text.chars().count() > NEEDS_YOU_EXCERPT_MAX_CHARS {
+            let cut: String = text.chars().take(NEEDS_YOU_EXCERPT_MAX_CHARS).collect();
+            return format!("{}\u{2026}", cut.trim_end());
+        }
+        return text;
+    }
+    String::new()
+}
+
+// The excerpt renders as plain text, so a Markdown escape ("10\. Cool") would
+// show its backslash.
+fn strip_markdown_escapes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' && chars.peek().is_some_and(|next| next.is_ascii_punctuation()) {
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+#[cfg(test)]
+mod needs_you_excerpt_tests {
+    use super::{needs_you_excerpt, NEEDS_YOU_EXCERPT_MAX_CHARS};
+
+    const SIG: &str = "Jon's Claude (Bram 0.6.6, main thread, Fable 5, macOS, Tuck) speaking from the Bram project (github.com/judell/bram):";
+
+    #[test]
+    fn markdown_escapes_do_not_show() {
+        assert_eq!(needs_you_excerpt(r"10\. Cool, thanks"), "10. Cool, thanks");
+        assert_eq!(needs_you_excerpt(r"a \\ b"), r"a \ b");
+        assert_eq!(needs_you_excerpt(r"C:\temp"), r"C:\temp");
+    }
+
+    #[test]
+    fn plain_comment_is_its_first_line() {
+        assert_eq!(
+            needs_you_excerpt("The gate toggle settles it.\nSecond line."),
+            "The gate toggle settles it."
+        );
+    }
+
+    #[test]
+    fn signature_only_comment_is_empty() {
+        assert_eq!(needs_you_excerpt(SIG), "");
+        assert_eq!(needs_you_excerpt(&format!("{}\n\n", SIG)), "");
+    }
+
+    #[test]
+    fn signature_then_heading_yields_the_heading_text() {
+        let body = format!("{}\n\n## Findings on the gate\nmore", SIG);
+        assert_eq!(needs_you_excerpt(&body), "Findings on the gate");
+    }
+
+    #[test]
+    fn emphasized_signature_is_still_skipped() {
+        let body = format!("_{}_\nReal content", SIG);
+        assert_eq!(needs_you_excerpt(&body), "Real content");
+    }
+
+    #[test]
+    fn long_line_is_capped_with_ellipsis() {
+        let out = needs_you_excerpt(&"word ".repeat(100));
+        assert!(out.chars().count() <= NEEDS_YOU_EXCERPT_MAX_CHARS);
+        assert!(out.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn empty_body_is_empty() {
+        assert_eq!(needs_you_excerpt(""), "");
+        assert_eq!(needs_you_excerpt("\n  \n---\n"), "");
+    }
 }
 
 // worklist-mirror-comments-signed: the mirror signs as "<owner>'s Bram (Bram
@@ -69282,6 +79972,7 @@ fn forge_awaiting_items_fetch<R: tauri::Runtime>(
         // pre-change detail was reason-only — "I need to know who replied
         // in order to judge what to do"). One call, one extra jq field.
         let mut replier: Option<String> = None;
+        let mut excerpt = String::new();
         let comments_url = format!(
             "{}/comments?per_page=100",
             subj_url.replace("/pulls/", "/issues/")
@@ -69293,21 +79984,27 @@ fn forge_awaiting_items_fetch<R: tauri::Runtime>(
                     "api",
                     comments_url.as_str(),
                     "--jq",
-                    ".[-1] | ((.user.login // \"\") + \"\\n\" + ((.body // \"\") | split(\"\\n\")[0]))",
+                    ".[-1] | ((.user.login // \"\") + \"\\n\" + ((.body // \"\")[0:4000]))",
                 ],
                 "gh last comment author",
             ) {
                 let raw = String::from_utf8_lossy(&cout).to_string();
-                let (author, first_line) = match raw.split_once('\n') {
-                    Some((a, b)) => (a.trim().to_string(), b.trim().to_string()),
+                // alerts-show-whats-new-and-what-was-said: the same call now
+                // returns the body's head (not just its first line); the
+                // first line still names the replier, and the excerpt skips
+                // a signature to reach the content.
+                let (author, comment_body) = match raw.split_once('\n') {
+                    Some((a, b)) => (a.trim().to_string(), b.to_string()),
                     None => (raw.trim().to_string(), String::new()),
                 };
+                let first_line = comment_body.lines().next().unwrap_or("").trim().to_string();
                 if !author.is_empty() {
                     if author.eq_ignore_ascii_case(login.as_str()) {
                         continue;
                     }
                     verified = true;
                     replier = needs_you_replier_phrase(&author, &first_line);
+                    excerpt = needs_you_excerpt(&comment_body);
                 }
             }
         }
@@ -69376,6 +80073,7 @@ fn forge_awaiting_items_fetch<R: tauri::Runtime>(
                     Some(who) => format!("{} · GitHub notification ({}).", who, reason),
                     None => format!("GitHub notification (reason: {}).", reason),
                 },
+                "excerpt": excerpt,
                 "link": "/issues",
                 // The thread's web page: replying is the act that clears the
                 // item, and GitHub is where replying happens — so Open goes
@@ -69411,7 +80109,8 @@ fn forge_awaiting_items_fetch<R: tauri::Runtime>(
 // (id, activityMarker): new activity on the thread moves the marker, so a
 // dismissed thread that gains a later comment correctly reappears — never
 // dismiss-forever.
-const NEEDS_YOU_DISMISSED_REL: &str = "resources/.needs-you-dismissed.json";
+// Relative to Bram's state folder.
+const NEEDS_YOU_DISMISSED_REL: &str = ".needs-you-dismissed.json";
 
 // needs-you-durable-dismissals: how long a dismissal outlives its thread's
 // absence from the fetch. Retirement is by marker movement (new activity)
@@ -69462,7 +80161,7 @@ fn needs_you_dismissed_pairs<R: tauri::Runtime>(app: &AppHandle<R>) -> Vec<(Stri
     let Some(root) = project_root(Some(app)) else {
         return Vec::new();
     };
-    std::fs::read_to_string(root.join(NEEDS_YOU_DISMISSED_REL))
+    std::fs::read_to_string(resource_relative_path(&root, NEEDS_YOU_DISMISSED_REL))
         .ok()
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
         .and_then(|d| d.get("dismissed").and_then(|v| v.as_array()).cloned())
@@ -69657,7 +80356,7 @@ fn write_needs_you_dismissed<R: tauri::Runtime>(
         .map(|(id, m, at)| serde_json::json!({ "id": id, "marker": m, "dismissedAtMs": at }))
         .collect();
     let doc = serde_json::json!({ "version": 2, "dismissed": arr });
-    let path = root.join(NEEDS_YOU_DISMISSED_REL);
+    let path = resource_relative_path(&root, NEEDS_YOU_DISMISSED_REL);
     if let Ok(body) = serde_json::to_string_pretty(&doc) {
         let tmp = path.with_extension("json.tmp");
         if std::fs::write(&tmp, format!("{}\n", body)).is_ok() {
@@ -69915,6 +80614,23 @@ mod needs_you_checking_tests {
     }
 }
 
+// Does a begun item have anything on disk to commit? One `git status` over its
+// declared files. An item with no files, or a git failure, counts as having
+// changes: when unsure, the row stays where the user will see it.
+fn begun_item_has_changes<R: tauri::Runtime>(app: &AppHandle<R>, item: &serde_json::Value) -> bool {
+    let files = worklist_item_files(item);
+    if files.is_empty() {
+        return true;
+    }
+    let mut args = vec!["status", "--porcelain", "--"];
+    args.extend(files.iter().map(String::as_str));
+    git_status_reports_changes(git_run(app, &args).ok().as_deref())
+}
+
+fn git_status_reports_changes(porcelain: Option<&str>) -> bool {
+    porcelain.map(|out| !out.trim().is_empty()).unwrap_or(true)
+}
+
 fn serve_needs_you<R: tauri::Runtime>(app: &AppHandle<R>) -> (u16, &'static str, Vec<u8>) {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -69965,6 +80681,29 @@ fn serve_needs_you<R: tauri::Runtime>(app: &AppHandle<R>) -> (u16, &'static str,
         let begun = item.get("begunAtMs").is_some();
         let waiting = status == "applied" || (status == "proposed" && begun);
         if !waiting || claimed.contains(&id) {
+            continue;
+        }
+        // alerts-begun-item-not-ready-to-commit: a begun item with nothing on
+        // disk isn't ready to commit. Its work may be running elsewhere, such
+        // as with a subagent, so it's a quiet row, not a blocking one.
+        if status == "proposed" && !begun_item_has_changes(app, &item) {
+            classified.push((
+                owner_state_lane(false, false, false),
+                serde_json::json!({
+                    "source": "bram-local",
+                    "id": id,
+                    "title": format!("Worklist item \u{201c}{}\u{201d} has no changes yet", id),
+                    "detail": "Started, with nothing on disk. If no agent is working on it, Resume or Drop it.",
+                    "activityAt": item
+                        .get("begunAtMs")
+                        .and_then(|v| v.as_i64())
+                        .map(format_iso_utc_ms),
+                    "link": format!("/worklist2?expand={}", id),
+                    "court": "agent",
+                    "blocking": false,
+                    "verified": true,
+                }),
+            ));
             continue;
         }
         let closes: Vec<String> = item
@@ -70311,20 +81050,24 @@ mod needs_you_tests {
     fn provider_needs_setup_none_falls_back_to_project_level() {
         // No provider active — the fresh/failure-path launch #320 is about.
         assert!(
-            provider_needs_setup_for(None, true, false, false),
+            provider_needs_setup_for(None, true, false, false, false),
             "claude needs → banner"
         );
         assert!(
-            provider_needs_setup_for(None, false, true, false),
+            provider_needs_setup_for(None, false, true, false, false),
             "codex needs → banner"
         );
         assert!(
-            provider_needs_setup_for(None, false, false, true),
+            provider_needs_setup_for(None, false, false, true, false),
             "opencode needs (only ever true where it's installed) → banner"
         );
-        assert!(provider_needs_setup_for(None, true, true, false));
         assert!(
-            !provider_needs_setup_for(None, false, false, false),
+            provider_needs_setup_for(None, false, false, false, true),
+            "antigravity needs (only ever true where agy can run) → banner"
+        );
+        assert!(provider_needs_setup_for(None, true, true, false, false));
+        assert!(
+            !provider_needs_setup_for(None, false, false, false, false),
             "none needs → no banner"
         );
         // Provider active — unchanged: exactly that provider's need.
@@ -70332,11 +81075,13 @@ mod needs_you_tests {
             Some(SessionProvider::Claude),
             true,
             false,
+            false,
             false
         ));
         assert!(!provider_needs_setup_for(
             Some(SessionProvider::Claude),
             false,
+            true,
             true,
             true
         ));
@@ -70344,12 +81089,14 @@ mod needs_you_tests {
             Some(SessionProvider::Codex),
             false,
             true,
+            false,
             false
         ));
         assert!(!provider_needs_setup_for(
             Some(SessionProvider::Codex),
             true,
             false,
+            true,
             true
         ));
         // opencode-worklist-guard: an OpenCode session answers for its plugin
@@ -70358,14 +81105,26 @@ mod needs_you_tests {
             Some(SessionProvider::Opencode),
             false,
             false,
-            true
+            true,
+            false
         ));
         assert!(!provider_needs_setup_for(
             Some(SessionProvider::Opencode),
             true,
             true,
-            false
+            false,
+            true
         ));
+    }
+
+    #[test]
+    fn begun_item_with_no_changes_is_not_ready_to_commit() {
+        assert!(!super::git_status_reports_changes(Some("")));
+        assert!(!super::git_status_reports_changes(Some("\n")));
+        assert!(super::git_status_reports_changes(Some(" M src/a.rs\n")));
+        assert!(super::git_status_reports_changes(Some("?? new.txt\n")));
+        // A git failure keeps the row visible, not silently gone.
+        assert!(super::git_status_reports_changes(None));
     }
 
     #[test]
@@ -71346,7 +82105,7 @@ fn stranded_approval_ids<R: tauri::Runtime>(
         return None;
     }
     let root = project_root(Some(app))?;
-    if root.join(INFLIGHT_CLAIM_REL).exists() {
+    if resource_relative_path(&root, INFLIGHT_CLAIM_REL).exists() {
         return None;
     }
     let issued = unix_now_ms().saturating_sub(age_ms);
@@ -71428,11 +82187,20 @@ fn trace_stranded_approval<R: tauri::Runtime>(
 // that has to decide whether rung 2 is safe.
 const STRANDED_CLAIM_QUIET_MS: i64 = 60_000;
 
+// A claim held by delegation is not stranded: a subagent is working on it,
+// and its activity doesn't reach the main session's PTY or JSONL clocks.
+fn claim_can_strand(claim: &InflightClaim, bound: &[String], main_turn_open: bool) -> bool {
+    !claim.ids.is_empty() && !held_by_delegation_at(Some(claim), bound, main_turn_open)
+}
+
 fn stranded_claim_ids<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<(Vec<String>, i64, i64)> {
-    let (ids, claimed_at) = inflight_claim_ids_and_claimed_at(app)?;
-    if ids.is_empty() {
+    let claim = read_inflight_claim(app)?;
+    if !claim_can_strand(&claim, &delegated_bound_ids_union(app), main_turn_open()) {
         return None;
     }
+    let InflightClaim {
+        ids, claimed_at, ..
+    } = claim;
     let now = unix_now_ms();
     let age_ms = now.saturating_sub(claimed_at);
     let latest_activity = turn_state_cell()
@@ -71538,10 +82306,7 @@ fn iterate_feedback_draft_text<R: tauri::Runtime>(app: &AppHandle<R>, turn_text:
         if r.is_empty() || r.contains('/') || r.contains('\\') || r.contains("..") {
             continue;
         }
-        let path = root
-            .join("resources")
-            .join("feedback-drafts")
-            .join(format!("{}.md", r));
+        let path = resource_relative_path(&root, "feedback-drafts").join(format!("{}.md", r));
         if let Ok(text) = std::fs::read_to_string(&path) {
             out.push_str(&text);
             out.push('\n');
@@ -71553,10 +82318,12 @@ fn iterate_feedback_draft_text<R: tauri::Runtime>(app: &AppHandle<R>, turn_text:
 fn record_codex_direct_edit_authorization<R: tauri::Runtime>(app: &AppHandle<R>, turn_text: &str) {
     // opencode-signature-and-conventions: OpenCode writes no transcript its
     // guard could read the phrase from either, so it takes Codex's
-    // host-side record.
+    // host-side record. antigravity-signature-and-conventions: so does agy,
+    // whose hook payload carries no Claude-shaped transcript_path; its guard
+    // reads the record through the same fresh_bypass().
     if !matches!(
         current_provider(app),
-        Some(SessionProvider::Codex | SessionProvider::Opencode)
+        Some(SessionProvider::Codex | SessionProvider::Opencode | SessionProvider::Antigravity)
     ) {
         return;
     }
@@ -71961,8 +82728,16 @@ fn maybe_enforce_worklist_policy<R: tauri::Runtime>(
             // sentinel has already been cleared, so write+clear here
             // is a small redundant pair of events. No state
             // divergence.
-            write_inflight_claim_sentinel_no_snapshot(app, &dropped_via_auth, "drop");
-            clear_inflight_claim_sentinel(app, &dropped_via_auth);
+            //
+            // delegated-work-action-gates: with a claim live (a subagent's
+            // hold, or the drop claim itself), retire the dropped ids from it
+            // instead; overwriting it would drop the bound ids it carries.
+            if inflight_sentinel_is_active(app) {
+                let _ = shrink_inflight_claim_sentinel(app, &dropped_via_auth, "drop-policy");
+            } else {
+                write_inflight_claim_sentinel_no_snapshot(app, &dropped_via_auth, "drop");
+                clear_inflight_claim_sentinel(app, &dropped_via_auth, "drop-policy");
+            }
             retire_worklist_authorization_ids(app, &dropped_via_auth);
         }
         return true;
@@ -73332,7 +84107,7 @@ fn close_withdrawn_note_text(issue: u64, commit_sha: &str, via: &str) -> String 
     let how = if via == "pane" {
         "the user withdrew it from the Commits tab"
     } else {
-        "it was removed from resources/.worklist-issue-close.json by hand"
+        "it was removed from .worklist-issue-close.json in Bram's state folder (.bram/ if it exists, else resources/) by hand"
     };
     format!(
         "the queued close of #{} (commit {}) was withdrawn -- {}; it will NOT fire on Push, and #{} stays open",
@@ -75528,45 +86303,26 @@ fn route_request<R: tauri::Runtime>(
             .unwrap_or_default()
         };
         let enrich_started = std::time::Instant::now();
-        // search-index-opencode-sessions: OpenCode sessions are indexed from
-        // Bram's exports of them, which live in its cache, not under ~/.codex/,
-        // so they were labeled Claude (and their Switch went to Claude).
+        // search-index-opencode-sessions: OpenCode and Antigravity sessions are
+        // indexed from Bram's exports of them, which live in its cache, not
+        // under ~/.codex/, so without export-dir matching they fall through to
+        // Claude (breaking modal detail and Switch).
         let opencode_dir = opencode_export_dir(app).ok();
+        let antigravity_dir = antigravity_export_dir(app).ok();
         let enriched_hits = hits
             .iter()
             .map(|h| {
                 // Session doc key is the JSONL path. Recover the provider
-                // (Codex sessions live under ~/.codex/, OpenCode exports in
-                // Bram's cache) and the session id the expander needs:
-                // Claude's and OpenCode's is the file stem, but a Codex id
-                // lives inside the file (codex_session_meta).
+                // (Codex sessions live under ~/.codex/, OpenCode/Antigravity
+                // exports in Bram's cache) and the session id the expander
+                // needs: Claude's, OpenCode's and Antigravity's is the file
+                // stem, while a Codex id lives inside the file (codex_session_meta).
                 let (provider, id) = if h.kind == "session" {
-                    let path = std::path::Path::new(&h.key);
-                    if opencode_dir
-                        .as_deref()
-                        .is_some_and(|dir| is_opencode_export_path(path, dir))
-                    {
-                        let id = path
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("")
-                            .to_string();
-                        ("opencode".to_string(), id)
-                    } else if h.key.contains("/.codex/") {
-                        let id = codex_session_meta(path)
-                            .ok()
-                            .flatten()
-                            .map(|(id, _)| id)
-                            .unwrap_or_default();
-                        ("codex".to_string(), id)
-                    } else {
-                        let id = path
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("")
-                            .to_string();
-                        ("claude".to_string(), id)
-                    }
+                    search_session_hit_provider_and_id(
+                        &h.key,
+                        opencode_dir.as_deref(),
+                        antigravity_dir.as_deref(),
+                    )
                 } else {
                     (String::new(), String::new())
                 };
@@ -75702,20 +86458,28 @@ fn route_request<R: tauri::Runtime>(
         // (project CLAUDE.md + @-imports, ~/.claude memory/settings, project
         // .claude/hooks, ~/.codex files). Those live outside the project root,
         // so root containment doesn't fit — instead require the requested path
-        // to be a MEMBER of the enumerated set (union of both providers). This
+        // to be a MEMBER of the enumerated set (union of every provider's). This
         // preserves the read-home-config feature while blocking arbitrary reads
         // (~/.aws/credentials, /etc/passwd). Canonicalize both sides so symlinks
         // and `..` can't dodge the membership check.
+        // antigravity-context-files: the union was Claude's and Codex's only,
+        // written when they were the two providers, so a file only OpenCode's
+        // or Antigravity's list names (opencode.json, .agents/hooks.json, agy's
+        // rules) was listed in the tab but refused here.
         let requested = std::path::Path::new(&file_path)
             .canonicalize()
             .ok()
             .map(strip_unc_prefix);
-        let allowed: std::collections::HashSet<PathBuf> =
-            [SessionProvider::Claude, SessionProvider::Codex]
-                .into_iter()
-                .flat_map(|prov| collect_context_files(app, Some(prov)))
-                .filter_map(|cf| cf.path.canonicalize().ok().map(strip_unc_prefix))
-                .collect();
+        let allowed: std::collections::HashSet<PathBuf> = [
+            SessionProvider::Claude,
+            SessionProvider::Codex,
+            SessionProvider::Opencode,
+            SessionProvider::Antigravity,
+        ]
+        .into_iter()
+        .flat_map(|prov| collect_context_files(app, Some(prov)))
+        .filter_map(|cf| cf.path.canonicalize().ok().map(strip_unc_prefix))
+        .collect();
         let allowed_hit = requested
             .as_ref()
             .map(|r| allowed.contains(r))
@@ -75800,13 +86564,6 @@ fn route_request<R: tauri::Runtime>(
             }
         }
         let dir = dir.trim_end_matches('/').to_string();
-        if !bram_state_dir_allowed(&dir) {
-            return (
-                403,
-                "application/json; charset=utf-8",
-                br#"{"error":"not a Bram state folder"}"#.to_vec(),
-            );
-        }
         let Some(root) = project_root(Some(app)) else {
             return (
                 500,
@@ -75814,6 +86571,13 @@ fn route_request<R: tauri::Runtime>(
                 br#"{"error":"no project root"}"#.to_vec(),
             );
         };
+        if !bram_state_dir_allowed(&root, &dir) {
+            return (
+                403,
+                "application/json; charset=utf-8",
+                br#"{"error":"not a Bram state folder"}"#.to_vec(),
+            );
+        }
         let mut subdirs: Vec<String> = Vec::new();
         let mut files: Vec<String> = Vec::new();
         if let Ok(entries) = std::fs::read_dir(root.join(&dir)) {
@@ -75888,10 +86652,15 @@ fn route_request<R: tauri::Runtime>(
                 &q,
                 "--",
             ];
-            state_args.extend(BRAM_STATE_GREP.iter().copied());
-            state_args.extend(BRAM_STATE_GREP_EXCLUDE.iter().copied());
+            let state_root = project_root(Some(app)).unwrap_or_default();
+            let state_specs = bram_state_grep_pathspecs(&state_root);
+            state_args.extend(state_specs.iter().map(|s| s.as_str()));
             let state_out = git_run_allow_exit(app, &state_args).unwrap_or_default();
-            let out = format!("{}{}", out, bram_state_grep_ordered(&state_out));
+            let out = format!(
+                "{}{}",
+                out,
+                bram_state_grep_ordered(&state_root, &state_out)
+            );
             let (hits, total) = repo_grep_hits(&out, &q, REPO_GREP_CAP);
             serde_json::json!({ "hits": hits, "total": total, "capped": total > REPO_GREP_CAP })
         };
@@ -76120,7 +86889,7 @@ fn route_request<R: tauri::Runtime>(
             agent_status_emit_finished(app, "codex", None, None, "codex-stale");
         }
         let body = if let Ok(cur) = agent_status_cell().lock() {
-            serde_json::to_vec(&*cur).unwrap_or_default()
+            serde_json::to_vec(&agent_status_with_error(&*cur)).unwrap_or_default()
         } else {
             b"{}".to_vec()
         };
@@ -76349,6 +87118,34 @@ fn route_request<R: tauri::Runtime>(
     // issue-90-q-page: durable scratch queue backing the Queue tab. GET
     // returns the whole queue file (default empty); writes go through the
     // POST /__queue/save route. Entry order is presentation order only.
+    // /__queue/draft?id=q-… — log-queue-entry-opens-message: one queue
+    // message by its stable id, for the Log's Open in Queue link when the
+    // message is no longer queued. The active entry wins, else its retained
+    // draft; `{ "missing": true }` when neither exists (an older message).
+    // Read-only: it never recreates a queue entry.
+    if path == "__queue/draft" {
+        let mut id = String::new();
+        for pair in query.split('&') {
+            if let Some(enc) = pair.strip_prefix("id=") {
+                id = percent_decode(enc);
+            }
+        }
+        let Some(qpath) = project_resource_path(app, ".bram-queue.json") else {
+            return (
+                500,
+                "text/plain; charset=utf-8",
+                b"no project root".to_vec(),
+            );
+        };
+        let state = qpath.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let body = queue_draft_lookup(&state, &id);
+        return (
+            200,
+            "application/json; charset=utf-8",
+            serde_json::to_vec(&body).unwrap_or_default(),
+        );
+    }
+
     if path == "__queue" {
         let Some(qpath) = project_resource_path(app, ".bram-queue.json") else {
             return (
@@ -76729,7 +87526,8 @@ fn route_request<R: tauri::Runtime>(
             "entries": entries,
             "nowMs": unix_now_ms(),
             "staleTerminalInput": stale_terminal_input(),
-            "awaitingTurn": send_ledger_awaiting_turn()
+            "awaitingTurn": send_ledger_awaiting_turn(),
+            "agentError": antigravity_error_json()
         });
         return match serde_json::to_vec(&body) {
             Ok(bytes) => (200, "application/json; charset=utf-8", bytes),
@@ -76899,7 +87697,9 @@ fn route_request<R: tauri::Runtime>(
                 let status = match e.as_str() {
                     "session not found" => 404,
                     "empty title" | "invalid session id" => 400,
-                    SESSION_DELETE_LIVE_REFUSAL => 409,
+                    SESSION_DELETE_LIVE_REFUSAL
+                    | ANTIGRAVITY_DELETE_OPEN_REFUSAL
+                    | PAIR_PLACEHOLDER_REFUSAL => 409,
                     _ => 500,
                 };
                 (status, "text/plain; charset=utf-8", e.into_bytes())
@@ -77591,13 +88391,14 @@ fn route_request<R: tauri::Runtime>(
         let mut unclaimed: Vec<serde_json::Value> = Vec::new();
         let porcelain =
             git_run(app, &["status", "--porcelain", "--no-renames"]).unwrap_or_default();
+        let state_root = project_root(Some(app)).unwrap_or_default();
         for line in porcelain.lines() {
             if line.len() < 4 {
                 continue;
             }
             let path = line[2..].trim_start().trim_matches('"').to_string();
             if path.is_empty()
-                || path.starts_with("resources/")
+                || bram_state_rel_strip(&state_root, &path).is_some()
                 || path == ".bram.json"
                 || path == ".xmlui-desktop.json"
                 || claimed.contains(&path)
@@ -77644,7 +88445,9 @@ fn route_request<R: tauri::Runtime>(
             // issue-425-retire-replay: part of the precheck key below; the
             // interval patch is built from this record.
             let wc_intervals_raw = project_root(Some(app))
-                .and_then(|r| std::fs::read_to_string(r.join(CLAIM_INTERVALS_REL)).ok())
+                .and_then(|r| {
+                    std::fs::read_to_string(resource_relative_path(&r, CLAIM_INTERVALS_REL)).ok()
+                })
                 .unwrap_or_default();
             if let Some(items) = doc.get_mut("items").and_then(|v| v.as_array_mut()) {
                 // Begun the way the gate counts it (handle_worklist_commit's
@@ -77709,6 +88512,12 @@ fn route_request<R: tauri::Runtime>(
                             precheck_content_hash(idx, &declared).hash(&mut h);
                         }
                         declared.hash(&mut h);
+                        // A re-anchor changes what the patch is built from
+                        // without moving HEAD or the file (same bytes, new
+                        // base), so it has to move the key itself.
+                        REANCHOR_EPOCH
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            .hash(&mut h);
                         let key = format!("{}|{:016x}", wc_head, h.finish());
                         Some(commit_precheck_cached(app, &id, &declared, &key))
                     } else {
@@ -77816,6 +88625,23 @@ fn route_request<R: tauri::Runtime>(
                         }
                         _ => None,
                     };
+                    // gate-names-the-outside-commit-that-strands-an-item: a
+                    // failing patch may be stranded by a commit made outside
+                    // the gate after the item began, not by a sibling's
+                    // uncommitted lines. Name those commits so the pane can
+                    // say what happened instead of "commit that first".
+                    let stranded: Vec<StrandingCommit> =
+                        match (&depends_on, item.get("begunAtMs").and_then(|v| v.as_i64())) {
+                            (Some((_, failing)), Some(begun_ms)) if begun_ms > 0 => {
+                                let paths: Vec<String> = if failing.is_empty() {
+                                    declared.to_vec()
+                                } else {
+                                    failing.clone()
+                                };
+                                stranded_by_cached(app, &id, begun_ms, &paths, &wc_head)
+                            }
+                            _ => Vec::new(),
+                        };
                     let refusal = last_commit_refusal_for(&id, &wc_head);
                     if let Some(obj) = item.as_object_mut() {
                         if let Some((owners, failing)) = &depends_on {
@@ -77824,6 +88650,9 @@ fn route_request<R: tauri::Runtime>(
                                 "commitCheckFailedPaths".to_string(),
                                 serde_json::json!(failing),
                             );
+                        }
+                        if !stranded.is_empty() {
+                            obj.insert("commitStrandedBy".to_string(), stranding_json(&stranded));
                         }
                         if let Some((at_ms, reason)) = &refusal {
                             obj.insert(
@@ -78081,7 +88910,52 @@ fn route_request<R: tauri::Runtime>(
             serde_json::to_string(&claim).ok()
         })()
         .unwrap_or(body);
+        // delegated-work-action-gates: live subagent bindings, and whether the
+        // claim survives only because of them (held_by_delegation, derived).
+        // Always present so the pane reads one shape.
+        let body = (|| -> Option<String> {
+            let mut v: serde_json::Value = serde_json::from_str(&body).ok()?;
+            let obj = v.as_object_mut()?;
+            obj.insert(
+                "delegated".into(),
+                serde_json::json!(delegated_inflight_rows(app)),
+            );
+            obj.insert(
+                "heldByDelegation".into(),
+                serde_json::json!(held_by_delegation(app)),
+            );
+            serde_json::to_string(&v).ok()
+        })()
+        .unwrap_or(body);
         return (200, "application/json; charset=utf-8", body.into_bytes());
+    }
+
+    // /__story/lines?since=<ISO> — issue-473-readable-launch-log: the lines
+    // the Status tab's Log narrator (helpers.js) tells episodes from. The host
+    // only selects; the pane does the telling, so wording changes are a pane
+    // reload, not a rebuild.
+    if path == "__story/lines" {
+        let mut since = String::new();
+        let mut kinds: Vec<String> = Vec::new();
+        for pair in query.split('&') {
+            if let Some(enc) = pair.strip_prefix("since=") {
+                since = percent_decode(enc);
+            }
+            // log-reads-across-trace-rotation: the kinds the Log shows;
+            // without it, every selected line (the CLI's view).
+            if let Some(enc) = pair.strip_prefix("kinds=") {
+                kinds = percent_decode(enc)
+                    .split(',')
+                    .map(|k| k.trim().to_string())
+                    .filter(|k| !k.is_empty())
+                    .collect();
+            }
+        }
+        return (
+            200,
+            "application/json; charset=utf-8",
+            story_lines(app, &since, &kinds),
+        );
     }
 
     // /__coordination-status — compact host-side summary for the Status tab.
@@ -78095,6 +88969,35 @@ fn route_request<R: tauri::Runtime>(
                 (500, "text/plain; charset=utf-8", e.into_bytes())
             }
         };
+    }
+
+    // /__state-dir/plan — judell/bram#469: what the 0.8.4 state-folder move
+    // would do here. Read-only; the Status tab's "State folder" section.
+    if path == "__state-dir/plan" {
+        let Some(root) = project_root(Some(app)) else {
+            return (
+                500,
+                "text/plain; charset=utf-8",
+                b"no project root".to_vec(),
+            );
+        };
+        let plan = state_dir_plan(&root);
+        let len = |k: &str| plan[k].as_array().map_or(0, |a| a.len());
+        append_bram_trace_line(
+            app,
+            "state-dir",
+            &format!(
+                "op=plan state_dir={} would_move={} foreign={} tracked={} live_claim={} nested={}",
+                plan["stateDir"].as_str().unwrap_or(""),
+                len("wouldMove"),
+                len("foreign"),
+                plan["tracked"]["count"].as_u64().unwrap_or(0),
+                plan["liveClaim"].as_bool().unwrap_or(false),
+                len("nested"),
+            ),
+        );
+        let body = serde_json::to_vec(&plan).unwrap_or_default();
+        return (200, "application/json; charset=utf-8", body);
     }
 
     // /__pty-intent — diagnostic readout of the right-pane intent queue
@@ -78204,6 +89107,21 @@ fn route_request<R: tauri::Runtime>(
         return (200, "application/json; charset=utf-8", body);
     }
 
+    // /__worklist-history/at?ts=<unix_ms> — the board as it stood at that
+    // moment: {ts, live, items: [{id, status, begun}]} (see worklist_board_at).
+    // log-shows-start-commit-push-search: a Log entry's expanded detail.
+    if path == "__worklist-history/at" {
+        let ts = query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("ts="))
+            .and_then(|v| percent_decode(v).parse::<u64>().ok());
+        let Some(ts) = ts else {
+            return (400, "text/plain; charset=utf-8", b"bad ts".to_vec());
+        };
+        let body = serde_json::to_vec(&worklist_board_at(app, ts)).unwrap_or_default();
+        return (200, "application/json; charset=utf-8", body);
+    }
+
     // /__worklist-history/snapshot?ts=<unix_ms> — raw .json snapshot
     if path == "__worklist-history/snapshot" {
         let mut ts = String::new();
@@ -78230,18 +89148,28 @@ fn route_request<R: tauri::Runtime>(
         };
     }
 
-    // worklist.json is the worklist convention. Treat it as always-present
-    // (empty when the project hasn't opted in) so the Workspace tool can
-    // poll without flooding devtools with 404s in guest projects.
-    if path == "resources/worklist.json" {
+    // judell/bram#469 0.8.4: `/__bram/<rel>` serves Bram's state folder,
+    // whatever it is called; `/resources/<rel>` is its alias until 0.8.5. The
+    // alias answers a file still in `resources/` first (a target app's own
+    // asset, or one a selective move left behind). worklist.json is always
+    // present, empty when the project hasn't opted in, so a poll of it doesn't
+    // flood devtools with 404s.
+    if let Some((rel, alias)) = state_url_rel(path) {
         let proj = project_root(Some(app)).unwrap_or_else(|| PathBuf::from("."));
-        return match std::fs::read(proj.join(path)) {
-            Ok(bytes) => (200, "application/json; charset=utf-8", bytes),
-            Err(_) => (
+        let legacy = proj.join(BRAM_STATE_DIR_LEGACY).join(rel);
+        let file = if alias && legacy.is_file() {
+            legacy
+        } else {
+            resource_relative_path(&proj, rel)
+        };
+        return match std::fs::read(&file) {
+            Ok(bytes) => (200, mime_for(&file), bytes),
+            Err(_) if rel == "worklist.json" => (
                 200,
                 "application/json; charset=utf-8",
                 empty_worklist_json().as_bytes().to_vec(),
             ),
+            Err(_) => (404, "text/plain; charset=utf-8", Vec::new()),
         };
     }
 
@@ -78270,8 +89198,8 @@ fn route_request<R: tauri::Runtime>(
     // from EMBEDDED_APP's founding comment: XMLUI probes optional
     // code-behind files that must genuinely 404 — so only extensionless
     // misses fall back (the try_files-shaped predicate below), and asset
-    // typos keep their honest 404s. Reserved namespaces (__*, /query,
-    // resources/worklist.json) returned earlier in this function, so they
+    // typos keep their honest 404s. Reserved namespaces (__*, /query, the
+    // state folder's resources/ alias) returned earlier in this function, so they
     // are unshadowable by position. Projects without a root index.html keep
     // the old behavior exactly.
     let proj = project_root(Some(app)).unwrap_or_else(|| PathBuf::from("."));
@@ -78281,6 +89209,17 @@ fn route_request<R: tauri::Runtime>(
             Ok(bytes) => (200, mime_for(&index), bytes),
             Err(_) => (404, "text/plain; charset=utf-8", Vec::new()),
         };
+    }
+    // loopback-root-serves-dotgit: the root serve stays inside the project
+    // and out of its dot-directories (.git, .bram, .env, .claude, ...). No
+    // caller needs either; the trace archives since 2026-07-20 show none.
+    if let Some(reason) = project_path_refusal(path) {
+        append_bram_trace_line(
+            app,
+            "project-serve",
+            &format!("op=refused reason={} path={}", reason, path),
+        );
+        return (404, "text/plain; charset=utf-8", Vec::new());
     }
     let full = proj.join(path);
     match std::fs::read(&full) {
@@ -78309,6 +89248,86 @@ fn spa_fallback_eligible(path: &str) -> bool {
     !last.is_empty() && !last.contains('.')
 }
 
+// loopback-root-serves-dotgit: why a project-relative path must not be
+// served, or None. `traversal`: a `.` or `..` segment, a backslash, a drive
+// colon or a leading slash could leave the project root. `dot-segment`: a
+// segment naming a dot-file or dot-directory. Pure and unit-tested.
+fn project_path_refusal(path: &str) -> Option<&'static str> {
+    if path.starts_with('/') || path.contains(['\\', ':']) {
+        return Some("traversal");
+    }
+    let mut dot = false;
+    for seg in path.split('/') {
+        if seg == "." || seg == ".." {
+            return Some("traversal");
+        }
+        if seg.starts_with('.') {
+            dot = true;
+        }
+    }
+    dot.then_some("dot-segment")
+}
+
+// judell/bram#469: the part of a `__bram/<rel>` or alias `resources/<rel>`
+// request path below the state folder, and whether it came by the alias.
+// None for any other path, and for a `rel` that could leave the folder
+// (empty, `.` or `..` segments, a backslash or a drive colon).
+fn state_url_rel(path: &str) -> Option<(&str, bool)> {
+    let (rest, alias) = match path.strip_prefix("__bram/") {
+        Some(rest) => (rest, false),
+        None => (
+            path.strip_prefix(BRAM_STATE_DIR_LEGACY)?
+                .strip_prefix('/')?,
+            true,
+        ),
+    };
+    let inside = !rest.contains(['\\', ':'])
+        && rest
+            .split('/')
+            .all(|seg| !seg.is_empty() && seg != "." && seg != "..");
+    inside.then_some((rest, alias))
+}
+
+#[cfg(test)]
+mod project_path_refusal_tests {
+    use super::project_path_refusal;
+
+    #[test]
+    fn refuses_traversal_and_dot_segments_only() {
+        assert_eq!(project_path_refusal(".git/config"), Some("dot-segment"));
+        assert_eq!(
+            project_path_refusal(".bram/worklist.json"),
+            Some("dot-segment")
+        );
+        assert_eq!(project_path_refusal("sub/.env"), Some("dot-segment"));
+        assert_eq!(
+            project_path_refusal("resources/../src-tauri/Cargo.toml"), // state-dir: literal ok (a URL path under test, not the state folder)
+            Some("traversal")
+        );
+        assert_eq!(
+            project_path_refusal("__bram/../.git/config"),
+            Some("traversal")
+        );
+        assert_eq!(project_path_refusal("./index.html"), Some("traversal"));
+        assert_eq!(project_path_refusal("a\\b"), Some("traversal"));
+        assert_eq!(project_path_refusal("C:/x"), Some("traversal"));
+        assert_eq!(project_path_refusal("/etc/passwd"), Some("traversal"));
+        for ok in [
+            "index.html",
+            "config.json",
+            "Main.xmlui.xs",
+            "components/Query.xmlui",
+            "themes/a.json",
+            "resources/code.svg", // state-dir: literal ok (a URL path under test, not the state folder)
+            "orientation/index.html",
+            "details",
+            "a..b/c.txt",
+        ] {
+            assert_eq!(project_path_refusal(ok), None, "{ok}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod spa_fallback_tests {
     use super::spa_fallback_eligible;
@@ -78324,6 +89343,300 @@ mod spa_fallback_tests {
         // Trailing slash: final segment empty — not a fallback candidate
         // (the bare root is handled before the predicate).
         assert!(!spa_fallback_eligible("details/"));
+    }
+}
+
+#[cfg(test)]
+mod state_url_tests {
+    #[test]
+    fn root_settings_signature_only_for_a_dirty_tracked_file() {
+        let root = std::env::temp_dir().join(format!("bram-settings-sig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .current_dir(&root)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap()
+                .status
+                .success());
+        };
+        git(&["init", "-q"]);
+        // Untracked: nothing to ask.
+        std::fs::write(root.join(".bram.json"), "{\"server\":{\"port\":8080}}\n").unwrap();
+        assert!(super::root_settings_signature(&root).is_none());
+        git(&["add", ".bram.json"]);
+        git(&["commit", "-q", "-m", "team settings"]);
+        // Tracked and clean: nothing to ask.
+        assert!(super::root_settings_signature(&root).is_none());
+        // Tracked and dirty (a personal key an earlier Bram wrote): ask.
+        std::fs::write(
+            root.join(".bram.json"),
+            "{\"server\":{\"port\":8080},\"shell\":{\"agent\":\"claude\"}}\n",
+        )
+        .unwrap();
+        let sig = super::root_settings_signature(&root).unwrap();
+        assert_eq!(sig.split(' ').count(), 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // untracked-root-bram-json-folds-into-state
+    fn fold_repo() -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("bram-fold-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join(".bram")).unwrap();
+        fold_git(&root, &["init", "-q"]);
+        root
+    }
+
+    fn fold_git(root: &std::path::Path, args: &[&str]) {
+        assert!(std::process::Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap()
+            .status
+            .success());
+    }
+
+    fn read_json(p: std::path::PathBuf) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn fold_renames_an_untracked_root_file_into_place() {
+        let root = fold_repo();
+        std::fs::write(root.join(".bram.json"), r#"{"shell":{"agent":"claude"}}"#).unwrap();
+        std::fs::write(root.join(".bram.json~"), "{}").unwrap();
+        let line = super::fold_untracked_root_settings(&root).unwrap();
+        assert_eq!(
+            line,
+            "op=settings-folded how=rename keys=shell backup=moved"
+        );
+        assert!(!root.join(".bram.json").exists());
+        assert!(!root.join(".bram.json~").exists());
+        assert!(root.join(".bram/.bram.json~").is_file());
+        assert_eq!(
+            read_json(root.join(".bram/settings.json"))["shell"]["agent"],
+            "claude"
+        );
+        // Nothing left to fold: no line.
+        assert!(super::fold_untracked_root_settings(&root).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fold_merges_under_existing_settings_which_win() {
+        let root = fold_repo();
+        std::fs::write(
+            root.join(".bram.json"),
+            r#"{"shell":{"agent":"codex","args":"--x"},"ui":{"a":1}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".bram/settings.json"),
+            r#"{"shell":{"agent":"claude"}}"#,
+        )
+        .unwrap();
+        let line = super::fold_untracked_root_settings(&root).unwrap();
+        assert_eq!(
+            line,
+            "op=settings-folded how=merge keys=shell,ui backup=none"
+        );
+        assert!(!root.join(".bram.json").exists());
+        let v = read_json(root.join(".bram/settings.json"));
+        assert_eq!(v["shell"]["agent"], "claude");
+        assert_eq!(v["shell"]["args"], "--x");
+        assert_eq!(v["ui"]["a"], 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fold_leaves_tracked_ignored_and_unparseable_files() {
+        let root = fold_repo();
+        std::fs::write(root.join(".bram.json"), r#"{"server":{"port":1}}"#).unwrap();
+        fold_git(&root, &["add", ".bram.json"]);
+        fold_git(&root, &["commit", "-q", "-m", "team"]);
+        assert_eq!(
+            super::fold_untracked_root_settings(&root).unwrap(),
+            "op=settings-fold-skipped reason=tracked"
+        );
+        fold_git(&root, &["rm", "-q", "--cached", ".bram.json"]);
+        std::fs::write(root.join(".gitignore"), ".bram.json\n").unwrap();
+        assert_eq!(
+            super::fold_untracked_root_settings(&root).unwrap(),
+            "op=settings-fold-skipped reason=ignored"
+        );
+        std::fs::remove_file(root.join(".gitignore")).unwrap();
+        std::fs::write(root.join(".bram.json"), "not json").unwrap();
+        assert_eq!(
+            super::fold_untracked_root_settings(&root).unwrap(),
+            "op=settings-fold-skipped reason=unparseable"
+        );
+        assert!(root.join(".bram.json").is_file());
+        assert!(!root.join(".bram/settings.json").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fold_waits_for_the_move() {
+        let root = std::env::temp_dir().join(format!("bram-fold-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join(super::BRAM_STATE_DIR_LEGACY)).unwrap();
+        fold_git(&root, &["init", "-q"]);
+        std::fs::write(root.join(".bram.json"), r#"{"shell":{}}"#).unwrap();
+        assert!(super::fold_untracked_root_settings(&root).is_none());
+        assert!(root.join(".bram.json").is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn settings_note_recipe_follows_heads_keys() {
+        let (r, t) = super::settings_note_text(Some(&[]));
+        assert_eq!(r, "restore");
+        assert!(t.contains("restores .bram.json to HEAD") && t.contains("recommend Drop"));
+        let keys = vec!["shell".to_string(), "ui".to_string()];
+        let (r, t) = super::settings_note_text(Some(&keys));
+        assert_eq!(r, "remove");
+        assert!(t.contains("(shell, ui)") && t.contains("real commit"));
+        assert!(!t.contains("recommend Drop"));
+        let (r, _) = super::settings_note_text(None);
+        assert_eq!(r, "unknown");
+    }
+
+    #[test]
+    fn head_settings_personal_keys_skips_team_keys() {
+        let root =
+            std::env::temp_dir().join(format!("bram-settings-head-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .current_dir(&root)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap()
+                .status
+                .success());
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.join(".bram.json"), "{\"server\":{\"port\":1}}\n").unwrap();
+        git(&["add", ".bram.json"]);
+        git(&["commit", "-q", "-m", "team"]);
+        assert_eq!(super::head_settings_personal_keys(&root), Some(vec![]));
+        std::fs::write(
+            root.join(".bram.json"),
+            "{\"server\":{\"port\":1},\"shell\":{\"agent\":\"claude\"}}\n",
+        )
+        .unwrap();
+        git(&["commit", "-q", "-am", "personal"]);
+        assert_eq!(
+            super::head_settings_personal_keys(&root),
+            Some(vec!["shell".to_string()])
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migrated_from_parses_each_form() {
+        let v =
+            super::parse_migrated_from("/Users/j/xmlui/resources 2026-11-04T22:16:08Z selective\n")
+                .unwrap();
+        assert_eq!(v["from"], "/Users/j/xmlui/resources");
+        assert_eq!(v["at"], "2026-11-04T22:16:08Z");
+        assert_eq!(v["selective"], true);
+        let v = super::parse_migrated_from("/p/resources 2026-11-04T20:31:17Z\n").unwrap();
+        assert_eq!(v["selective"], false);
+        assert!(v["how"].is_null());
+        let v =
+            super::parse_migrated_from("/p/resources 2026-11-04T22:02:15Z demo-hydrate").unwrap();
+        assert_eq!(v["how"], "demo-hydrate");
+        assert!(super::parse_migrated_from("").is_none());
+        assert!(super::parse_migrated_from("2026-11-04T22:02:15Z").is_none());
+    }
+
+    use super::{state_migrate_moved, state_url_rel, StateMigrateOutcome, BRAM_STATE_DIR_LEGACY};
+
+    #[test]
+    fn bram_route_and_alias_map_into_the_state_folder() {
+        assert_eq!(
+            state_url_rel("__bram/worklist.json"),
+            Some(("worklist.json", false))
+        );
+        assert_eq!(
+            state_url_rel("__bram/bram-traces/bram-trace.log"),
+            Some(("bram-traces/bram-trace.log", false))
+        );
+        let alias = format!("{}/worklist.json", BRAM_STATE_DIR_LEGACY);
+        assert_eq!(state_url_rel(&alias), Some(("worklist.json", true)));
+        for other in [
+            "index.html",
+            "__bramx/a",
+            "resourcesx/a",
+            "__worklist",
+            "__bram",
+        ] {
+            assert_eq!(state_url_rel(other), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn state_url_refuses_paths_that_could_leave_the_folder() {
+        for bad in [
+            "__bram/",
+            "__bram/../Cargo.toml",
+            "__bram/a/../../x",
+            "__bram/./x",
+            "__bram/a//b",
+            "__bram/a/",
+            "__bram/..\\x",
+            "__bram/C:/x",
+        ] {
+            assert_eq!(state_url_rel(bad), None, "{bad}");
+        }
+        let alias_up = format!("{}/../Cargo.toml", BRAM_STATE_DIR_LEGACY);
+        assert_eq!(state_url_rel(&alias_up), None);
+    }
+
+    #[test]
+    fn only_a_move_queues_the_resumed_session_note() {
+        assert!(state_migrate_moved(&StateMigrateOutcome::Moved {
+            entries: 3,
+            ms: 1,
+            marker_written: true,
+        }));
+        assert!(state_migrate_moved(&StateMigrateOutcome::MovedSelective {
+            entries: 3,
+            left: 1,
+            marker_written: false,
+        }));
+        assert!(!state_migrate_moved(&StateMigrateOutcome::Skipped(
+            "already-moved"
+        )));
+        assert!(!state_migrate_moved(&StateMigrateOutcome::Blocked {
+            os_error: Some(32),
+            attempts: 10,
+            restored: true,
+        }));
+        assert!(!state_migrate_moved(
+            &StateMigrateOutcome::SelectiveFailed {
+                reason: "blocked",
+                os_error: None,
+                entry: "worklist.json".to_string(),
+                moved: 0,
+                rolled_back: true,
+            }
+        ));
     }
 }
 
@@ -78470,7 +89783,7 @@ fn drain_worklist_intent<R: tauri::Runtime>(app: &AppHandle<R>) {
                 (s, b)
             }
             "worklist-mutate" => {
-                let (s, _m, b) = handle_worklist_mutate(app, &body_bytes);
+                let (s, _m, b) = handle_worklist_mutate(app, &body_bytes, MutateCaller::External);
                 (s, b)
             }
             "worklist-commit" => {
@@ -78565,14 +89878,15 @@ fn guard_selftest_fixture() -> Result<PathBuf, String> {
         std::fs::write(&p, body).map_err(|e| e.to_string())
     };
     w(
-        "resources/worklist.json",
+        &bram_state_rel(&dir, "worklist.json"),
         r#"{"version":1,"items":[{"id":"selftest-covered","status":"proposed","files":["src/covered.txt"]}]}"#,
     )?;
     w(
-        "resources/.worklist-authorization.json",
+        &bram_state_rel(&dir, WORKLIST_AUTH_REL),
         r#"{"kind":"","ids":[],"items":[]}"#,
     )?;
     w("src/covered.txt", "x\n")?;
+    std::fs::create_dir_all(dir.join(".agents")).map_err(|e| e.to_string())?;
     let git = |args: &[&str]| {
         std::process::Command::new("git")
             .current_dir(&dir)
@@ -78602,13 +89916,24 @@ fn guard_selftest_run_case(
 ) -> (String, String) {
     use std::io::Write;
     use std::process::Stdio;
-    let mut child = match std::process::Command::new(link)
-        .args(["guard", hook])
+    let mut cmd = std::process::Command::new(link);
+    cmd.args(["guard", hook])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    // agy 1.4.12 spawns `.agents/hooks.json` hooks from `<workspace>/.agents`.
+    if hook.starts_with("antigravity") {
+        if let Some(ws) = payload
+            .pointer("/workspacePaths/0")
+            .and_then(|v| v.as_str())
+        {
+            let dot_agents = Path::new(ws).join(".agents");
+            if dot_agents.is_dir() {
+                cmd.current_dir(dot_agents);
+            }
+        }
+    }
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             return (
@@ -78669,6 +89994,28 @@ fn guard_selftest_run_case(
             ),
         };
     }
+    // antigravity-worklist-guard: agy reads {"decision", "reason"} from
+    // stdout, exit 0. Empty output would let agy run the tool, so a missing
+    // decision fails here rather than passing as an allow.
+    if hook.starts_with("antigravity") {
+        if code != Some(0) {
+            return (
+                "error".to_string(),
+                format!("exit {:?}: {}", code, short(&stderr)),
+            );
+        }
+        let line = stdout.trim().lines().last().unwrap_or("");
+        let v: serde_json::Value = serde_json::from_str(line).unwrap_or_default();
+        let reason = v.get("reason").and_then(|m| m.as_str()).unwrap_or("");
+        return match v.get("decision").and_then(|d| d.as_str()) {
+            Some("allow") => ("allow".to_string(), String::new()),
+            Some("deny") => ("deny".to_string(), short(reason)),
+            _ => (
+                "error".to_string(),
+                format!("no decision: {}", short(&stdout)),
+            ),
+        };
+    }
     match code {
         Some(0) => ("allow".to_string(), String::new()),
         Some(2) => ("deny".to_string(), short(&stderr)),
@@ -78708,6 +90055,11 @@ fn guard_selftest<R: tauri::Runtime>(app: &AppHandle<R>) -> serde_json::Value {
             );
             let opencode_signed = format!(
                 "Bram's OpenCode (Bram {}, main thread, selftest, {}, selftest) speaking from the Selftest project (github.com/example/bram-guard-selftest):\n\nguard self-test",
+                env!("CARGO_PKG_VERSION"),
+                os
+            );
+            let antigravity_signed = format!(
+                "Bram's Antigravity (Bram {}, main thread, selftest, {}, selftest) speaking from the Selftest project (github.com/example/bram-guard-selftest):\n\nguard self-test",
                 env!("CARGO_PKG_VERSION"),
                 os
             );
@@ -78856,6 +90208,79 @@ fn guard_selftest<R: tauri::Runtime>(app: &AppHandle<R>) -> serde_json::Value {
                     "mcp": {"server": "filesystem", "tool": "write_file"},
                     "input": {"path": file("src/covered.txt"), "content": "y"}}),
                 ),
+                // antigravity-worklist-guard: agy 1.4.12's PreToolUse payloads,
+                // shaped as the specimen pack captured them. The project is
+                // `workspacePaths[0]`; there is no `cwd`. The signed forge
+                // case signs as `Antigravity`
+                // (antigravity-signature-and-conventions).
+                (
+                    "antigravity-write-covered",
+                    "antigravity-worklist",
+                    "allow",
+                    serde_json::json!({
+                    "conversationId": "selftest", "stepIdx": 1, "workspacePaths": [root],
+                    "toolCall": {"name": "write_file", "args": {"Path": file("src/covered.txt"), "Content": "y"}}}),
+                ),
+                (
+                    "antigravity-write-uncovered",
+                    "antigravity-worklist",
+                    "deny",
+                    serde_json::json!({
+                    "conversationId": "selftest", "stepIdx": 1, "workspacePaths": [root],
+                    "toolCall": {"name": "write_file", "args": {"Path": file("src/uncovered.txt"), "Content": "y"}}}),
+                ),
+                (
+                    "antigravity-edit-uncovered",
+                    "antigravity-worklist",
+                    "deny",
+                    serde_json::json!({
+                    "conversationId": "selftest", "stepIdx": 1, "workspacePaths": [root],
+                    "toolCall": {"name": "edit_file", "args": {"Path": file("src/uncovered.txt"), "Target": "a", "Replacement": "b"}}}),
+                ),
+                (
+                    "antigravity-command-harmless",
+                    "antigravity-worklist",
+                    "allow",
+                    serde_json::json!({
+                    "conversationId": "selftest", "stepIdx": 1, "workspacePaths": [root],
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": "git status", "WaitMsBeforeAsync": 5000}}}),
+                ),
+                (
+                    "antigravity-forge-unsigned",
+                    "antigravity-worklist",
+                    "deny",
+                    serde_json::json!({
+                    "conversationId": "selftest", "stepIdx": 1, "workspacePaths": [root],
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": "gh issue comment 5 --body \"guard self-test\"", "WaitMsBeforeAsync": 5000}}}),
+                ),
+                (
+                    "antigravity-forge-signed",
+                    "antigravity-worklist",
+                    "allow",
+                    serde_json::json!({
+                    "conversationId": "selftest", "stepIdx": 1, "workspacePaths": [root],
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": format!("gh issue comment 5 --body {}", serde_json::json!(antigravity_signed)), "WaitMsBeforeAsync": 5000}}}),
+                ),
+                (
+                    "antigravity-mcp-write-uncovered",
+                    "antigravity-worklist",
+                    "deny",
+                    serde_json::json!({
+                    "conversationId": "selftest", "stepIdx": 1, "workspacePaths": [root],
+                    "toolCall": {"name": "call_mcp_tool", "args": {
+                        "ServerName": "filesystem", "ToolName": "write_file",
+                        "Arguments": {"path": file("src/uncovered.txt"), "content": "y"}}}}),
+                ),
+                (
+                    "antigravity-mcp-write-covered",
+                    "antigravity-worklist",
+                    "allow",
+                    serde_json::json!({
+                    "conversationId": "selftest", "stepIdx": 1, "workspacePaths": [root],
+                    "toolCall": {"name": "call_mcp_tool", "args": {
+                        "ServerName": "filesystem", "ToolName": "write_file",
+                        "Arguments": {"path": file("src/covered.txt"), "content": "y"}}}}),
+                ),
             ];
             for (id, hook, expect, payload) in specs {
                 let (got, reason) = guard_selftest_run_case(link, hook, &payload);
@@ -78934,6 +90359,23 @@ fn guard_selftest<R: tauri::Runtime>(app: &AppHandle<R>) -> serde_json::Value {
     if !opencode_ok {
         failed.push("opencode-registration".to_string());
     }
+    // antigravity-worklist-guard: agy's registration is Bram's group in the
+    // project's .agents/hooks.json, checked wherever agy is wanted
+    // (antigravity_hooks_wanted, the rule Setup and antigravityNeedsSetup use).
+    // An unparseable file fails here although it raises no banner: agy then
+    // runs without the guard, and only a hand edit can fix it.
+    let (antigravity_wanted, antigravity_hooks) = project_root(Some(app))
+        .map(|proj| {
+            (
+                antigravity_hooks_wanted(app, &proj),
+                antigravity_hooks_state(&proj),
+            )
+        })
+        .unwrap_or((false, AntigravityHooksState::Missing));
+    let antigravity_ok = !antigravity_wanted || antigravity_hooks == AntigravityHooksState::Current;
+    if !antigravity_ok {
+        failed.push("antigravity-registration".to_string());
+    }
     let ok = failed.is_empty();
     append_bram_trace_line(
         app,
@@ -78967,7 +90409,9 @@ fn guard_selftest<R: tauri::Runtime>(app: &AppHandle<R>) -> serde_json::Value {
         .and_then(|l| std::fs::read_link(l).ok())
         .map(|t| t.to_string_lossy().to_string());
     let project_guard = project_root(Some(app))
-        .and_then(|root| std::fs::read_to_string(root.join(guard::GUARD_TARGET_REL)).ok())
+        .and_then(|root| {
+            std::fs::read_to_string(resource_relative_path(&root, GUARD_TARGET_STATE_REL)).ok()
+        })
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty());
     serde_json::json!({
@@ -78988,6 +90432,11 @@ fn guard_selftest<R: tauri::Runtime>(app: &AppHandle<R>) -> serde_json::Value {
             },
             "codex": { "ok": codex_ok },
             "opencode": { "ok": opencode_ok, "wanted": opencode_wanted, "custom": opencode_custom },
+            "antigravity": {
+                "ok": antigravity_ok,
+                "wanted": antigravity_wanted,
+                "state": antigravity_hooks.as_str(),
+            },
         },
         "ranAtMs": unix_now_ms(),
     })
@@ -79058,6 +90507,52 @@ mod guard_selftest_tests {
         let silent = fake("silent", "exit 0");
         assert_eq!(
             guard_selftest_run_case(&silent, "opencode-worklist", &payload).0,
+            "error"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // antigravity-worklist-guard: agy reads {"decision", "reason"}. A guard
+    // that exits 0 with no output is the one case agy lets through (the
+    // 2026-10-31 spike), so the self-test must fail it, not pass it as allow.
+    #[cfg(unix)]
+    #[test]
+    fn antigravity_answer_needs_a_decision() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "bram-guard-selftest-antigravity-{}-{}",
+            std::process::id(),
+            unix_now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{}\n", body)).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+        let payload = serde_json::json!({ "toolCall": { "name": "write_file", "args": {} } });
+        let deny = fake(
+            "deny",
+            r#"echo '{"decision":"deny","reason":"Blocked: uncovered"}'"#,
+        );
+        assert_eq!(
+            guard_selftest_run_case(&deny, "antigravity-worklist", &payload),
+            ("deny".to_string(), "Blocked: uncovered".to_string())
+        );
+        let allow = fake("allow", r#"echo '{"decision":"allow"}'"#);
+        assert_eq!(
+            guard_selftest_run_case(&allow, "antigravity-worklist", &payload).0,
+            "allow"
+        );
+        let silent = fake("silent", "exit 0");
+        assert_eq!(
+            guard_selftest_run_case(&silent, "antigravity-worklist", &payload).0,
+            "error"
+        );
+        let crashed = fake("crashed", "exit 1");
+        assert_eq!(
+            guard_selftest_run_case(&crashed, "antigravity-worklist", &payload).0,
             "error"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -79287,19 +90782,27 @@ fn validate_worklist_plan_steps(
     let mut summary_parts = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     if steps.iter().any(|s| plan_step_verb(s) == "feedback")
-        && steps.iter().any(|s| plan_step_verb(s) == "commit")
+        && steps
+            .iter()
+            .any(|s| matches!(plan_step_verb(s), "commit" | "start"))
     {
         return Err(
-            "a plan can't both send feedback and commit: both start agent turns, so post them \
-             as separate plans"
+            "a plan can't both send feedback and commit or start: each starts an agent turn, \
+             so post them as separate plans"
                 .to_string(),
         );
     }
+    // whats-my-sequence-button: a start step rides in the same approval as
+    // the plan's commits (one agent turn), and an approval's commit consent
+    // (commit_too) is record-wide. So a start may share a plan only with
+    // commits of applied items, which need no apply-and-commit consent;
+    // otherwise the started item would gain consent to commit.
+    let has_start = steps.iter().any(|s| plan_step_verb(s) == "start");
     for step in steps {
         let verb = plan_step_verb(step);
-        if verb != "drop" && verb != "commit" && verb != "feedback" {
+        if verb != "drop" && verb != "commit" && verb != "feedback" && verb != "start" {
             return Err(format!(
-                "step verb must be \"drop\", \"commit\" or \"feedback\", got {:?}",
+                "step verb must be \"drop\", \"commit\", \"feedback\" or \"start\", got {:?}",
                 verb
             ));
         }
@@ -79332,15 +90835,31 @@ fn validate_worklist_plan_steps(
             let Some(item) = worklist_plan_item(doc, id) else {
                 return Err(format!("{} is not on the board", id));
             };
+            let applied = item.get("status").and_then(|v| v.as_str()) == Some("applied");
+            let begun = item.get("begunAtMs").is_some();
             // Commit needs work to commit: the item has begun or is applied.
             if verb == "commit" {
-                let applied = item.get("status").and_then(|v| v.as_str()) == Some("applied");
-                if !applied && item.get("begunAtMs").is_none() {
+                if !applied && !begun {
                     return Err(format!(
                         "{} hasn't started, so there is nothing to commit",
                         id
                     ));
                 }
+                if has_start && !applied {
+                    return Err(format!(
+                        "{} isn't applied, so committing it needs apply-and-commit consent that \
+                         a start in the same plan would share; post the commit first and the \
+                         start as its own plan",
+                        id
+                    ));
+                }
+            }
+            // Start is for work not yet begun; a begun item resumes from its row.
+            if verb == "start" && (applied || begun) {
+                return Err(format!(
+                    "{} has already begun, so there is nothing to start",
+                    id
+                ));
             }
         }
         summary_parts.push(format!("{}={}", verb, ids.join(",")));
@@ -79406,6 +90925,42 @@ mod validate_worklist_plan_steps_tests {
         );
         assert!(check(json!([{"verb": "rename", "ids": ["a"]}])).is_err());
     }
+
+    // whats-my-sequence-button: start steps.
+    #[test]
+    fn start_steps_name_unbegun_items_and_share_only_plain_commits() {
+        let b = json!({"version": 3, "items": [
+            {"id": "a", "status": "proposed"},
+            {"id": "b", "status": "applied"},
+            {"id": "c", "status": "proposed", "begunAtMs": 1},
+            {"id": "d", "status": "proposed"}
+        ]});
+        let check = |steps: serde_json::Value| {
+            super::validate_worklist_plan_steps(steps.as_array().unwrap(), &b).map(|(s, _)| s)
+        };
+        assert!(check(json!([{"verb": "start", "ids": ["a", "d"]}])).is_ok());
+        assert!(
+            check(json!([{"verb": "commit", "ids": ["b"]}, {"verb": "start", "ids": ["a"]}]))
+                .is_ok()
+        );
+        assert!(
+            check(json!([{"verb": "drop", "ids": ["d"]}, {"verb": "start", "ids": ["a"]}])).is_ok()
+        );
+        let begun = check(json!([{"verb": "start", "ids": ["c"]}]));
+        assert!(begun.unwrap_err().contains("already begun"));
+        assert!(check(json!([{"verb": "start", "ids": ["b"]}])).is_err());
+        // c is begun but not applied: its commit needs commit_too, which a
+        // start in the same approval would share.
+        let consent =
+            check(json!([{"verb": "commit", "ids": ["c"]}, {"verb": "start", "ids": ["a"]}]));
+        assert!(consent.unwrap_err().contains("apply-and-commit"));
+        assert!(check(json!([{"verb": "commit", "ids": ["c"]}])).is_ok());
+        let fb = check(json!([
+            {"verb": "start", "ids": ["a"]},
+            {"verb": "feedback", "ids": ["d"], "text": "x"}
+        ]));
+        assert!(fb.unwrap_err().contains("separate plans"));
+    }
 }
 
 fn handle_worklist_plan<R: tauri::Runtime>(
@@ -79453,6 +91008,9 @@ fn handle_worklist_plan<R: tauri::Runtime>(
     let version = doc.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
     let plan = serde_json::json!({
         "summary": req.get("summary").and_then(|v| v.as_str()).unwrap_or(""),
+        // whats-my-sequence-button: the plan's reasoning, Markdown, shown by
+        // the gate bar's Why? button. Optional; it goes stale with the plan.
+        "why": req.get("why").and_then(|v| v.as_str()).unwrap_or("").trim(),
         "steps": clean_steps,
         "version": version,
         "postedAtMs": unix_now_ms(),
@@ -79565,6 +91123,9 @@ fn handle_queue_save<R: tauri::Runtime>(
     app: &AppHandle<R>,
     body: &[u8],
 ) -> (u16, &'static str, Vec<u8>) {
+    // Serialize the version check and writes, including retained drafts.
+    static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _save_guard = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let v: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => {
@@ -79601,10 +91162,13 @@ fn handle_queue_save<R: tauri::Runtime>(
         .map(|a| a.len())
         .unwrap_or(0);
     let base = v.get("version").and_then(|x| x.as_u64());
-    let on_disk = std::fs::read(&qpath)
+    let previous = std::fs::read(&qpath)
         .ok()
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .and_then(|d| d.get("version").and_then(|x| x.as_u64()))
+        .unwrap_or_default();
+    let on_disk = previous
+        .get("version")
+        .and_then(|x| x.as_u64())
         .unwrap_or(0);
     match base {
         Some(b) if b == on_disk => {}
@@ -79634,9 +91198,13 @@ fn handle_queue_save<R: tauri::Runtime>(
     let mut out = v.clone();
     if let Some(obj) = out.as_object_mut() {
         obj.insert("version".to_string(), serde_json::json!(next_ver));
+        obj.remove("retainedEntries");
+    }
+    if let Err(e) = retain_queue_drafts(qpath.parent().unwrap(), &previous, &v) {
+        return (500, "text/plain; charset=utf-8", e.into_bytes());
     }
     let pretty = serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".to_string());
-    match std::fs::write(&qpath, format!("{}\n", pretty)) {
+    match atomic_write_text(&qpath, &format!("{}\n", pretty)) {
         Ok(()) => {
             append_bram_trace_line(
                 app,
@@ -79663,6 +91231,32 @@ fn handle_queue_save<R: tauri::Runtime>(
 // with a transport=fetch-fallback field, so a line arriving here is itself
 // evidence of which channel died. Same sink and redaction as the invoke
 // command (log_from_right_pane_impl).
+// pane-idle-flush-when-degraded: POST /__pane/flush. The degraded, idle pane
+// asks for a forced reload; it goes through the same deferral as every other
+// forced reload (emit_or_defer_tools_pane_reload), so a turn in flight holds
+// it until the claim clears. Refused unless ui.paneIdleFlush is on. Workaround
+// route; judell/bram#482 for the underlying leak.
+fn handle_pane_flush<R: tauri::Runtime>(app: &AppHandle<R>) -> (u16, &'static str, Vec<u8>) {
+    const JSON: &str = "application/json; charset=utf-8";
+    let enabled = project_root(Some(app))
+        .and_then(|root| load_project_config(&root))
+        .and_then(|c| c.ui)
+        .and_then(|u| u.pane_idle_flush)
+        .unwrap_or(false);
+    if !enabled {
+        return (
+            409,
+            JSON,
+            br#"{"ok":false,"error":"ui.paneIdleFlush is off"}"#.to_vec(),
+        );
+    }
+    if bram_trace_enabled() {
+        append_bram_trace_line(app, "tools-pane-reload", "op=requested source=pane-flush");
+    }
+    emit_or_defer_tools_pane_reload(app, true);
+    (200, JSON, br#"{"ok":true}"#.to_vec())
+}
+
 fn handle_trace_pane<R: tauri::Runtime>(
     app: &AppHandle<R>,
     body: &[u8],
@@ -79744,6 +91338,481 @@ fn handle_audit_direct_edit<R: tauri::Runtime>(
     )
 }
 
+// --- misaddressed-feedback-resends-as-chat ----------------------------------
+// When feedback sent with an item ticked is plainly about something else, the
+// agent flags it here instead of asking "Did you mean to address …?" and
+// stopping, and the pane offers one click, Resend as chat, which unticks the
+// item, sends the same text as chat, and notes on the feedback record that it
+// was resent. Under /__worklist/ so the agents' existing loopback allowlist
+// covers it. One pending flag at a time, in memory: it describes the turn
+// being answered, so a relaunch forgetting it is right.
+//
+// GET  -> {"pending": {"feedbackRef","itemId","atMs"} | null}
+// POST {"op":"flag","feedbackRef"}    the agent; only a live draft whose item
+//                                     the running iterate turn is addressed to
+// POST {"op":"resend","feedbackRef"}  the pane's button; must be the pending
+//                                     ref; appends the note, returns the text
+// POST {"op":"dismiss"}               the pane, on the next send
+//
+// misaddressed-chat-resends-as-feedback: the other direction. A message sent
+// as chat (nothing ticked) that is plainly feedback on an item on the board:
+// POST {"op":"flag-chat","turnRef","id"}       the agent; turnRef is the
+//                                     running chat turn's outbound record
+//                                     (<ms>-turn), the newest one; id is on
+//                                     the board
+// POST {"op":"resend-as-feedback","turnRef"}   the pane's button; must be the
+//                                     pending ref; returns the turn's text,
+//                                     images and a note to send as feedback
+// The pending flag carries its kind ("feedback" or "chat"); GET names a chat
+// flag's ref as turnRef.
+#[derive(Clone)]
+struct MisaddressedFeedback {
+    fref: String,
+    item_id: String,
+    at_ms: i64,
+    kind: &'static str,
+}
+
+// An outbound turn id is "<unix_ms>-turn". Anything else, including
+// path-shaped input, is refused.
+fn misaddressed_turn_ref_ok(turn_ref: &str) -> bool {
+    match turn_ref.strip_suffix("-turn") {
+        Some(ms) => !ms.is_empty() && ms.chars().all(|c| c.is_ascii_digit()),
+        None => false,
+    }
+}
+
+// The note sent with a chat message resent as feedback, so the item's
+// record says where the message first went.
+fn misaddressed_chat_note(turn_ref: &str, at_iso: &str) -> String {
+    format!(
+        "\n\n---\n*Resent as feedback {}: first sent as chat (turn `{}`).*\n",
+        at_iso, turn_ref
+    )
+}
+
+static MISADDRESSED_FEEDBACK: OnceLock<Mutex<Option<MisaddressedFeedback>>> = OnceLock::new();
+
+fn misaddressed_cell() -> &'static Mutex<Option<MisaddressedFeedback>> {
+    MISADDRESSED_FEEDBACK.get_or_init(|| Mutex::new(None))
+}
+
+// A feedbackRef is "<unix_ms>-<itemId>". Returns the item id, or None for
+// anything else, including path-shaped input.
+fn misaddressed_ref_item(fref: &str) -> Option<String> {
+    let (ms, item) = fref.split_once('-')?;
+    if ms.is_empty() || !ms.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    if item.is_empty() || item.contains('/') || item.contains('\\') || item.contains("..") {
+        return None;
+    }
+    Some(item.to_string())
+}
+
+// The note appended to a resent feedback record. The original text stays
+// above it, so the record is corrected, not rewritten.
+fn misaddressed_note(item_id: &str, at_iso: &str) -> String {
+    format!(
+        "\n\n---\n*Resent as chat {}: this message was not about `{}`.*\n",
+        at_iso, item_id
+    )
+}
+
+fn misaddressed_json(status: u16, v: serde_json::Value) -> (u16, &'static str, Vec<u8>) {
+    (
+        status,
+        "application/json; charset=utf-8",
+        v.to_string().into_bytes(),
+    )
+}
+
+fn handle_worklist_misaddressed<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    method: &str,
+    body: &[u8],
+) -> (u16, &'static str, Vec<u8>) {
+    let trace = |line: String| {
+        if bram_trace_enabled() {
+            append_bram_trace_line(app, "feedback-misaddressed", &line);
+        }
+    };
+    if method == "GET" {
+        let pending = misaddressed_cell().lock().ok().and_then(|g| g.clone());
+        return misaddressed_json(
+            200,
+            serde_json::json!({ "pending": pending.map(|p| if p.kind == "chat" {
+                serde_json::json!({
+                    "kind": "chat", "turnRef": p.fref, "itemId": p.item_id, "atMs": p.at_ms,
+                })
+            } else {
+                serde_json::json!({
+                    "kind": "feedback", "feedbackRef": p.fref, "itemId": p.item_id, "atMs": p.at_ms,
+                })
+            }) }),
+        );
+    }
+    if method != "POST" {
+        return misaddressed_json(405, serde_json::json!({ "error": "GET or POST" }));
+    }
+    let req: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => {
+            return misaddressed_json(
+                400,
+                serde_json::json!({ "error": format!("invalid JSON: {}", e) }),
+            )
+        }
+    };
+    let op = req.get("op").and_then(|v| v.as_str()).unwrap_or("");
+    let fref = req
+        .get("feedbackRef")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    match op {
+        "flag" => {
+            let Some(item_id) = misaddressed_ref_item(&fref) else {
+                trace("op=flag-refused reason=bad-ref".to_string());
+                return misaddressed_json(400, serde_json::json!({ "error": "bad feedbackRef" }));
+            };
+            let draft_live = feedback_drafts_dir(app)
+                .map(|d| d.join(format!("{}.md", fref)).is_file())
+                .unwrap_or(false);
+            if !draft_live {
+                trace(format!("op=flag-refused reason=no-live-draft ref={}", fref));
+                return misaddressed_json(
+                    409,
+                    serde_json::json!({ "error": "no live feedback draft for that ref" }),
+                );
+            }
+            let ctx = project_root(Some(app))
+                .and_then(|root| {
+                    std::fs::read_to_string(resource_relative_path(&root, TURN_CONTEXT_REL)).ok()
+                })
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .unwrap_or_default();
+            let addressed = ctx.get("kind").and_then(|k| k.as_str()) == Some("iterate")
+                && ctx
+                    .get("addressedIds")
+                    .and_then(|a| a.as_array())
+                    .map(|a| a.iter().any(|v| v.as_str() == Some(item_id.as_str())))
+                    .unwrap_or(false);
+            if !addressed {
+                trace(format!(
+                    "op=flag-refused reason=not-this-turn ref={} item={}",
+                    fref, item_id
+                ));
+                return misaddressed_json(
+                    409,
+                    serde_json::json!({ "error": "the running turn is not feedback to that item" }),
+                );
+            }
+            if let Ok(mut g) = misaddressed_cell().lock() {
+                *g = Some(MisaddressedFeedback {
+                    fref: fref.clone(),
+                    item_id: item_id.clone(),
+                    at_ms: unix_now_ms(),
+                    kind: "feedback",
+                });
+            }
+            trace(format!("op=flag ref={} item={}", fref, item_id));
+            emit_replayable_signal(app, "feedback-misaddressed-changed");
+            misaddressed_json(200, serde_json::json!({ "ok": true, "itemId": item_id }))
+        }
+        "resend" => {
+            let pending = misaddressed_cell().lock().ok().and_then(|g| g.clone());
+            let Some(p) = pending.filter(|p| p.kind == "feedback" && p.fref == fref) else {
+                trace(format!("op=resend-refused reason=not-pending ref={}", fref));
+                return misaddressed_json(
+                    409,
+                    serde_json::json!({ "error": "that ref is not the pending flag" }),
+                );
+            };
+            let Some(path) = feedback_drafts_dir(app).map(|d| d.join(format!("{}.md", p.fref)))
+            else {
+                return misaddressed_json(409, serde_json::json!({ "error": "no drafts folder" }));
+            };
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                trace(format!(
+                    "op=resend-refused reason=draft-gone ref={}",
+                    p.fref
+                ));
+                return misaddressed_json(
+                    409,
+                    serde_json::json!({ "error": "the feedback draft is gone" }),
+                );
+            };
+            let at_iso = format_iso_utc(unix_now_ms());
+            let noted = format!(
+                "{}{}",
+                text.trim_end(),
+                misaddressed_note(&p.item_id, &at_iso)
+            );
+            if let Err(e) = std::fs::write(&path, noted) {
+                trace(format!(
+                    "op=resend-refused reason=write-failed ref={} error={}",
+                    p.fref, e
+                ));
+                return misaddressed_json(500, serde_json::json!({ "error": "note write failed" }));
+            }
+            if let Ok(mut g) = misaddressed_cell().lock() {
+                *g = None;
+            }
+            trace(format!("op=resend ref={} item={}", p.fref, p.item_id));
+            emit_replayable_signal(app, "feedback-misaddressed-changed");
+            misaddressed_json(
+                200,
+                serde_json::json!({ "ok": true, "itemId": p.item_id, "text": text.trim() }),
+            )
+        }
+        "flag-chat" => {
+            let turn_ref = req
+                .get("turnRef")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let item_id = req
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !misaddressed_turn_ref_ok(&turn_ref) {
+                trace("op=flag-chat-refused reason=bad-ref".to_string());
+                return misaddressed_json(400, serde_json::json!({ "error": "bad turnRef" }));
+            }
+            // The turn must be a plain chat message (not skip-worklist, not a
+            // gate action), and the newest one: the message being answered.
+            let dir = outbound_turns_dir(app);
+            let record = dir
+                .as_ref()
+                .and_then(|d| std::fs::read_to_string(d.join(format!("{}.json", turn_ref))).ok())
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+            let Some(record) = record else {
+                trace(format!(
+                    "op=flag-chat-refused reason=no-turn ref={}",
+                    turn_ref
+                ));
+                return misaddressed_json(
+                    409,
+                    serde_json::json!({ "error": "no outbound turn with that ref" }),
+                );
+            };
+            let is_chat = record.get("kind").and_then(|v| v.as_str()) == Some("message")
+                && record
+                    .get("mode")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .is_empty();
+            if !is_chat {
+                trace(format!(
+                    "op=flag-chat-refused reason=not-chat ref={}",
+                    turn_ref
+                ));
+                return misaddressed_json(
+                    409,
+                    serde_json::json!({ "error": "that turn was not sent as chat" }),
+                );
+            }
+            let newest = dir
+                .as_ref()
+                .and_then(|d| std::fs::read_dir(d).ok())
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .filter_map(|e| {
+                            let n = e.file_name().to_string_lossy().to_string();
+                            let stem = n.strip_suffix(".json")?.to_string();
+                            let ms: u64 = stem.strip_suffix("-turn")?.parse().ok()?;
+                            Some((ms, stem))
+                        })
+                        .max_by_key(|(ms, _)| *ms)
+                        .map(|(_, stem)| stem)
+                })
+                .unwrap_or(None);
+            if newest.as_deref() != Some(turn_ref.as_str()) {
+                trace(format!(
+                    "op=flag-chat-refused reason=not-newest ref={}",
+                    turn_ref
+                ));
+                return misaddressed_json(
+                    409,
+                    serde_json::json!({ "error": "that is not the message being answered" }),
+                );
+            }
+            let ctx_general = project_root(Some(app))
+                .and_then(|root| {
+                    std::fs::read_to_string(resource_relative_path(&root, TURN_CONTEXT_REL)).ok()
+                })
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|c| {
+                    c.get("kind")
+                        .and_then(|k| k.as_str())
+                        .map(|k| k == "general")
+                })
+                .unwrap_or(false);
+            if !ctx_general {
+                trace(format!(
+                    "op=flag-chat-refused reason=not-chat-turn ref={}",
+                    turn_ref
+                ));
+                return misaddressed_json(
+                    409,
+                    serde_json::json!({ "error": "the running turn is not a chat turn" }),
+                );
+            }
+            let on_board = worklist_file(app)
+                .and_then(|p| std::fs::read(p).ok())
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                .and_then(|w| {
+                    w.get("items").and_then(|a| a.as_array()).map(|a| {
+                        a.iter().any(|it| {
+                            it.get("id").and_then(|v| v.as_str()) == Some(item_id.as_str())
+                        })
+                    })
+                })
+                .unwrap_or(false);
+            if item_id.is_empty() || !on_board {
+                trace(format!(
+                    "op=flag-chat-refused reason=not-on-board ref={} item={}",
+                    turn_ref, item_id
+                ));
+                return misaddressed_json(
+                    409,
+                    serde_json::json!({ "error": "that item is not on the board" }),
+                );
+            }
+            if let Ok(mut g) = misaddressed_cell().lock() {
+                *g = Some(MisaddressedFeedback {
+                    fref: turn_ref.clone(),
+                    item_id: item_id.clone(),
+                    at_ms: unix_now_ms(),
+                    kind: "chat",
+                });
+            }
+            trace(format!("op=flag-chat ref={} item={}", turn_ref, item_id));
+            emit_replayable_signal(app, "feedback-misaddressed-changed");
+            misaddressed_json(200, serde_json::json!({ "ok": true, "itemId": item_id }))
+        }
+        "resend-as-feedback" => {
+            let turn_ref = req
+                .get("turnRef")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let pending = misaddressed_cell().lock().ok().and_then(|g| g.clone());
+            let Some(p) = pending.filter(|p| p.kind == "chat" && p.fref == turn_ref) else {
+                trace(format!(
+                    "op=resend-as-feedback-refused reason=not-pending ref={}",
+                    turn_ref
+                ));
+                return misaddressed_json(
+                    409,
+                    serde_json::json!({ "error": "that ref is not the pending flag" }),
+                );
+            };
+            let record = outbound_turns_dir(app)
+                .and_then(|d| std::fs::read_to_string(d.join(format!("{}.json", p.fref))).ok())
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+            let Some(record) = record else {
+                trace(format!(
+                    "op=resend-as-feedback-refused reason=turn-gone ref={}",
+                    p.fref
+                ));
+                return misaddressed_json(
+                    409,
+                    serde_json::json!({ "error": "the chat turn's record is gone" }),
+                );
+            };
+            let text = record
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let images = record
+                .get("images")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([]));
+            if let Ok(mut g) = misaddressed_cell().lock() {
+                *g = None;
+            }
+            let note = misaddressed_chat_note(&p.fref, &format_iso_utc(unix_now_ms()));
+            trace(format!(
+                "op=resend-as-feedback ref={} item={}",
+                p.fref, p.item_id
+            ));
+            emit_replayable_signal(app, "feedback-misaddressed-changed");
+            misaddressed_json(
+                200,
+                serde_json::json!({
+                    "ok": true, "itemId": p.item_id, "text": text, "images": images, "note": note,
+                }),
+            )
+        }
+        "dismiss" => {
+            let cleared = misaddressed_cell().lock().ok().and_then(|mut g| g.take());
+            if let Some(p) = cleared {
+                trace(format!("op=ignored ref={} item={}", p.fref, p.item_id));
+                emit_replayable_signal(app, "feedback-misaddressed-changed");
+            }
+            misaddressed_json(200, serde_json::json!({ "ok": true }))
+        }
+        _ => misaddressed_json(
+            400,
+            serde_json::json!({
+                "error": "op must be flag, resend, flag-chat, resend-as-feedback or dismiss"
+            }),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod misaddressed_feedback_tests {
+    use super::{
+        misaddressed_chat_note, misaddressed_note, misaddressed_ref_item, misaddressed_turn_ref_ok,
+    };
+
+    #[test]
+    fn turn_ref_accepts_only_outbound_turn_ids() {
+        assert!(misaddressed_turn_ref_ok("1794093936375-turn"));
+        assert!(!misaddressed_turn_ref_ok("1794093936375"));
+        assert!(!misaddressed_turn_ref_ok("-turn"));
+        assert!(!misaddressed_turn_ref_ok("abc-turn"));
+        assert!(!misaddressed_turn_ref_ok("../1-turn"));
+        assert!(!misaddressed_turn_ref_ok("1/2-turn"));
+    }
+
+    #[test]
+    fn chat_note_names_the_turn() {
+        let note = misaddressed_chat_note("1794093936375-turn", "2026-11-07T23:00:00Z");
+        assert!(note.starts_with("\n\n---\n"));
+        assert!(note.contains("Resent as feedback 2026-11-07T23:00:00Z"));
+        assert!(note.contains("`1794093936375-turn`"));
+    }
+
+    #[test]
+    fn ref_item_parses_only_well_formed_refs() {
+        assert_eq!(
+            misaddressed_ref_item("1793976481800-transcript-worklist-open-keeps-reading")
+                .as_deref(),
+            Some("transcript-worklist-open-keeps-reading")
+        );
+        assert_eq!(misaddressed_ref_item("abc-item"), None);
+        assert_eq!(misaddressed_ref_item("123-"), None);
+        assert_eq!(misaddressed_ref_item("123-../../etc"), None);
+        assert_eq!(misaddressed_ref_item("123-a/b"), None);
+        assert_eq!(misaddressed_ref_item("nodash"), None);
+    }
+
+    #[test]
+    fn note_keeps_the_original_above_it() {
+        let note = misaddressed_note("item-x", "2026-11-06T15:00:00Z");
+        assert!(note.starts_with("\n\n---\n"));
+        assert!(note.contains("Resent as chat 2026-11-06T15:00:00Z"));
+        assert!(note.contains("`item-x`"));
+    }
+}
+
 fn handle_iterate_end<R: tauri::Runtime>(
     app: &AppHandle<R>,
     body: &[u8],
@@ -79787,14 +91856,15 @@ fn handle_iterate_end<R: tauri::Runtime>(
     // Report what actually happened. This returned a bare {"ok":true} whether
     // or not anything was cleared, so a caller ending one id of a two-id claim
     // got success, a still-live claim, and a spinner it could not explain.
-    let body = match shrink_inflight_claim_sentinel(app, &ids) {
+    // Ids a live subagent binding holds stay in `remaining` (op=retain).
+    let body = match shrink_inflight_claim_sentinel(app, &ids, "end") {
         ClaimShrink::Cleared => serde_json::json!({ "ok": true, "cleared": true }),
         ClaimShrink::Shrunk { remaining } => serde_json::json!({
             "ok": true,
             "cleared": false,
             "remaining": remaining,
         }),
-        ClaimShrink::NoClaim => serde_json::json!({
+        ClaimShrink::NoClaim | ClaimShrink::Uncovered => serde_json::json!({
             "ok": true,
             "cleared": false,
             "remaining": [],
@@ -80893,6 +92963,91 @@ fn git_run_owned<R: tauri::Runtime>(app: &AppHandle<R>, args: &[String]) -> Resu
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+// worklist-commit-waits-out-index-lock: another git process (an editor's
+// background status, a hook, a second Bram) can hold `.git/index.lock` for a
+// few milliseconds. The gate used to answer 500 to that. These helpers wait
+// out the collision (100 ms steps, ~2 s total) before failing. git refuses
+// before it changes anything when it cannot take the lock, so the retry is
+// safe.
+const INDEX_LOCK_RETRY_STEP_MS: u64 = 100;
+const INDEX_LOCK_RETRY_MAX_WAIT_MS: u64 = 2000;
+const INDEX_LOCK_GAVE_UP_PREFIX: &str =
+    "another git process holds .git/index.lock (an editor?); retry when it's gone. \
+     Never delete the lock while a git process is running (pgrep -x git); if none \
+     is, it is stale: tell the user before removing it. Git said: ";
+
+fn git_error_is_index_lock_collision(text: &str) -> bool {
+    text.contains("Unable to create") && text.contains("index.lock")
+}
+
+fn index_lock_gave_up(e: &str) -> bool {
+    e.starts_with(INDEX_LOCK_GAVE_UP_PREFIX)
+}
+
+// Pure retry core. `on_wait(n)` is called before the n-th sleep. When the
+// wait budget runs out on an index.lock collision, the error is prefixed with
+// INDEX_LOCK_GAVE_UP_PREFIX so callers can say what happened.
+fn retry_on_index_lock(
+    mut run: impl FnMut() -> Result<String, String>,
+    step: std::time::Duration,
+    max_wait: std::time::Duration,
+    mut on_wait: impl FnMut(u32),
+) -> Result<String, String> {
+    // index-lock-wait-counts-git-time: the budget is wall-clock from entry, so
+    // slow git launches (Windows) count against it too; adding up only the
+    // sleeps let the loop run well past max_wait (#469, 2026-11-05).
+    let started = std::time::Instant::now();
+    let mut attempt = 0u32;
+    loop {
+        match run() {
+            Err(e) if git_error_is_index_lock_collision(&e) => {
+                let elapsed = started.elapsed();
+                if elapsed >= max_wait {
+                    return Err(format!("{}{}", INDEX_LOCK_GAVE_UP_PREFIX, e.trim()));
+                }
+                attempt += 1;
+                on_wait(attempt);
+                std::thread::sleep(step.min(max_wait - elapsed));
+            }
+            other => return other,
+        }
+    }
+}
+
+// Run a git command for the worklist-commit route with the index.lock wait,
+// tracing each wait and a give-up under `[worklist-commit]`.
+fn worklist_git_lock_retry<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    args: &[&str],
+) -> Result<String, String> {
+    let owned: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    let verb = args.first().copied().unwrap_or("").to_string();
+    let result = retry_on_index_lock(
+        || git_run_owned(app, &owned),
+        std::time::Duration::from_millis(INDEX_LOCK_RETRY_STEP_MS),
+        std::time::Duration::from_millis(INDEX_LOCK_RETRY_MAX_WAIT_MS),
+        |attempt| {
+            if bram_trace_enabled() {
+                append_bram_trace_line(
+                    app,
+                    "worklist-commit",
+                    &format!("op=index-lock-wait attempt={} cmd={}", attempt, verb),
+                );
+            }
+        },
+    );
+    if let Err(e) = &result {
+        if index_lock_gave_up(e) && bram_trace_enabled() {
+            append_bram_trace_line(
+                app,
+                "worklist-commit",
+                &format!("op=index-lock-gave-up cmd={}", verb),
+            );
+        }
+    }
+    result
+}
+
 fn worklist_json_error(status: u16, message: impl Into<String>) -> (u16, &'static str, Vec<u8>) {
     (
         status,
@@ -80959,6 +93114,12 @@ fn handle_worklist_drop_direct<R: tauri::Runtime>(
     if ids.is_empty() {
         return worklist_json_error(400, "ids[] required");
     }
+    // delegated-work-action-gates: the prune below refuses bound ids too
+    // (handle_worklist_mutate's gate); this early check only keeps a refused
+    // drop from recording a grant and writing a drop claim first.
+    if let Some(refusal) = delegated_refusal_response(app, &ids, "worklist-drop") {
+        return refusal;
+    }
     // Record the drop authorization (the pane click IS the authorization),
     // so resolve/prune are self-contained and race-free — no dependency on a
     // separate pane auth-invoke landing first.
@@ -80975,7 +93136,8 @@ fn handle_worklist_drop_direct<R: tauri::Runtime>(
     // resolve consumes the auth and writes the drop sentinel; prune clears it.
     let _ = handle_worklist_resolve(app, Some(ids.clone()));
     let prune_body = serde_json::json!({ "op": "prune", "ids": ids }).to_string();
-    let (code, _, mbytes) = handle_worklist_mutate(app, prune_body.as_bytes());
+    let (code, _, mbytes) =
+        handle_worklist_mutate(app, prune_body.as_bytes(), MutateCaller::External);
     append_bram_trace_line(
         app,
         "worklist-drop",
@@ -81031,7 +93193,7 @@ fn item_interval_changed_paths<R: tauri::Runtime>(
         return None;
     }
     let root = project_root(Some(app))?;
-    let text = std::fs::read_to_string(root.join(CLAIM_INTERVALS_REL)).ok()?;
+    let text = std::fs::read_to_string(resource_relative_path(&root, CLAIM_INTERVALS_REL)).ok()?;
     let doc = serde_json::from_str::<serde_json::Value>(&text).ok()?;
     let arr = doc.get("intervals").and_then(|v| v.as_array())?;
     let mut owned_any = false;
@@ -81331,6 +93493,179 @@ fn landed_seen_cell() -> &'static Mutex<HashSet<String>> {
 // at call time and prunes nothing else; the pane's "Clear them" button and an
 // agent asked in chat ("clear those") both use it. Ids that aren't landed are
 // refused and listed.
+// gate-names-the-outside-commit-that-strands-an-item: `POST
+// /__worklist/reanchor { ids }`. For each begun item whose interval patch no
+// longer applies to HEAD, record a re-anchor for every failing declared path
+// whose uncommitted lines membership credits to that item alone (see
+// REANCHORS_KEY). Nothing in the worktree, the index or history moves; the
+// next precheck and commit build that path's chunk from `git diff HEAD`. 409
+// with every refusal named when nothing could be re-anchored. Authorization:
+// none beyond the loopback gate. It grants nothing and commits nothing; it
+// changes only how an already-begun item's own lines are cut into a patch,
+// under a condition the commit re-verifies.
+fn handle_worklist_reanchor<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    body: &[u8],
+) -> (u16, &'static str, Vec<u8>) {
+    let _mutate_guard = worklist_mutate_cell().lock();
+    let req: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => return worklist_json_error(400, format!("invalid JSON: {}", e)),
+    };
+    let ids = worklist_json_ids(&req, "ids");
+    if ids.is_empty() {
+        return worklist_json_error(400, "ids[] required");
+    }
+    let items: Vec<serde_json::Value> = worklist_file(app)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v.get("items").and_then(|i| i.as_array()).cloned())
+        .unwrap_or_default();
+    let Some((partition, _fresh)) = membership_partition(app) else {
+        return worklist_json_error(503, "membership has no partition yet; retry shortly");
+    };
+    let head = match git_run(app, &["rev-parse", "HEAD"]) {
+        Ok(h) => h.trim().to_string(),
+        Err(e) => return worklist_json_error(500, format!("rev-parse HEAD failed: {}", e)),
+    };
+    let short: String = head.chars().take(7).collect();
+    let mut recorded: Vec<serde_json::Value> = Vec::new();
+    let mut refused: Vec<serde_json::Value> = Vec::new();
+    let mut new_records: Vec<serde_json::Value> = Vec::new();
+    let now = unix_now_ms();
+    let refuse = |id: &str, path: &str, reason: &str, refused: &mut Vec<serde_json::Value>| {
+        append_bram_trace_line(
+            app,
+            "worklist-commit",
+            &format!(
+                "op=reanchor id={} path={} head={} outcome=refused reason={}",
+                id,
+                if path.is_empty() { "-" } else { path },
+                short,
+                reason
+            ),
+        );
+        refused.push(serde_json::json!({ "id": id, "path": path, "reason": reason }));
+    };
+    for id in &ids {
+        let Some(item) = items
+            .iter()
+            .find(|i| i.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+        else {
+            refuse(id, "", "unknown-item", &mut refused);
+            continue;
+        };
+        let begun = item.get("status").and_then(|v| v.as_str()) == Some("applied")
+            || item.get("begunAtMs").and_then(|v| v.as_i64()).unwrap_or(0) > 0;
+        if !begun {
+            refuse(id, "", "not-begun", &mut refused);
+            continue;
+        }
+        let files = worklist_item_files(item);
+        let mut fmap: std::collections::HashMap<String, Vec<String>> = Default::default();
+        fmap.insert(id.clone(), files.clone());
+        let failing = match interval_commit_precheck(app, &[id.clone()], &fmap) {
+            Ok(_) => {
+                refuse(id, "", "already-applies", &mut refused);
+                continue;
+            }
+            Err(f) => f,
+        };
+        let candidates: Vec<String> = partition
+            .keys()
+            .filter(|p| files.iter().any(|d| declared_covers(d, p)))
+            .filter(|p| failing.is_empty() || failing.contains(p))
+            .cloned()
+            .collect();
+        if candidates.is_empty() {
+            refuse(id, "", "no-failing-path", &mut refused);
+            continue;
+        }
+        for path in candidates {
+            let Some(bucket) = partition.get(&path) else {
+                continue;
+            };
+            if let Some(reason) = reanchor_refusal_reason(bucket, id) {
+                refuse(id, &path, &reason, &mut refused);
+                continue;
+            }
+            if git_run(app, &["cat-file", "-e", &format!("HEAD:{}", path)]).is_err() {
+                refuse(id, &path, "untracked", &mut refused);
+                continue;
+            }
+            let blob = match git_run(app, &["hash-object", "--", &path]) {
+                Ok(b) => b.trim().to_string(),
+                Err(_) => {
+                    refuse(id, &path, "hash-failed", &mut refused);
+                    continue;
+                }
+            };
+            let own_patch = claim_interval_diff(app, id, &path)
+                .get("patch")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if own_patch.trim().is_empty() {
+                refuse(id, &path, "no-window-patch", &mut refused);
+                continue;
+            }
+            if let Err(reason) = reanchor_verified_blob(app, &path, &own_patch, &blob) {
+                refuse(id, &path, &reason, &mut refused);
+                continue;
+            }
+            append_bram_trace_line(
+                app,
+                "worklist-commit",
+                &format!(
+                    "op=reanchor id={} path={} head={} outcome=recorded",
+                    id, path, short
+                ),
+            );
+            new_records.push(serde_json::json!({
+                "id": id, "path": path, "head": head, "blob": blob, "atMs": now,
+            }));
+            recorded.push(serde_json::json!({ "id": id, "path": path }));
+        }
+    }
+    if !new_records.is_empty() {
+        let Some((sidecar, mut doc)) = claim_intervals_doc(app) else {
+            return worklist_json_error(500, "claim-intervals sidecar unreadable");
+        };
+        let mut arr: Vec<serde_json::Value> = doc
+            .get(REANCHORS_KEY)
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        // One record per (id, path): a repeat re-anchor replaces the old one.
+        arr.retain(|r| {
+            !new_records
+                .iter()
+                .any(|n| n.get("id") == r.get("id") && n.get("path") == r.get("path"))
+        });
+        arr.extend(new_records);
+        if let Some(obj) = doc.as_object_mut() {
+            obj.insert(REANCHORS_KEY.to_string(), serde_json::Value::Array(arr));
+        }
+        if !write_claim_intervals_doc(&sidecar, &doc) {
+            return worklist_json_error(500, "claim-intervals sidecar write failed");
+        }
+        REANCHOR_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        emit_replayable_signal(app, "worklist-changed");
+    }
+    let status = if recorded.is_empty() { 409 } else { 200 };
+    let body = serde_json::json!({
+        "ok": !recorded.is_empty(),
+        "head": short,
+        "reanchored": recorded,
+        "refused": refused,
+    });
+    (
+        status,
+        "application/json; charset=utf-8",
+        serde_json::to_vec(&body).unwrap_or_default(),
+    )
+}
+
 fn handle_worklist_clear_landed<R: tauri::Runtime>(
     app: &AppHandle<R>,
     body: &[u8],
@@ -81609,9 +93944,18 @@ fn handle_worklist_reorder<R: tauri::Runtime>(
     )
 }
 
+// Who is calling handle_worklist_mutate. Only the commit route's own
+// post-commit prune is Internal: its commit already refused bound ids.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MutateCaller {
+    External,
+    Internal,
+}
+
 fn handle_worklist_mutate<R: tauri::Runtime>(
     app: &AppHandle<R>,
     body: &[u8],
+    caller: MutateCaller,
 ) -> (u16, &'static str, Vec<u8>) {
     // Serialize concurrent mutates so the RMW (read worklist → apply op →
     // write back) is atomic with respect to other mutate callers. Without
@@ -81646,6 +93990,14 @@ fn handle_worklist_mutate<R: tauri::Runtime>(
             "application/json; charset=utf-8",
             serde_json::json!({ "error": e }).to_string().into_bytes(),
         );
+    }
+    // delegated-work-action-gates: the one prune refusal, shared by the HTTP
+    // route, Codex's worklist-mutate intent and host-direct Drop. Advance on a
+    // bound id is allowed: the claim retains the id anyway.
+    if op == "prune" && caller == MutateCaller::External {
+        if let Some(refusal) = delegated_refusal_response(app, &ids, "worklist-mutate") {
+            return refusal;
+        }
     }
 
     // Auth check. Deliberately ignores consumedAtMs: same-turn
@@ -81717,7 +94069,7 @@ fn handle_worklist_mutate<R: tauri::Runtime>(
             // over finished work). Other refusals leave the claim alone —
             // they may be retried under the same auth.
             if e.contains("authorization expired") {
-                let _ = shrink_inflight_claim_sentinel(app, &ids);
+                let _ = shrink_inflight_claim_sentinel(app, &ids, "auth-expired");
             }
             return (
                 400,
@@ -81856,7 +94208,7 @@ fn handle_worklist_mutate<R: tauri::Runtime>(
         // ids, and each mutate resolves only its own. worklist-commit reaches
         // this same path by delegating a prune.
         let cleared = !matches!(
-            shrink_inflight_claim_sentinel(app, completion_ids),
+            shrink_inflight_claim_sentinel(app, completion_ids, op),
             ClaimShrink::NoClaim
         );
         if !cleared {
@@ -81994,7 +94346,7 @@ fn release_claim_on_commit_refusal<R: tauri::Runtime>(
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
     record_last_commit_refusal(ids, &head, reason);
-    let _ = shrink_inflight_claim_sentinel(app, ids);
+    let _ = shrink_inflight_claim_sentinel(app, ids, "commit-refusal");
     append_bram_trace_line(
         app,
         "inflight-sentinel",
@@ -82070,6 +94422,9 @@ fn worklist_selection_prediction<R: tauri::Runtime>(
     };
     let mut begun: std::collections::HashSet<String> = Default::default();
     let mut files_map: std::collections::HashMap<String, Vec<String>> = Default::default();
+    // The earliest start among the requested items bounds the outside-commit
+    // search (gate-names-the-outside-commit-that-strands-an-item).
+    let mut since_ms: Option<i64> = None;
     if let Some(wf) = worklist_file(app) {
         if let Some(doc) = std::fs::read_to_string(&wf)
             .ok()
@@ -82091,6 +94446,13 @@ fn worklist_selection_prediction<R: tauri::Runtime>(
                 }
                 if ids.iter().any(|r| r == id) {
                     files_map.insert(id.to_string(), worklist_item_files(it));
+                    if let Some(b) = it
+                        .get("begunAtMs")
+                        .and_then(|v| v.as_i64())
+                        .filter(|b| *b > 0)
+                    {
+                        since_ms = Some(since_ms.map_or(b, |s: i64| s.min(b)));
+                    }
                 }
             }
         }
@@ -82115,10 +94477,25 @@ fn worklist_selection_prediction<R: tauri::Runtime>(
                     "added": a, "removed": r, "entangledWith": entangled_with,
                 })
             }
-            Err(paths) => serde_json::json!({
-                "ready": true, "stale": !fresh, "stateKey": state_key, "mode": "interval",
-                "dependentPaths": paths, "entangledWith": entangled_with,
-            }),
+            Err(paths) => {
+                let stranded = match since_ms {
+                    Some(s) => outside_commits_touching(
+                        app,
+                        s,
+                        if paths.is_empty() {
+                            &requested_files
+                        } else {
+                            &paths
+                        },
+                    ),
+                    None => Vec::new(),
+                };
+                serde_json::json!({
+                    "ready": true, "stale": !fresh, "stateKey": state_key, "mode": "interval",
+                    "dependentPaths": paths, "entangledWith": entangled_with,
+                    "strandedBy": stranding_json(&stranded),
+                })
+            }
         };
     }
     selection_whole_file_json(&partition, fresh, state_key, &requested_files)
@@ -82267,7 +94644,8 @@ fn membership_joint_owners(
 // issue-432: when the joint set was approved, for the refusal message — the
 // latest claim interval whose ids are exactly these members.
 fn joint_click_at_ms(project_root: &Path, members: &[String]) -> Option<i64> {
-    let text = std::fs::read_to_string(project_root.join(CLAIM_INTERVALS_REL)).ok()?;
+    let text =
+        std::fs::read_to_string(resource_relative_path(&project_root, CLAIM_INTERVALS_REL)).ok()?;
     let doc: serde_json::Value = serde_json::from_str(&text).ok()?;
     let mut want: Vec<&str> = members.iter().map(|s| s.as_str()).collect();
     want.sort();
@@ -82735,6 +95113,11 @@ fn handle_worklist_commit<R: tauri::Runtime>(
                 .to_string(),
         );
     }
+    // delegated-work-action-gates: a subagent still bound to any requested id
+    // is still writing its files; committing now would ship half its work.
+    if let Some(refusal) = delegated_refusal_response(app, &ids, "worklist-commit") {
+        return refusal;
+    }
 
     let Some(auth_path) = worklist_auth_file(app) else {
         return worklist_json_error(500, "no project root");
@@ -82927,7 +95310,8 @@ fn handle_worklist_commit<R: tauri::Runtime>(
             "commit refused: Bram couldn't work out which lines belong to which item, so it \
              can't tell whether this commit would take another item's work. Nothing was \
              committed. If this repeats, retrying won't clear it: the trace line \
-             `op=membership … reason=` in resources/bram-traces/bram-trace.log says why."
+             `op=membership … reason=` in bram-traces/bram-trace.log, in Bram's state \
+             folder (.bram/ if it exists, else resources/), says why."
                 .to_string(),
         );
     };
@@ -83160,7 +95544,19 @@ fn handle_worklist_commit<R: tauri::Runtime>(
         let mut skipped_unmatched: Vec<String> = Vec::new();
         for file in &files {
             let add_args = worklist_commit_add_args(std::slice::from_ref(file));
-            if let Err(e) = git_run_owned(app, &add_args) {
+            let add_refs: Vec<&str> = add_args.iter().map(|a| a.as_str()).collect();
+            if let Err(e) = worklist_git_lock_retry(app, &add_refs) {
+                if index_lock_gave_up(&e) {
+                    // Files staged earlier in this loop stay staged; the
+                    // next attempt re-adds them and is idempotent.
+                    return worklist_json_error(
+                        500,
+                        format!(
+                            "git add failed: {}. Nothing was committed; files this request already staged stay staged, and a retry picks them up.",
+                            e.trim()
+                        ),
+                    );
+                }
                 if e.contains("did not match any files") {
                     skipped_unmatched.push(file.clone());
                     continue;
@@ -83249,7 +95645,8 @@ fn handle_worklist_commit<R: tauri::Runtime>(
         if let Some((reason, drift)) = drift_check {
             let mut unstage = vec!["reset".to_string(), "-q".to_string(), "--".to_string()];
             unstage.extend(staged_after.iter().cloned());
-            let _ = git_run_owned(app, &unstage);
+            let unstage_refs: Vec<&str> = unstage.iter().map(|a| a.as_str()).collect();
+            let _ = worklist_git_lock_retry(app, &unstage_refs);
             append_bram_trace_line(
                 app,
                 "worklist-commit",
@@ -83335,7 +95732,17 @@ fn handle_worklist_commit<R: tauri::Runtime>(
         if bram_trace_enabled() {
             append_bram_trace_line(app, "worklist-commit", "op=committing");
         }
-        if let Err(e) = git_run_owned(app, &commit_args) {
+        let commit_refs: Vec<&str> = commit_args.iter().map(|a| a.as_str()).collect();
+        if let Err(e) = worklist_git_lock_retry(app, &commit_refs) {
+            if index_lock_gave_up(&e) {
+                return worklist_json_error(
+                    500,
+                    format!(
+                        "git commit failed: {}. Nothing was committed; the items' files are staged, and a retry commits them.",
+                        e.trim()
+                    ),
+                );
+            }
             return worklist_json_error(500, format!("git commit failed: {}", e.trim()));
         }
         sha = match git_run(app, &["rev-parse", "HEAD"]) {
@@ -83383,14 +95790,7 @@ fn handle_worklist_commit<R: tauri::Runtime>(
         // the worktree or index, so moving the ref back to head_before cleanly
         // discards the empty commit and leaves no staged residue.
         if sha != head_before {
-            let _ = git_run_owned(
-                app,
-                &[
-                    "update-ref".to_string(),
-                    "HEAD".to_string(),
-                    head_before.clone(),
-                ],
-            );
+            let _ = worklist_git_lock_retry(app, &["update-ref", "HEAD", &head_before]);
         }
         if bram_trace_enabled() {
             append_bram_trace_line(app, "worklist-commit", "op=refuse-empty-commit");
@@ -83556,7 +95956,7 @@ fn handle_worklist_commit<R: tauri::Runtime>(
         // outlive the turn — release both exactly as the prune path would,
         // leaving only the item row behind.
         retire_worklist_authorization(app, Some(&retained));
-        let _ = shrink_inflight_claim_sentinel(app, &retained);
+        let _ = shrink_inflight_claim_sentinel(app, &retained, "residual-withhold");
         append_bram_trace_line(
             app,
             "inflight-sentinel",
@@ -83606,7 +96006,8 @@ fn handle_worklist_commit<R: tauri::Runtime>(
             "ids": prune_ids,
         });
         let prune_bytes = serde_json::to_vec(&prune_body).unwrap_or_default();
-        let (status, _content_type, body) = handle_worklist_mutate(app, &prune_bytes);
+        let (status, _content_type, body) =
+            handle_worklist_mutate(app, &prune_bytes, MutateCaller::Internal);
         if !(200..300).contains(&status) {
             let parsed: serde_json::Value = serde_json::from_slice(&body)
                 .unwrap_or_else(|_| serde_json::json!({ "raw": String::from_utf8_lossy(&body) }));
@@ -84216,33 +96617,22 @@ mod worklist_authorization_tests {
         // issue-312 repro: an item declaring a directory staged 59 files and
         // committed 1, because the directory is never literally in git's
         // staged FILE list. Prefix matching carries it.
-        let staged = ids(&[
-            "resources/worklist.json",
-            "resources/worklist-drafts/a.md",
-            "resources/worklist-drafts/b.md",
-            "resources/worklist-history/2026.json",
-        ]);
-        assert!(staged_path_covered_by_any(
-            "resources/worklist.json",
-            &staged
-        ));
-        assert!(staged_path_covered_by_any(
-            "resources/worklist-drafts",
-            &staged
-        ));
-        assert!(staged_path_covered_by_any(
-            "resources/worklist-drafts/",
-            &staged
-        ));
-        assert!(staged_path_covered_by_any(
-            "resources/worklist-history",
-            &staged
-        ));
+        use crate::test_state_rel as st;
+        let staged = vec![
+            st("worklist.json"),
+            st("worklist-drafts/a.md"),
+            st("worklist-drafts/b.md"),
+            st("worklist-history/2026.json"),
+        ];
+        assert!(staged_path_covered_by_any(&st("worklist.json"), &staged));
+        assert!(staged_path_covered_by_any(&st("worklist-drafts"), &staged));
+        assert!(staged_path_covered_by_any(&st("worklist-drafts/"), &staged));
+        assert!(staged_path_covered_by_any(&st("worklist-history"), &staged));
         // A never-staged path stays excluded, so `git commit -- <path>` is
         // never handed a pathspec matching nothing.
-        assert!(!staged_path_covered_by_any("resources/gone.md", &staged));
+        assert!(!staged_path_covered_by_any(&st("gone.md"), &staged));
         // A prefix that is not a path boundary must not match.
-        assert!(!staged_path_covered_by_any("resources/worklist", &staged));
+        assert!(!staged_path_covered_by_any(&st("worklist"), &staged));
     }
 
     #[test]
@@ -84259,23 +96649,21 @@ mod worklist_authorization_tests {
 
     #[test]
     fn left_behind_detects_staged_paths_no_pathspec_covers() {
-        let staged = ids(&[
-            "resources/worklist.json",
-            "resources/worklist-drafts/a.md",
-            "resources/worklist-drafts/b.md",
-        ]);
+        use crate::test_state_rel as st;
+        let staged = vec![
+            st("worklist.json"),
+            st("worklist-drafts/a.md"),
+            st("worklist-drafts/b.md"),
+        ];
         // The pre-fix behavior: only the plain file in the pathspec.
-        let left = staged_paths_left_behind(&ids(&["resources/worklist.json"]), &staged);
+        let left = staged_paths_left_behind(&[st("worklist.json")], &staged);
         assert_eq!(
             left.len(),
             2,
             "both draft files should be reported: {left:?}"
         );
         // The fixed behavior: the directory covers its contents, nothing left.
-        let none = staged_paths_left_behind(
-            &ids(&["resources/worklist.json", "resources/worklist-drafts"]),
-            &staged,
-        );
+        let none = staged_paths_left_behind(&[st("worklist.json"), st("worklist-drafts")], &staged);
         assert!(none.is_empty(), "unexpected leftovers: {none:?}");
     }
 
@@ -84317,35 +96705,42 @@ mod worklist_authorization_tests {
     fn worklist_commit_accepts_files_under_declared_directory() {
         // #295: `git add` expands a declared directory to its contents;
         // the verification must agree instead of refusing what it staged.
-        let approved = ids(&["docs/a.md", "resources/worklist-drafts"]);
+        use crate::test_state_rel as st;
+        let approved = vec!["docs/a.md".to_string(), st("worklist-drafts")];
         ensure_no_unrelated_staged_files(
-            &ids(&[
-                "docs/a.md",
-                "resources/worklist-drafts/item-one.md",
-                "resources/worklist-drafts/nested/deep.md",
-            ]),
+            &[
+                "docs/a.md".to_string(),
+                st("worklist-drafts/item-one.md"),
+                st("worklist-drafts/nested/deep.md"),
+            ],
             &approved,
         )
         .expect("files under a declared directory are related");
 
         // A trailing slash on the declared entry behaves the same.
         ensure_no_unrelated_staged_files(
-            &ids(&["resources/worklist-drafts/item-one.md"]),
-            &ids(&["resources/worklist-drafts/"]),
+            &[st("worklist-drafts/item-one.md")],
+            &[st("worklist-drafts/")],
         )
         .expect("trailing slash on the declared entry is normalized");
 
         // Prefix match requires a path separator: `foo` is not `foobar`,
         // and a genuinely foreign staged file is still refused.
         let err = ensure_no_unrelated_staged_files(
-            &ids(&["resources/worklist-drafts-archive/old.md", "src/other.rs"]),
-            &ids(&["resources/worklist-drafts"]),
+            &[
+                st("worklist-drafts-archive/old.md"),
+                "src/other.rs".to_string(),
+            ],
+            &[st("worklist-drafts")],
         )
         .expect_err("sibling-prefix and foreign staged files are refused");
         assert_eq!(
             err,
-            "refusing worklist commit because unrelated files are staged: \
-             resources/worklist-drafts-archive/old.md, src/other.rs"
+            format!(
+                "refusing worklist commit because unrelated files are staged: \
+                 {}, src/other.rs",
+                st("worklist-drafts-archive/old.md")
+            )
         );
     }
 
@@ -84561,17 +96956,853 @@ mod worklist_authorization_tests {
 
     #[test]
     fn resource_relative_path_joins_under_resources() {
+        // judell/bram#469: no `.bram/` means the legacy folder, exactly as
+        // before the resolver existed.
+        let legacy = Path::new("/tmp/bram").join(super::BRAM_STATE_DIR_LEGACY);
+        assert_eq!(super::BRAM_STATE_DIR_LEGACY, "resources");
         assert_eq!(
             resource_relative_path(Path::new("/tmp/bram"), "worklist.json"),
-            Path::new("/tmp/bram")
-                .join("resources")
-                .join("worklist.json")
+            legacy.join("worklist.json")
         );
         assert_eq!(
             resource_relative_path(Path::new("/tmp/bram"), Path::new("feedback-drafts")),
-            Path::new("/tmp/bram")
-                .join("resources")
-                .join("feedback-drafts")
+            legacy.join("feedback-drafts")
+        );
+    }
+
+    #[test]
+    fn state_dir_resolver_prefers_dot_bram_when_present() {
+        let root = std::env::temp_dir().join(format!("bram-469-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let legacy = super::BRAM_STATE_DIR_LEGACY;
+        let legacy_wl = format!("{}/worklist.json", legacy);
+        assert_eq!(super::bram_state_dir(&root), root.join(legacy));
+        assert_eq!(super::bram_state_rel(&root, "worklist.json"), legacy_wl);
+        assert_eq!(super::bram_state_rel(&root, ""), legacy);
+        assert_eq!(
+            super::bram_state_rel_strip(&root, &legacy_wl),
+            Some("worklist.json")
+        );
+        assert_eq!(super::bram_state_rel_strip(&root, "resourcesX/a"), None);
+        // A `.bram` file is not the folder.
+        std::fs::write(root.join(".bram"), "").unwrap();
+        assert_eq!(super::bram_state_dir(&root), root.join(legacy));
+        std::fs::remove_file(root.join(".bram")).unwrap();
+        std::fs::create_dir_all(root.join(".bram")).unwrap();
+        assert_eq!(super::bram_state_dir(&root), root.join(".bram"));
+        assert_eq!(
+            resource_relative_path(&root, ".bram-port"),
+            root.join(".bram").join(".bram-port")
+        );
+        assert_eq!(
+            super::bram_state_rel(&root, "worklist.json"),
+            ".bram/worklist.json"
+        );
+        assert_eq!(super::bram_state_rel_strip(&root, &legacy_wl), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn state_dir_plan_temp_root() -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("bram-469-plan-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    // state-move-ignores-finished-authorization: a fresh authorization
+    // counts as live work only while one of its ids is still on the board.
+    fn state_dir_live_claim_fixture(board_ids: &[&str], auth_ids: &[&str]) -> std::path::PathBuf {
+        let root = state_dir_plan_temp_root();
+        let res = super::bram_state_dir(&root);
+        std::fs::create_dir_all(&res).unwrap();
+        let items: Vec<serde_json::Value> = board_ids
+            .iter()
+            .map(|id| serde_json::json!({ "id": id, "status": "proposed" }))
+            .collect();
+        std::fs::write(
+            res.join("worklist.json"),
+            serde_json::json!({ "version": 1, "items": items }).to_string(),
+        )
+        .unwrap();
+        let now = super::unix_now_ms();
+        std::fs::write(
+            res.join(super::WORKLIST_AUTH_REL),
+            serde_json::json!({
+                "kind": "approved", "ids": auth_ids,
+                "issuedAtMs": now - 1000, "consumedAtMs": now - 500
+            })
+            .to_string(),
+        )
+        .unwrap();
+        root
+    }
+
+    #[test]
+    fn state_dir_live_claim_ignores_authorization_for_pruned_items() {
+        let root = state_dir_live_claim_fixture(&["other"], &["committed-item"]);
+        let plan = super::state_dir_plan(&root);
+        assert_eq!(plan["liveClaim"], false);
+        assert_eq!(plan["liveClaimDetail"]["staleAuthorization"], true);
+        assert!(plan["liveClaimDetail"]["authorization"].is_null());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn state_dir_live_claim_keeps_authorization_with_an_item_on_the_board() {
+        let root = state_dir_live_claim_fixture(&["mid-edit"], &["gone", "mid-edit"]);
+        let plan = super::state_dir_plan(&root);
+        assert_eq!(plan["liveClaim"], true);
+        assert_eq!(plan["liveClaimDetail"]["staleAuthorization"], false);
+        assert_eq!(plan["liveClaimDetail"]["authorization"], "approved");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn state_dir_live_claim_counts_the_inflight_claim_alone() {
+        let root = state_dir_live_claim_fixture(&[], &["gone"]);
+        std::fs::write(
+            super::resource_relative_path(&root, super::INFLIGHT_CLAIM_REL),
+            serde_json::json!({ "ids": ["x"] }).to_string(),
+        )
+        .unwrap();
+        let plan = super::state_dir_plan(&root);
+        assert_eq!(plan["liveClaim"], true);
+        assert_eq!(plan["liveClaimDetail"]["staleAuthorization"], true);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn state_dir_plan_on_an_empty_root() {
+        let root = state_dir_plan_temp_root();
+        let plan = super::state_dir_plan(&root);
+        assert_eq!(plan["stateDir"], super::BRAM_STATE_DIR_LEGACY);
+        assert_eq!(plan["stateDirExists"], false);
+        assert_eq!(plan["wouldMove"].as_array().unwrap().len(), 0);
+        assert_eq!(plan["foreign"].as_array().unwrap().len(), 0);
+        assert_eq!(plan["tracked"]["count"], 0);
+        assert_eq!(plan["tracked"]["truncated"], false);
+        assert_eq!(plan["liveClaim"], false);
+        assert_eq!(plan["nested"].as_array().unwrap().len(), 0);
+        assert_eq!(plan["note"], super::STATE_DIR_PLAN_NOTE);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn state_dir_plan_splits_owned_foreign_and_nested() {
+        let root = state_dir_plan_temp_root();
+        let legacy = super::BRAM_STATE_DIR_LEGACY;
+        std::fs::create_dir_all(super::bram_state_dir(&root)).unwrap();
+        std::fs::write(resource_relative_path(&root, "worklist.json"), "{}").unwrap();
+        std::fs::write(resource_relative_path(&root, ".bram-port"), "1").unwrap();
+        let foreign_name = "custom.txt";
+        std::fs::write(super::bram_state_dir(&root).join(foreign_name), "x").unwrap();
+        let sub_state = root.join("sub").join(legacy);
+        std::fs::create_dir_all(&sub_state).unwrap();
+        std::fs::write(sub_state.join(".bram-port"), "2").unwrap();
+        let plan = super::state_dir_plan(&root);
+        assert_eq!(plan["stateDir"], legacy);
+        assert_eq!(plan["stateDirExists"], true);
+        let moved: Vec<(String, String)> = plan["wouldMove"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                (
+                    e["path"].as_str().unwrap().to_string(),
+                    e["kind"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            moved,
+            vec![
+                (format!("{}/.bram-port", legacy), "file".to_string()),
+                (format!("{}/worklist.json", legacy), "file".to_string()),
+            ]
+        );
+        assert_eq!(
+            plan["foreign"],
+            serde_json::json!([{ "name": "custom.txt", "isDir": false }])
+        );
+        assert_eq!(
+            plan["nested"],
+            serde_json::json!([{ "path": "sub", "stateDir": legacy }])
+        );
+        assert_eq!(plan["tracked"]["count"], 0);
+        assert_eq!(plan["liveClaim"], false);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn state_dir_plan_resolves_dot_bram() {
+        let root = state_dir_plan_temp_root();
+        std::fs::create_dir_all(root.join(super::BRAM_STATE_DIR_NEW)).unwrap();
+        // An unknown dotfile falls under the dotfiles rule.
+        std::fs::write(resource_relative_path(&root, ".bram-port"), "1").unwrap();
+        let unknown_dotfile = ".something-new.json";
+        std::fs::write(super::bram_state_dir(&root).join(unknown_dotfile), "{}").unwrap();
+        let plan = super::state_dir_plan(&root);
+        assert_eq!(plan["stateDir"], super::BRAM_STATE_DIR_NEW);
+        assert_eq!(plan["stateDirExists"], true);
+        let kinds: Vec<&str> = plan["wouldMove"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, vec!["file", "dotfile"]);
+        assert_eq!(plan["foreign"].as_array().unwrap().len(), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // judell/bram#469 0.8.4 mover: a legacy folder holding only owned state.
+    fn state_migrate_root() -> std::path::PathBuf {
+        let root = state_dir_plan_temp_root();
+        let old = root.join(super::BRAM_STATE_DIR_LEGACY);
+        std::fs::create_dir_all(old.join("worklist-drafts")).unwrap();
+        std::fs::write(old.join("worklist.json"), "{}").unwrap();
+        std::fs::write(old.join(".bram-port"), "61455").unwrap();
+        // The mover runs only at a repo's root, and an inventory it can't
+        // query refuses (tracked-unknown), so the fixture is a repo.
+        assert!(std::process::Command::new("git")
+            .current_dir(&root)
+            .args(["init", "-q"])
+            .output()
+            .unwrap()
+            .status
+            .success());
+        root
+    }
+
+    fn state_migrate(
+        root: &std::path::Path,
+        rename: &mut dyn FnMut(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+    ) -> super::StateMigrateOutcome {
+        super::migrate_state_dir_with(
+            root,
+            super::unix_now_ms(),
+            rename,
+            3,
+            std::time::Duration::ZERO,
+        )
+    }
+
+    fn real_rename(a: &std::path::Path, b: &std::path::Path) -> std::io::Result<()> {
+        std::fs::rename(a, b)
+    }
+
+    #[test]
+    fn state_migrate_moves_a_fresh_legacy_folder() {
+        let root = state_migrate_root();
+        let outcome = state_migrate(&root, &mut real_rename);
+        assert!(
+            matches!(
+                outcome,
+                super::StateMigrateOutcome::Moved { entries: 3, .. }
+            ),
+            "{:?}",
+            outcome
+        );
+        let new = root.join(super::BRAM_STATE_DIR_NEW);
+        assert!(!root.join(super::BRAM_STATE_DIR_LEGACY).exists());
+        assert_eq!(
+            std::fs::read_to_string(new.join(".gitignore")).unwrap(),
+            "*\n"
+        );
+        assert!(new.join("worklist-drafts").is_dir());
+        let note = std::fs::read_to_string(new.join(super::STATE_MIGRATED_FROM_REL)).unwrap();
+        assert!(note.contains(super::BRAM_STATE_DIR_LEGACY), "{}", note);
+        // The resolver follows at once: the port file is found where it moved.
+        assert_eq!(
+            std::fs::read_to_string(resource_relative_path(&root, ".bram-port")).unwrap(),
+            "61455"
+        );
+        // And a second startup does nothing.
+        assert_eq!(
+            state_migrate(&root, &mut real_rename),
+            super::StateMigrateOutcome::Skipped("already-moved")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn state_migrate_skips_without_moving() {
+        let skipped = |root: &std::path::Path, reason: &'static str| {
+            let mut renames = 0;
+            let outcome = state_migrate(root, &mut |_, _| {
+                renames += 1;
+                Ok(())
+            });
+            assert_eq!(outcome, super::StateMigrateOutcome::Skipped(reason));
+            assert_eq!(renames, 0);
+            let _ = std::fs::remove_dir_all(root);
+        };
+        skipped(&state_dir_plan_temp_root(), "no-old-folder");
+        // A `.gitignore` that exists but can't be read as a file stops the run,
+        // so a blocked rename could never delete what it couldn't restore.
+        let root = state_migrate_root();
+        std::fs::create_dir_all(root.join(super::BRAM_STATE_DIR_LEGACY).join(".gitignore"))
+            .unwrap();
+        skipped(&root, "ignore-unreadable");
+        // Both folders present.
+        let root = state_migrate_root();
+        std::fs::create_dir_all(root.join(super::BRAM_STATE_DIR_NEW)).unwrap();
+        skipped(&root, "already-moved");
+        // A foreign entry: the mixed-folder dialog's case.
+        let root = state_migrate_root();
+        std::fs::write(
+            root.join(super::BRAM_STATE_DIR_LEGACY).join("notes.md"),
+            "x",
+        )
+        .unwrap();
+        skipped(&root, "mixed");
+        // A live claim.
+        let root = state_migrate_root();
+        std::fs::write(
+            resource_relative_path(&root, super::INFLIGHT_CLAIM_REL),
+            r#"{"ids":["some-item"]}"#,
+        )
+        .unwrap();
+        skipped(&root, "live-claim");
+        // A tracked file under the folder.
+        let root = state_migrate_root();
+        let git = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .current_dir(&root)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success());
+        };
+        git(&["init", "-q"]);
+        git(&["add", "--", super::BRAM_STATE_DIR_LEGACY]);
+        skipped(&root, "tracked");
+        // Codex review: the root is a repo, but the index can't be read, so
+        // `ls-files` fails. Unknown is not empty: nothing moves.
+        let root = state_migrate_root();
+        let git = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .current_dir(&root)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success());
+        };
+        git(&["init", "-q"]);
+        git(&["add", "--", super::BRAM_STATE_DIR_LEGACY]);
+        std::fs::write(root.join(".git").join("index"), b"not an index").unwrap();
+        skipped(&root, "tracked-unknown");
+    }
+
+    #[test]
+    fn state_migrate_abandons_when_a_claim_appears_between_retries() {
+        // Codex review: the first rename is blocked, and while it waits a
+        // running instance writes a claim. The retry must not move it.
+        let root = state_migrate_root();
+        let claim = resource_relative_path(&root, super::INFLIGHT_CLAIM_REL);
+        let mut calls = 0;
+        let outcome = state_migrate(&root, &mut |from, to| {
+            calls += 1;
+            if calls == 1 {
+                std::fs::write(&claim, r#"{"ids":["now-running"]}"#).unwrap();
+                return Err(std::io::Error::from_raw_os_error(5));
+            }
+            std::fs::rename(from, to)
+        });
+        assert_eq!(
+            outcome,
+            super::StateMigrateOutcome::Abandoned {
+                reason: "live-claim",
+                attempts: 1,
+                restored: true
+            }
+        );
+        assert_eq!(calls, 1, "no rename after eligibility changed");
+        assert!(root.join(super::BRAM_STATE_DIR_LEGACY).is_dir());
+        assert!(!root.join(super::BRAM_STATE_DIR_NEW).exists());
+        assert!(!root
+            .join(super::BRAM_STATE_DIR_LEGACY)
+            .join(".gitignore")
+            .exists());
+        assert_eq!(
+            super::state_migrate_trace_lines(&outcome),
+            vec![
+                "op=start",
+                "op=abandoned reason=live-claim attempts=1 restored=ok"
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn state_migrate_blocked_rename_retries_then_leaves_the_folder() {
+        let root = state_migrate_root();
+        let mut calls = 0;
+        let outcome = state_migrate(&root, &mut |_, _| {
+            calls += 1;
+            Err(std::io::Error::from_raw_os_error(5))
+        });
+        assert_eq!(
+            outcome,
+            super::StateMigrateOutcome::Blocked {
+                os_error: Some(5),
+                attempts: 3,
+                restored: true
+            }
+        );
+        assert_eq!(calls, 3);
+        let old = root.join(super::BRAM_STATE_DIR_LEGACY);
+        assert!(
+            !old.join(".gitignore").exists(),
+            "the pre-written ignore is removed"
+        );
+        assert!(old.join("worklist.json").is_file());
+        assert!(!root.join(super::BRAM_STATE_DIR_NEW).exists());
+        assert_eq!(
+            super::state_migrate_trace_lines(&outcome),
+            vec!["op=start", "op=blocked os_error=5 attempts=3 restored=ok"]
+        );
+        // Next startup, unblocked: the move goes through.
+        assert!(matches!(
+            state_migrate(&root, &mut real_rename),
+            super::StateMigrateOutcome::Moved { .. }
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // issue-469-mixed-folder-dialog: a legacy folder with a foreign file, a
+    // tracked foreign file and its own .gitignore, plus the user's answer.
+    fn state_move_mixed_root(choice: Option<&str>) -> std::path::PathBuf {
+        let root = state_migrate_root();
+        let old = root.join(super::BRAM_STATE_DIR_LEGACY);
+        std::fs::write(old.join("notes.md"), "x").unwrap();
+        std::fs::write(old.join("logo.svg"), "<svg/>").unwrap();
+        std::fs::write(old.join(".gitignore"), "notes.md\n").unwrap();
+        let logo = format!("{}/logo.svg", super::BRAM_STATE_DIR_LEGACY);
+        assert!(std::process::Command::new("git")
+            .current_dir(&root)
+            .args(["add", "--", &logo])
+            .status()
+            .unwrap()
+            .success());
+        if let Some(c) = choice {
+            let body = format!(r#"{{"choice":"{}"}}"#, c);
+            let (status, _, _) = super::handle_state_move_decision(&root, body.as_bytes(), 1);
+            assert_eq!(status, 200);
+        }
+        root
+    }
+
+    #[test]
+    fn state_move_selective_leaves_foreign_and_tracked() {
+        let root = state_move_mixed_root(Some("move"));
+        let plan = super::state_dir_plan(&root);
+        assert_eq!(plan["pending"], "tracked");
+        assert_eq!(plan["decision"]["choice"], "move");
+        let outcome = state_migrate(&root, &mut real_rename);
+        // worklist.json, worklist-drafts, .bram-port moved; notes.md,
+        // logo.svg and .gitignore stayed (.state-move was deleted).
+        assert_eq!(
+            outcome,
+            super::StateMigrateOutcome::MovedSelective {
+                entries: 3,
+                left: 3,
+                marker_written: true
+            }
+        );
+        let old = root.join(super::BRAM_STATE_DIR_LEGACY);
+        let new = root.join(super::BRAM_STATE_DIR_NEW);
+        assert_eq!(
+            std::fs::read_to_string(new.join(".gitignore")).unwrap(),
+            "*\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(old.join(".gitignore")).unwrap(),
+            "notes.md\n"
+        );
+        assert!(new.join("worklist.json").is_file() && new.join("worklist-drafts").is_dir());
+        assert!(old.join("notes.md").is_file() && old.join("logo.svg").is_file());
+        assert!(!old.join(super::STATE_MOVE_REL).exists());
+        assert!(!root.join(super::STATE_MOVE_STAGING).exists());
+        assert!(new.join(super::STATE_MIGRATED_FROM_REL).is_file());
+        assert_eq!(
+            super::state_migrate_trace_lines(&outcome)[1],
+            "op=moved-selective entries=3 left=3 marker=ok"
+        );
+        // Now moved: no banner, and the decision route refuses.
+        let plan = super::state_dir_plan(&root);
+        assert!(plan["pending"].is_null() && plan["decision"].is_null());
+        let (status, _, _) = super::handle_state_move_decision(&root, br#"{"choice":"move"}"#, 2);
+        assert_eq!(status, 409);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn state_move_selective_refusals_and_rollback() {
+        // No answer yet: the plan asks, nothing moves.
+        let root = state_move_mixed_root(None);
+        let plan = super::state_dir_plan(&root);
+        assert_eq!(plan["pending"], "tracked");
+        assert!(plan["decision"].is_null());
+        assert_eq!(
+            state_migrate(&root, &mut real_rename),
+            super::StateMigrateOutcome::Skipped("tracked")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        // Not now: declined, nothing moved.
+        let root = state_move_mixed_root(Some("not-now"));
+        assert_eq!(
+            state_migrate(&root, &mut real_rename),
+            super::StateMigrateOutcome::Skipped("declined")
+        );
+        assert!(!root.join(super::BRAM_STATE_DIR_NEW).exists());
+        assert!(root
+            .join(super::BRAM_STATE_DIR_LEGACY)
+            .join("worklist.json")
+            .is_file());
+        let _ = std::fs::remove_dir_all(&root);
+        // A tracked inventory entry: the host never moves it.
+        let root = state_move_mixed_root(Some("move"));
+        let wl = format!("{}/worklist.json", super::BRAM_STATE_DIR_LEGACY);
+        assert!(std::process::Command::new("git")
+            .current_dir(&root)
+            .args(["add", "--", &wl])
+            .status()
+            .unwrap()
+            .success());
+        assert!(super::state_dir_plan(&root)["pending"].is_null());
+        assert_eq!(
+            state_migrate(&root, &mut real_rename),
+            super::StateMigrateOutcome::Skipped("tracked-owned")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        // A rename blocked partway: the moved entries go back, no .bram/.
+        let root = state_move_mixed_root(Some("move"));
+        let outcome = state_migrate(&root, &mut |from, to| {
+            if from.ends_with("worklist.json") {
+                return Err(std::io::Error::from_raw_os_error(5));
+            }
+            std::fs::rename(from, to)
+        });
+        assert!(
+            matches!(
+                &outcome,
+                super::StateMigrateOutcome::SelectiveFailed {
+                    reason: "blocked",
+                    os_error: Some(5),
+                    moved: 2,
+                    rolled_back: true,
+                    ..
+                }
+            ),
+            "{:?}",
+            outcome
+        );
+        let old = root.join(super::BRAM_STATE_DIR_LEGACY);
+        assert!(!root.join(super::BRAM_STATE_DIR_NEW).exists());
+        assert!(!root.join(super::STATE_MOVE_STAGING).exists());
+        assert!(old.join(".bram-port").is_file() && old.join("worklist-drafts").is_dir());
+        assert!(
+            old.join(super::STATE_MOVE_REL).is_file(),
+            "the answer is kept"
+        );
+        // Bad choice.
+        let (status, _, _) = super::handle_state_move_decision(&root, br#"{"choice":"x"}"#, 1);
+        assert_eq!(status, 400);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // judell/bram#469: every construction of the state folder goes through
+    // the resolver. Scans this file and worklist_state.rs at test time; a
+    // line that must keep the literal carries the marker comment below, with
+    // a reason. The needles are assembled so this test's own lines don't
+    // match them.
+    #[test]
+    fn state_dir_literals_go_through_the_resolver() {
+        let needles = [
+            concat!("join(\"", "resources\")"),
+            concat!("\"resources", "/"),
+        ];
+        let marker = concat!("state-dir: ", "literal ok");
+        let mut offenders: Vec<String> = Vec::new();
+        for (name, src) in [
+            ("lib.rs", include_str!("lib.rs")),
+            ("worklist_state.rs", include_str!("worklist_state.rs")),
+        ] {
+            for (i, line) in src.lines().enumerate() {
+                if line.contains(marker) {
+                    continue;
+                }
+                if needles.iter().any(|n| line.contains(n)) {
+                    offenders.push(format!("{}:{}: {}", name, i + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "state-folder literals outside the resolver (use bram_state_dir / \
+             resource_relative_path / bram_state_rel, or mark the line):\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    // judell/bram#469: every state path this file names as a literal is on
+    // BRAM_OWNED_ENTRIES. Finds each resolver call (and bram_state_dir(..)
+    // .join(..)), takes its path argument, and checks it: a string literal or
+    // a `const NAME: &str` must match a File entry or sit under a Dir entry;
+    // a format! must start with a Dir entry's literal segment. Arguments
+    // that are variables are plumbing and skipped. A line carrying the
+    // marker below is skipped; say why beside it. Needles are assembled so
+    // this test's own lines don't match them.
+    #[test]
+    fn owned_entries_cover_every_state_write() {
+        use super::{owned_entry_covers, OwnedEntry, OwnedKind, BRAM_OWNED_ENTRIES};
+        let src: &str = include_str!("lib.rs");
+        let marker = concat!("owned-entries: ", "not state");
+        let needles = [
+            concat!("resource_relative_path", "("),
+            concat!("project_resource_path", "("),
+            concat!("bram_state_rel", "("),
+            concat!("bram_state_dir", "("),
+        ];
+        let bytes = src.as_bytes();
+        let line_of = |at: usize| src[..at].matches('\n').count() + 1;
+        let line_text = |at: usize| {
+            let start = src[..at].rfind('\n').map_or(0, |i| i + 1);
+            let end = src[at..].find('\n').map_or(src.len(), |i| at + i);
+            &src[start..end]
+        };
+        // Top-level arguments of the call whose `(` ends at `open`, and the
+        // index just past its `)`.
+        let call_args = |open: usize| -> (Vec<String>, usize) {
+            let (mut depth, mut i, mut cur) = (0i32, open, String::new());
+            let mut args = Vec::new();
+            let mut in_str = false;
+            while i < bytes.len() {
+                let c = bytes[i] as char;
+                if in_str {
+                    cur.push(c);
+                    if c == '\\' {
+                        cur.push(bytes[i + 1] as char);
+                        i += 1;
+                    } else if c == '"' {
+                        in_str = false;
+                    }
+                } else {
+                    match c {
+                        '"' => {
+                            in_str = true;
+                            cur.push(c);
+                        }
+                        '(' | '[' | '{' => {
+                            depth += 1;
+                            cur.push(c);
+                        }
+                        ')' | ']' | '}' if depth == 0 => {
+                            args.push(cur.trim().to_string());
+                            return (args, i + 1);
+                        }
+                        ')' | ']' | '}' => {
+                            depth -= 1;
+                            cur.push(c);
+                        }
+                        ',' if depth == 0 => {
+                            args.push(cur.trim().to_string());
+                            cur.clear();
+                        }
+                        _ => cur.push(c),
+                    }
+                }
+                i += 1;
+            }
+            (args, i)
+        };
+        let first_literal = |s: &str| -> Option<String> {
+            let start = s.find('"')? + 1;
+            let end = s[start..].find('"')? + start;
+            Some(s[start..end].to_string())
+        };
+        let const_value = |name: &str| -> Option<String> {
+            let decl = format!("const {}: &str = ", name);
+            let at = src.find(&decl)? + decl.len();
+            first_literal(&src[at..src[at..].find(';')? + at])
+        };
+        let state_entries: Vec<&OwnedEntry> = BRAM_OWNED_ENTRIES
+            .iter()
+            .filter(|e| !e.root_relative && e.kind != OwnedKind::DotfilesUnderStateRoot)
+            .collect();
+        let covered = |rel: &str| {
+            state_entries.iter().any(|e| match e.kind {
+                OwnedKind::File => rel == e.rel,
+                _ => owned_entry_covers(e, rel),
+            })
+        };
+        let mut checked = 0usize;
+        let mut unmatched: Vec<String> = Vec::new();
+        for needle in needles {
+            for (at, _) in src.match_indices(needle) {
+                let line = line_text(at);
+                if line.contains(marker) || src[..at].ends_with("fn ") {
+                    continue;
+                }
+                let (args, end) = call_args(at + needle.len());
+                let arg = if needle.starts_with("bram_state_dir") {
+                    // Only `bram_state_dir(..).join(<path>)` names a path.
+                    let rest = src[end..].trim_start();
+                    let join = ".join(";
+                    if !rest.starts_with(join) {
+                        continue;
+                    }
+                    let open = src.len() - rest.len() + join.len();
+                    call_args(open).0.first().cloned().unwrap_or_default()
+                } else {
+                    args.last().cloned().unwrap_or_default()
+                };
+                let arg = arg.trim_start_matches('&');
+                let (rel, computed) = if arg.starts_with('"') || arg.starts_with("Path::new(\"") {
+                    (first_literal(arg), false)
+                } else if arg.starts_with("format!(") {
+                    (first_literal(arg), true)
+                } else if !arg.is_empty()
+                    && arg
+                        .chars()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                {
+                    (const_value(arg), false)
+                } else {
+                    continue;
+                };
+                let Some(rel) = rel else {
+                    unmatched.push(format!("{}: unresolved {}", line_of(at), arg));
+                    continue;
+                };
+                // The empty path names the folder itself.
+                if rel.is_empty() {
+                    continue;
+                }
+                checked += 1;
+                let ok = if computed {
+                    rel.split_once('/').is_some_and(|(head, _)| {
+                        !head.contains('{')
+                            && state_entries
+                                .iter()
+                                .any(|e| e.kind == OwnedKind::Dir && e.rel == head)
+                    })
+                } else {
+                    covered(&rel)
+                };
+                if !ok {
+                    unmatched.push(format!("{}: {:?} ({})", line_of(at), rel, line.trim()));
+                }
+            }
+        }
+        assert!(checked > 40, "scan found only {} state paths", checked);
+        assert!(
+            unmatched.is_empty(),
+            "state paths missing from BRAM_OWNED_ENTRIES (add an entry, or mark \
+             a read of something Bram doesn't own):\n{}",
+            unmatched.join("\n")
+        );
+    }
+
+    // judell/bram#469: this repo's hand-maintained .gitignore ignores every
+    // machine-state entry (Setup's only .gitignore writes are the self-ignore
+    // files inside .opencode/ and .agents/).
+    #[test]
+    fn repo_gitignore_covers_machine_state_entries() {
+        use super::{OwnedClass, OwnedKind, BRAM_OWNED_ENTRIES};
+        let lines: std::collections::HashSet<&str> = include_str!("../../.gitignore")
+            .lines()
+            .map(str::trim)
+            .collect();
+        let legacy = super::BRAM_STATE_DIR_LEGACY;
+        let missing: Vec<String> = BRAM_OWNED_ENTRIES
+            .iter()
+            .filter(|e| e.class == OwnedClass::MachineState && !e.root_relative)
+            .filter_map(|e| match e.kind {
+                OwnedKind::File => Some(format!("{}/{}", legacy, e.rel)),
+                OwnedKind::Dir => Some(format!("{}/{}/", legacy, e.rel)),
+                OwnedKind::DotfilesUnderStateRoot | OwnedKind::Glob => None,
+            })
+            .filter(|want| !lines.contains(want.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            ".gitignore lacks machine-state entries:\n{}",
+            missing.join("\n")
+        );
+    }
+
+    // The owned-path predicate keeps every answer it gave before the table
+    // (judell/bram#469), and covers the two sidecars #393 found.
+    #[test]
+    fn owned_path_answers_survive_the_table() {
+        use super::{bram_state_dirs, bram_state_files, bram_state_grep, is_bram_owned_path};
+        use crate::test_state_rel as st;
+        let root = crate::test_state_root();
+        for rel in [
+            "worklist.json",
+            "worklist.json.tmp.123",
+            "worklist-drafts/a.md",
+            "worklist-history/1.json",
+            "feedback-drafts/a.md",
+            "feedback-history/a.md",
+            "bram-traces/bram-trace.log",
+            "outbound-turns/1.json",
+            "message-drafts/d.md",
+            "session-digests/codex-x.md",
+            ".bram-port",
+            ".needs-you-dismissed.json",
+            ".worklist-direct-edit.json",
+        ] {
+            assert!(is_bram_owned_path(root, &st(rel)), "{}", rel);
+        }
+        for path in [
+            ".claude/bram-conventions.md",
+            ".claude/bram-reference/diagnostics.md",
+            ".claude/settings.json",
+            ".claude/settings.local.json",
+            ".claude/skills/x/SKILL.md",
+        ] {
+            assert!(is_bram_owned_path(root, path), "{}", path);
+        }
+        for path in [
+            st("review/catalog.json"),
+            st("sub/.hidden"),
+            st("handoffs/note.md"),
+            ".claude/my-notes.md".to_string(),
+            ".claude/bram-conventions.md.orig/x".to_string(),
+            "worklist.json".to_string(),
+        ] {
+            assert!(!is_bram_owned_path(root, &path), "{}", path);
+        }
+        assert_eq!(bram_state_files().collect::<Vec<_>>(), ["worklist.json"]);
+        assert_eq!(
+            bram_state_grep(),
+            [
+                "worklist.json",
+                "worklist-drafts",
+                "feedback-drafts",
+                "session-digests",
+                "handoffs",
+                "worklist-history",
+                "feedback-history",
+                "outbound-turns",
+            ]
+        );
+        assert_eq!(
+            bram_state_dirs().collect::<Vec<_>>(),
+            [
+                "worklist-drafts",
+                "worklist-history",
+                "feedback-drafts",
+                "feedback-history",
+                "session-digests",
+                "handoffs",
+                "outbound-turns",
+                "bram-traces",
+            ]
         );
     }
 
@@ -86275,7 +99506,7 @@ fn opencode_turn_ended<R: tauri::Runtime>(app: &AppHandle<R>, sid: &str, at_ms: 
                     ),
                 );
             }
-            clear_inflight_claim_sentinel(app, &claimed_ids);
+            clear_inflight_claim_sentinel(app, &claimed_ids, "opencode-turn-end");
         }
         Err(reason) => {
             if bram_trace_enabled() {
@@ -86292,17 +99523,2737 @@ fn opencode_turn_ended<R: tauri::Runtime>(app: &AppHandle<R>, sid: &str, at_ms: 
     }
 }
 
+// --- antigravity-turn-lifecycle ---------------------------------------------
+// agy reports its state over OSC 7501 (`state=<s>:app=antigravity`) once Bram's
+// PTY sets AGY_CLI_OSC7501=on (pty_spawn). Its hooks can't carry a turn end: an
+// interrupted turn fires no Stop and no PostInvocation. A completed turn ends
+// with `done`, and an interrupted one with `idle` (the 2026-10-31 spike and a
+// demo-instance turn, docs/agent-specimens/antigravity/osc7501-turns.md);
+// `idle` also comes at launch and at exit. A background command's turn ends at
+// `done` too, and when the command finishes agy starts a new turn on its own
+// (`working`, then `done`). Every launch first reports `blocked:kind=auth`
+// ("Sign in required"): a fresh launch, not a blocked turn. A turn's start and
+// end drive what opencode_turn_started / opencode_turn_ended drive for
+// OpenCode.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AntigravityMark {
+    Working,
+    // `error:msg=<base64>`: the turn failed before its reply began (a quota
+    // refusal on 2026-11-03). An `idle` follows and ends the turn.
+    Error,
+    // `done` (completed) or `idle` (interrupted, or between launches).
+    Ended,
+    // `blocked:kind=auth`, which every launch reports first.
+    Launch,
+    // Any other Antigravity state, such as a permission `blocked`.
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AntigravityTurnEvent {
+    Start,
+    End,
+    // A launch arrived with a turn still open (agy exited mid-turn).
+    Reset,
+}
+
+// The bodies of the complete OSC 7501 state markers in `buf`, in order, and
+// where an incomplete trailing marker begins (`buf.len()` when none does).
+fn osc7501_state_bodies(buf: &[u8]) -> (Vec<String>, usize) {
+    const OSC: &[u8] = b"\x1b]7501;state=";
+    let mut bodies = Vec::new();
+    let mut i = 0;
+    while let Some(off) = buf[i..].windows(OSC.len()).position(|w| w == OSC) {
+        let start = i + off;
+        let rest = &buf[start + OSC.len()..];
+        let Some(end) = rest.iter().position(|b| *b == 0x07 || *b == 0x1b) else {
+            return (bodies, start);
+        };
+        bodies.push(String::from_utf8_lossy(&rest[..end]).into_owned());
+        i = start + OSC.len() + end + 1;
+    }
+    // A marker whose introducer itself is split: the tail is a prefix of it.
+    let from = i.max(buf.len().saturating_sub(OSC.len() - 1));
+    let partial = (from..buf.len()).find(|&k| OSC.starts_with(&buf[k..]));
+    (bodies, partial.unwrap_or(buf.len()))
+}
+
+fn antigravity_mark(body: &str) -> Option<AntigravityMark> {
+    let mut fields = body.split(':');
+    let state = fields.next()?;
+    let rest: Vec<&str> = fields.collect();
+    if !rest.contains(&"app=antigravity") {
+        return None;
+    }
+    Some(match state {
+        "working" => AntigravityMark::Working,
+        "error" => AntigravityMark::Error,
+        "done" | "idle" => AntigravityMark::Ended,
+        "blocked" if rest.contains(&"kind=auth") => AntigravityMark::Launch,
+        _ => AntigravityMark::Other,
+    })
+}
+
+// One marker's effect on whether a turn is open.
+fn antigravity_turn_step(
+    open: bool,
+    mark: AntigravityMark,
+) -> (bool, Option<AntigravityTurnEvent>) {
+    match mark {
+        AntigravityMark::Working if !open => (true, Some(AntigravityTurnEvent::Start)),
+        AntigravityMark::Working => (true, None),
+        AntigravityMark::Ended if open => (false, Some(AntigravityTurnEvent::End)),
+        AntigravityMark::Ended => (false, None),
+        AntigravityMark::Launch if open => (false, Some(AntigravityTurnEvent::Reset)),
+        AntigravityMark::Launch => (false, None),
+        // The error is reported mid-turn; the `idle` after it ends the turn.
+        AntigravityMark::Error => (open, None),
+        AntigravityMark::Other => (open, None),
+    }
+}
+
+// The open turn's start (ms), from its first `working` marker.
+fn antigravity_turn_cell() -> &'static Mutex<Option<i64>> {
+    static CELL: OnceLock<Mutex<Option<i64>>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+// antigravity-error-state-surfaced. agy reports a turn that failed before its
+// reply began as `state=error:app=antigravity:msg=<base64>`, between `working`
+// and `idle` (2026-11-03, Windows: "Individual quota reached. Please upgrade
+// your subscription to increase your limits. Resets in 125h7m40s.";
+// docs/agent-specimens/antigravity/osc7501-error.txt). Bram used to read only
+// the `idle`, so the turn ended as finished and the send ledger, finding no
+// transcript record of a send agy had in fact taken, called it stranded. The
+// decoded message is kept here until the next turn starts: the pane's notice
+// and the ledger's verdict both read it.
+struct AntigravityError {
+    text: String,
+    at_ms: i64,
+}
+
+fn antigravity_error_cell() -> &'static Mutex<Option<AntigravityError>> {
+    static CELL: OnceLock<Mutex<Option<AntigravityError>>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+// When agy last opened a turn (a `working` with no turn open), for the send
+// ledger: a send injected before it was taken by agy whether or not a
+// transcript Bram can read ever records it.
+static ANTIGRAVITY_LAST_TURN_START_MS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
+fn antigravity_error_at_ms() -> i64 {
+    antigravity_error_cell()
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|e| e.at_ms))
+        .unwrap_or(0)
+}
+
+fn antigravity_clear_error() {
+    if let Ok(mut g) = antigravity_error_cell().lock() {
+        *g = None;
+    }
+}
+
+// The `msg=` field of an OSC 7501 body, base64-decoded (standard alphabet;
+// padding optional, so a marker cut mid-field still yields its prefix).
+// Lossy UTF-8; None when there is no field or it decodes to nothing.
+fn antigravity_marker_message(body: &str) -> Option<String> {
+    let b64 = body.split(':').find_map(|f| f.strip_prefix("msg="))?.trim();
+    let bytes = st_decode_base64(b64)?;
+    let text = String::from_utf8_lossy(&bytes).trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+// What a turn ended as: `error` when agy reported one since the turn opened,
+// otherwise the ending marker's own state (`done` or `idle`).
+fn antigravity_end_state<'a>(state: &'a str, started_at: i64, error_at_ms: i64) -> &'a str {
+    if error_at_ms > 0 && error_at_ms >= started_at {
+        "error"
+    } else {
+        state
+    }
+}
+
+// The send ledger's verdict from agy's markers alone, for a send its
+// transcript search did not find: `osc-working` when agy opened a turn after
+// the send was injected (it took the send), `osc-error` when that turn then
+// reported an error (it took the send and refused). None when no turn opened
+// after the inject; an error from an earlier turn does not count.
+fn antigravity_osc_landing(
+    injected_at_ms: i64,
+    last_turn_start_ms: i64,
+    last_error_ms: i64,
+) -> Option<&'static str> {
+    if last_turn_start_ms <= injected_at_ms {
+        return None;
+    }
+    if last_error_ms >= last_turn_start_ms {
+        Some("osc-error")
+    } else {
+        Some("osc-working")
+    }
+}
+
+// A quoted trace field: quotes and backslashes escaped, control characters
+// spaced, capped in characters.
+fn antigravity_trace_quoted(text: &str, cap: usize) -> String {
+    let mut out = String::new();
+    for (i, c) in text.chars().enumerate() {
+        if i >= cap {
+            out.push('…');
+            break;
+        }
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if c.is_control() => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+// The latest error as the pane reads it: `agentError` on
+// `agent-status-changed`, `/__agent-status` and `/__send-ledger`. Null once
+// the next turn starts.
+fn antigravity_error_json() -> serde_json::Value {
+    match antigravity_error_cell().lock() {
+        Ok(g) => match g.as_ref() {
+            Some(e) => serde_json::json!({ "text": e.text, "atMs": e.at_ms }),
+            None => serde_json::Value::Null,
+        },
+        Err(_) => serde_json::Value::Null,
+    }
+}
+
+// The agent-status payload with `agentError` attached while one is on
+// record. Attached at the emit rather than carried on AgentStatus, whose
+// thirteen constructors would each need the field.
+fn agent_status_with_error(status: &AgentStatus) -> serde_json::Value {
+    let mut value = serde_json::to_value(status).unwrap_or(serde_json::Value::Null);
+    let error = antigravity_error_json();
+    if !error.is_null() {
+        if let Some(map) = value.as_object_mut() {
+            map.insert("agentError".to_string(), error);
+        }
+    }
+    value
+}
+
+// Records agy's error: the trace line, the cell, a status emit so the pane
+// hears it even if no `idle` follows, and a ledger refetch.
+fn antigravity_note_error<R: tauri::Runtime>(app: &AppHandle<R>, body: &str, now: i64) {
+    let text = antigravity_marker_message(body).unwrap_or_else(|| "(no message)".to_string());
+    if bram_trace_enabled() {
+        append_bram_trace_line(
+            app,
+            "antigravity-turn",
+            &format!(
+                "op=error via=osc7501 at={} msg=\"{}\"",
+                now,
+                antigravity_trace_quoted(&text, 300)
+            ),
+        );
+    }
+    if let Ok(mut g) = antigravity_error_cell().lock() {
+        *g = Some(AntigravityError { text, at_ms: now });
+    }
+    let status = agent_status_cell().lock().ok().map(|cur| (*cur).clone());
+    if let Some(status) = status {
+        maybe_emit_agent_status(app, &status);
+    }
+    emit_replayable_signal(app, "send-ledger-changed");
+}
+
+// The start of a marker split across PTY chunks, held for the next chunk.
+fn antigravity_osc_carry_cell() -> &'static Mutex<Vec<u8>> {
+    static CELL: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn antigravity_latest_state_cell() -> &'static Mutex<Option<String>> {
+    static CELL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+fn antigravity_permission_menu_shown_cell() -> &'static Mutex<Option<String>> {
+    static CELL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+fn antigravity_after_footer_is_live(after_footer: &str) -> bool {
+    let squashed: String = after_footer
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    !squashed.contains("?forshortcuts")
+        && !squashed.contains("────")
+        && squashed.chars().count() <= 120
+}
+
+fn antigravity_find_option_marker(text: &str, number: usize) -> Option<usize> {
+    let marker = format!("{number}. ");
+    let mut offset = 0;
+    while let Some(rel) = text[offset..].find(&marker) {
+        let at = offset + rel;
+        if at == 0 || matches!(text.as_bytes()[at - 1], b' ' | b'>') {
+            return Some(at);
+        }
+        offset = at + marker.len();
+    }
+    None
+}
+
+fn antigravity_rfind_option_marker(text: &str, number: usize) -> Option<usize> {
+    let marker = format!("{number}. ");
+    let mut end = text.len();
+    while let Some(at) = text[..end].rfind(&marker) {
+        if at == 0 || matches!(text.as_bytes()[at - 1], b' ' | b'>') {
+            return Some(at);
+        }
+        end = at;
+    }
+    None
+}
+
+fn antigravity_parse_options(option_text: &str) -> Vec<MenuOption> {
+    let mut options = Vec::new();
+    let mut offset = 0;
+    for number in 1..=9 {
+        let Some(rel) = antigravity_find_option_marker(&option_text[offset..], number) else {
+            if !options.is_empty() {
+                break;
+            }
+            continue;
+        };
+        let value_start = offset + rel + format!("{number}. ").len();
+        let after = &option_text[value_start..];
+        let next_rel = (number + 1..=9)
+            .filter_map(|n| antigravity_find_option_marker(after, n))
+            .min();
+        let raw_end = next_rel.unwrap_or(after.len());
+        let label = after[..raw_end]
+            .trim()
+            .trim_start_matches('>')
+            .trim_end_matches('>')
+            .trim();
+        let label = label.split("↑/↓").next().unwrap_or(label).trim();
+        if label.is_empty() {
+            break;
+        }
+        options.push(MenuOption {
+            key: number.to_string(),
+            label: label.to_string(),
+            answer_keys: Some(number.to_string()),
+            description: None,
+        });
+        offset = value_start + raw_end;
+    }
+    options
+}
+
+fn antigravity_permission_menu(
+    provider_is_antigravity: bool,
+    latest_state: Option<&str>,
+    tail: &str,
+) -> Option<PtyMenu> {
+    const TITLES: &[&str] = &[
+        "Run this command?",
+        "Allow creation of this file?",
+        "Accept this file edit?",
+        "Allow calling this tool?",
+    ];
+    const NAV_FOOTER: &str = "↑/↓ Navigate";
+
+    if !provider_is_antigravity || !latest_state.is_some_and(antigravity_permission_state) {
+        return None;
+    }
+    // agy draws backspaces before an option whose predecessor wrapped
+    // ("'jq' \x08\x083. Yes", permission-wrapped-options-44x67). collapse_tail
+    // keeps them, and an option number after one wouldn't be recognized, which
+    // lost options 3 and 4, "No, cancel" among them.
+    let tail: String = tail
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let tail = tail.as_str();
+    if matches!(
+        terminal_attention_prompt_shape(tail),
+        Some("antigravity-folder-trust" | "antigravity-login" | "antigravity-resume-picker")
+    ) {
+        return None;
+    }
+
+    // 1. Newest known title (`rfind`), provided that dialog is still the live
+    //    bottom of the screen (not an earlier answered dialog followed by
+    //    composer chrome or a later titleless dialog). Options end at the
+    //    "↑/↓ Navigate" footer or at "esc to cancel". Every capture draws one
+    //    of them, full and short screens included. With neither, the dialog
+    //    is still being painted (the state marker comes first, and the paint
+    //    spans chunks), so wait: a menu now would show partial options.
+    let latest_title = TITLES
+        .iter()
+        .filter_map(|&t| tail.rfind(t).map(|at| (t, at)))
+        .max_by_key(|(_, at)| *at);
+    if let Some((title, title_at)) = latest_title {
+        let after_title = &tail[title_at + title.len()..];
+        let option_slice = if let Some(nav_rel) = after_title.find(NAV_FOOTER) {
+            antigravity_after_footer_is_live(&after_title[nav_rel + NAV_FOOTER.len()..])
+                .then_some(&after_title[..nav_rel])
+        } else if let Some(esc_rel) = after_title.find("esc to cancel") {
+            antigravity_after_footer_is_live(&after_title[esc_rel + "esc to cancel".len()..])
+                .then_some(&after_title[..esc_rel])
+        } else {
+            None
+        };
+        if let Some(option_text) = option_slice {
+            let options = antigravity_parse_options(option_text);
+            if !options.is_empty() {
+                let before_title = &tail[..title_at];
+                let dialog_start = std::iter::once(NAV_FOOTER)
+                    .chain(TITLES.iter().copied())
+                    .filter_map(|m| before_title.rfind(m).map(|i| i + m.len()))
+                    .max()
+                    .unwrap_or(0);
+                let prefix = &before_title[dialog_start..];
+                // antigravity-live-check-fixes: the subject is informational
+                // and never gates the menu.
+                let (subject, reason) = if title == "Run this command?" {
+                    let subject = prefix
+                        .rsplit_once("Requesting permission for:")
+                        .map(|(_, s)| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+                    let reason = prefix
+                        .rsplit_once("Reason:")
+                        .map(|(_, s)| {
+                            s.split("Requesting permission for:")
+                                .next()
+                                .unwrap_or(s)
+                                .trim()
+                                .to_string()
+                        })
+                        .filter(|s| !s.is_empty());
+                    (subject, reason)
+                } else if title == "Allow calling this tool?" {
+                    antigravity_mcp_subject_and_reason(prefix)
+                } else {
+                    (antigravity_file_subject(prefix), None)
+                };
+                let text = [Some(title.to_string()), subject, reason]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return Some(PtyMenu {
+                    tool: "Antigravity permission".into(),
+                    text,
+                    options,
+                    prompt_id: None,
+                    tool_call_signature: None,
+                    tool_call_diff: None,
+                    tool_call_content: None,
+                    cache_source: None,
+                    at_host_ms: None,
+                    signature_source: None,
+                });
+            }
+        }
+    }
+
+    // 2. Titleless fallback (e.g. 46x12, where Ink clips the dialog's title
+    //    and top option off the screen): require the live permission footer
+    //    ("↑/↓ Navigate · tab Amend") so an OSC marker arriving a chunk before
+    //    the dialog paint cannot misread an assistant markdown list, then read
+    //    the contiguous numbered options leading into that footer.
+    let nav_at = tail.rfind(NAV_FOOTER)?;
+    if !antigravity_after_footer_is_live(&tail[nav_at + NAV_FOOTER.len()..]) {
+        return None;
+    }
+    let footer_sq: String = tail[nav_at..]
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    if !footer_sq.starts_with("↑/↓navigate·tabamend") {
+        return None;
+    }
+    let before_nav = &tail[..nav_at];
+    let cut = [NAV_FOOTER, "esc to cancel", "────"]
+        .into_iter()
+        .chain(TITLES.iter().copied())
+        .filter_map(|sep| before_nav.rfind(sep).map(|i| i + sep.len()))
+        .max()
+        .unwrap_or(0);
+    let window = &before_nav[cut..];
+    const SPINNERS: &[char] = &['⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '⣷'];
+    let mut rev_options: Vec<(usize, String)> = Vec::new();
+    let mut end = window.len();
+    for number in (1..=9).rev() {
+        let Some(at) = antigravity_rfind_option_marker(&window[..end], number) else {
+            if !rev_options.is_empty() {
+                break;
+            }
+            continue;
+        };
+        if let Some(&(prev_num, _)) = rev_options.last() {
+            if number + 1 != prev_num {
+                break;
+            }
+        }
+        let val_start = at + format!("{number}. ").len();
+        let label = window[val_start..end]
+            .trim()
+            .trim_start_matches('>')
+            .trim_end_matches('>')
+            .trim();
+        if label.is_empty() || label.chars().count() > 260 || label.contains(SPINNERS) {
+            if !rev_options.is_empty() {
+                break;
+            }
+            continue;
+        }
+        rev_options.push((number, label.to_string()));
+        end = at;
+    }
+    if rev_options.is_empty() {
+        return None;
+    }
+    rev_options.reverse();
+    let options = rev_options
+        .into_iter()
+        .map(|(number, label)| MenuOption {
+            key: number.to_string(),
+            label,
+            answer_keys: Some(number.to_string()),
+            description: None,
+        })
+        .collect();
+    Some(PtyMenu {
+        tool: "Antigravity permission".into(),
+        text: "Permission required (top of dialog scrolled off — check terminal for full details)"
+            .into(),
+        options,
+        prompt_id: None,
+        tool_call_signature: None,
+        tool_call_diff: None,
+        tool_call_content: None,
+        cache_source: None,
+        at_host_ms: None,
+        signature_source: None,
+    })
+}
+
+// The file a creation or edit approval names: after the "Create file" /
+// "Pending edit" header (and any rule run), up to the first of the diff stat
+// (" +1"), a diff line (" 1 + …", " 1 - …") or the title. agy 1.4.12 cuts a
+// long path off at the terminal width, and the stat with it, so a cut path is
+// returned as drawn.
+fn antigravity_file_subject(prefix: &str) -> Option<String> {
+    let (at, len) = ["Create file", "Pending edit"]
+        .into_iter()
+        .filter_map(|header| prefix.rfind(header).map(|at| (at, header.len())))
+        .max_by_key(|(at, _)| *at)?;
+    let body = prefix[at + len..].trim_start_matches(|c: char| c == '─' || c.is_whitespace());
+    let mut end = body.len();
+    for (i, c) in body.char_indices() {
+        if c != ' ' {
+            continue;
+        }
+        let rest = &body[i + 1..];
+        let stat = rest
+            .strip_prefix('+')
+            .is_some_and(|r| r.starts_with(|d: char| d.is_ascii_digit()));
+        let digits = rest.chars().take_while(|d| d.is_ascii_digit()).count();
+        let diff_line =
+            digits > 0 && (rest[digits..].starts_with(" + ") || rest[digits..].starts_with(" - "));
+        if stat || diff_line {
+            end = i;
+            break;
+        }
+    }
+    let subject = body[..end].trim();
+    (!subject.is_empty()).then(|| subject.to_string())
+}
+
+// The `<server>/<tool>` line immediately above "Allow calling this tool?", plus
+// any `Reason:` line inside the `MCP` header block (which may omit `─` when Ink
+// reuses the composer's horizontal rule row, `mcp-approval-reason.raw`).
+fn antigravity_mcp_subject_and_reason(prefix: &str) -> (Option<String>, Option<String>) {
+    let trimmed = prefix.trim();
+    let (before_subject, subject) = match trimmed.rsplit_once(char::is_whitespace) {
+        Some((before, tok)) if tok.contains('/') => (before.trim_end(), Some(tok.to_string())),
+        _ if trimmed.contains('/') && !trimmed.chars().any(char::is_whitespace) => {
+            ("", Some(trimmed.to_string()))
+        }
+        _ => (trimmed, None),
+    };
+    let header_after_mcp = ["MCP ─", "MCP Reason:"]
+        .into_iter()
+        .filter_map(|hdr| before_subject.rfind(hdr).map(|at| at + "MCP".len()))
+        .max()
+        .map(|after_mcp| &before_subject[after_mcp..]);
+    let reason = header_after_mcp
+        .map(|body| body.trim_start_matches(|c: char| c == '─' || c.is_whitespace()))
+        .and_then(|body| body.strip_prefix("Reason:"))
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty());
+    (subject, reason)
+}
+
+// Past this the transcript isn't the live session's.
+const ANTIGRAVITY_IN_FLIGHT_MAX_AGE_MS: u128 = 300_000;
+// Larger files get a path and no diff: this runs on the PTY reader thread.
+const ANTIGRAVITY_MAX_DIFF_FILE_BYTES: u64 = 512 * 1024;
+
+// What a file dialog was enriched with, computed once per dialog. The key is
+// the dialog's unenriched text. It's cleared when the menu clears, because two
+// dialogs in a row can have identical text.
+#[derive(Clone)]
+struct AntigravityMenuEnrichment {
+    key: String,
+    text: String,
+    signature: Option<String>,
+    diff: Option<String>,
+}
+
+fn antigravity_enrichment_cell() -> &'static Mutex<Option<AntigravityMenuEnrichment>> {
+    static CELL: OnceLock<Mutex<Option<AntigravityMenuEnrichment>>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+fn clear_antigravity_enrichment() {
+    if let Ok(mut g) = antigravity_enrichment_cell().lock() {
+        *g = None;
+    }
+}
+
+// Antigravity flushes the `PLANNER_RESPONSE` record (carrying `tool_calls`) before painting the
+// permission prompt and appends one `GENERIC` record as each call finishes, so
+// `tool_calls[completed_generics]` is the call currently held at the prompt.
+fn antigravity_in_flight_tool_from_transcript_str(source: &str) -> Option<PendingToolCall> {
+    let mut in_flight: Vec<(String, serde_json::Value)> = Vec::new();
+    let mut completed = 0usize;
+    for line in source.lines() {
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match record.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+            "USER_INPUT" | "CHECKPOINT" => {
+                in_flight.clear();
+                completed = 0;
+            }
+            "PLANNER_RESPONSE" => {
+                in_flight.clear();
+                completed = 0;
+                if let Some(calls) = record.get("tool_calls").and_then(|v| v.as_array()) {
+                    for call in calls {
+                        let name = call.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        let args = call
+                            .get("args")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!({}));
+                        in_flight.push(antigravity_translate_tool_call(name, &args));
+                    }
+                }
+            }
+            "GENERIC" => {
+                completed += 1;
+            }
+            _ => {}
+        }
+    }
+    let (name, input) = in_flight.get(completed)?.clone();
+    matches!(name.as_str(), "Edit" | "Write").then_some(PendingToolCall {
+        name,
+        input,
+        id: String::new(),
+    })
+}
+
+fn antigravity_in_flight_tool_for_project(root: &Path) -> Option<PendingToolCall> {
+    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let rows = antigravity_summary_rows(&canonical.to_string_lossy());
+    let live = antigravity_live_session_cell()
+        .lock()
+        .ok()
+        .and_then(|g| g.clone());
+    let id = resolve_antigravity_live_session_id(live.as_deref(), &rows)?;
+    let logs = antigravity_data_dir()?
+        .join("brain")
+        .join(id)
+        .join(".system_generated")
+        .join("logs");
+    let full = logs.join("transcript_full.jsonl");
+    let regular = logs.join("transcript.jsonl");
+    let source = match (regular.metadata().ok(), full.metadata().ok()) {
+        (_, Some(b)) if b.len() > 0 => full,
+        (Some(_), _) => regular,
+        _ => return None,
+    };
+    let modified = std::fs::metadata(&source).ok()?.modified().ok()?;
+    if modified.elapsed().ok()?.as_millis() > ANTIGRAVITY_IN_FLIGHT_MAX_AGE_MS {
+        return None;
+    }
+    let text = std::fs::read_to_string(&source).ok()?;
+    antigravity_in_flight_tool_from_transcript_str(&text)
+}
+
+fn antigravity_subject_matches_path(subject: &str, file_path: &str) -> bool {
+    let s = subject.trim();
+    if s.is_empty() {
+        return true;
+    }
+    file_path == s || file_path.starts_with(s) || file_path.ends_with(s)
+}
+
+fn antigravity_tool_call_diff(
+    call: &PendingToolCall,
+    project_root: Option<&Path>,
+) -> Option<String> {
+    use similar::TextDiff;
+    let field = |k: &str| call.input.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    let file_path = field("file_path");
+    let display_path = if file_path.is_empty() {
+        String::new()
+    } else if let Some(root) = project_root {
+        match Path::new(file_path).strip_prefix(root) {
+            Ok(rel) => rel.to_string_lossy().into_owned(),
+            Err(_) => file_path.trim_start_matches('/').to_string(),
+        }
+    } else {
+        file_path.trim_start_matches('/').to_string()
+    };
+    let header_old_rel = if display_path.is_empty() {
+        "a".to_string()
+    } else {
+        format!("a/{display_path}")
+    };
+    let header_new_rel = if display_path.is_empty() {
+        "b".to_string()
+    } else {
+        format!("b/{display_path}")
+    };
+    match call.name.as_str() {
+        "Edit" => {
+            let old_string = field("old_string");
+            let new_string = field("new_string");
+            if old_string.is_empty() && new_string.is_empty() {
+                return None;
+            }
+            let diff = TextDiff::from_lines(old_string, new_string)
+                .unified_diff()
+                .context_radius(3)
+                .missing_newline_hint(false)
+                .header(&header_old_rel, &header_new_rel)
+                .to_string();
+            (!diff.is_empty()).then_some(diff)
+        }
+        "Write" => {
+            let content = field("content");
+            let append = call
+                .input
+                .get("append")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if std::fs::metadata(file_path).is_ok_and(|m| m.len() > ANTIGRAVITY_MAX_DIFF_FILE_BYTES)
+            {
+                return None;
+            }
+            let existing = (!file_path.is_empty())
+                .then(|| std::fs::read_to_string(file_path).ok())
+                .flatten();
+            let (old_text, new_text, h_old): (String, String, &str) = match (append, existing) {
+                (true, Some(ex)) => {
+                    let combined = format!("{ex}{content}");
+                    (ex, combined, header_old_rel.as_str())
+                }
+                (_, Some(ex)) => (ex, content.to_string(), header_old_rel.as_str()),
+                (_, None) => {
+                    if content.is_empty() {
+                        return None;
+                    }
+                    (String::new(), content.to_string(), "/dev/null")
+                }
+            };
+            let diff = TextDiff::from_lines(&old_text, &new_text)
+                .unified_diff()
+                .context_radius(3)
+                .missing_newline_hint(false)
+                .header(h_old, &header_new_rel)
+                .to_string();
+            (!diff.is_empty()).then_some(diff)
+        }
+        _ => None,
+    }
+}
+
+fn antigravity_enrich_permission_menu(
+    menu: &mut PtyMenu,
+    call: &PendingToolCall,
+    project_root: Option<&Path>,
+) -> bool {
+    let mut lines = menu.text.lines();
+    let first_line = lines.next().unwrap_or("");
+    let screen_subject = lines.next();
+    let title = match (first_line, call.name.as_str()) {
+        ("Accept this file edit?", "Edit") => "Accept this file edit?",
+        ("Allow creation of this file?", "Write") => "Allow creation of this file?",
+        (s, "Edit") if s.starts_with("Permission required (top of dialog scrolled off") => {
+            "Accept this file edit?"
+        }
+        (s, "Write") if s.starts_with("Permission required (top of dialog scrolled off") => {
+            "Allow creation of this file?"
+        }
+        _ => return false,
+    };
+    let file_path = call
+        .input
+        .get("file_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if file_path.is_empty() {
+        return false;
+    }
+    if let Some(subj) = screen_subject {
+        if !antigravity_subject_matches_path(subj, file_path) {
+            return false;
+        }
+    }
+    menu.text = format!("{title}\n{file_path}");
+    menu.tool_call_signature = Some(format_pending_tool_call(call));
+    menu.tool_call_diff = antigravity_tool_call_diff(call, project_root);
+    true
+}
+
+fn antigravity_may_be_file_dialog(text: &str) -> bool {
+    let first = text.lines().next().unwrap_or("");
+    first == "Accept this file edit?"
+        || first == "Allow creation of this file?"
+        || first.starts_with("Permission required (top of dialog scrolled off")
+}
+
+// Only file dialogs read the transcript, and each only until it has its call:
+// this runs for every chunk while a dialog is up.
+fn antigravity_enrich_file_dialog<R: tauri::Runtime>(app: &AppHandle<R>, menu: &mut PtyMenu) {
+    if !antigravity_may_be_file_dialog(&menu.text) {
+        return;
+    }
+    let key = menu.text.clone();
+    if let Ok(g) = antigravity_enrichment_cell().lock() {
+        if let Some(done) = g.as_ref().filter(|done| done.key == key) {
+            menu.text = done.text.clone();
+            menu.tool_call_signature = done.signature.clone();
+            menu.tool_call_diff = done.diff.clone();
+            return;
+        }
+    }
+    let root = project_root(Some(app));
+    let Some(call) = root
+        .as_deref()
+        .and_then(antigravity_in_flight_tool_for_project)
+    else {
+        return;
+    };
+    if antigravity_enrich_permission_menu(menu, &call, root.as_deref()) {
+        if let Ok(mut g) = antigravity_enrichment_cell().lock() {
+            *g = Some(AntigravityMenuEnrichment {
+                key,
+                text: menu.text.clone(),
+                signature: menu.tool_call_signature.clone(),
+                diff: menu.tool_call_diff.clone(),
+            });
+        }
+    }
+}
+
+// Called with every PTY chunk (pty_menu_update). Acts only while Antigravity
+// is the current provider.
+fn note_antigravity_state_markers<R: tauri::Runtime>(app: &AppHandle<R>, chunk: &[u8]) {
+    let bodies = {
+        let Ok(mut carry) = antigravity_osc_carry_cell().lock() else {
+            return;
+        };
+        let joined;
+        let buf: &[u8] = if carry.is_empty() {
+            chunk
+        } else {
+            joined = [carry.as_slice(), chunk].concat();
+            &joined
+        };
+        let (bodies, leftover) = osc7501_state_bodies(buf);
+        let rest = &buf[leftover..];
+        // A real marker is well under 1 KB (`done` carries a base64 summary);
+        // anything longer is not one, and is dropped rather than carried.
+        *carry = if rest.len() <= 4096 {
+            rest.to_vec()
+        } else {
+            Vec::new()
+        };
+        bodies
+    };
+    let marks: Vec<(AntigravityMark, String)> = bodies
+        .iter()
+        .filter_map(|b| antigravity_mark(b).map(|m| (m, b.clone())))
+        .collect();
+    if marks.is_empty() || current_provider(app) != Some(SessionProvider::Antigravity) {
+        return;
+    }
+    for (mark, state) in marks {
+        let now = unix_now_ms();
+        ANTIGRAVITY_PERMISSION_BLOCKED_AT_MS.store(
+            if antigravity_permission_state(&state) {
+                now
+            } else {
+                0
+            },
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        if let Ok(mut latest) = antigravity_latest_state_cell().lock() {
+            *latest = Some(state.clone());
+        }
+        let started = antigravity_turn_cell().lock().ok().and_then(|g| *g);
+        let (open, event) = antigravity_turn_step(started.is_some(), mark);
+        if let Ok(mut g) = antigravity_turn_cell().lock() {
+            *g = if open { started.or(Some(now)) } else { None };
+        }
+        if mark == AntigravityMark::Error {
+            antigravity_note_error(app, &state, now);
+        }
+        match event {
+            Some(AntigravityTurnEvent::Start) => {
+                antigravity_clear_error();
+                ANTIGRAVITY_LAST_TURN_START_MS.store(now, std::sync::atomic::Ordering::SeqCst);
+                antigravity_turn_started(app, now)
+            }
+            Some(AntigravityTurnEvent::End) => {
+                clear_antigravity_enrichment();
+                let started_at = started.unwrap_or(now);
+                antigravity_turn_ended(
+                    app,
+                    started_at,
+                    now,
+                    antigravity_end_state(
+                        state.split(':').next().unwrap_or("ended"),
+                        started_at,
+                        antigravity_error_at_ms(),
+                    ),
+                );
+            }
+            Some(AntigravityTurnEvent::Reset) => {
+                clear_antigravity_enrichment();
+                stop_antigravity_turn_watch();
+                if bram_trace_enabled() {
+                    append_bram_trace_line(
+                        app,
+                        "antigravity-turn",
+                        &format!("op=reset reason=launch started={}", started.unwrap_or(0)),
+                    );
+                }
+            }
+            None => {}
+        }
+    }
+}
+
+enum AntigravityMenuTransition {
+    Unchanged,
+    Show {
+        menu: PtyMenu,
+        superseded: Option<PromptResolvedEvent>,
+        shown: Option<PromptShownEvent>,
+    },
+    Clear {
+        resolved: Option<PromptResolvedEvent>,
+    },
+}
+
+fn antigravity_menu_identity(menu: &PtyMenu) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        menu.text,
+        menu.tool_call_signature.as_deref().unwrap_or(""),
+        menu.tool_call_diff.is_some(),
+        menu.options
+            .iter()
+            .map(|o| format!("{}:{}", o.key, o.label))
+            .collect::<Vec<_>>()
+            .join("|")
+    )
+}
+
+fn antigravity_apply_menu_detection(
+    current_shown: &mut Option<String>,
+    open_prompt: &mut Option<OpenPrompt>,
+    retain_shown: bool,
+    menu: Option<PtyMenu>,
+    now: i64,
+) -> AntigravityMenuTransition {
+    let identity = menu.as_ref().map(antigravity_menu_identity);
+    if identity == *current_shown {
+        return AntigravityMenuTransition::Unchanged;
+    }
+    if let Some(menu) = menu {
+        let labels = menu.options.iter().map(|o| o.label.clone()).collect();
+        let (superseded, shown) =
+            prompt_shown_in(open_prompt, &menu.tool, None, labels, "antigravity", now);
+        *current_shown = identity;
+        let mut bound = Some(menu);
+        bind_menu_prompt_id(
+            &mut bound,
+            open_prompt.as_ref().map(|p| p.prompt_id.as_str()),
+        );
+        AntigravityMenuTransition::Show {
+            menu: bound.unwrap(),
+            superseded,
+            shown,
+        }
+    } else if retain_shown
+        && current_shown.is_some()
+        && open_prompt
+            .as_ref()
+            .is_some_and(|p| p.source == "antigravity")
+    {
+        AntigravityMenuTransition::Unchanged
+    } else if current_shown.take().is_some() {
+        let resolved = prompt_resolved_in(
+            open_prompt,
+            Some("antigravity"),
+            "superseded",
+            "no-menu",
+            now,
+        );
+        AntigravityMenuTransition::Clear { resolved }
+    } else {
+        AntigravityMenuTransition::Unchanged
+    }
+}
+
+fn finish_antigravity_menu_answer_prompt(
+    open_prompt: &mut Option<OpenPrompt>,
+    now: i64,
+) -> Option<PromptResolvedEvent> {
+    prompt_resolved_in(
+        open_prompt,
+        Some("antigravity"),
+        "answered",
+        "antigravity-permission",
+        now,
+    )
+}
+
+fn antigravity_permission_menu_update<R: tauri::Runtime>(app: &AppHandle<R>, tail: &str) {
+    let provider = current_provider(app) == Some(SessionProvider::Antigravity);
+    if !provider {
+        // Switched away with agy's dialog up: its last state is moot, and
+        // keeping it would send every later chunk of the new provider here.
+        // A relaunched agy reports fresh states.
+        ANTIGRAVITY_PERMISSION_BLOCKED_AT_MS.store(0, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut latest) = antigravity_latest_state_cell().lock() {
+            *latest = None;
+        }
+        clear_antigravity_enrichment();
+        stop_antigravity_turn_watch();
+    }
+    let state = antigravity_latest_state_cell()
+        .lock()
+        .ok()
+        .and_then(|g| g.clone());
+    let mut menu = antigravity_permission_menu(provider, state.as_deref(), tail);
+    if let Some(m) = menu.as_mut() {
+        antigravity_enrich_file_dialog(app, m);
+    }
+    let retain_shown = provider
+        && state.as_deref().is_some_and(antigravity_permission_state)
+        && !matches!(
+            terminal_attention_prompt_shape(tail),
+            Some("antigravity-folder-trust" | "antigravity-login" | "antigravity-resume-picker")
+        );
+    let transition = {
+        let Ok(mut current) = antigravity_permission_menu_shown_cell().lock() else {
+            return;
+        };
+        let Ok(mut open) = prompt_open_cell().lock() else {
+            return;
+        };
+        antigravity_apply_menu_detection(&mut current, &mut open, retain_shown, menu, unix_now_ms())
+    };
+    match transition {
+        AntigravityMenuTransition::Unchanged => {}
+        AntigravityMenuTransition::Show {
+            menu,
+            superseded,
+            shown,
+        } => {
+            if bram_trace_enabled() {
+                append_bram_trace_line(app, "pty-menu", "op=antigravity-permission-show");
+            }
+            if let Some(sup) = superseded {
+                let _ = record_prompt_resolved(app, sup);
+            }
+            if let Some(ev) = shown {
+                record_prompt_shown(app, ev);
+            }
+            turn_state_set_menu(app, Some(menu), "antigravity-permission", "detected");
+        }
+        AntigravityMenuTransition::Clear { resolved } => {
+            clear_antigravity_enrichment();
+            if bram_trace_enabled() {
+                append_bram_trace_line(app, "pty-menu", "op=antigravity-permission-clear");
+            }
+            if let Some(ev) = resolved {
+                let _ = record_prompt_resolved(app, ev);
+            }
+            turn_state_set_menu(app, None, "antigravity-permission", "dismissed");
+        }
+    }
+}
+
+#[cfg(test)]
+mod antigravity_permission_menu_tests {
+    use super::{antigravity_permission_menu, collapse_tail};
+    const STATE: &str = "blocked:kind=permission:app=antigravity";
+    fn raw(name: &str) -> String {
+        let bytes = match name {
+            "approval" => {
+                include_bytes!("../../docs/agent-specimens/antigravity/approval.raw").as_slice()
+            }
+            "write" => {
+                include_bytes!("../../docs/agent-specimens/antigravity/tool-write-approval.raw")
+                    .as_slice()
+            }
+            "edit" => {
+                include_bytes!("../../docs/agent-specimens/antigravity/tool-edit-approval.raw")
+                    .as_slice()
+            }
+            "shell" => {
+                include_bytes!("../../docs/agent-specimens/antigravity/tool-shell-approval.raw")
+                    .as_slice()
+            }
+            "command" => {
+                include_bytes!("../../docs/agent-specimens/antigravity/command-approval.raw")
+                    .as_slice()
+            }
+            "mcp" => {
+                include_bytes!("../../docs/agent-specimens/antigravity/mcp-approval.raw").as_slice()
+            }
+            "mcp_reason" => {
+                include_bytes!("../../docs/agent-specimens/antigravity/mcp-approval-reason.raw")
+                    .as_slice()
+            }
+            "mcp_arrow_delta" => include_bytes!(
+                "../../docs/agent-specimens/antigravity/mcp-approval-arrow-down-delta.raw"
+            )
+            .as_slice(),
+            _ => unreachable!(),
+        };
+        collapse_tail(bytes, 1200)
+    }
+    #[test]
+    fn each_captured_dialog_builds_its_expected_menu_and_digit_answers() {
+        let mcp_labels = || {
+            vec![
+                "Yes, allow tool call",
+                "Yes, and always allow tool 'xmlui/xmlui_status' in this conversation",
+                "Yes, and always allow tool 'xmlui/xmlui_status' (Persist to settings.json)",
+                "No, deny tool call",
+                "No, and always deny tool 'xmlui/xmlui_status' in this conversation",
+                "No, and always deny tool 'xmlui/xmlui_status' (Persist to settings.json)",
+            ]
+        };
+        for (name, title, subject, labels) in [
+            ("approval", "Allow creation of this file?", "<workspace>/specimen.txt", vec!["Yes, allow creation", "No, deny creation"]),
+            ("write", "Allow creation of this file?", "<workspace>/tool-probe.txt", vec!["Yes, allow creation", "No, deny creation"]),
+            ("edit", "Allow creation of this file?", "<workspace>/tool-probe.txt", vec!["Yes, allow creation", "No, deny creation"]),
+            ("shell", "Accept this file edit?", "<workspace>/tool-probe.txt", vec!["Yes, accept this change", "No, reject this change"]),
+            ("command", "Run this command?", "echo APPROVAL-7731", vec!["Yes, run command", "Yes, and always allow in this conversation for commands that start with 'echo'", "Yes, and always allow for commands that start with 'echo' (Persist to settings.json)", "No, cancel"]),
+            ("mcp", "Allow calling this tool?", "xmlui/xmlui_status", mcp_labels()),
+            ("mcp_reason", "Allow calling this tool?", "xmlui/xmlui_status", mcp_labels()),
+        ] {
+            let menu = antigravity_permission_menu(true, Some(STATE), &raw(name)).unwrap_or_else(|| panic!("{name}"));
+            assert!(menu.text.contains(title), "{name}: {}", menu.text);
+            assert!(menu.text.contains(subject), "{name}: {}", menu.text);
+            if name == "command" {
+                assert!(menu.text.contains("Specimen command requires approval."), "{}", menu.text);
+            }
+            if name == "mcp" {
+                assert_eq!(menu.text, "Allow calling this tool?\nxmlui/xmlui_status");
+            }
+            if name == "mcp_reason" {
+                assert_eq!(
+                    menu.text,
+                    "Allow calling this tool?\nxmlui/xmlui_status\nSpecimen MCP call requires approval."
+                );
+            }
+            assert_eq!(menu.options.iter().map(|o| o.label.as_str()).collect::<Vec<_>>(), labels, "{name}");
+            assert!(
+                menu.options.iter().enumerate().all(|(i, o)| {
+                    let expected = (i + 1).to_string();
+                    o.answer_keys.as_deref() == Some(expected.as_str())
+                }),
+                "{name}"
+            );
+        }
+    }
+    #[test]
+    fn file_subjects_keep_real_paths_with_spaces() {
+        for (name, filename) in [
+            ("approval", "specimen.txt"),
+            ("write", "tool-probe.txt"),
+            ("edit", "tool-probe.txt"),
+            ("shell", "tool-probe.txt"),
+        ] {
+            let tail = raw(name).replace("<workspace>", "/Users/someone/my project");
+            let menu = antigravity_permission_menu(true, Some(STATE), &tail)
+                .unwrap_or_else(|| panic!("{name}"));
+            assert!(
+                menu.text
+                    .contains(&format!("/Users/someone/my project/{filename}")),
+                "{name}: {}",
+                menu.text
+            );
+        }
+    }
+
+    // antigravity-live-check-fixes: the live 2026-10-31 tail (path shortened
+    // and redacted). The workspace path is cut off at the terminal width, so
+    // no "+1" diff stat is drawn. The first parser required one and showed
+    // no menu.
+    const LIVE_CUT_PATH: &str = "\u{25cf} Edited 1 file (live-...) (ctrl+o to expand) \
+        Create file /private/tmp/claude-501/-Users-someone-cod 1 + hello \
+        Allow creation of this file? > 1. Yes, allow creation 2. No, deny creation \
+        \u{2191}/\u{2193} Navigate \u{b7} tab Amend \u{b7} f full diff esc to cancel \
+        Gemini 3.8 Flash \u{b7} high";
+
+    #[test]
+    fn a_path_cut_at_the_terminal_width_still_gets_its_menu() {
+        let menu = antigravity_permission_menu(true, Some(STATE), LIVE_CUT_PATH)
+            .expect("menu for the live tail");
+        assert_eq!(
+            menu.text,
+            "Allow creation of this file?\n/private/tmp/claude-501/-Users-someone-cod"
+        );
+        let answers: Vec<_> = menu
+            .options
+            .iter()
+            .map(|o| (o.label.as_str(), o.answer_keys.as_deref()))
+            .collect();
+        assert_eq!(
+            answers,
+            vec![
+                ("Yes, allow creation", Some("1")),
+                ("No, deny creation", Some("2"))
+            ]
+        );
+    }
+
+    #[test]
+    fn each_file_specimen_with_its_stat_cut_off_keeps_its_menu() {
+        for name in ["approval", "write", "edit", "shell"] {
+            let tail = raw(name);
+            // The dialog's own path and stat: the last "<workspace>/…" and
+            // the " +1" (and " -1") after it.
+            let start = tail.rfind("<workspace>/").expect("path");
+            let stat = start + tail[start..].find(" +1").expect("stat");
+            let mut end = stat + " +1".len();
+            if tail[end..].starts_with(" -1") {
+                end += " -1".len();
+            }
+            let cut = format!(
+                "{}/Users/someone/a-very-long-workspa{}",
+                &tail[..start],
+                &tail[end..]
+            );
+            let menu = antigravity_permission_menu(true, Some(STATE), &cut)
+                .unwrap_or_else(|| panic!("{name}"));
+            assert!(
+                menu.text.contains("/Users/someone/a-very-long-workspa"),
+                "{name}: {}",
+                menu.text
+            );
+        }
+    }
+
+    #[test]
+    fn a_subject_that_cannot_be_read_does_not_hide_the_menu() {
+        let no_header = LIVE_CUT_PATH.replace("Create file ", "");
+        let menu = antigravity_permission_menu(true, Some(STATE), &no_header).expect("menu");
+        assert_eq!(menu.text, "Allow creation of this file?");
+        assert_eq!(menu.options.len(), 2);
+    }
+
+    #[test]
+    fn no_menu_for_other_provider_state_shapes_or_quoted_dialog() {
+        let active = raw("command");
+        assert!(antigravity_permission_menu(false, Some(STATE), &active).is_none());
+        assert!(
+            antigravity_permission_menu(true, Some("working:app=antigravity"), &active).is_none()
+        );
+        for name in [
+            "first-run-trust.raw",
+            "idle-composer.raw",
+            "permission-prompt.raw",
+        ] {
+            let bytes = match name {
+                "first-run-trust.raw" => {
+                    include_bytes!("../../docs/agent-specimens/antigravity/first-run-trust.raw")
+                        .as_slice()
+                }
+                "idle-composer.raw" => {
+                    include_bytes!("../../docs/agent-specimens/antigravity/idle-composer.raw")
+                        .as_slice()
+                }
+                _ => include_bytes!("../../docs/agent-specimens/antigravity/permission-prompt.raw")
+                    .as_slice(),
+            };
+            assert!(
+                antigravity_permission_menu(true, Some(STATE), &collapse_tail(bytes, 1200))
+                    .is_none(),
+                "{name}"
+            );
+        }
+        let dialog = include_bytes!("../../docs/agent-specimens/antigravity/command-approval.raw");
+        let composer = include_bytes!("../../docs/agent-specimens/antigravity/idle-composer.raw");
+        let quoted_and_idle = [dialog.as_slice(), composer.as_slice()].concat();
+        let quoted_and_idle = collapse_tail(&quoted_and_idle, 1200);
+        assert!(antigravity_permission_menu(true, Some(STATE), &quoted_and_idle).is_none());
+    }
+
+    #[test]
+    fn full_screen_44x67_shows_menu_for_every_dialog_without_esc_footer() {
+        let stream = include_bytes!(
+            "../../docs/agent-specimens/antigravity/permission-full-screen-44x67.raw"
+        );
+        // First dialog (`echo alpha`) ends right before the `working` marker
+        // emitted when the first digit answer ran; the stream as saved ends on
+        // the second dialog (`echo bravo`). Neither draws "esc to cancel".
+        let needle = b"\x1b]7501;state=blocked:kind=permission";
+        let first_perm = stream
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("first permission marker");
+        let first_working = first_perm
+            + stream[first_perm..]
+                .windows(b"\x1b]7501;state=working".len())
+                .position(|w| w == b"\x1b]7501;state=working")
+                .expect("working marker after first dialog");
+        let first_tail = collapse_tail(&stream[..first_working], 1200);
+        assert!(
+            !first_tail[first_tail.rfind("Run this command?").unwrap()..].contains("esc to cancel"),
+            "{first_tail}"
+        );
+        let first_menu =
+            antigravity_permission_menu(true, Some(STATE), &first_tail).expect("first dialog menu");
+        assert_eq!(first_menu.text, "Run this command?\necho alpha");
+        assert_eq!(first_menu.options.len(), 4);
+        assert_eq!(first_menu.options[0].label, "Yes, run command");
+        assert_eq!(first_menu.options[3].label, "No, cancel");
+
+        let second_tail = collapse_tail(stream, 1200);
+        assert!(
+            !second_tail[second_tail.rfind("Run this command?").unwrap()..]
+                .contains("esc to cancel"),
+            "{second_tail}"
+        );
+        let second_menu = antigravity_permission_menu(true, Some(STATE), &second_tail)
+            .expect("second dialog menu");
+        assert_eq!(second_menu.text, "Run this command?\necho bravo");
+        assert_eq!(second_menu.options.len(), 4);
+        assert_eq!(second_menu.options[0].label, "Yes, run command");
+        assert_eq!(second_menu.options[3].label, "No, cancel");
+    }
+
+    #[test]
+    fn short_46x26_and_scrolled_title_46x12_specimens_parse_and_hold() {
+        let short_raw =
+            include_bytes!("../../docs/agent-specimens/antigravity/permission-short-46x26.raw");
+        let short_tail = collapse_tail(short_raw, 1200);
+        let short_menu =
+            antigravity_permission_menu(true, Some(STATE), &short_tail).expect("46x26 menu");
+        assert!(short_menu
+            .text
+            .starts_with("Run this command?\ncurl -4 -sS"));
+        assert_eq!(short_menu.options.len(), 4);
+        assert_eq!(short_menu.options[0].answer_keys.as_deref(), Some("1"));
+        assert_eq!(short_menu.options[3].label, "No, cancel");
+
+        // 46x12: Ink clipped the dialog title and option 1 off the top of the
+        // screen, leaving options 2..4 and "↑/↓ Navigate · tab Amend".
+        let scrolled_raw = include_bytes!(
+            "../../docs/agent-specimens/antigravity/permission-scrolled-title-46x12.raw"
+        );
+        let scrolled_tail = collapse_tail(scrolled_raw, 1200);
+        assert!(!scrolled_tail.contains("Run this command?"));
+        let fallback = antigravity_permission_menu(true, Some(STATE), &scrolled_tail)
+            .expect("46x12 fallback menu");
+        assert!(fallback.text.contains("scrolled off"));
+        let keys_and_labels: Vec<_> = fallback
+            .options
+            .iter()
+            .map(|o| (o.key.as_str(), o.answer_keys.as_deref(), o.label.as_str()))
+            .collect();
+        assert_eq!(keys_and_labels.len(), 3);
+        assert_eq!(keys_and_labels[0].0, "2");
+        assert_eq!(keys_and_labels[0].1, Some("2"));
+        assert!(keys_and_labels[0]
+            .2
+            .starts_with("Yes, and always allow in this conversation"));
+        assert_eq!(keys_and_labels[1].0, "3");
+        assert_eq!(keys_and_labels[2], ("4", Some("4"), "No, cancel"));
+    }
+
+    // A wrapped label makes agy draw backspaces before the next option. The
+    // parser once lost options 3 and 4 here, so a pipeline's approval had no
+    // "No, cancel", and option 2's label ran on through option 3's text.
+    #[test]
+    fn backspaces_before_a_wrapped_option_keep_every_option() {
+        let raw = include_bytes!(
+            "../../docs/agent-specimens/antigravity/permission-wrapped-options-44x67.raw"
+        );
+        let tail = collapse_tail(raw, 1200);
+        assert!(tail.contains('\u{8}'), "the specimen shows the backspaces");
+        let menu = antigravity_permission_menu(true, Some(STATE), &tail).expect("menu");
+        let labels: Vec<_> = menu.options.iter().map(|o| o.label.as_str()).collect();
+        assert_eq!(labels.len(), 4, "{labels:?}");
+        assert!(labels[1].ends_with("start with 'jq'"), "{labels:?}");
+        assert!(
+            labels[2].ends_with("(Persist to settings.json)"),
+            "{labels:?}"
+        );
+        assert_eq!(labels[3], "No, cancel");
+    }
+
+    #[test]
+    fn newest_dialog_wins_when_command_and_file_dialogs_share_the_tail() {
+        let combined = "\
+            Command Reason: Specimen command requires approval. \
+            Requesting permission for: echo OLD \
+            Run this command? > 1. Yes, run command 2. Yes, and always allow \
+            3. Yes, and always allow (Persist) 4. No, cancel \
+            ↑/↓ Navigate · tab Amend · ctrl+g edit/expand command \
+            Create file <workspace>/next.txt +1 1 + NEW \
+            Allow creation of this file? > 1. Yes, allow creation 2. No, deny creation \
+            ↑/↓ Navigate · tab Amend · f full diff";
+        let menu = antigravity_permission_menu(true, Some(STATE), combined).expect("newest menu");
+        assert_eq!(
+            menu.text,
+            "Allow creation of this file?\n<workspace>/next.txt"
+        );
+        let labels: Vec<_> = menu.options.iter().map(|o| o.label.as_str()).collect();
+        assert_eq!(labels, vec!["Yes, allow creation", "No, deny creation"]);
+    }
+
+    #[test]
+    fn only_file_dialogs_read_the_transcript() {
+        use super::antigravity_may_be_file_dialog;
+        assert!(antigravity_may_be_file_dialog("Accept this file edit?"));
+        assert!(antigravity_may_be_file_dialog(
+            "Allow creation of this file?\n/p/a.txt"
+        ));
+        assert!(antigravity_may_be_file_dialog(
+            "Permission required (top of dialog scrolled off — check terminal for full details)"
+        ));
+        assert!(!antigravity_may_be_file_dialog(
+            "Run this command?\necho hi"
+        ));
+        assert!(!antigravity_may_be_file_dialog(
+            "Allow calling this tool?\nxmlui/xmlui_status"
+        ));
+    }
+
+    #[test]
+    fn a_write_over_a_large_file_gets_no_diff() {
+        use super::{antigravity_tool_call_diff, PendingToolCall, ANTIGRAVITY_MAX_DIFF_FILE_BYTES};
+        let dir = std::env::temp_dir().join(format!("bram-agy-big-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let big = dir.join("big.txt");
+        std::fs::write(&big, "x\n".repeat(ANTIGRAVITY_MAX_DIFF_FILE_BYTES as usize)).unwrap();
+        let small = dir.join("small.txt");
+        std::fs::write(&small, "old\n").unwrap();
+        let call = |path: &std::path::Path| PendingToolCall {
+            name: "Write".into(),
+            input: serde_json::json!({ "file_path": path, "content": "new\n" }),
+            id: String::new(),
+        };
+        assert_eq!(antigravity_tool_call_diff(&call(&big), None), None);
+        assert!(antigravity_tool_call_diff(&call(&small), None)
+            .unwrap()
+            .contains("+new"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_second_call_of_a_response_is_in_flight_once_the_first_has_its_result() {
+        use super::antigravity_in_flight_tool_from_transcript_str;
+        let planner = r#"{"type":"PLANNER_RESPONSE","step_index":1,"content":"x","tool_calls":[{"name":"edit_file","args":{"Path":"/a","Target":"1","Replacement":"2"}},{"name":"edit_file","args":{"Path":"/b","Target":"3","Replacement":"4"}}]}"#;
+        let path = |source: &str| {
+            antigravity_in_flight_tool_from_transcript_str(source)
+                .map(|c| c.input["file_path"].as_str().unwrap().to_string())
+        };
+        assert_eq!(path(planner).as_deref(), Some("/a"));
+        let one_done = format!("{planner}\n{}", r#"{"type":"GENERIC","content":"done"}"#);
+        assert_eq!(path(&one_done).as_deref(), Some("/b"));
+    }
+
+    #[test]
+    fn file_edit_and_creation_menus_get_full_path_and_unified_diff() {
+        use super::{
+            antigravity_enrich_permission_menu, antigravity_in_flight_tool_from_transcript_str,
+            PendingToolCall,
+        };
+        use std::path::Path;
+
+        // 1. Live edit specimen (`raw("shell")` has "Accept this file edit?" on
+        //    `<workspace>/tool-probe.txt`) + transcript fallback up to line 6
+        //    (step 5's `PLANNER_RESPONSE` for `edit_file`, before its `GENERIC`).
+        let transcript =
+            include_str!("../../docs/agent-specimens/antigravity/transcript-record-tools.jsonl");
+        let until_edit_prompt = transcript.lines().take(6).collect::<Vec<_>>().join("\n");
+        let in_flight = antigravity_in_flight_tool_from_transcript_str(&until_edit_prompt)
+            .expect("in-flight edit call");
+        assert_eq!(in_flight.name, "Edit");
+
+        let mut edit_menu =
+            antigravity_permission_menu(true, Some(STATE), &raw("shell")).expect("edit menu");
+        let root = Path::new("<workspace>");
+        assert!(antigravity_enrich_permission_menu(
+            &mut edit_menu,
+            &in_flight,
+            Some(root)
+        ));
+        assert_eq!(
+            edit_menu.tool_call_signature.as_deref(),
+            Some("Edit(<workspace>/tool-probe.txt)")
+        );
+        let diff = edit_menu.tool_call_diff.as_deref().expect("edit diff");
+        assert!(diff.contains("--- a/tool-probe.txt"), "{diff}");
+        assert!(diff.contains("+++ b/tool-probe.txt"), "{diff}");
+        assert!(diff.contains("-FIRST-VALUE"), "{diff}");
+        assert!(diff.contains("+SECOND-VALUE"), "{diff}");
+
+        // 1b. Long diff pushed "Pending edit <path>" out of the 1200-char tail,
+        //     leaving `menu.text == "Accept this file edit?"` with no subject:
+        //     enrichment restores both the full path and the unified diff.
+        let header_scrolled_tail = raw("shell").replace("Pending edit ", "");
+        let mut subjectless_edit_menu =
+            antigravity_permission_menu(true, Some(STATE), &header_scrolled_tail)
+                .expect("subjectless edit menu");
+        assert_eq!(subjectless_edit_menu.text, "Accept this file edit?");
+        assert!(antigravity_enrich_permission_menu(
+            &mut subjectless_edit_menu,
+            &in_flight,
+            Some(root)
+        ));
+        assert_eq!(
+            subjectless_edit_menu.text,
+            "Accept this file edit?\n<workspace>/tool-probe.txt"
+        );
+        assert!(subjectless_edit_menu.tool_call_diff.is_some());
+
+        // 2. Narrow terminal (`LIVE_CUT_PATH`, clipped at column 46) recovers the full path
+        //    and gets a unified diff for file creation, while rejecting an unrelated path.
+        let mut cut_menu =
+            antigravity_permission_menu(true, Some(STATE), LIVE_CUT_PATH).expect("cut menu");
+        let unrelated = PendingToolCall {
+            name: "Write".into(),
+            input: serde_json::json!({
+                "file_path": "/completely/different/path.txt",
+                "content": "hello\n",
+            }),
+            id: String::new(),
+        };
+        assert!(!antigravity_enrich_permission_menu(
+            &mut cut_menu,
+            &unrelated,
+            None
+        ));
+        let full_path = "/private/tmp/claude-501/-Users-someone-code-project/src/new_module.rs";
+        let matching_write = PendingToolCall {
+            name: "Write".into(),
+            input: serde_json::json!({
+                "file_path": full_path,
+                "content": "pub fn greet() {}\n",
+            }),
+            id: String::new(),
+        };
+        assert!(antigravity_enrich_permission_menu(
+            &mut cut_menu,
+            &matching_write,
+            Some(Path::new(
+                "/private/tmp/claude-501/-Users-someone-code-project"
+            ))
+        ));
+        assert_eq!(
+            cut_menu.text,
+            format!("Allow creation of this file?\n{full_path}")
+        );
+        assert!(cut_menu
+            .tool_call_signature
+            .as_deref()
+            .unwrap_or("")
+            .starts_with(&format!("Write({full_path})\n")));
+        let write_diff = cut_menu.tool_call_diff.as_deref().expect("write diff");
+        assert!(write_diff.contains("--- /dev/null"), "{write_diff}");
+        assert!(
+            write_diff.contains("+++ b/src/new_module.rs"),
+            "{write_diff}"
+        );
+        assert!(write_diff.contains("+pub fn greet() {}"), "{write_diff}");
+
+        // 3. 46x12 scrolled-off title upgrades from generic placeholder to title + path + diff.
+        let scrolled_raw = include_bytes!(
+            "../../docs/agent-specimens/antigravity/permission-scrolled-title-46x12.raw"
+        );
+        let mut scrolled_menu =
+            antigravity_permission_menu(true, Some(STATE), &collapse_tail(scrolled_raw, 1200))
+                .expect("scrolled menu");
+        assert!(antigravity_enrich_permission_menu(
+            &mut scrolled_menu,
+            &in_flight,
+            Some(root)
+        ));
+        assert!(scrolled_menu.text.starts_with("Accept this file edit?\n"));
+        assert!(scrolled_menu.tool_call_diff.is_some());
+    }
+
+    #[test]
+    fn a_dialog_still_painting_shows_no_menu_and_osc_holds_unreadable() {
+        // The state marker comes first, and the paint spans chunks: options
+        // so far, no footer yet. A menu here would show a partial list.
+        let painting = "Requesting permission for: echo hi \
+            Run this command? > 1. Yes, run command 2. Yes, and always allow";
+        assert!(antigravity_permission_menu(true, Some(STATE), painting).is_none());
+        let painted =
+            format!("{painting} in this conversation 3. No, cancel ↑/↓ Navigate · tab Amend");
+        let menu = antigravity_permission_menu(true, Some(STATE), &painted).expect("painted");
+        assert_eq!(menu.options.len(), 3);
+        assert_eq!(menu.options[2].label, "No, cancel");
+
+        // Pre-paint / completely clipped screen: no menu, no fake options from
+        // assistant prose, and OSC state still blocks pane sends and fires the
+        // terminal-attention hold.
+        let prose_before_paint = "Plan: 1. Read lib.rs 2. Run cargo test";
+        assert!(antigravity_permission_menu(true, Some(STATE), prose_before_paint).is_none());
+        assert_eq!(
+            super::pane_input_blocking_prompt_or_osc(
+                prose_before_paint,
+                Some(super::SessionProvider::Antigravity),
+                true,
+            ),
+            Some("antigravity-permission")
+        );
+        assert_eq!(
+            super::pane_input_blocking_prompt_or_osc(
+                prose_before_paint,
+                Some(super::SessionProvider::Claude),
+                true,
+            ),
+            None
+        );
+        let mut tracker = super::TerminalAttentionTracker::new();
+        assert_eq!(
+            tracker.step_with_permission_block_shape(
+                true,
+                false,
+                64,
+                Some("antigravity-permission"),
+                || panic!("explicit OSC permission block needs no silence wait"),
+            ),
+            vec![super::TerminalAttentionTransition::Fire {
+                shape: "antigravity-permission",
+            }]
+        );
+        assert_eq!(
+            tracker.step_with_permission_block_shape(true, false, 0, None, || panic!("unblocked")),
+            vec![super::TerminalAttentionTransition::Clear {
+                reason: "permission-unblocked",
+            }]
+        );
+    }
+
+    #[test]
+    fn menu_clear_after_escape_idle_keeps_turn_finished_without_rearming_claim() {
+        use super::{
+            antigravity_mark, antigravity_turn_step, apply_menu_turn_state, osc7501_state_bodies,
+            turn_state_transition_rearms_claim, AntigravityTurnEvent, TurnState,
+        };
+
+        let stream = include_bytes!("../../docs/agent-specimens/antigravity/permission-escape.raw");
+        let perm_needle = b"\x1b]7501;state=blocked:kind=permission";
+        let perm_at = stream
+            .windows(perm_needle.len())
+            .position(|w| w == perm_needle)
+            .expect("permission marker");
+        let idle_needle = b"\x1b]7501;state=idle:app=antigravity";
+        let esc_idle_at = perm_at
+            + stream[perm_at..]
+                .windows(idle_needle.len())
+                .position(|w| w == idle_needle)
+                .expect("idle marker on Esc");
+
+        struct Driver {
+            turn_open: bool,
+            latest_state: Option<String>,
+            shown: bool,
+            screen: Vec<u8>,
+            turn_state: TurnState,
+        }
+        impl Driver {
+            fn new() -> Self {
+                Self {
+                    turn_open: false,
+                    latest_state: None,
+                    shown: false,
+                    screen: Vec::new(),
+                    turn_state: TurnState::idle(),
+                }
+            }
+            fn drive(&mut self, chunk: &[u8]) -> bool {
+                let mut rearmed = false;
+                let (bodies, _) = osc7501_state_bodies(chunk);
+                for body in bodies {
+                    let Some(mark) = antigravity_mark(&body) else {
+                        continue;
+                    };
+                    self.latest_state = Some(body);
+                    let (open, event) = antigravity_turn_step(self.turn_open, mark);
+                    self.turn_open = open;
+                    match event {
+                        Some(AntigravityTurnEvent::Start) => {
+                            let prev = self.turn_state.clone();
+                            self.turn_state.provider = Some("antigravity".into());
+                            if self.turn_state.pending_menu.is_none() {
+                                self.turn_state.phase = "working".into();
+                            }
+                            rearmed |= turn_state_transition_rearms_claim(&prev, &self.turn_state);
+                        }
+                        Some(AntigravityTurnEvent::End) => {
+                            let prev = self.turn_state.clone();
+                            self.turn_state.phase = "finished".into();
+                            rearmed |= turn_state_transition_rearms_claim(&prev, &self.turn_state);
+                        }
+                        Some(AntigravityTurnEvent::Reset) | None => {}
+                    }
+                }
+                self.screen.extend_from_slice(chunk);
+                let tail = collapse_tail(&self.screen, 1200);
+                let menu = antigravity_permission_menu(true, self.latest_state.as_deref(), &tail);
+                if let Some(m) = menu {
+                    let prev = self.turn_state.clone();
+                    apply_menu_turn_state(
+                        &mut self.turn_state,
+                        Some("antigravity".into()),
+                        Some(m),
+                        "antigravity-permission",
+                        self.turn_open,
+                    );
+                    rearmed |= turn_state_transition_rearms_claim(&prev, &self.turn_state);
+                    self.shown = true;
+                } else if self.shown {
+                    self.shown = false;
+                    let prev = self.turn_state.clone();
+                    apply_menu_turn_state(
+                        &mut self.turn_state,
+                        Some("antigravity".into()),
+                        None,
+                        "antigravity-permission",
+                        self.turn_open,
+                    );
+                    rearmed |= turn_state_transition_rearms_claim(&prev, &self.turn_state);
+                }
+                rearmed
+            }
+        }
+
+        // 1. Up to the dialog: turn opens (`working`), then blocks on the menu.
+        let mut d = Driver::new();
+        assert!(d.drive(&stream[..esc_idle_at]));
+        assert!(d.turn_open);
+        assert_eq!(d.turn_state.phase, "waiting-for-permission");
+        assert_eq!(
+            d.turn_state.pending_menu.as_ref().map(|m| m.text.as_str()),
+            Some("Run this command?\necho ESC-DIALOG-7731")
+        );
+
+        // 2. Esc response (`idle` + composer redraw in one chunk): turn closes,
+        //    menu clears, phase stays `finished`, and no claim re-arms.
+        assert!(!d.drive(&stream[esc_idle_at..]));
+        assert!(!d.turn_open);
+        assert_eq!(d.turn_state.phase, "finished");
+        assert!(d.turn_state.pending_menu.is_none());
+
+        // 3. `blocked` then `idle` landing together in one chunk (while an earlier
+        //    dialog menu was shown): turn closes, menu clears, phase stays `finished`,
+        //    and no claim re-arms.
+        let mut coalesced = Driver::new();
+        assert!(coalesced.drive(&stream[..perm_at]));
+        coalesced.shown = true;
+        coalesced.turn_state.phase = "waiting-for-permission".into();
+        assert!(!coalesced.drive(&stream[perm_at..]));
+        assert!(!coalesced.turn_open);
+        assert_eq!(coalesced.turn_state.phase, "finished");
+        assert!(coalesced.turn_state.pending_menu.is_none());
+
+        // 4. Open-turn Antigravity clears and other providers' clears still enter `working`.
+        d.turn_state.phase = "waiting-for-permission".into();
+        apply_menu_turn_state(
+            &mut d.turn_state,
+            Some("antigravity".into()),
+            None,
+            "antigravity-permission",
+            true,
+        );
+        assert_eq!(d.turn_state.phase, "working");
+
+        d.turn_state.phase = "finished".into();
+        apply_menu_turn_state(
+            &mut d.turn_state,
+            Some("claude".into()),
+            None,
+            "pty-menu",
+            false,
+        );
+        assert_eq!(d.turn_state.phase, "working");
+    }
+
+    // agy-menu-resolve-open-prompt: identical back-to-back Antigravity file-edit
+    // menus have the same `tool` ("Antigravity permission") and option `labels`.
+    // Answering through `menuAnswer` or clearing the menu on `working` must
+    // resolve `OpenPrompt` so the next menu mints a fresh `promptId`, while
+    // in-place enrichment of the same still-open menu keeps its `promptId`.
+    #[test]
+    fn consecutive_identical_antigravity_prompts_mint_distinct_ids_after_answer_or_clear() {
+        use super::{
+            antigravity_apply_menu_detection, finish_antigravity_menu_answer_prompt,
+            menu_answer_identity_verdict, AntigravityMenuTransition, MenuAnswerIdentityVerdict,
+            OpenPrompt,
+        };
+
+        let edit_menu_for = |file: &str| {
+            let mut m = antigravity_permission_menu(
+                true,
+                Some(STATE),
+                &collapse_tail(raw("write").as_bytes(), 1200),
+            )
+            .expect("file write menu");
+            m.text = format!("Allow creation of this file?\n{file}");
+            m
+        };
+
+        let mut shown: Option<String> = None;
+        let mut open: Option<OpenPrompt> = None;
+
+        // 1. First file menu shows and mints prompt_id p1.
+        let p1 = match antigravity_apply_menu_detection(
+            &mut shown,
+            &mut open,
+            true,
+            Some(edit_menu_for("src/a.rs")),
+            1_000,
+        ) {
+            AntigravityMenuTransition::Show {
+                menu,
+                shown: Some(_),
+                superseded: None,
+            } => menu.prompt_id.expect("bound prompt_id"),
+            _ => panic!("expected initial Show"),
+        };
+        assert_eq!(
+            menu_answer_identity_verdict(open.as_ref().map(|p| p.prompt_id.as_str()), &p1),
+            MenuAnswerIdentityVerdict::Accept
+        );
+
+        // 1b. Transcript enrichment of the SAME open menu updates identity
+        //     without minting a new prompt_id.
+        let mut enriched = edit_menu_for("src/a.rs");
+        enriched.tool_call_signature = Some("write_file src/a.rs".into());
+        let p1_after_enrich = match antigravity_apply_menu_detection(
+            &mut shown,
+            &mut open,
+            true,
+            Some(enriched),
+            1_050,
+        ) {
+            AntigravityMenuTransition::Show {
+                menu,
+                shown: None,
+                superseded: None,
+            } => menu.prompt_id.expect("preserved prompt_id"),
+            _ => panic!("expected in-place Show without new shown event"),
+        };
+        assert_eq!(p1_after_enrich, p1);
+
+        // 2. Answering via `menuAnswer` resolves p1 immediately (`outcome=answered`),
+        //    and the subsequent `working` clear is a no-op (1:1 shown/resolved).
+        let answered = finish_antigravity_menu_answer_prompt(&mut open, 1_100)
+            .expect("menuAnswer must resolve open Antigravity prompt");
+        assert_eq!(answered.open.prompt_id, p1);
+        assert_eq!(answered.outcome, "answered");
+        assert_eq!(answered.detail, "antigravity-permission");
+        assert!(open.is_none());
+        assert_eq!(
+            menu_answer_identity_verdict(open.as_ref().map(|p| p.prompt_id.as_str()), &p1),
+            MenuAnswerIdentityVerdict::NoOpenPrompt
+        );
+        match antigravity_apply_menu_detection(&mut shown, &mut open, false, None, 1_120) {
+            AntigravityMenuTransition::Clear { resolved: None } => {}
+            _ => panic!("clear after menuAnswer should not emit a second resolved event"),
+        }
+
+        // 3. Second identical file-edit menu mints a distinct prompt_id p2 != p1.
+        let p2 = match antigravity_apply_menu_detection(
+            &mut shown,
+            &mut open,
+            true,
+            Some(edit_menu_for("src/b.rs")),
+            2_000,
+        ) {
+            AntigravityMenuTransition::Show {
+                menu,
+                shown: Some(_),
+                superseded: None,
+            } => menu.prompt_id.expect("bound prompt_id"),
+            _ => panic!("expected fresh Show for second file"),
+        };
+        assert_ne!(p2, p1, "second menu must not reuse resolved prompt_id");
+        assert_eq!(
+            menu_answer_identity_verdict(open.as_ref().map(|p| p.prompt_id.as_str()), &p2),
+            MenuAnswerIdentityVerdict::Accept
+        );
+
+        // 4. Answering directly in the terminal skips `menuAnswer`; the clear
+        //    branch resolves p2 (`superseded` / `no-menu`), so a third identical
+        //    menu still mints a distinct prompt_id p3.
+        match antigravity_apply_menu_detection(&mut shown, &mut open, false, None, 2_500) {
+            AntigravityMenuTransition::Clear { resolved: Some(ev) } => {
+                assert_eq!(ev.open.prompt_id, p2);
+                assert_eq!(ev.outcome, "superseded");
+                assert_eq!(ev.detail, "no-menu");
+            }
+            _ => panic!("clear after terminal answer must resolve open Antigravity prompt"),
+        }
+        let p3 = match antigravity_apply_menu_detection(
+            &mut shown,
+            &mut open,
+            true,
+            Some(edit_menu_for("src/c.rs")),
+            3_000,
+        ) {
+            AntigravityMenuTransition::Show {
+                menu,
+                shown: Some(_),
+                superseded: None,
+            } => menu.prompt_id.expect("bound prompt_id"),
+            _ => panic!("expected fresh Show for third file"),
+        };
+        assert_ne!(p3, p2);
+        assert_ne!(p3, p1);
+
+        // 5. Provider-switch safety: clearing Antigravity's shown marker never
+        //    clobbers another source's OpenPrompt.
+        open = Some(OpenPrompt {
+            prompt_id: "p-claude-hook".into(),
+            tool: "Edit".into(),
+            tool_use_id: Some("toolu_1".into()),
+            labels: vec!["Yes".into(), "No".into()],
+            source: "hook",
+            shown_at_ms: 3_100,
+        });
+        match antigravity_apply_menu_detection(&mut shown, &mut open, false, None, 3_200) {
+            AntigravityMenuTransition::Clear { resolved: None } => {}
+            _ => panic!("must not resolve a non-antigravity OpenPrompt"),
+        }
+        assert_eq!(
+            open.as_ref().map(|p| p.prompt_id.as_str()),
+            Some("p-claude-hook")
+        );
+    }
+
+    #[test]
+    fn arrow_key_redraw_retains_shown_menu_until_osc_state_leaves_permission() {
+        use super::{
+            antigravity_apply_menu_detection, finish_antigravity_menu_answer_prompt,
+            menu_answer_identity_verdict, AntigravityMenuTransition, MenuAnswerIdentityVerdict,
+            OpenPrompt,
+        };
+
+        let initial_menu =
+            antigravity_permission_menu(true, Some(STATE), &raw("command")).expect("command menu");
+        // After pty_menu_clear empties PTY_TAIL on `\x1b[B`, agy emits only the
+        // two-option highlight redraw with no title, no footer, and no OSC 7501
+        // state transition (`STATE` stays `blocked:kind=permission:app=antigravity`).
+        let delta_tail = raw("mcp_arrow_delta");
+        assert!(
+            antigravity_permission_menu(true, Some(STATE), &delta_tail).is_none(),
+            "partial arrow-key redraw has neither title nor footer"
+        );
+
+        let mut shown: Option<String> = None;
+        let mut open: Option<OpenPrompt> = None;
+
+        // 1. Initial menu shows and mints p1.
+        let p1 = match antigravity_apply_menu_detection(
+            &mut shown,
+            &mut open,
+            true,
+            Some(initial_menu.clone()),
+            1_000,
+        ) {
+            AntigravityMenuTransition::Show {
+                menu,
+                shown: Some(_),
+                superseded: None,
+            } => menu.prompt_id.expect("bound prompt_id"),
+            _ => panic!("expected initial Show"),
+        };
+
+        // 2. Arrow-key redraw (`menu == None`, `retain_shown == true`) keeps the
+        //    pane card and `p1` alive.
+        match antigravity_apply_menu_detection(&mut shown, &mut open, true, None, 1_050) {
+            AntigravityMenuTransition::Unchanged => {}
+            _ => panic!("expected Unchanged on arrow-key redraw"),
+        }
+        assert!(shown.is_some(), "shown marker must remain set");
+        assert_eq!(
+            menu_answer_identity_verdict(open.as_ref().map(|p| p.prompt_id.as_str()), &p1),
+            MenuAnswerIdentityVerdict::Accept
+        );
+
+        // 3. Terminal Esc (`state=idle`) or Enter/digit (`state=working`) flips
+        //    `retain_shown` to false and clears + resolves `p1`.
+        match antigravity_apply_menu_detection(&mut shown, &mut open, false, None, 1_200) {
+            AntigravityMenuTransition::Clear { resolved: Some(ev) } => {
+                assert_eq!(ev.open.prompt_id, p1);
+                assert_eq!(ev.outcome, "superseded");
+                assert_eq!(ev.detail, "no-menu");
+            }
+            _ => panic!("expected Clear with resolved prompt once OSC state leaves permission"),
+        }
+        assert!(shown.is_none());
+        assert!(open.is_none());
+
+        // 4. Clicking a pane button after terminal arrow-key navigation resolves
+        //    `open` via `finish_antigravity_menu_answer_prompt`, so the next chunk
+        //    clears `shown` even before OSC 7501 flips out of permission.
+        let p2 = match antigravity_apply_menu_detection(
+            &mut shown,
+            &mut open,
+            true,
+            Some(initial_menu),
+            2_000,
+        ) {
+            AntigravityMenuTransition::Show {
+                menu,
+                shown: Some(_),
+                superseded: None,
+            } => menu.prompt_id.expect("bound prompt_id"),
+            _ => panic!("expected second Show"),
+        };
+        assert_ne!(p2, p1);
+        match antigravity_apply_menu_detection(&mut shown, &mut open, true, None, 2_050) {
+            AntigravityMenuTransition::Unchanged => {}
+            _ => panic!("expected Unchanged on arrow-key redraw"),
+        }
+        let answered = finish_antigravity_menu_answer_prompt(&mut open, 2_100)
+            .expect("pane click resolves open prompt");
+        assert_eq!(answered.open.prompt_id, p2);
+        match antigravity_apply_menu_detection(&mut shown, &mut open, true, None, 2_120) {
+            AntigravityMenuTransition::Clear { resolved: None } => {}
+            _ => panic!("expected Clear after pane click resolved open prompt"),
+        }
+    }
+}
+
+const ANTIGRAVITY_LIVE_COALESCE_MS: u64 = 400;
+const ANTIGRAVITY_LIVE_MIN_INTERVAL_MS: u64 = 1500;
+
+#[derive(Default, Debug, PartialEq, Eq)]
+struct AntigravityLiveRefreshGate {
+    last_emitted_len: Option<u64>,
+    last_emit_ms: Option<u64>,
+    pending_len: Option<u64>,
+    first_pending_ms: Option<u64>,
+    last_event_ms: Option<u64>,
+}
+
+impl AntigravityLiveRefreshGate {
+    fn seeded(initial_len: Option<u64>) -> Self {
+        Self {
+            last_emitted_len: initial_len,
+            ..Self::default()
+        }
+    }
+
+    fn note_change(&mut self, now_ms: u64, current_len: Option<u64>) {
+        let Some(len) = current_len else {
+            return;
+        };
+        if self.last_emitted_len == Some(len) {
+            return;
+        }
+        self.pending_len = Some(len);
+        self.last_event_ms = Some(now_ms);
+        if self.first_pending_ms.is_none() {
+            self.first_pending_ms = Some(now_ms);
+        }
+    }
+
+    fn poll_ready(&mut self, now_ms: u64, current_len: Option<u64>) -> Option<u64> {
+        if let Some(len) = current_len {
+            if self.last_emitted_len == Some(len) {
+                self.pending_len = None;
+                self.first_pending_ms = None;
+                self.last_event_ms = None;
+                return None;
+            }
+            if self.pending_len.is_some() {
+                self.pending_len = Some(len);
+            }
+        }
+        let len = self.pending_len?;
+        if self
+            .last_emit_ms
+            .is_some_and(|t| now_ms.saturating_sub(t) < ANTIGRAVITY_LIVE_MIN_INTERVAL_MS)
+        {
+            return None;
+        }
+        let quiet_enough = self
+            .last_event_ms
+            .is_some_and(|t| now_ms.saturating_sub(t) >= ANTIGRAVITY_LIVE_COALESCE_MS);
+        let waited_cap = self
+            .first_pending_ms
+            .is_some_and(|t| now_ms.saturating_sub(t) >= ANTIGRAVITY_LIVE_MIN_INTERVAL_MS);
+        if quiet_enough || waited_cap {
+            self.last_emitted_len = Some(len);
+            self.last_emit_ms = Some(now_ms);
+            self.pending_len = None;
+            self.first_pending_ms = None;
+            self.last_event_ms = None;
+            Some(len)
+        } else {
+            None
+        }
+    }
+}
+
+static ANTIGRAVITY_TURN_WATCH_GEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn antigravity_turn_watch_stop_cell() -> &'static Mutex<Option<std::sync::mpsc::Sender<()>>> {
+    static CELL: OnceLock<Mutex<Option<std::sync::mpsc::Sender<()>>>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+fn stop_antigravity_turn_watch() {
+    ANTIGRAVITY_TURN_WATCH_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if let Ok(mut guard) = antigravity_turn_watch_stop_cell().lock() {
+        *guard = None;
+    }
+}
+
+fn current_antigravity_session_id<R: tauri::Runtime>(app: &AppHandle<R>) -> Option<String> {
+    if let Some(sid) =
+        live_session_id(app, SessionProvider::Antigravity).filter(|s| session_id_is_safe(s))
+    {
+        return Some(sid);
+    }
+    if let Ok(last) = last_talk_session_sid_cell().lock() {
+        if let Some(sid) = last.get("antigravity").filter(|s| session_id_is_safe(s)) {
+            return Some(sid.clone());
+        }
+    }
+    read_last_active_session(app)
+        .filter(|r| r.provider == "antigravity" && session_id_is_safe(&r.session_id))
+        .map(|r| r.session_id)
+}
+
+fn antigravity_source_transcript_file_and_len(logs_dir: &Path) -> Option<(PathBuf, u64)> {
+    let full = logs_dir.join("transcript_full.jsonl");
+    let regular = logs_dir.join("transcript.jsonl");
+    match (regular.metadata().ok(), full.metadata().ok()) {
+        (_, Some(b)) if b.len() > 0 => Some((full, b.len())),
+        (Some(a), _) => Some((regular, a.len())),
+        _ => None,
+    }
+}
+
+fn emit_antigravity_live_transcript_tick<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    sid: &str,
+    root: &Path,
+) {
+    let Some(export_path) = antigravity_export_path_for_project(app, sid, root) else {
+        return;
+    };
+    let len = std::fs::metadata(&export_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let payload = serde_json::json!({
+        "correlation_id": next_talk_session_correlation_id(),
+        "at_host_ms": unix_now_ms(),
+        "sid": sid,
+        "len": len,
+        "provider": "antigravity",
+        "source": "push",
+    });
+    if bram_trace_enabled() {
+        append_bram_trace_line(
+            app,
+            "antigravity-turn",
+            &format!("op=live-transcript-push session={sid} bytes={len}"),
+        );
+    }
+    emit_replayable_payload(app, "talk-session-changed", payload);
+    emit_conversation_state_changed(app);
+}
+
+fn start_antigravity_turn_watch<R: tauri::Runtime>(app: &AppHandle<R>) {
+    let gen = ANTIGRAVITY_TURN_WATCH_GEN
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        .wrapping_add(1);
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    if let Ok(mut guard) = antigravity_turn_watch_stop_cell().lock() {
+        *guard = Some(stop_tx);
+    }
+    let app = app.clone();
+    std::thread::spawn(move || {
+        use notify::{recommended_watcher, Event, RecursiveMode, Watcher};
+        use std::sync::atomic::Ordering;
+        use std::sync::mpsc::{channel, RecvTimeoutError, TryRecvError};
+        use std::time::{Duration, Instant};
+
+        if ANTIGRAVITY_TURN_WATCH_GEN.load(Ordering::SeqCst) != gen {
+            return;
+        }
+        let Some(sid) = current_antigravity_session_id(&app) else {
+            return;
+        };
+        let Some(root) = project_root(Some(&app)).and_then(|p| p.canonicalize().ok()) else {
+            return;
+        };
+        let Some(logs_dir) = antigravity_data_dir().map(|d| {
+            d.join("brain")
+                .join(&sid)
+                .join(".system_generated")
+                .join("logs")
+        }) else {
+            return;
+        };
+        if !logs_dir.is_dir() {
+            return;
+        }
+        let Ok(cache_dir) = app.path().app_cache_dir() else {
+            return;
+        };
+        let export_path = cache_dir
+            .join(ANTIGRAVITY_EXPORT_DIR)
+            .join(encode_path_for_filename(&strip_unc_prefix(root.clone())))
+            .join(format!("{sid}.jsonl"));
+
+        let (ev_tx, ev_rx) = channel::<notify::Result<Event>>();
+        let Ok(mut watcher) = recommended_watcher(ev_tx) else {
+            return;
+        };
+        if watcher
+            .watch(&logs_dir, RecursiveMode::NonRecursive)
+            .is_err()
+        {
+            return;
+        }
+        if ANTIGRAVITY_TURN_WATCH_GEN.load(Ordering::SeqCst) != gen {
+            return;
+        }
+
+        let origin = Instant::now();
+        let initial = antigravity_source_transcript_file_and_len(&logs_dir);
+        let mut gate = match initial {
+            Some((ref src, len)) if !antigravity_export_is_fresh(&export_path, src) => {
+                let mut g = AntigravityLiveRefreshGate::default();
+                g.note_change(0, Some(len));
+                g
+            }
+            Some((_, len)) => AntigravityLiveRefreshGate::seeded(Some(len)),
+            None => AntigravityLiveRefreshGate::default(),
+        };
+
+        let is_transcript_event = |ev: &Event| {
+            ev.paths.iter().any(|p| {
+                matches!(
+                    p.file_name().and_then(|n| n.to_str()),
+                    Some("transcript_full.jsonl" | "transcript.jsonl")
+                )
+            })
+        };
+
+        loop {
+            let wake = ev_rx.recv_timeout(Duration::from_millis(200));
+            if ANTIGRAVITY_TURN_WATCH_GEN.load(Ordering::SeqCst) != gen {
+                break;
+            }
+            match stop_rx.try_recv() {
+                Ok(()) | Err(TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Empty) => {}
+            }
+            if current_provider(&app) != Some(SessionProvider::Antigravity) {
+                break;
+            }
+            let now_ms = origin.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            let mut saw_transcript_event = false;
+            match wake {
+                Ok(Ok(ev)) => {
+                    if is_transcript_event(&ev) {
+                        saw_transcript_event = true;
+                    }
+                }
+                Ok(Err(_)) | Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+            while let Ok(res) = ev_rx.try_recv() {
+                if let Ok(ev) = res {
+                    if is_transcript_event(&ev) {
+                        saw_transcript_event = true;
+                    }
+                }
+            }
+            let cur_len = antigravity_source_transcript_file_and_len(&logs_dir).map(|(_, len)| len);
+            if saw_transcript_event {
+                gate.note_change(now_ms, cur_len);
+            }
+            if gate.poll_ready(now_ms, cur_len).is_some() {
+                emit_antigravity_live_transcript_tick(&app, &sid, &root);
+            }
+        }
+    });
+}
+
+fn antigravity_turn_started<R: tauri::Runtime>(app: &AppHandle<R>, at_ms: i64) {
+    let next = AgentStatus {
+        provider: Some("antigravity".to_string()),
+        state: "working".to_string(),
+        verb: Some("working".to_string()),
+        elapsed_text: None,
+        substate: None,
+        output_tokens_text: None,
+        updated_at_ms: unix_now_ms(),
+        source: Some("osc7501".to_string()),
+    };
+    let mut emit_payload: Option<AgentStatus> = None;
+    if let Ok(mut cur) = agent_status_cell().lock() {
+        if cur.state != next.state || cur.provider != next.provider || cur.verb != next.verb {
+            *cur = next.clone();
+            emit_payload = Some(next);
+        }
+    }
+    if let Some(payload) = emit_payload {
+        maybe_emit_agent_status(app, &payload);
+    }
+    update_turn_state(app, "osc7501", "antigravity-working", |s| {
+        s.provider = Some("antigravity".to_string());
+        s.turn_stamp = Some(at_ms.to_string());
+        if s.pending_menu.is_none() {
+            s.phase = "working".to_string();
+        }
+    });
+    // A later turn of a multi-turn apply: the first turn's end retired the
+    // claim and the authorization is still live (no-op otherwise).
+    if inflight_claim_ids_and_claimed_at(app).is_none() {
+        rearm_claim_for_live_authorization(app);
+    }
+    start_antigravity_turn_watch(app);
+    if bram_trace_enabled() {
+        append_bram_trace_line(
+            app,
+            "antigravity-turn",
+            &format!("op=start via=osc7501 at={}", at_ms),
+        );
+    }
+}
+
+// antigravity-live-check-fixes: Bram hears that a session changed from the
+// session-file watcher (Claude's and Codex's directories) or from OpenCode's
+// plugin events. agy's sessions live in a database under ~/.gemini, so nothing
+// signalled them: live (2026-10-31), a fresh agy partner's queued name never
+// bound to the conversation agy started, and no group formed. A turn's end is
+// when agy has written its conversation row. Not at the start: a fresh
+// partner's row may not exist yet, and the newest one would be the previous
+// conversation. Off the PTY reader thread, since the pass reads agy's
+// database and re-projects its transcript.
+fn antigravity_session_changed<R: tauri::Runtime>(app: &AppHandle<R>) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        emit_talk_session_changed_for_provider(&app, Some(SessionProvider::Antigravity));
+    });
+}
+
+fn antigravity_turn_ended<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    started_at: i64,
+    at_ms: i64,
+    state: &str,
+) {
+    stop_antigravity_turn_watch();
+    agent_status_emit_finished(app, "antigravity", None, None, "osc7501");
+    // The finished conversation's transcript has changed; a sessions pass
+    // re-projects and indexes it (antigravity-sessions-browser).
+    search_index_request(IndexBucket::Sessions);
+    antigravity_session_changed(app);
+    clear_proposing_flag(app, "turn-finished");
+    end_turn_context_unless_fresh(app, "antigravity-turn-end");
+    if bram_trace_enabled() {
+        append_bram_trace_line(
+            app,
+            "antigravity-turn",
+            &format!(
+                "op=end via=osc7501 state={} started={} ms={}",
+                state,
+                started_at,
+                at_ms.saturating_sub(started_at)
+            ),
+        );
+    }
+    let Some((claimed_ids, claimed_at)) = inflight_claim_ids_and_claimed_at(app) else {
+        return;
+    };
+    if claimed_ids.is_empty() {
+        return;
+    }
+    let ids_json = serde_json::to_string(&claimed_ids).unwrap_or_else(|_| "[]".to_string());
+    // The turn's start is its input time: a turn that began before the claim
+    // belongs to earlier work, and the claim waits for its own turn's end.
+    match opencode_end_retires_claim(claimed_at, Some(started_at), at_ms, unix_now_ms()) {
+        Ok(()) => {
+            if bram_trace_enabled() {
+                append_bram_trace_line(
+                    app,
+                    "inflight-sentinel",
+                    &format!(
+                        "op=clear-at-turn-end source=osc7501 provider=antigravity kind={} ids={}",
+                        inflight_claim_kind(app).as_deref().unwrap_or(""),
+                        ids_json
+                    ),
+                );
+            }
+            clear_inflight_claim_sentinel(app, &claimed_ids, "antigravity-turn-end");
+        }
+        Err(reason) => {
+            if bram_trace_enabled() {
+                append_bram_trace_line(
+                    app,
+                    "inflight-sentinel",
+                    &format!(
+                        "op=skip-clear source=osc7501 provider=antigravity reason={} claimed={} started={} ids={}",
+                        reason, claimed_at, started_at, ids_json
+                    ),
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod antigravity_turn_tests {
+    use super::{
+        antigravity_end_state, antigravity_mark, antigravity_marker_message,
+        antigravity_osc_landing, antigravity_trace_quoted, antigravity_turn_step,
+        osc7501_state_bodies, AntigravityMark, AntigravityTurnEvent,
+    };
+
+    fn marker(body: &str) -> Vec<u8> {
+        [b"\x1b]7501;state=".as_slice(), body.as_bytes(), b"\x07"].concat()
+    }
+
+    // The three runs of the 2026-10-31 spike, as agy 1.4.12 emitted them
+    // (docs/agent-specimens/antigravity/osc7501-turns.md), through the parser
+    // and the step function together.
+    fn events(states: &[&str]) -> Vec<AntigravityTurnEvent> {
+        let stream: Vec<u8> = states
+            .iter()
+            .flat_map(|s| [b"screen ".to_vec(), marker(s)].concat())
+            .collect();
+        let (bodies, rest) = osc7501_state_bodies(&stream);
+        assert_eq!(rest, stream.len());
+        let mut open = false;
+        let mut out = Vec::new();
+        for mark in bodies.iter().filter_map(|b| antigravity_mark(b)) {
+            let (next, event) = antigravity_turn_step(open, mark);
+            open = next;
+            out.extend(event);
+        }
+        out
+    }
+
+    #[test]
+    fn spike_runs_end_at_done_or_idle() {
+        use AntigravityTurnEvent::*;
+        let auth = "blocked:kind=auth:app=antigravity:msg=U2lnbiBpbiByZXF1aXJlZA==";
+        // A completed turn ends at `done`; the snapshot 14 s after the reply
+        // still ended there. The two trailing `idle`s came from the
+        // capture's closing Ctrl-C, with no turn open.
+        assert_eq!(
+            events(&[
+                auth,
+                "idle:app=antigravity",
+                "working:app=antigravity",
+                "done:app=antigravity:msg=VFVSTi1PSy03NzMx",
+                "idle:app=antigravity",
+                "idle:app=antigravity",
+            ]),
+            vec![Start, End]
+        );
+        // Esc during a command, then Esc while streaming: two turns, each
+        // ended by `idle`, although agy fired no Stop hook for either.
+        assert_eq!(
+            events(&[
+                auth,
+                "idle:app=antigravity",
+                "working:app=antigravity",
+                "idle:app=antigravity",
+                "working:app=antigravity",
+                "idle:app=antigravity",
+                "idle:app=antigravity",
+            ]),
+            vec![Start, End, Start, End]
+        );
+        // A background command: its turn ends at `done` while the command
+        // runs, and agy's own follow-up when it finishes is a second turn.
+        assert_eq!(
+            events(&[
+                auth,
+                "idle:app=antigravity",
+                "working:app=antigravity",
+                "done:app=antigravity:msg=U1RBUlRFRA==",
+                "working:app=antigravity",
+                "done:app=antigravity:msg=ZG9uZQ==",
+                "idle:app=antigravity",
+            ]),
+            vec![Start, End, Start, End]
+        );
+        // The demo-instance turn (2026-10-31): working, then done, and no
+        // idle afterwards. Its end must not wait for one.
+        assert_eq!(
+            events(&[
+                "working:app=antigravity:msg=RWRpdA==",
+                "done:app=antigravity:msg=REVNTy1UVVJOLTc3MzE=",
+            ]),
+            vec![Start, End]
+        );
+    }
+
+    // antigravity-error-state-surfaced. The 2026-11-03 Windows trace
+    // (docs/agent-specimens/antigravity/osc7501-error.txt): each send went
+    // `working`, then `error` with the quota message in base64, then `idle`.
+    // The trace preview cut the base64 mid-field; the full text is agy's
+    // log's, so the complete marker here is synthesized from it.
+    const QUOTA_TEXT: &str = "Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 125h7m40s.";
+    const QUOTA_B64: &str = "SW5kaXZpZHVhbCBxdW90YSByZWFjaGVkLiBQbGVhc2UgdXBncmFkZSB5b3VyIHN1YnNjcmlwdGlvbiB0byBpbmNyZWFzZSB5b3VyIGxpbWl0cy4gUmVzZXRzIGluIDEyNWg3bTQwcy4=";
+    const QUOTA_B64_AS_TRACED: &str = "SW5kaXZpZHVhbCBxdW90YSByZWFjaGVkLiBQbGVhc";
+
+    #[test]
+    fn error_marker_is_parsed_decoded_and_ends_the_turn_as_error() {
+        use AntigravityTurnEvent::*;
+        let body = format!("error:app=antigravity:msg={}", QUOTA_B64);
+        let stream = [b"screen ".as_slice(), &marker(&body)].concat();
+        let (bodies, rest) = osc7501_state_bodies(&stream);
+        assert_eq!(rest, stream.len());
+        assert_eq!(bodies, vec![body.clone()]);
+        assert_eq!(antigravity_mark(&body), Some(AntigravityMark::Error));
+        assert_eq!(
+            antigravity_marker_message(&body).as_deref(),
+            Some(QUOTA_TEXT)
+        );
+        // The trace's truncated copy still yields the message's prefix.
+        assert_eq!(
+            antigravity_marker_message(&format!(
+                "error:app=antigravity:msg={}",
+                QUOTA_B64_AS_TRACED
+            ))
+            .as_deref(),
+            Some("Individual quota reached. Plea")
+        );
+        assert_eq!(antigravity_marker_message("error:app=antigravity"), None);
+        // The error does not move the turn; the idle after it ends it.
+        assert_eq!(
+            events(&[
+                "working:app=antigravity",
+                body.as_str(),
+                "idle:app=antigravity"
+            ]),
+            vec![Start, End]
+        );
+        assert_eq!(
+            antigravity_turn_step(true, AntigravityMark::Error),
+            (true, None)
+        );
+        assert_eq!(
+            antigravity_turn_step(false, AntigravityMark::Error),
+            (false, None)
+        );
+        // ...and that end is recorded as `error`, not the idle's own state.
+        assert_eq!(antigravity_end_state("idle", 1_000, 1_500), "error");
+        assert_eq!(antigravity_end_state("idle", 1_000, 1_000), "error");
+        assert_eq!(antigravity_end_state("idle", 1_000, 0), "idle");
+        // An earlier turn's error does not colour this one.
+        assert_eq!(antigravity_end_state("done", 1_000, 900), "done");
+        assert_eq!(
+            antigravity_trace_quoted("say \"hi\"\n\\", 300),
+            "say \\\"hi\\\" \\\\"
+        );
+        assert_eq!(antigravity_trace_quoted("abcdef", 3), "abc…");
+    }
+
+    // The send ledger's verdict from the markers, for a send no transcript
+    // search found.
+    #[test]
+    fn osc_markers_land_a_send_agy_took() {
+        // No turn opened after the inject: nothing to say.
+        assert_eq!(antigravity_osc_landing(1_000, 0, 0), None);
+        assert_eq!(antigravity_osc_landing(1_000, 1_000, 0), None);
+        assert_eq!(antigravity_osc_landing(1_000, 900, 950), None);
+        // agy opened a turn after the inject: delivered.
+        assert_eq!(
+            antigravity_osc_landing(1_000, 1_200, 0),
+            Some("osc-working")
+        );
+        // ...and reported an error in that turn: delivered, refused.
+        assert_eq!(
+            antigravity_osc_landing(1_000, 1_200, 1_900),
+            Some("osc-error")
+        );
+        // An error from the turn before this send's is not this send's.
+        assert_eq!(
+            antigravity_osc_landing(1_000, 1_200, 1_100),
+            Some("osc-working")
+        );
+    }
+
+    #[test]
+    fn a_launch_with_a_turn_open_resets_it() {
+        assert_eq!(
+            antigravity_turn_step(true, AntigravityMark::Launch),
+            (false, Some(AntigravityTurnEvent::Reset))
+        );
+        assert_eq!(
+            antigravity_turn_step(true, AntigravityMark::Other),
+            (true, None)
+        );
+    }
+
+    #[test]
+    fn marks_belong_to_antigravity_only() {
+        assert_eq!(
+            antigravity_mark("working:app=antigravity"),
+            Some(AntigravityMark::Working)
+        );
+        assert_eq!(
+            antigravity_mark("done:app=antigravity:msg=eA=="),
+            Some(AntigravityMark::Ended)
+        );
+        assert_eq!(
+            antigravity_mark("idle:app=antigravity"),
+            Some(AntigravityMark::Ended)
+        );
+        // The folder-trust dialog reports this; it is not a turn boundary.
+        assert_eq!(
+            antigravity_mark("blocked:kind=permission:app=antigravity:msg=VHJ1c3Q="),
+            Some(AntigravityMark::Other)
+        );
+        assert_eq!(antigravity_mark("idle:app=opencode"), None);
+        assert_eq!(antigravity_mark("idle:id=x:app=codex"), None);
+    }
+
+    #[test]
+    fn markers_end_at_bel_or_st_and_split_ones_are_carried() {
+        let st = b"a\x1b]7501;state=idle:app=antigravity\x1b\\b";
+        assert_eq!(
+            osc7501_state_bodies(st),
+            (vec!["idle:app=antigravity".to_string()], st.len())
+        );
+        // Split inside the body: nothing yet, and the marker's start is kept.
+        let body_split = b"xx\x1b]7501;state=work";
+        assert_eq!(osc7501_state_bodies(body_split), (vec![], 2));
+        // Split inside the introducer.
+        let intro_split = b"xx\x1b]75";
+        assert_eq!(osc7501_state_bodies(intro_split), (vec![], 2));
+        // The carried start plus the next chunk completes it.
+        let joined = [&body_split[2..], b"ing:app=antigravity\x07".as_slice()].concat();
+        assert_eq!(
+            osc7501_state_bodies(&joined),
+            (vec!["working:app=antigravity".to_string()], joined.len())
+        );
+        // A plain ESC sequence at the end is not a marker start.
+        let other = b"text\x1b[0m";
+        assert_eq!(osc7501_state_bodies(other), (vec![], other.len()));
+    }
+
+    #[test]
+    fn live_refresh_gate_coalesces_bursts_and_caps_sustained_streams() {
+        use super::{
+            antigravity_turn_watch_stop_cell, stop_antigravity_turn_watch,
+            AntigravityLiveRefreshGate, ANTIGRAVITY_TURN_WATCH_GEN,
+        };
+        use std::sync::atomic::Ordering;
+        use std::sync::mpsc::TryRecvError;
+
+        // Seeded fresh state emits nothing until byte length grows.
+        let mut gate = AntigravityLiveRefreshGate::seeded(Some(100));
+        gate.note_change(0, Some(100));
+        assert_eq!(gate.poll_ready(500, Some(100)), None);
+
+        // A 3-write burst (t = 100, 200, 350) coalesces into one emit at 350 + 400 = 750ms.
+        gate.note_change(100, Some(150));
+        assert_eq!(gate.poll_ready(200, Some(150)), None);
+        gate.note_change(200, Some(220));
+        gate.note_change(350, Some(300));
+        assert_eq!(gate.poll_ready(700, Some(300)), None);
+        assert_eq!(gate.poll_ready(750, Some(300)), Some(300));
+        // Duplicate event with unchanged byte length is suppressed.
+        gate.note_change(800, Some(300));
+        assert_eq!(gate.poll_ready(1300, Some(300)), None);
+
+        // Continuous writes every 200ms (never quiet for 400ms) still flush at
+        // the 1500ms interval cap rather than starving for minutes.
+        let mut t = 1000u64;
+        let mut size = 400u64;
+        let mut fired_at = Vec::new();
+        while t <= 4500 {
+            size += 50;
+            gate.note_change(t, Some(size));
+            if gate.poll_ready(t, Some(size)).is_some() {
+                fired_at.push(t);
+            }
+            t += 200;
+        }
+        assert_eq!(fired_at, vec![2600, 4400]);
+
+        // Stopping a turn watch advances generation and disconnects its stop channel.
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        *antigravity_turn_watch_stop_cell().lock().unwrap() = Some(tx);
+        let before = ANTIGRAVITY_TURN_WATCH_GEN.load(Ordering::SeqCst);
+        stop_antigravity_turn_watch();
+        assert!(ANTIGRAVITY_TURN_WATCH_GEN.load(Ordering::SeqCst) > before);
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Disconnected));
+    }
+}
+
 // opencode-permission-menu: OpenCode asks in its own prompt, and Bram's plugin
 // reports it as permission.asked, then permission.replied once it is answered
 // (in the terminal, or by the pane's keys). Each request becomes a claim in the
 // queue Claude's and Codex's hook menus use, keyed by OpenCode's request id.
 //
-// The plugin runs in OpenCode's shared background service (`opencode serve
-// --service`, started by whichever OpenCode ran first, ppid 1), so it can't
-// carry the BRAM_MENU_TOKEN Bram gives the agent it launches (#113). The
-// evidence instead is Bram's own terminal: the card shows only once the
-// terminal draws OpenCode's permission prompt. That also keeps a prompt from
-// another OpenCode window on the same project out of this pane.
+// The token doesn't settle this. Launched --standalone the plugin carries
+// BRAM_MENU_TOKEN (#113), but the route still accepts an untokened event until
+// it has seen one (handle_opencode_event), as OpenCode's shared background
+// service sends. The evidence stays Bram's own terminal: the card shows only
+// once the terminal draws OpenCode's permission prompt. That also keeps a
+// prompt from another OpenCode window on the same project out of this pane.
 //
 // opencode-question-card: its question tool's forms (form.created, then
 // form.replied or form.cancelled) take the same path, keyed by the form id and
@@ -86680,10 +102631,37 @@ fn handle_opencode_event<R: tauri::Runtime>(
     body: &[u8],
 ) -> (u16, &'static str, Vec<u8>) {
     const JSON: &str = "application/json; charset=utf-8";
-    let v: serde_json::Value = match serde_json::from_slice(body) {
+    let parsed: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(_) => return (400, JSON, b"{\"ok\":false}".to_vec()),
     };
+    // opencode-session-own-terminal: rule 1 of the session spine, "this Bram's
+    // terminal". Launched `--standalone`, the plugin has the token.
+    let authed = authenticated_menu_payload(body, menu_session_token());
+    let claimed = parsed.get("bram_token").is_some();
+    if authed.is_some() {
+        OPENCODE_TOKEN_SEEN.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    if opencode_event_is_foreign(
+        authed.is_some(),
+        claimed,
+        OPENCODE_TOKEN_SEEN.load(std::sync::atomic::Ordering::SeqCst),
+    ) {
+        if bram_trace_enabled() {
+            append_bram_trace_line(
+                app,
+                "opencode-event",
+                &format!(
+                    "op=foreign-dropped type={} session={} claimed={}",
+                    opencode_event_token(&parsed, "type"),
+                    opencode_event_token(&parsed, "sessionID"),
+                    claimed
+                ),
+            );
+        }
+        return (200, JSON, b"{\"ok\":true,\"handled\":false}".to_vec());
+    }
+    let v = authed.unwrap_or(parsed);
     // Ids and event names are token-shaped; anything else is dropped from the
     // trace rather than written into it.
     let token = |k: &str| opencode_event_token(&v, k);
@@ -86747,11 +102725,58 @@ fn handle_opencode_event<R: tauri::Runtime>(
     // opencode-sessions-browser: whichever session OpenCode's events name is
     // the live one, and every boundary may have added export lines, so the
     // Transcript refreshes as it does when a Claude transcript grows.
-    if let Ok(mut live) = opencode_live_session_cell().lock() {
-        *live = Some(sid.clone());
+    let previous = opencode_live_session_cell()
+        .lock()
+        .ok()
+        .and_then(|mut live| live.replace(sid.clone()));
+    if previous.as_deref() != Some(sid.as_str()) && bram_trace_enabled() {
+        append_bram_trace_line(
+            app,
+            "agent-switch",
+            &format!(
+                "op=live-session-set provider=opencode session={} previous={} source=agent-event",
+                sid,
+                previous.as_deref().unwrap_or("")
+            ),
+        );
     }
     emit_talk_session_changed_for_provider(app, Some(SessionProvider::Opencode));
     (200, JSON, b"{\"ok\":true,\"handled\":true}".to_vec())
+}
+
+// opencode-session-own-terminal: until a tokened event has been seen, an
+// untokened one is a project whose plugin predates the token (Setup's banner
+// offers the refresh), or an OpenCode without --standalone, and is taken as
+// before. After one, it's another OpenCode in this project. A wrong token is
+// another Bram's terminal either way.
+static OPENCODE_TOKEN_SEEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn opencode_event_is_foreign(authenticated: bool, claimed: bool, token_seen: bool) -> bool {
+    !authenticated && (claimed || token_seen)
+}
+
+#[cfg(test)]
+mod opencode_event_identity_tests {
+    use super::opencode_event_is_foreign as foreign;
+
+    #[test]
+    fn this_terminals_events_always_count() {
+        assert!(!foreign(true, true, false));
+        assert!(!foreign(true, true, true));
+    }
+
+    #[test]
+    fn a_wrong_token_never_counts() {
+        assert!(foreign(false, true, false));
+        assert!(foreign(false, true, true));
+    }
+
+    #[test]
+    fn an_untokened_event_counts_only_until_the_token_is_seen() {
+        assert!(!foreign(false, false, false));
+        assert!(foreign(false, false, true));
+    }
 }
 
 fn handle_hook_trace<R: tauri::Runtime>(
@@ -87138,8 +103163,44 @@ fn handle_http<R: tauri::Runtime>(app: &AppHandle<R>, mut request: tiny_http::Re
         .find(|h| h.field.equiv("Origin"))
         .map(|h| h.value.as_str().to_string());
 
+    // issue-465: one gate for state-changing requests and for any Host that
+    // isn't this instance's loopback address (DNS rebinding). Refusals are
+    // traced so a false refusal shows up in the log.
+    let request_host: Option<String> = request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Host"))
+        .map(|h| h.value.as_str().to_string());
+    let gate_refusal = loopback_gate_refusal(
+        &method,
+        path,
+        request_origin.as_deref(),
+        request_host.as_deref(),
+        LOOPBACK_PORT.get().copied(),
+    );
+    if let Some(reason) = gate_refusal {
+        append_bram_trace_line(
+            app,
+            "loopback-refusal",
+            &format!(
+                "op=refuse reason={} method={} path=/{} origin={} host={}",
+                reason,
+                method,
+                path,
+                request_origin.as_deref().unwrap_or("(none)"),
+                request_host.as_deref().unwrap_or("(none)")
+            ),
+        );
+    }
+
     // POST-only routes (route_request is GET-only).
-    let (status, content_type, body) = if path == "__self-update" {
+    let (status, content_type, body) = if gate_refusal.is_some() {
+        (
+            403,
+            "text/plain; charset=utf-8",
+            b"forbidden: cross-origin caller".to_vec(),
+        )
+    } else if path == "__self-update" {
         // clickable-update-from-banner: start the install flow (idempotent
         // guard: 409 while one runs). Progress rides /__self-update/status +
         // the self-update-changed event.
@@ -87154,20 +103215,6 @@ fn handle_http<R: tauri::Runtime>(app: &AppHandle<R>, mut request: tiny_http::Re
         } else {
             handle_self_update_relaunch(app)
         }
-    } else if path == "__issue/comment" && !issue_comment_origin_allowed(request_origin.as_deref())
-    {
-        // M7 (docs/security.md): /__issue/comment is a forge WRITE posting as
-        // the user; a browser page that learned the port must not drive it.
-        // Refuse when a FOREIGN Origin is present — no-Origin callers (the
-        // pane's own fetches, which the H6 soak showed send no Origin, and
-        // curl) and the shell origin itself pass. This is exactly H6's
-        // accepted-residual boundary, enforced with its soaked platform-aware
-        // SHELL_ORIGIN rather than a fresh predicate.
-        (
-            403,
-            "text/plain; charset=utf-8",
-            b"forbidden: cross-origin caller".to_vec(),
-        )
     } else if path == "query" {
         // issue-355: the dataType="sql" receiving end. Unprefixed on
         // purpose — target markup calls it with a relative URL, matching
@@ -87220,7 +103267,7 @@ fn handle_http<R: tauri::Runtime>(app: &AppHandle<R>, mut request: tiny_http::Re
         } else {
             let mut buf = Vec::new();
             let _ = request.as_reader().read_to_end(&mut buf);
-            handle_worklist_mutate(app, &buf)
+            handle_worklist_mutate(app, &buf, MutateCaller::External)
         }
     } else if path == "__worklist/drop" {
         // issue-340: a host-direct drop. A drop is pure host work
@@ -87244,6 +103291,16 @@ fn handle_http<R: tauri::Runtime>(app: &AppHandle<R>, mut request: tiny_http::Re
             let mut buf = Vec::new();
             let _ = request.as_reader().read_to_end(&mut buf);
             handle_worklist_clear_landed(app, &buf)
+        }
+    } else if path == "__worklist/reanchor" {
+        // gate-names-the-outside-commit-that-strands-an-item: see
+        // handle_worklist_reanchor.
+        if method != "POST" {
+            (405, "text/plain; charset=utf-8", b"POST only".to_vec())
+        } else {
+            let mut buf = Vec::new();
+            let _ = request.as_reader().read_to_end(&mut buf);
+            handle_worklist_reanchor(app, &buf)
         }
     } else if path == "__worklist/reorder" {
         if method != "POST" {
@@ -87269,6 +103326,12 @@ fn handle_http<R: tauri::Runtime>(app: &AppHandle<R>, mut request: tiny_http::Re
             let _ = request.as_reader().read_to_end(&mut buf);
             handle_audit_direct_edit(app, &buf)
         }
+    } else if path == "__pane/flush" {
+        if method != "POST" {
+            (405, "text/plain; charset=utf-8", b"POST only".to_vec())
+        } else {
+            handle_pane_flush(app)
+        }
     } else if path == "__trace/pane" {
         if method != "POST" {
             (405, "text/plain; charset=utf-8", b"POST only".to_vec())
@@ -87292,6 +103355,63 @@ fn handle_http<R: tauri::Runtime>(app: &AppHandle<R>, mut request: tiny_http::Re
             let mut buf = Vec::new();
             let _ = request.as_reader().read_to_end(&mut buf);
             handle_permission_menu(app, &buf, false)
+        }
+    } else if path == "__agent/session" {
+        if method != "POST" {
+            (405, "text/plain; charset=utf-8", b"POST only".to_vec())
+        } else {
+            let mut buf = Vec::new();
+            let _ = request.as_reader().read_to_end(&mut buf);
+            handle_agent_session(app, &buf)
+        }
+    } else if path == "__agent/subagent" {
+        // delegated-work-action-gates: the guard's SubagentStart/Stop report.
+        if method != "POST" {
+            (405, "text/plain; charset=utf-8", b"POST only".to_vec())
+        } else {
+            let mut buf = Vec::new();
+            let _ = request.as_reader().read_to_end(&mut buf);
+            handle_agent_subagent(app, &buf)
+        }
+    } else if path == "__agent/subagent/release" {
+        // delegated-work-action-gates: the row's Release control.
+        if method != "POST" {
+            (405, "text/plain; charset=utf-8", b"POST only".to_vec())
+        } else {
+            let mut buf = Vec::new();
+            let _ = request.as_reader().read_to_end(&mut buf);
+            handle_agent_subagent_release(app, &buf)
+        }
+    } else if path == "__state-dir/decision" {
+        // issue-469-mixed-folder-dialog: the banner's Move / Not now.
+        if method != "POST" {
+            (405, "text/plain; charset=utf-8", b"POST only".to_vec())
+        } else if let Some(root) = project_root(Some(app)) {
+            let mut buf = Vec::new();
+            let _ = request.as_reader().read_to_end(&mut buf);
+            let out = handle_state_move_decision(&root, &buf, unix_now_ms());
+            append_bram_trace_line(
+                app,
+                "state-dir",
+                &format!(
+                    "op=decision status={} body={}",
+                    out.0,
+                    String::from_utf8_lossy(&out.2)
+                ),
+            );
+            // The banner and Status refetch on this push, rather than waiting
+            // on an APICall's completion, which the pane delivered ~30 s late
+            // on both platforms (issue-469-state-move-pane-fixes).
+            if out.0 == 200 {
+                emit_replayable_signal(app, "state-dir-changed");
+            }
+            out
+        } else {
+            (
+                500,
+                "text/plain; charset=utf-8",
+                b"no project root".to_vec(),
+            )
         }
     } else if path == "__menu/permission/clear" {
         if method != "POST" {
@@ -87318,6 +103438,13 @@ fn handle_http<R: tauri::Runtime>(app: &AppHandle<R>, mut request: tiny_http::Re
             let _ = request.as_reader().read_to_end(&mut buf);
             handle_opencode_event(app, &buf)
         }
+    } else if path == "__worklist/misaddressed" {
+        // misaddressed-feedback-resends-as-chat: see handle_worklist_misaddressed.
+        let mut buf = Vec::new();
+        if method == "POST" {
+            let _ = request.as_reader().read_to_end(&mut buf);
+        }
+        handle_worklist_misaddressed(app, &method, &buf)
     } else if path == "__worklist/end" {
         // The last-action route agents may call to close approved/drop
         // turns (the sentinel doesn't care which kind wrote it; the
@@ -87459,32 +103586,153 @@ fn cors_allowed_origin(request_origin: Option<&str>) -> Option<&'static str> {
     }
 }
 
-// M7 (docs/security.md): the write-route screen built on the same boundary.
-// CORS stops a foreign page READING responses; it does not stop the request
-// itself, and /__issue/comment has an external side effect. So the request is
-// refused outright when a foreign Origin is present. No-Origin callers pass —
-// the pane's own fetches send no Origin (H6 soak receipt) and a same-user
-// local process is the accepted residual. Pure for unit testing.
-fn issue_comment_origin_allowed(request_origin: Option<&str>) -> bool {
+// issue-465 (docs/security.md H6 send half, M7): the Origin rule for
+// state-changing requests. CORS stops a foreign page READING responses; it does
+// not stop the request, so a foreign Origin is refused outright. No-Origin
+// callers pass (the pane's own fetches, hooks, guards, scripts and curl send
+// none; a same-user local process is H6's accepted residual). The shell origin
+// passes. `Origin: null` (sandboxed iframes, file:// pages) is foreign. The
+// display-only target pane (`bramapp://localhost`) is foreign here too.
+// Pure for unit testing.
+fn state_change_origin_allowed(request_origin: Option<&str>) -> bool {
     match request_origin {
         None => true,
         Some(o) => o == SHELL_ORIGIN,
     }
 }
 
+// GET routes that change state or have side effects beyond reading. Origin
+// rule applies to them as to non-GET methods. Keep in step with route_request.
+const STATE_CHANGING_GET_PATHS: &[&str] = &[
+    "__issue/comment",    // forge write
+    "__enhance/run",      // runs Setup (writes files, hooks)
+    "__restart-server",   // restarts the spawned project server
+    "__worklist/init",    // creates worklist.json
+    "__worklist/resolve", // consumes the recorded approval
+    "__startup-ready",    // emits startup events
+];
+
+fn request_changes_state(method: &str, path: &str) -> bool {
+    !matches!(method, "GET" | "HEAD" | "OPTIONS") || STATE_CHANGING_GET_PATHS.contains(&path)
+}
+
+// Host must be 127.0.0.1 or localhost at this instance's port; anything else
+// is a DNS-rebinding attempt. A missing Host passes: HTTP/1.1 requires one, so
+// only a hand-rolled HTTP/1.0 client omits it, and a browser (the rebinding
+// vector) always sends it. Pure for unit testing.
+fn loopback_host_allowed(host: Option<&str>, port: Option<u16>) -> bool {
+    let Some(host) = host else { return true };
+    let Some(port) = port else { return true };
+    let host = host.trim().to_ascii_lowercase();
+    host == format!("127.0.0.1:{port}") || host == format!("localhost:{port}")
+}
+
+// The gate: Some(reason) when the request must be refused with 403.
+fn loopback_gate_refusal(
+    method: &str,
+    path: &str,
+    request_origin: Option<&str>,
+    request_host: Option<&str>,
+    port: Option<u16>,
+) -> Option<&'static str> {
+    if !loopback_host_allowed(request_host, port) {
+        return Some("bad-host");
+    }
+    if request_changes_state(method, path) && !state_change_origin_allowed(request_origin) {
+        return Some("foreign-origin");
+    }
+    None
+}
+
 #[cfg(test)]
 mod cors_origin_tests {
-    use super::{cors_allowed_origin, issue_comment_origin_allowed, SHELL_ORIGIN};
+    use super::{
+        cors_allowed_origin, loopback_gate_refusal, loopback_host_allowed,
+        state_change_origin_allowed, SHELL_ORIGIN,
+    };
 
     #[test]
-    fn issue_comment_screen_passes_no_origin_and_shell_only() {
-        // M7: no-Origin (pane fetches, curl) and the shell origin pass; any
-        // foreign Origin — another page, the display-only target pane — is
-        // refused before the forge write runs.
-        assert!(issue_comment_origin_allowed(None));
-        assert!(issue_comment_origin_allowed(Some(SHELL_ORIGIN)));
-        assert!(!issue_comment_origin_allowed(Some("https://evil.example")));
-        assert!(!issue_comment_origin_allowed(Some("bramapp://localhost")));
+    fn state_change_rule_passes_no_origin_and_shell_only() {
+        assert!(state_change_origin_allowed(None));
+        assert!(state_change_origin_allowed(Some(SHELL_ORIGIN)));
+        assert!(!state_change_origin_allowed(Some("https://evil.example")));
+        assert!(!state_change_origin_allowed(Some("bramapp://localhost")));
+        assert!(!state_change_origin_allowed(Some(
+            "http://bramapp.localhost"
+        )));
+        assert!(!state_change_origin_allowed(Some("null")));
+        assert!(!state_change_origin_allowed(Some("")));
+    }
+
+    #[test]
+    fn host_must_be_loopback_at_our_port() {
+        let p = Some(5000u16);
+        assert!(loopback_host_allowed(Some("127.0.0.1:5000"), p));
+        assert!(loopback_host_allowed(Some("localhost:5000"), p));
+        assert!(loopback_host_allowed(Some("LocalHost:5000"), p));
+        assert!(loopback_host_allowed(None, p));
+        assert!(!loopback_host_allowed(Some("127.0.0.1:5001"), p));
+        assert!(!loopback_host_allowed(Some("127.0.0.1"), p));
+        assert!(!loopback_host_allowed(Some("evil.example:5000"), p));
+        assert!(!loopback_host_allowed(
+            Some("127.0.0.1.evil.example:5000"),
+            p
+        ));
+        assert!(!loopback_host_allowed(Some(""), p));
+    }
+
+    #[test]
+    fn gate_refuses_foreign_origin_on_state_changes_only() {
+        let h = Some("127.0.0.1:5000");
+        let p = Some(5000u16);
+        let evil = Some("https://evil.example");
+        // state-changing: POST, and the GET routes with side effects
+        assert_eq!(
+            loopback_gate_refusal("POST", "__worklist/reorder", evil, h, p),
+            Some("foreign-origin")
+        );
+        assert_eq!(
+            loopback_gate_refusal(
+                "POST",
+                "__worklist/reorder",
+                Some("bramapp://localhost"),
+                h,
+                p
+            ),
+            Some("foreign-origin")
+        );
+        assert_eq!(
+            loopback_gate_refusal("GET", "__enhance/run", evil, h, p),
+            Some("foreign-origin")
+        );
+        assert_eq!(
+            loopback_gate_refusal("GET", "__issue/comment", evil, h, p),
+            Some("foreign-origin")
+        );
+        assert_eq!(
+            loopback_gate_refusal("POST", "__self-update", evil, h, p),
+            Some("foreign-origin")
+        );
+        // legitimate
+        assert_eq!(
+            loopback_gate_refusal("POST", "__worklist/reorder", None, h, p),
+            None
+        );
+        assert_eq!(
+            loopback_gate_refusal("POST", "__worklist/reorder", Some(SHELL_ORIGIN), h, p),
+            None
+        );
+        // reads from a foreign origin still reach the handler (CORS governs reading)
+        assert_eq!(loopback_gate_refusal("GET", "__worklist", evil, h, p), None);
+        assert_eq!(
+            loopback_gate_refusal("OPTIONS", "__worklist", evil, h, p),
+            None
+        );
+        // bad Host refused even for a read
+        assert_eq!(
+            loopback_gate_refusal("GET", "__worklist", None, Some("evil.example:5000"), p),
+            Some("bad-host")
+        );
     }
 
     #[test]
@@ -88033,7 +104281,6 @@ pub fn run() {
             // switch-matrix-harness: test-drive routes, only on request.
             if test_drive_enabled() {
                 let _ = TEST_DRIVE_APP.set(app.handle().clone());
-                append_bram_trace_line(app.handle(), "test-drive", "op=enabled env=BRAM_TEST_DRIVE");
             }
             // issue-405: SIGTERM/SIGINT/SIGHUP run shutdown_children, so a
             // `kill` hangs up the terminal's jobs instead of orphaning them.
@@ -88049,13 +104296,31 @@ pub fn run() {
             // to ephemeral when the previous port is held by anything
             // else, including a second Bram instance.
             let startup_project_root = project_root(Some(app.handle()));
+            // judell/bram#469: move resources/ to .bram/ before anything
+            // opens a file under it. Traced after prepare_bram_trace_log.
+            let state_migrate_lines = startup_project_root.as_deref().map(|root| {
+                let outcome = if project_folder().is_ok() {
+                    migrate_state_dir(root)
+                } else {
+                    StateMigrateOutcome::Skipped("not-repo")
+                };
+                let lines = state_migrate_trace_lines(&outcome);
+                // Only an outcome the trace can't record goes to stderr: outside
+                // a project folder nothing is traced at all.
+                if matches!(outcome, StateMigrateOutcome::Skipped("not-repo")) {
+                    for line in &lines {
+                        eprintln!("[state-migrate] {}", line);
+                    }
+                }
+                (lines, state_migrate_moved(&outcome))
+            });
             set_shell_window_title(app.handle());
             set_shell_dock_badge(app.handle());
             // issue-414: --minimized / --open-app, or .bram.json "launch".
             apply_launch_options(app.handle(), startup_project_root.as_deref());
             let previous_port = startup_project_root
                 .as_ref()
-                .and_then(|p| std::fs::read_to_string(p.join("resources/.bram-port")).ok())
+                .and_then(|p| std::fs::read_to_string(resource_relative_path(p, ".bram-port")).ok())
                 .and_then(|s| s.trim().parse::<u16>().ok())
                 .filter(|&p| (49152..=65535).contains(&p));
             let (server, sticky) = match previous_port {
@@ -88084,12 +104349,40 @@ pub fn run() {
             let _ = LOOPBACK_STARTED_MS.set(started_at_ms);
             eprintln!("[bram] loopback port={} sticky={}", port, sticky);
             if let Some(proj) = startup_project_root.as_ref() {
-                remove_bram_port_files(proj);
                 // issue-217: startup is the safe cutover point for the
                 // hook rename — no Bram-spawned session exists yet.
                 prune_legacy_claude_hooks(proj);
             }
+            // Must run before the first `append_bram_trace_line` of the
+            // process: the first trace caches the log's file handle, and the
+            // archive rename below would carry that handle into the archive
+            // (test-drive-trace-before-archive).
             prepare_bram_trace_log(app.handle());
+            if let Some((lines, moved)) = &state_migrate_lines {
+                for line in lines {
+                    append_bram_trace_line(app.handle(), "state-migrate", line);
+                }
+                // No rescan request is needed: the search indexer's first
+                // pass (below) reads worklist-history through the resolver,
+                // under keys that don't name the folder.
+                if *moved {
+                    queue_host_note(
+                        app.handle(),
+                        STATE_MOVED_NOTE_KIND,
+                        STATE_MOVED_NOTE.to_string(),
+                    );
+                }
+            }
+            if let Some(proj) = startup_project_root.as_ref() {
+                if let Some(line) = fold_untracked_root_settings(proj) {
+                    append_bram_trace_line(app.handle(), "state-migrate", &line);
+                }
+                let line = state_settings_note(app.handle(), proj);
+                append_bram_trace_line(app.handle(), "state-migrate", &line);
+            }
+            if test_drive_enabled() {
+                append_bram_trace_line(app.handle(), "test-drive", "op=enabled env=BRAM_TEST_DRIVE");
+            }
             trace_whisper_env(app.handle());
             // issue-230 unified search: background Claude-session indexer.
             start_search_indexer(app.handle().clone());
@@ -88122,6 +104415,7 @@ pub fn run() {
             // design), so name it at startup too — the trace dedupe keeps
             // this and the board serve from double-logging one record.
             let _ = stranded_approval_ids(app.handle());
+            harmonize_antigravity_members_at_startup(app.handle().clone());
             // Remove any stale pty-intent queue from a prior session so
             // its intents don't replay into the fresh PTY. Refs #86.
             cleanup_stale_pty_intents(app.handle());
@@ -88271,10 +104565,11 @@ pub fn run() {
                 }
             });
             // Publish the loopback port only after the accept loop is
-            // actually serving HTTP. Otherwise agents can race startup:
-            // lsof shows a listener, but curl still gets connection refused.
+            // actually serving HTTP, and preserve a live same-project owner.
+            // Leave the old files in place until this decision: deleting them
+            // at startup hides the owner and lets a second instance take over.
             if let Some(proj) = startup_project_root.as_ref() {
-                let port_path = proj.join("resources/.bram-port");
+                let port_path = resource_relative_path(proj, ".bram-port");
                 // issue-353: never scaffold the home directory. The port
                 // files are the write that creates ~/resources on a
                 // mis-launch, and everything under home then reads as
@@ -88291,18 +104586,27 @@ pub fn run() {
                         proj.display()
                     );
                 } else if wait_for_loopback_http(port, 5000) {
-                    match write_bram_port_files(proj, port, started_at_ms) {
-                        Ok(()) => eprintln!(
-                            "[bram] wrote ready port files: {}, {}",
-                            port_path.display(),
-                            bram_port_metadata_path(&port_path).display()
+                    let publication = git_dir_path(app.handle())
+                        .ok_or_else(|| "could not resolve this project's git directory".to_string())
+                        .and_then(|git_dir| {
+                            publish_bram_port_files(proj, &git_dir, port, started_at_ms)
+                        });
+                    let detail = match publication {
+                        Ok(None) => format!(
+                            "op=publish port={} pid={} started_at_ms={}",
+                            port, std::process::id(), started_at_ms
                         ),
-                        Err(e) => eprintln!(
-                            "[bram] failed to write ready port files for {}: {}",
-                            port_path.display(),
-                            e
+                        Ok(Some(owner_port)) => format!(
+                            "op=preserve reason=live-project-owner port={} owner_port={} pid={}",
+                            port, owner_port, std::process::id()
                         ),
-                    }
+                        Err(e) => format!(
+                            "op=publish-error port={} pid={} error={:?}",
+                            port, std::process::id(), e
+                        ),
+                    };
+                    eprintln!("[bram-port] {}", detail);
+                    append_bram_trace_line(app.handle(), "bram-port", &detail);
                 } else {
                     eprintln!(
                         "[bram] loopback port {} did not become HTTP-ready; leaving {} unpublished",
@@ -88694,8 +104998,9 @@ pub fn run() {
                         Err(RecvTimeoutError::Timeout) => continue,
                         Err(RecvTimeoutError::Disconnected) => break,
                     };
+                    let state_dir_name = bram_state_dir_name(&proj_root_path);
                     let in_ignored_dir = |p: &std::path::Path| {
-                        let igs = [".git", "target", "node_modules", "resources"];
+                        let igs = [".git", "target", "node_modules", state_dir_name];
                         p.components().any(|c| {
                             let name = c.as_os_str();
                             igs.iter().any(|ig| name == *ig)
@@ -88713,8 +105018,8 @@ pub fn run() {
                                     .unwrap_or("")
                                     .to_string()
                             });
-                        if rel == "resources/bram-traces/bram-trace.log"
-                            || is_bram_trace_archive_rel(&rel)
+                        if is_bram_trace_live_rel(&proj_root_path, &rel)
+                            || is_bram_trace_archive_rel(&proj_root_path, &rel)
                         {
                             None
                         } else {
@@ -88806,8 +105111,8 @@ pub fn run() {
                                         .unwrap_or("")
                                         .to_string()
                                 });
-                            if rel == "resources/bram-traces/bram-trace.log"
-                                || is_bram_trace_archive_rel(&rel)
+                            if is_bram_trace_live_rel(&proj_root_path, &rel)
+                                || is_bram_trace_archive_rel(&proj_root_path, &rel)
                             {
                                 continue;
                             }
@@ -89045,7 +105350,7 @@ pub fn run() {
                     // file, or anything under resources/worklist-history/. Workspace
                     // refetches its DataSources on this.
                     let is_worklist_change = event.paths.iter().any(|p| {
-                        let in_resources = p.components().any(|c| c.as_os_str() == "resources");
+                        let in_resources = p.components().any(|c| c.as_os_str() == state_dir_name);
                         let file = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
                         let in_history = p
                             .components()
@@ -89071,7 +105376,7 @@ pub fn run() {
                     // (once per iterate cycle), so no debounce needed.
                     let is_feedback_history_change = event.paths.iter().any(|p| {
                         p.components().any(|c| c.as_os_str() == "feedback-history")
-                            && p.components().any(|c| c.as_os_str() == "resources")
+                            && p.components().any(|c| c.as_os_str() == state_dir_name)
                     });
                     if is_feedback_history_change {
                         trace_dispatch("feedback-history", &[]);
@@ -89086,7 +105391,7 @@ pub fn run() {
                     // them.
                     let is_feedback_drafts_change = event.paths.iter().any(|p| {
                         p.components().any(|c| c.as_os_str() == "feedback-drafts")
-                            && p.components().any(|c| c.as_os_str() == "resources")
+                            && p.components().any(|c| c.as_os_str() == state_dir_name)
                     });
                     if is_feedback_drafts_change {
                         trace_dispatch("feedback-drafts", &[]);
@@ -89101,7 +105406,7 @@ pub fn run() {
                     // file, so duplicate events in one notify burst no-op.
                     let is_intent_event = event.paths.iter().any(|p| {
                         p.file_name().and_then(|n| n.to_str()) == Some(".worklist-intent.json")
-                            && p.components().any(|c| c.as_os_str() == "resources")
+                            && p.components().any(|c| c.as_os_str() == state_dir_name)
                     });
                     if is_intent_event
                         && matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_))
@@ -89121,7 +105426,7 @@ pub fn run() {
                     let is_close_queue_event = event.paths.iter().any(|p| {
                         p.file_name().and_then(|n| n.to_str())
                             == Some(".worklist-issue-close.json")
-                            && p.components().any(|c| c.as_os_str() == "resources")
+                            && p.components().any(|c| c.as_os_str() == state_dir_name)
                     });
                     if is_close_queue_event {
                         if let Some(ref cq_path) = close_queue_path {
@@ -89194,7 +105499,7 @@ pub fn run() {
                     // Detect them here, snapshot the prior contents, then
                     // fall through to the normal skip.
                     let is_worklist_event = event.paths.iter().any(|p| {
-                        let in_resources = p.components().any(|c| c.as_os_str() == "resources");
+                        let in_resources = p.components().any(|c| c.as_os_str() == state_dir_name);
                         let in_drafts = p
                             .components()
                             .any(|c| c.as_os_str() == "worklist-drafts");
@@ -89536,8 +105841,11 @@ fn reset_state_after_pty_replace<R: tauri::Runtime>(app: &AppHandle<R>) {
                 serde_json::to_string(&ids).unwrap_or_else(|_| "[]".to_string())
             ),
         );
-        clear_inflight_claim_sentinel(app, &ids);
     }
+    // delegated-work-action-gates: the spawning session is gone, and its
+    // subagents with it: release their bindings and clear the claim (the
+    // force variant).
+    delegated_release_all_and_clear(app, "session-end");
     let provider = match current_provider(app) {
         Some(SessionProvider::Codex) => "codex",
         Some(SessionProvider::Opencode) => "opencode",
@@ -90955,7 +107263,8 @@ mod untracked_undeclared_tests {
         for i in 0..2 {
             untracked.push(format!("build/out{}.o", i));
         }
-        let (count, top, bram_owned) = untracked_undeclared_summary(&untracked, &declared);
+        let (count, top, bram_owned) =
+            untracked_undeclared_summary(crate::test_state_root(), &untracked, &declared);
         assert_eq!(count, 8);
         assert_eq!(bram_owned, 0);
         assert_eq!(
@@ -90992,29 +107301,31 @@ mod untracked_undeclared_tests {
     // resources/review/...) or stops excluding Bram's churn.
     #[test]
     fn bram_owned_files_are_excluded_but_project_resources_count() {
-        let untracked = paths(&[
-            "resources/worklist.json",
-            "resources/worklist-drafts/a.md",
-            "resources/worklist-history/2026.json",
-            "resources/feedback-history/x.md",
-            "resources/outbound-turns/1-turn.json",
-            "resources/message-drafts/d.md",
-            "resources/bram-traces/bram-trace.log",
-            "resources/.host-notes.json",
-            ".claude/bram-reference/diagnostics.md",
-            ".claude/bram-conventions.md",
-            "resources/review/catalog.json",
-            "resources/sub/.hidden",
-            ".claude/my-notes.md",
-            "stray.txt",
-        ]);
-        let (count, top, bram_owned) = untracked_undeclared_summary(&untracked, &HashMap::new());
+        use crate::test_state_rel as st;
+        let untracked: Vec<String> = vec![
+            st("worklist.json"),
+            st("worklist-drafts/a.md"),
+            st("worklist-history/2026.json"),
+            st("feedback-history/x.md"),
+            st("outbound-turns/1-turn.json"),
+            st("message-drafts/d.md"),
+            st("bram-traces/bram-trace.log"),
+            st(".host-notes.json"),
+            ".claude/bram-reference/diagnostics.md".to_string(),
+            ".claude/bram-conventions.md".to_string(),
+            st("review/catalog.json"),
+            st("sub/.hidden"),
+            ".claude/my-notes.md".to_string(),
+            "stray.txt".to_string(),
+        ];
+        let (count, top, bram_owned) =
+            untracked_undeclared_summary(crate::test_state_root(), &untracked, &HashMap::new());
         assert_eq!(bram_owned, 10);
         assert_eq!(count, 4);
         assert_eq!(
             top,
             vec![
-                ("resources/".to_string(), 2),
+                (format!("{}/", st("")), 2),
                 ("(root)".to_string(), 1),
                 (".claude/".to_string(), 1),
             ]
@@ -91521,5 +107832,633 @@ mod push_withheld_tests {
     fn default_and_origin_head_are_not_another_branch() {
         let c = vec![v(&["main", "origin/main", "origin/HEAD", "origin"])];
         assert!(push_withheld_branches("main", "main", &c).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod pair_sessions_query_tests {
+    use super::{
+        parse_pair_sessions_query, session_id_is_placeholder, SessionProvider,
+        PAIR_PLACEHOLDER_REFUSAL,
+    };
+
+    const CLAUDE: &str = "6f1c2b9e-0000-4000-8000-123456789abc";
+    const CODEX: &str = "01999999-aaaa-7bbb-8ccc-0123456789ab";
+    const OPENCODE: &str = "ses_abc123XYZ";
+    const PENDING: &str = "pending-1793380088801";
+
+    #[test]
+    fn placeholder_check_matches_pending_prefix() {
+        assert!(session_id_is_placeholder(PENDING));
+        assert!(!session_id_is_placeholder(CLAUDE));
+        assert!(!session_id_is_placeholder(CODEX));
+        assert!(!session_id_is_placeholder(OPENCODE));
+    }
+
+    #[test]
+    fn placeholder_on_either_side_is_refused_for_either_from() {
+        for from in ["claude", "opencode", ""] {
+            for q in [
+                format!("claude={PENDING}&opencode={OPENCODE}&from={from}"),
+                format!("claude={CLAUDE}&opencode={PENDING}&from={from}"),
+                format!("opencode={PENDING}&claude={CLAUDE}&from={from}"),
+                format!("claude={PENDING}&codex={PENDING}&from={from}"),
+            ] {
+                assert_eq!(
+                    parse_pair_sessions_query(&q),
+                    Err(PAIR_PLACEHOLDER_REFUSAL.to_string()),
+                    "{q}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn real_ids_are_accepted_and_from_picks_the_anchor() {
+        let q = format!("claude={CLAUDE}&codex={CODEX}&from=claude");
+        let (anchor, arrived) = parse_pair_sessions_query(&q).unwrap();
+        assert_eq!(anchor, (SessionProvider::Claude, CLAUDE.to_string()));
+        assert_eq!(arrived, (SessionProvider::Codex, CODEX.to_string()));
+
+        let q = format!("claude={CLAUDE}&codex={CODEX}&from=codex");
+        let (anchor, arrived) = parse_pair_sessions_query(&q).unwrap();
+        assert_eq!(anchor, (SessionProvider::Codex, CODEX.to_string()));
+        assert_eq!(arrived, (SessionProvider::Claude, CLAUDE.to_string()));
+
+        // No `from`: the first side anchors.
+        let q = format!("opencode={OPENCODE}&claude={CLAUDE}");
+        let (anchor, arrived) = parse_pair_sessions_query(&q).unwrap();
+        assert_eq!(anchor, (SessionProvider::Opencode, OPENCODE.to_string()));
+        assert_eq!(arrived, (SessionProvider::Claude, CLAUDE.to_string()));
+    }
+
+    #[test]
+    fn preallocated_id_with_no_transcript_is_accepted() {
+        // Exists nowhere on disk; the pure function must not look.
+        let q = "claude=00000000-0000-4000-8000-00000000dead&opencode=ses_nowhere&from=opencode";
+        let (anchor, arrived) = parse_pair_sessions_query(q).unwrap();
+        assert_eq!(anchor.0, SessionProvider::Opencode);
+        assert_eq!(arrived.0, SessionProvider::Claude);
+    }
+
+    #[test]
+    fn existing_two_sessions_error_is_kept() {
+        assert_eq!(
+            parse_pair_sessions_query(&format!("claude={CLAUDE}")),
+            Err("two sessions of different providers required".to_string())
+        );
+    }
+}
+
+#[cfg(test)]
+mod setup_reason_tests {
+    use super::{
+        parse_cargo_package_version, setup_reasons, version_is_older, SessionProvider,
+        SetupReasonInputs,
+    };
+
+    fn healthy() -> SetupReasonInputs {
+        SetupReasonInputs {
+            core_installed: true,
+            claude_hook_registered: true,
+            claude_menu_hook_registered: true,
+            claude_docs_current: true,
+            codex_hook_block_current: true,
+            codex_instr_current: true,
+            codex_docs_current: true,
+            opencode_wanted: true,
+            opencode_plugin_ok: true,
+            opencode_instructions_current: true,
+            antigravity_wanted: true,
+            antigravity_hooks_ok: true,
+            antigravity_rules_current: true,
+            is_source_repo: false,
+        }
+    }
+
+    #[test]
+    fn healthy_project_has_no_reasons() {
+        assert!(setup_reasons(None, healthy()).is_empty());
+    }
+
+    #[test]
+    fn stale_claude_instructions_alone_is_named() {
+        // #465: claudeNeedsSetup true with every hook present.
+        let i = SetupReasonInputs {
+            claude_docs_current: false,
+            ..healthy()
+        };
+        assert_eq!(
+            setup_reasons(Some(SessionProvider::Claude), i),
+            vec!["claude-instructions-stale"]
+        );
+    }
+
+    #[test]
+    fn missing_menu_hook_is_distinguished_from_stale_docs() {
+        let i = SetupReasonInputs {
+            claude_menu_hook_registered: false,
+            ..healthy()
+        };
+        assert_eq!(setup_reasons(None, i), vec!["claude-menu-hook-missing"]);
+    }
+
+    #[test]
+    fn source_repo_exempts_doc_currency_only() {
+        let i = SetupReasonInputs {
+            is_source_repo: true,
+            claude_docs_current: false,
+            claude_hook_registered: false,
+            ..healthy()
+        };
+        assert_eq!(setup_reasons(None, i), vec!["claude-hook-missing"]);
+    }
+
+    #[test]
+    fn reasons_follow_the_active_provider() {
+        let i = SetupReasonInputs {
+            codex_hook_block_current: false,
+            ..healthy()
+        };
+        assert!(setup_reasons(Some(SessionProvider::Claude), i).is_empty());
+        assert_eq!(
+            setup_reasons(Some(SessionProvider::Codex), i),
+            vec!["codex-hook-missing"]
+        );
+    }
+
+    #[test]
+    fn opencode_reasons_only_where_wanted() {
+        let i = SetupReasonInputs {
+            opencode_plugin_ok: false,
+            ..healthy()
+        };
+        assert_eq!(
+            setup_reasons(Some(SessionProvider::Opencode), i),
+            vec!["opencode-plugin-missing"]
+        );
+        let i = SetupReasonInputs {
+            opencode_wanted: false,
+            ..i
+        };
+        assert!(setup_reasons(None, i).is_empty());
+    }
+
+    #[test]
+    fn antigravity_reasons_match_verdict_and_scope() {
+        use super::provider_needs_setup_for;
+
+        let missing_hook = SetupReasonInputs {
+            antigravity_hooks_ok: false,
+            ..healthy()
+        };
+        assert_eq!(
+            setup_reasons(Some(SessionProvider::Antigravity), missing_hook),
+            vec!["antigravity-hook-missing"]
+        );
+        assert_eq!(
+            setup_reasons(None, missing_hook),
+            vec!["antigravity-hook-missing"]
+        );
+        assert!(setup_reasons(Some(SessionProvider::Claude), missing_hook).is_empty());
+
+        let stale_rules = SetupReasonInputs {
+            antigravity_rules_current: false,
+            ..healthy()
+        };
+        assert_eq!(
+            setup_reasons(Some(SessionProvider::Antigravity), stale_rules),
+            vec!["antigravity-rules-stale"]
+        );
+
+        let both = SetupReasonInputs {
+            antigravity_hooks_ok: false,
+            antigravity_rules_current: false,
+            ..healthy()
+        };
+        assert_eq!(
+            setup_reasons(Some(SessionProvider::Antigravity), both),
+            vec!["antigravity-hook-missing", "antigravity-rules-stale"]
+        );
+        assert!(setup_reasons(
+            None,
+            SetupReasonInputs {
+                antigravity_wanted: false,
+                ..both
+            }
+        )
+        .is_empty());
+
+        for wanted in [false, true] {
+            for core in [false, true] {
+                for hooks_ok in [false, true] {
+                    for rules_ok in [false, true] {
+                        let i = SetupReasonInputs {
+                            core_installed: core,
+                            antigravity_wanted: wanted,
+                            antigravity_hooks_ok: hooks_ok,
+                            antigravity_rules_current: rules_ok,
+                            ..healthy()
+                        };
+                        let antigravity_needs = wanted && (!core || !rules_ok || !hooks_ok);
+                        let verdict = provider_needs_setup_for(
+                            Some(SessionProvider::Antigravity),
+                            false,
+                            false,
+                            false,
+                            antigravity_needs,
+                        );
+                        let reasons = setup_reasons(Some(SessionProvider::Antigravity), i);
+                        assert_eq!(
+                            !reasons.is_empty(),
+                            verdict,
+                            "wanted={wanted} core={core} hooks_ok={hooks_ok} rules_ok={rules_ok}: {reasons:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn not_installed_is_named_once() {
+        let i = SetupReasonInputs {
+            core_installed: false,
+            ..healthy()
+        };
+        assert_eq!(setup_reasons(None, i), vec!["not-installed"]);
+    }
+
+    #[test]
+    fn versions_compare_numerically_not_as_strings() {
+        assert!(version_is_older("0.7.8", "0.8.1"));
+        assert!(version_is_older("0.9.9", "0.10.0"));
+        assert!(!version_is_older("0.10.0", "0.9.9"));
+        assert!(!version_is_older("0.8.1", "0.8.1"));
+        assert!(version_is_older("0.8", "0.8.1"));
+        assert!(!version_is_older("0.8.1", "garbage"));
+    }
+
+    #[test]
+    fn cargo_version_comes_from_the_package_table() {
+        let t = "[dependencies]\nversion = \"9.9.9\"\n[package]\nname = \"bram\"\nversion = \"0.8.2\"\n";
+        assert_eq!(parse_cargo_package_version(t).as_deref(), Some("0.8.2"));
+        assert_eq!(parse_cargo_package_version("[package]\nname=\"x\"\n"), None);
+    }
+}
+
+// windows-checkout-version-through-junction: the served app root must lead
+// to the checkout's Cargo.toml whether it is the real `<repo>/app` or a
+// junction pointing at it.
+#[cfg(test)]
+mod checkout_version_root_tests {
+    use super::{checkout_cargo_toml_for_app_root, parse_cargo_package_version, strip_unc_prefix};
+    use std::path::PathBuf;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "bram-checkout-root-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    // `<tmp>/repo/app` plus `<tmp>/repo/src-tauri/Cargo.toml` at 9.9.9.
+    fn checkout(tmp: &PathBuf) -> PathBuf {
+        let repo = tmp.join("repo");
+        std::fs::create_dir_all(repo.join("app")).unwrap();
+        std::fs::create_dir_all(repo.join("src-tauri")).unwrap();
+        std::fs::write(
+            repo.join("src-tauri").join("Cargo.toml"),
+            "[package]\nname = \"bram\"\nversion = \"9.9.9\"\n",
+        )
+        .unwrap();
+        repo
+    }
+
+    // The checkout as the OS reports it: temp_dir may be spelled with short
+    // names (Windows) or through a symlink (macOS `/var`), and the function
+    // under test resolves those too.
+    fn expected_toml(repo: &PathBuf) -> PathBuf {
+        strip_unc_prefix(std::fs::canonicalize(repo).unwrap())
+            .join("src-tauri")
+            .join("Cargo.toml")
+    }
+
+    #[test]
+    fn plain_app_root_finds_the_checkout_cargo_toml() {
+        let tmp = scratch("plain");
+        let repo = checkout(&tmp);
+        let toml = checkout_cargo_toml_for_app_root(&repo.join("app")).unwrap();
+        assert_eq!(toml, expected_toml(&repo));
+        let text = std::fs::read_to_string(&toml).unwrap();
+        assert_eq!(parse_cargo_package_version(&text).as_deref(), Some("9.9.9"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn missing_app_root_falls_back_to_the_lexical_parent() {
+        let tmp = scratch("missing");
+        let root = tmp.join("nowhere").join("app");
+        let toml = checkout_cargo_toml_for_app_root(&root).unwrap();
+        assert_eq!(
+            toml,
+            tmp.join("nowhere").join("src-tauri").join("Cargo.toml")
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn junction_app_root_resolves_to_the_checkout_cargo_toml() {
+        let tmp = scratch("junction");
+        let repo = checkout(&tmp);
+        let exe_dir = tmp.join("exe");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        let link = exe_dir.join("app");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(repo.join("app"))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J failed");
+        // The lexical parent is `<tmp>\exe`, which holds no checkout: this
+        // is the shape that read as `checkoutVersion: null` on Windows.
+        assert!(!exe_dir.join("src-tauri").join("Cargo.toml").exists());
+
+        let toml = checkout_cargo_toml_for_app_root(&link).unwrap();
+        assert_eq!(toml, expected_toml(&repo));
+        assert!(!toml.to_string_lossy().starts_with(r"\\?\"));
+        let text = std::fs::read_to_string(&toml).unwrap();
+        assert_eq!(parse_cargo_package_version(&text).as_deref(), Some("9.9.9"));
+
+        // Remove the junction itself first so remove_dir_all never walks
+        // into the target through it.
+        let _ = std::fs::remove_dir(&link);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
+
+#[cfg(test)]
+mod orientation_scaffolding_tests {
+    use super::*;
+
+    fn arch(engine: &str, site: &str) -> String {
+        format!(
+            "// {}\n{}\n{}\n{}\n{}\n{}\n",
+            ORIENTATION_MARKER, engine, ORIENTATION_EDIT_START, site, ORIENTATION_EDIT_END, engine
+        )
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "bram-orient-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn arch_keeps_site_block_takes_template_engine() {
+        let site = arch("old engine", "const SITE = 'mine';");
+        let tmpl = arch("new engine", "const SITE = 'PROJECT';");
+        let out = orientation_refreshed("arch.js", &site, &tmpl).unwrap();
+        assert_eq!(out, arch("new engine", "const SITE = 'mine';"));
+    }
+
+    #[test]
+    fn arch_unmarked() {
+        let tmpl = arch("e", "x");
+        assert_eq!(
+            orientation_refreshed("arch.js", "plain file", &tmpl),
+            Err("unmarked")
+        );
+    }
+
+    #[test]
+    fn arch_marked_without_edit_block() {
+        let tmpl = arch("e", "x");
+        let site = format!("// {}\nno block here\n", ORIENTATION_MARKER);
+        assert_eq!(
+            orientation_refreshed("arch.js", &site, &tmpl),
+            Err("no-edit-block")
+        );
+    }
+
+    #[test]
+    fn main_keeps_site_title() {
+        let site = format!(
+            "<!-- {} -->\n<PageMetaTitle value=\"Mine\" />\nold",
+            ORIENTATION_MARKER
+        );
+        let tmpl = "<!-- t -->\n<PageMetaTitle value=\"PROJECT\" />\nnew".to_string();
+        assert_eq!(
+            orientation_refreshed("Main.xmlui", &site, &tmpl).unwrap(),
+            "<!-- t -->\n<PageMetaTitle value=\"Mine\" />\nnew"
+        );
+        let notitle = format!("<!-- {} -->\nold", ORIENTATION_MARKER);
+        assert_eq!(
+            orientation_refreshed("Main.xmlui", &notitle, &tmpl).unwrap(),
+            tmpl
+        );
+        assert_eq!(orientation_refreshed("other", &site, &tmpl), Err("unknown"));
+    }
+
+    #[test]
+    fn already_current_is_identical() {
+        let site = arch("same", "const SITE = 'mine';");
+        let tmpl = arch("same", "const SITE = 'PROJECT';");
+        assert_eq!(
+            orientation_refreshed("arch.js", &site, &tmpl).unwrap(),
+            site
+        );
+    }
+
+    #[test]
+    fn discovery_finds_marked_and_skips_the_rest() {
+        let root = scratch("find");
+        let marked = format!("// {}\n", ORIENTATION_MARKER);
+        let put = |rel: &str, body: &str| {
+            let d = root.join(rel);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("arch.js"), body).unwrap();
+        };
+        put("a/orientation", &marked);
+        put("docs/orientation", &marked);
+        put("unmarked", "nothing");
+        put(".hidden/o", &marked);
+        put("node_modules/o", &marked);
+        put("l1/l2/l3/l4/l5", &marked);
+        let found = find_orientation_site_dirs(&root);
+        assert_eq!(
+            found,
+            vec![root.join("a/orientation"), root.join("docs/orientation")]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn real_template_matches_real_site() {
+        let m = env!("CARGO_MANIFEST_DIR");
+        let t = format!("{}/../app/__shell/reference/orientation-template", m);
+        let o = format!("{}/../orientation", m);
+        for f in ["arch.js", "Main.xmlui"] {
+            let tmpl = std::fs::read_to_string(format!("{}/{}", t, f)).unwrap();
+            let site = std::fs::read_to_string(format!("{}/{}", o, f)).unwrap();
+            assert_eq!(
+                orientation_refreshed(f, &site, &tmpl).unwrap(),
+                site,
+                "{}",
+                f
+            );
+        }
+    }
+}
+
+// worklist-commit-waits-out-index-lock: the retry core against a real repo
+// whose `.git/index.lock` is held by a second thread, like an editor's git.
+#[cfg(test)]
+mod index_lock_retry_tests {
+    use super::{index_lock_gave_up, retry_on_index_lock};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::time::Duration;
+
+    fn scratch_repo(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "bram-index-lock-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(Command::new("git")
+            .current_dir(&root)
+            .args(["init", "-q", "-b", "main", "."])
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        root
+    }
+
+    fn git_add(root: &Path) -> Result<String, String> {
+        let out = Command::new("git")
+            .current_dir(root)
+            .args(["add", "--", "a.txt"])
+            .output()
+            .map_err(|e| e.to_string())?;
+        if out.status.success() {
+            Ok(String::new())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).into_owned())
+        }
+    }
+
+    fn hold_lock(root: &Path, ms: u64) -> std::thread::JoinHandle<()> {
+        let lock = root.join(".git").join("index.lock");
+        std::fs::write(&lock, "").unwrap();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(ms));
+            let _ = std::fs::remove_file(&lock);
+        })
+    }
+
+    #[test]
+    fn add_succeeds_after_a_short_lock_is_released() {
+        let root = scratch_repo("short");
+        let holder = hold_lock(&root, 300);
+        let mut waits = 0u32;
+        let out = retry_on_index_lock(
+            || git_add(&root),
+            Duration::from_millis(100),
+            Duration::from_millis(2000),
+            |_| waits += 1,
+        );
+        holder.join().unwrap();
+        assert!(out.is_ok(), "{:?}", out);
+        assert!(waits >= 1, "expected at least one traced wait");
+        let staged = Command::new("git")
+            .current_dir(&root)
+            .args(["diff", "--cached", "--name-only"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&staged.stdout).trim(), "a.txt");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn add_gives_up_when_the_lock_outlasts_the_budget() {
+        let root = scratch_repo("long");
+        let holder = hold_lock(&root, 3000);
+        let started = std::time::Instant::now();
+        let out = retry_on_index_lock(
+            || git_add(&root),
+            Duration::from_millis(100),
+            Duration::from_millis(2000),
+            |_| {},
+        );
+        let elapsed = started.elapsed();
+        holder.join().unwrap();
+        let err = out.expect_err("lock held past the budget must fail");
+        assert!(index_lock_gave_up(&err), "{}", err);
+        assert!(err.contains("index.lock"));
+        assert!(elapsed >= Duration::from_millis(1900), "{:?}", elapsed);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // index-lock-wait-counts-git-time: time spent inside `run` counts against
+    // the budget. Each run takes 300 ms; summing only the 100 ms sleeps gave
+    // up after ~2.4 s against a 500 ms budget.
+    #[test]
+    fn slow_git_calls_count_against_the_budget() {
+        let started = std::time::Instant::now();
+        let out = retry_on_index_lock(
+            || {
+                std::thread::sleep(Duration::from_millis(300));
+                Err("fatal: Unable to create '/x/.git/index.lock': File exists.".to_string())
+            },
+            Duration::from_millis(100),
+            Duration::from_millis(500),
+            |_| {},
+        );
+        let elapsed = started.elapsed();
+        assert!(index_lock_gave_up(&out.expect_err("must give up")));
+        assert!(elapsed < Duration::from_millis(1500), "{:?}", elapsed);
+    }
+
+    #[test]
+    fn other_git_errors_are_not_retried() {
+        let mut calls = 0;
+        let out = retry_on_index_lock(
+            || {
+                calls += 1;
+                Err("fatal: pathspec 'x' did not match any files".to_string())
+            },
+            Duration::from_millis(100),
+            Duration::from_millis(2000),
+            |_| {},
+        );
+        assert_eq!(calls, 1);
+        assert!(!index_lock_gave_up(&out.unwrap_err()));
     }
 }

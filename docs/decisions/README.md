@@ -30,6 +30,10 @@ Status: decided YYYY-MM-DD · revisit <when>
 
 ## Index
 
+- [2026-11-06 — The Transcript session-menu experiment is dropped; switching stays on the Sessions tab for now](2026-11-06-sessions-menu-experiment-dropped.md)
+- [2026-11-04 — Delegated work binds to the claim it was spawned under, and is released only on evidence](2026-11-04-delegated-work-binds-to-the-spawning-claim.md)
+- [2026-11-02 — Bram's per-project state folder becomes `.bram/`, moved in three releases](2026-11-02-bram-state-folder-is-dot-bram.md)
+- [2026-10-30 — Bram finds subagent transcripts from each provider's own parent link](2026-10-30-subagent-transcript-provider-discovery.md)
 - [2026-10-27 — Bram chooses the session; nothing else names it](2026-10-27-bram-chooses-the-session.md)
 - [2026-10-21 — Authorization becomes one pipeline, designed for a cooperative agent that makes mistakes](2026-10-21-authorization-one-pipeline.md)
 - [2026-10-17 — Bram vendors xmlui#3941 candidate 4 before it is released, and keeps measuring](2026-10-17-xmlui-3941-candidates.md)

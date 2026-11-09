@@ -33,6 +33,8 @@ sys.path.insert(0, str(SCRIPTS))
 
 import importlib.util  # noqa: E402
 
+import bram_state  # noqa: E402
+
 _spec = importlib.util.spec_from_file_location("msc", SCRIPTS / "membership-starter-check.py")
 msc = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(msc)  # reuse run() and trace_lines()
@@ -41,7 +43,7 @@ def trace_lines(repo: Path) -> list[str]:
     """The trace the instance is writing. Observed 2026-10-27 22:37Z: after a
     launch the instance kept writing to a rotated name (bram-trace-<date>-N.log)
     while bram-trace.log stayed empty, so read the most recently written one."""
-    files = [p for p in (repo / "resources/bram-traces").glob("bram-trace*.log") if p.is_file()]
+    files = [p for p in bram_state.trace_dir(repo).glob("bram-trace*.log") if p.is_file()]
     if not files:
         return []
     newest = max(files, key=lambda p: p.stat().st_mtime)
@@ -72,7 +74,7 @@ class Run:
     def url(self, path: str) -> str:
         # Reread every call: right after a launch the file can still hold the
         # previous instance's port.
-        port = (self.repo / "resources/.bram-port").read_text().strip()
+        port = bram_state.port_file(self.repo).read_text().strip()
         return f"http://127.0.0.1:{port}/{path}"
 
     def _send(self, make) -> tuple[int, str]:
@@ -203,7 +205,10 @@ def matrix(r: Run, turns: bool, agents: list[str], new_session_only: bool = Fals
             return
 
         # fresh partners: a New-session-born session starts a named, paired partner.
-        for p in ("opencode", "codex"):
+        # antigravity-live-check-fixes: agy's partner pairs at the end of its
+        # first turn (agy signals session changes only at turn boundaries),
+        # well inside self_timeout.
+        for p in ("opencode", "codex", "antigravity"):
             if p not in agents:
                 r.skip(f"fresh-partner-{p}", "agent not selected")
                 continue
@@ -226,7 +231,7 @@ def matrix(r: Run, turns: bool, agents: list[str], new_session_only: bool = Fals
             ])
             if p == "opencode":
                 b = pid
-            else:
+            elif p == "codex":
                 x = pid
             # No wait for the partner's catch-up turn: people switch mid-turn,
             # and Bram escalates when an agent doesn't exit (op=exit-retry).
@@ -420,7 +425,7 @@ def main() -> int:
     ap.add_argument("--timeout", type=float, default=90)
     ap.add_argument("--no-turns", action="store_true", help="skip cases that start a model turn")
     ap.add_argument("--agents", default="claude,opencode,codex",
-                    help="comma list; claude is always used (default: all three)")
+                    help="comma list; claude is always used (default: all three; antigravity accepted)")
     ap.add_argument("--keep", action="store_true", help="leave the demo running even on success")
     ap.add_argument("--new-session-opencode-only", action="store_true",
                     help="run just the OpenCode New session delivery/reply regression")
@@ -430,6 +435,9 @@ def main() -> int:
     args = ap.parse_args()
     repo = Path(args.repo).resolve()
     agents = [a.strip() for a in args.agents.split(",") if a.strip()]
+    unknown_agents = sorted(set(agents) - {"claude", "codex", "opencode", "antigravity"})
+    if unknown_agents:
+        ap.error("unknown --agents value(s): " + ", ".join(unknown_agents))
     if args.new_session_opencode_only and (args.no_turns or "opencode" not in agents):
         ap.error("--new-session-opencode-only requires turns and opencode")
 

@@ -88,7 +88,9 @@ the source of truth; this is the announcement surface.
 | 10 | [Static & hot-reload](#10-static--hot-reload) | Files served from disk or embedded; iframe reload coupling | both iframes |
 | 11 | [Inflight sentinel](#11-inflight-sentinel) | Host-managed claim file driving the Worklist tab's spinner state | agent pane iframe, agent (curl) |
 | 12 | [Agent message queue](#12-agent-message-queue) | Durable, manually sent messages parked while an agent works | agent pane iframe |
-| 13 | [Prompt lifecycle](#13-prompt-lifecycle) | Locally implemented prompt shown/resolved ledger | agent pane iframe |
+| 13 | [Prompt lifecycle](#13-prompt-lifecycle) | Locally implemented prompt shown/resolved ledger; hook and plugin callbacks | agent pane iframe |
+| 14 | [Search index](#14-search-index) | Full-text search over sessions, commits, issues, worklist history | agent pane iframe, agent (curl) |
+| 15 | [Needs You inbox](#15-needs-you-inbox) | The Inbox tab's lanes and dismissals | agent pane iframe |
 
 ## 1. App & shell meta
 
@@ -99,9 +101,22 @@ uses them for the target app info dialog.
 
 | Surface | Kind | Query / params | Response | Consumer |
 | --- | --- | --- | --- | --- |
-| `/__app-info` | HTTP GET | — | `{ current, latest, has_update, release_url }` | parent shell, agent pane iframe |
-| `/__target app-info` | HTTP GET | — | `{ url, default_right_pane, spawned? }` | agent pane iframe |
+| `/__app-info` | HTTP GET | — | `{ current, latest, has_update, release_url, forge, embeddedAppHash, servingEmbedded, project?, projectKey?, repo?, targetAppUrl }`. `embeddedAppHash` / `servingEmbedded` say which `app/` tree this process serves; `project` / `projectKey` carry the window's project identity; `targetAppUrl` is where a person opens the project's app, or `null`. | parent shell, agent pane iframe, agents (version for forge signatures) |
+| `/__right-pane-info` | HTTP GET | — | `{ url, default_right_pane, spawned?, browserUrl, hasTargetApp }`. `browserUrl` is the browser-safe address of the target app (or `null`); `hasTargetApp` says whether the project has one. | agent pane iframe |
 | `/__restart-server` | HTTP GET | — | empty / 200 on success | agent pane iframe |
+| `/__startup-ready` | HTTP GET | `event=<event-name>` (required; 400 without) | `{ ok, exists, name, replayed, … }` — asks the host to re-emit a named Tauri event for a pane that attached late (`talk-session-changed` re-emits live and answers `seeded: true`). Sibling of `/__event/latest`, which only reads the remembered payload. | agent pane iframe |
+| `/__agent-status` | HTTP GET | — | the live agent status row `{ provider, state, verb?, elapsedText?, substate?, … }` parsed from the terminal's status line; a stale Codex `working` reads as `finished`. | agent pane iframe |
+| `/__turn-state` | HTTP GET | — | the host's turn-phase record `{ provider, phase, turnStamp?, lastPtyActivityAtMs, lastJsonlActivityAtMs, lastNonFinalAssistantAtMs, lastCompletionAtMs, … }` that drives turn-end detection. | agent pane iframe, diagnostics |
+| `/__guard/selftest` | HTTP GET | — | `{ ok, failed: [...], cases: [{ id, pass, got, reason }], claude, codex, opencode }` — runs the installed guard chain (hook scripts and plugin) against a throwaway fixture project and reports allow/deny per case (issue-415). Read-only against the real project. | agent pane iframe (Status tab), diagnostics |
+| `/__self-update/status` | HTTP GET | — | `{ state: idle\|running\|done\|failed, phase, tail: [...], error?, installed_to?, target_version?, started_at_ms, finished_at_ms? }` | parent shell (update banner) |
+| `/__self-update` | HTTP POST | — (no body) | `{ ok: true, state: "running" }`; 409 while an update runs or when no release info is known; 405 on other methods. Starts the install flow: the host fetches the release's installer script and runs it on a background thread; progress rides `/__self-update/status` and the `self-update-changed` event. **Authorization:** none beyond the common loopback gate; it needs no grant and ignores the body and query, so a caller cannot choose the URL or version. The script comes from `BRAM_BASE_URL` / `XMLUI_DESKTOP_BASE_URL` when Bram's own environment sets one, else `https://github.com/judell/bram/releases/download/<latest tag>/install.sh` (`self_update_base_url`, `run_self_update`). The host does not verify the script; `install.sh` checks the artifact against a `SHA256SUMS` fetched from the same base, which catches corruption, not a compromised release. The 409 guard is only a double-start check on the in-process status (`state == "running"`), not a caller check. See [authorization.md](authorization.md#action-matrix) and its known gaps. | parent shell (update banner) |
+| `/__self-update/relaunch` | HTTP POST | — (no body) | `{ ok: true }` then the process exits; 409 `no relaunch target` if the installed binary cannot be found. Spawns the freshly installed binary against the current project root, detached, and quits this instance. **Authorization:** none beyond the common loopback gate, and no 'update finished' precondition: it relaunches `installed_to` if one was recorded, else the running executable (`handle_self_update_relaunch`). The caller supplies nothing, so it picks no target. It ends the running instance, so an unwanted call is a disruption. | parent shell (update banner) |
+| `/__trace-archive-status` | HTTP GET | — | the last trace-archival pass: `{ state, completedAtMs?, archiveAfterDays, candidateFiles, archivedFiles, rawBytes, compressedBytes, redactions, failures, skippedExisting, elapsedMs }` (see Trace persistence in section 5). | agent pane iframe (Status tab) |
+| `/__pty-intent` | HTTP GET | — | `{ queue: [<parsed intent line>, …] }` — read-only view of the right-pane intent queue file; `{ queue: [] }` when empty or missing (#86). | diagnostics |
+| `/__trace/pane` | HTTP POST | JSON trace payload (the same shape as `log_from_right_pane`) | `{ ok: true }`; 400 on bad JSON. Fetch fallback for the pane's trace transport when the Tauri invoke bridge is unavailable (#343); same sink and redaction as the IPC command. | agent pane iframe (`helpers.js`) |
+| `/__pane/flush` | HTTP POST | none | `{ ok: true }`, or 409 `{ ok: false, error: "ui.paneIdleFlush is off" }`. Requests a forced reload of the agent pane through `emit_or_defer_tools_pane_reload`, so a turn in flight holds it until the claim clears; traces `[tools-pane-reload] op=requested source=pane-flush`. Called by the pane's own idle flush (`__bramPaneFlushTick`) only when it has degraded and every guard is clear. A workaround for judell/bram#482. pane-idle-flush-when-degraded. | agent pane iframe |
+| `/__paste-image` | HTTP POST | `type=<image/png\|jpeg\|gif\|webp>`; body is the raw image bytes | `{ ok: true, path }` — the image is staged under `~/.cache/bram/paste/` so the message text can reference it as `[Image: source: <path>]`; 400 on an empty body or unsupported type. **Authorization:** none beyond the common loopback gate. The caller picks neither directory nor file name: the directory is fixed, the name is `<unix-ms>-<hash>.<ext>`, and `ext` comes from a four-entry allowlist keyed on `type`. Contents are not checked to be an image, and there is no size cap or cleanup in the handler (`handle_paste_image`), so repeated calls can fill disk. | agent pane iframe (composer paste) |
+| `/__test/switch`, `/__test/reload`, `/__test/new-session`, `/__test/turn` | HTTP POST | JSON body per route (`provider`, `id`, `title`, …) | the result of the same command function the pane's IPC calls. **404 unless Bram was started with `BRAM_TEST_DRIVE=1`** (never set by `./bram`); 405 on non-POST. For `scripts/switch-matrix.py` on a disposable demo instance. See the Test-drive row in [authorization.md](authorization.md#action-matrix). | `scripts/switch-matrix.py` |
 | `/__error` | HTTP GET | — | reported error context | agent pane iframe |
 | `/__pty-tail` | HTTP GET | `lines=` | last N lines of PTY output, `text/plain` | agent pane iframe |
 | `/__pty-stripped` | HTTP GET | — | PTY output with ANSI escapes removed, `text/plain` | agent pane iframe |
@@ -109,7 +124,9 @@ uses them for the target app info dialog.
 | `/__settings` | HTTP GET | — | user-facing slice of `.bram.json`: `{ shell: { agent }, worklist: { batchCommitActions }, ui: { targetAppMinimized } }` (always populated, defaults filled) | agent pane iframe (Settings tab), parent shell |
 | `/__settings` | HTTP POST | body matches GET shape | merged response after writing `.bram.json` atomically; preserves unknown top-level keys; 400 on JSON parse error / 500 on IO error | agent pane iframe (Settings tab) |
 | `settings-changed` | Tauri event | — | same payload `GET /__settings` returns | agent pane iframe (Settings DataSource refetch), parent shell (`app/main.js` `targetAppMinimized` driver) |
+| `/__story/lines` | HTTP GET | `since` (ISO-8601 UTC; lines at or after it); `kinds` (optional, comma-separated Log kinds: `gate`, `push`, `search`, `queue-add`, `queue-delete`, `selection`, `turn`, `stall`, `refusal`, `launch`; returns only the lines those kinds are told from, plus session sets; an unknown kind gets every line; omitted, every selected line) | `{ lines: [{ ts, src: "trace"\|"hook", cat, text }], queueDrafts: { [queueId]: entry } }`; drafts are resolved only for queue IDs in the returned trace window, from retained `queue-drafts/<id>.json` or the active queue (legacy fallback). Lines sorted by `ts`: the trace lines that mark episodes (`turn-state` transitions, `turn-context`, `inflight-sentinel`, `auth-record`, `turn-send`, `worklist-commit`, `queue`, `bram-trace`, `git-push`, `demo-instance`, `agent-switch` sets only, and iframe `click` / `queue` / `long-task` / `input-latency` / `heartbeat-drift` / `w2-selection-restore` / `search-query`) plus `hook-events.log` denies. Reads across trace rotation (log-reads-across-trace-rotation): the live `bram-trace.log` and `hook-events.log`, plus every plain `bram-trace-*.log` and `hook-events-*.log` archive modified at or after `since` (gzipped archives are past `archiveAfterDays` and out of any window). The host keeps what it selected in memory: archives are read once, the live files only from the offset last read. The last session set before `since` leads the lines, so the window's first entries can be named. Emits `[story] op=lines` (`kinds`, `selected`, `lines`, `bytes`, `read_bytes`, `files`, `archives_read`, `ms`). The host also emits the signal `story-changed`, debounced 1.5 s, when the trace gains a line that can end a shown kind's episode (`worklist-commit op=committed`, `git-push op=push-result`, iframe `search-query` / `queue` / `w2-selection-restore`, a gate-bar `click`); the Log refetches on it. Since log-shows-start-commit-push-search the body also carries `currentSession` (`{ provider, sessionId, title }` or null), `sessionTitles` (`{ [sessionId]: title }` for the sessions the window's set lines name) `commitUrlBase` (the repo's web address plus `/commit/`, or null without a remote) and `unpushedShas` (full shas on HEAD that no remote has, `git rev-list HEAD --not --remotes`, at most 500), for the entries' expanded detail and the commit links: a pushed sha links to the forge, an unpushed one to `/commits?sha=` (the Commits tab's local view), and a push's range to the forge's compare view. Read-only. The pane tells them (`__bramStoryTell` in `helpers.js`); issue-473-readable-launch-log. | agent pane iframe (the Log tab, under More) |
 | `/__coordination-status` | HTTP GET | — | derived status payload for the Status tab: `{ generatedAt, sections: [{ title, rows: [{ signal, level, state, detail, seen }] }] }`. Aggregates worklist counts by status, inflight sentinel state, turn-completion monitor state, authorization record freshness, watcher / hook health, recent trace tails. | agent pane iframe (Status tab) |
+| `/__state-dir/plan` | HTTP GET | — | judell/bram#469 dry run, read-only (nothing moves in 0.8.3): `{ stateDir, stateDirExists, wouldMove: [{ path, kind, isDir }], foreign: [{ name, isDir }], tracked: { count, paths, truncated }, liveClaim, liveClaimDetail: { claimIds, authorization }, nested: [{ path, stateDir }], note }`. `wouldMove` is the machine-state and shown-only `BRAM_OWNED_ENTRIES` present at the state folder's top level (`kind` = `file` \| `dir` \| `dotfile`, the last for dotfiles only the dotfiles rule covers); `foreign` is every other top-level entry there; `tracked` is `git ls-files -- <stateDir>` (list capped at 200; empty outside a repo); `liveClaim` is a non-empty inflight claim or an unexpired, non-`none` authorization record; `nested` is subfolders to depth 3 (skipping `.git`, `node_modules`, `target`, the state folder) holding their own `.bram-port` or `worklist.json`, which migrate themselves. Emits `[state-dir] op=plan`. The same JSON without a window: `bram --state-dir-plan <root>` (no trace line). | agent pane iframe (Status tab, State folder section); the CLI flag |
 | `/__event/latest` | HTTP GET | `name=<event-name>` | `{ exists, payload, tsMs }` — the most recently remembered Tauri event of the given name; subscriber replay for late-attaching listeners. | agent pane iframe, diagnostics |
 | `pty_spawn` | IPC | `{ shell, cwd, env, agentAutostart? }` | `Result<(), String>` | parent shell |
 | `pty_write` | IPC | `{ data: String }` | `Result<(), String>` | parent shell, iframe helpers (direct) |
@@ -160,8 +177,15 @@ content hashes or produces `rejected_stale` for a mismatch. Worklist
 | `/__worklist/commit` | HTTP POST | `{ ids: [...], message: "..." }` | `{ ok: true, sha, queuedCloses: [n, ...], ... }`; may include `retained` / `residualPaths`; commits and performs its own prune | agent |
 | `/__worklist/drop` | HTTP POST | `{ ids: [...] }` | `{ ok: true, pruned: [...] }`; records its own drop grant, resolves, prunes | feedback-less pane Drop; handler does not establish caller identity |
 | `/__worklist/clear-landed` | HTTP POST | `{ ids: [...], via?: "pane" \| "agent" }` | `{ ok: true, cleared: [{id, sha}], refused: [...] }` when at least one clears; refuses if none qualify | pane / agent; Git evidence replaces a Drop grant |
+| `/__worklist/reanchor` | HTTP POST | `{ ids: [...] }` | `{ ok, head, reanchored: [{id, path}], refused: [{id, path, reason}] }`; 409 when nothing was re-anchored (every refusal named: `already-applies`, `not-begun`, `unknown-item`, `no-failing-path`, `other-owners:<ids>`, `no-window-patch`, `not-only-this-items-work`, `untracked`), 503 while membership has no partition. For a begun item whose interval patch no longer applies to HEAD (a commit outside the gate changed its file after it began; the row's `commitStrandedBy` names it), records under `reanchors` in the claim-intervals sidecar that, at this HEAD and file content, `git diff HEAD -- path` is the item's patch — allowed only when the item's own window patch, applied to HEAD's copy of the file (with normal, then one-line, then no context), reproduces the worktree file byte for byte, which proves the worktree differs from HEAD on that path by the item's work alone. Membership is consulted only to name another begun owner (`other-owners`), since its removed-line attribution is unreliable in exactly the stranded case. The precheck and the commit then build that path's chunk from that diff while HEAD and the file's bytes still match; otherwise the record is stale and ignored. Worktree, index and history untouched. **Authorization:** none beyond the common loopback gate; it grants nothing and commits nothing. Trace `[worklist-commit] op=reanchor`. | agent (asked in chat: "re-anchor the item") |
 | `/__worklist/plan` | HTTP POST | `{ summary, steps: [{ verb: "drop" \| "commit" \| "feedback", ids, text? }] }` | validates and stores a version-bound recommendation; feedback requires text and cannot share a plan with commit | agent proposes; pane executes on user click |
 | `/__worklist/will-commit` | HTTP GET | `ids=a,b` | `{ ready, stale, mode: "whole-file" \| "interval", added, removed, unowned?: [{ path, added, removed }], entangledWith?: [...], dependentPaths?: [...], ids, stateKey }` (`ready: false` when membership has no partition yet). The gate's routing for that selection, run without committing: what committing those items together would take. The pane shows an answer only when it is fresh and its `stateKey` matches the board's `membershipStateKey` (issue-425-retire-replay) | gate bar (selection line); agent before a multi-id `worklist-commit` |
+| `/__worklist/end` | HTTP POST | `{ ids: [...] }` | releases the named ids' inflight claim early (the shrink helper of section 11); 400 on bad JSON; GET or empty ids are refused. Also dispatched from the Codex intent channel as `worklist-end`. **Authorization:** none beyond the common loopback gate; it needs no grant (`handle_iterate_end`). It only shrinks or clears the inflight claim, never a grant, and retires the named ids only if they are in the claim. A caller who knows the ids can release a running turn's claim early, which unlocks the board and ends the claim window used for attribution; it cannot approve, commit or drop. See authorization.md. | agent |
+| `/__worklist/misaddressed` | HTTP GET / POST | GET: none. POST: `{ op: "flag", feedbackRef }` (agent), `{ op: "resend", feedbackRef }` (pane's **Resend as chat**), `{ op: "dismiss" }` (pane, on the next send); and the other direction, `{ op: "flag-chat", turnRef, id }` (agent) and `{ op: "resend-as-feedback", turnRef }` (pane's **Resend as feedback**) | GET: `{ pending: { kind: "feedback", feedbackRef, itemId, atMs } \| { kind: "chat", turnRef, itemId, atMs } \| null }`. `flag`: `{ ok, itemId }`, or 400 for a malformed ref and 409 when the ref has no live draft in `feedback-drafts/` or the running turn (`.turn-context.json`) isn't an `iterate` turn addressed to that item. `resend`: 409 unless the ref is the pending flag; appends a "Resent as chat" note to the draft (original text kept above it) and returns `{ ok, itemId, text }` for the pane to send as chat. `flag-chat` (misaddressed-chat-resends-as-feedback): a chat message that was feedback on an item; 400 for a `turnRef` not shaped `<ms>-turn`, 409 unless it is the newest file in `outbound-turns/`, sent as chat (`kind: "message"`, empty `mode`), while the running turn's context is `general`, and `id` is on the board. `resend-as-feedback`: 409 unless the ref is the pending chat flag; returns `{ ok, itemId, text, images, note }` from the turn's record, which the pane sends to the item as feedback (images as screenshot markers, the note saying it was first sent as chat). `dismiss`: clears either flag. Every change emits `feedback-misaddressed-changed`. One pending flag, in memory. misaddressed-feedback-resends-as-chat. | agent (flag); agent pane composer (GET, resend, dismiss) |
+| `/__worklist/reorder` | HTTP POST | `{ ids: [...], baseVersion: <n> }` | `{ ok: true, changed: bool }`; 409 when `baseVersion` is stale or `ids` is not exactly the current item set (the pane refetches). The pane's drag-to-reorder: changes order only, bumps `version`. **Authorization:** none beyond the common loopback gate; the handler requires no grant because it changes no item's content or lifecycle. Its checks are consistency, not identity: `baseVersion` must equal the version on disk and `ids` must be exactly the current item set, so it cannot add, remove or alter an item (`handle_worklist_reorder`). Those checks mean a caller must already know the board's version and ids. | agent pane iframe |
+| `/__worklist/interval-diff` | HTTP GET | `id=<item id or __unattributed>`, `path=<file>` (both required; 400 otherwise) | `{ patch, intervals, … }` — one scope's own patch for one path, from the recorded claim intervals; fetched when the Diff tab's scope selector leaves "All changes". Read-only. | agent pane iframe |
+| `/__worklist/independence` | HTTP GET | `path=<file>` (required; 400 otherwise) | `{ items: { <id>: … } }` — per-claimant separability for one path, measured with `git apply --check` in a throwaway index (worktree untouched). Fetched when a file expander renders its ownership summary. Read-only. | agent pane iframe |
+| `/__audit/direct-edit` | HTTP POST | `{ provider, source?, turnKey? }` | `{ ok: true }` (`deduped: true` for a repeated `turnKey`); 400 on bad JSON. Audit-only breadcrumb recording that the Claude guard already allowed a direct edit. It never writes `.worklist-authorization.json` and authorizes nothing; see the Direct edit row in [authorization.md](authorization.md#action-matrix). | Claude guard (hook) |
 | `/__worklist-config` | HTTP GET | — | `{ batchCommitActions: bool }` from `.bram.json` `worklist` block; defaults to `false` | agent pane iframe (`Workspace.xmlui` gates batch-commit UI on this) |
 | `/query` | HTTP POST | body `{ sql, params? }` (or a bare SQL string) — the de-facto XMLUI `dataType="sql"` wire contract | 200 JSON array of column-keyed row objects; 409 when `.bram.json` has no `db`; 400 on bad body / SQL error; read-only enforced at the engine (read-only open + `PRAGMA query_only`) | target app / pane markup (`DataSource dataType="sql"`), #355 |
 
@@ -248,7 +272,8 @@ worklist state at that moment; Markdown is the changelog narrative
 | `/__worklist-history/list` | HTTP GET | — | `[{ ts, iso, summary, ids, changelog }, …]` (newest first) | agent pane iframe |
 | `/__worklist-history/changelog` | HTTP GET | `ts=<ms>` | raw `.md` body, `text/markdown` | agent pane iframe |
 | `/__worklist-history/snapshot` | HTTP GET | `ts=<ms>` | raw `.json` body | agent pane iframe |
-| `/__worklist-history/search` | HTTP GET | `q=<query>` (min 2 chars; shorter returns `{results:[]}`) | `{ results: [<WorklistHistoryGroup augmented with `hitBody`>, …] }`. `hitBody` is concatenated title + subtitle + prose summary + before / after, centered on the first match, capped at 4 KB. | agent pane iframe (History tab `<SearchHitModal>`) |
+| `/__worklist-history/at` | HTTP GET | `ts=<ms>` | `{ ts, live, items: [{ id, status, begun }] }`: the board as it stood at `ts`. Each snapshot holds the board as it was just before the change stamped in its name, so this is the earliest snapshot stamped at or after `ts` (`live:false`, its stamp in `ts`), or the live board when nothing has changed since (`live:true`, `ts:null`). One directory listing, no file reads but the one. log-shows-start-commit-push-search: a Log entry's expanded detail | agent pane iframe (the Log tab) |
+| `/__history-index` | HTTP GET | `limit=<n>` (default 200, clamped 1–2000) | `[{ id, title, date, extra }, …]` newest first, read from the search index rather than by scanning files; `extra` is the full history group, so an expander needs no refetch. Lags the live files by up to one indexer pass. | agent pane iframe (History tab) |
 
 - The list endpoint parses item ids out of changelog bullet lines
   (`` - `<id>` (was …) ``, `` - `<id>` (proposed, …) ``,
@@ -266,21 +291,22 @@ when the cycle's `advance` / `prune` mutation lands,
 `promote_feedback_drafts_for_items` moves the file to
 `resources/feedback-history/<unix_ms>-<itemId>.md` so the draft
 directory stays small and the history dir accumulates a permanent
-record. The backend keeps these routes for audit/history tooling; the primary
-user-facing feedback flow now lives on each Worklist item.
+record. The standalone Feedback tab and its `/__feedback-history/{list,content,search}`
+routes were retired when feedback was folded into the History page
+(`444bcd5e`); `/__feedback/content` and `/__feedback/map` remain because the
+iterate flow and the Transcript resolve a `feedbackRef` through them.
 
 | Surface | Kind | Query / params | Response | Consumer |
 | --- | --- | --- | --- | --- |
-| `/__feedback-history/list` | HTTP GET | `limit=<n>` (default 120) | `[{ ts, itemId, fileName }, …]` (newest first) | agent pane iframe / history tooling |
-| `/__feedback-history/content` | HTTP GET | `ts=<unix_ms>`, `itemId=<id>` | raw `.md` body, `text/markdown`; 400 on missing / unsafe params; 404 if no matching file | agent pane iframe / history tooling |
-| `/__feedback-history/search` | HTTP GET | `q=<query>` (min 2 chars) | `{ results: [{ ts, itemId, fileName, snippet, body }, …] }`. `snippet` is a ~200-char window centered on the first match; `body` is the full `.md` body for the `<SearchHitModal>` 500-char centered window. | agent pane iframe / history tooling |
+| `/__feedback/content` | HTTP GET | `ref=<feedbackRef>` | raw `.md` body, `text/markdown`, from `feedback-drafts/` (live) then `feedback-history/` (promoted); 404 if neither has it | agent pane iframe (iterate flow, Transcript) |
+| `/__feedback/map` | HTTP GET | `limit=<n>` (default 200) | `{ "<feedbackRef>": "<text>", … }` across drafts and history, most recent first; the Transcript fetches it once to resolve each iterate turn's `feedbackRef` | agent pane iframe (Transcript) |
 | `feedback-history-changed` | Tauri event | — | empty payload | agent pane iframe DataSource refetch |
 
 - Filename schema is `<unix_ms>-<itemId>.md`. Uniqueness collisions
   (rare) get a `-<n>` suffix before `.md` via
   `unique_feedback_history_path`.
-- The content route reconstructs the filename from `ts` + `itemId`
-  rather than trusting a client-supplied path — no traversal.
+- `/__feedback/content` reconstructs the filename from the `ref` rather
+  than trusting a client-supplied path — no traversal.
 - `feedback-history-changed` is emitted by the filesystem watcher
   whenever anything under `resources/feedback-history/` changes. No
   debounce — promotion fires at most once per iterate cycle.
@@ -295,17 +321,24 @@ providers, switched by the `provider=` query.
 | --- | --- | --- | --- | --- |
 | `/__sessions/meta` | HTTP GET | `provider=` | `{ count, latest_mtime, … }` | agent pane iframe |
 | `/__sessions/list` | HTTP GET | `provider=` | `[{ id, mtime, title, … }, …]` | agent pane iframe |
+| `/__agent/session` | HTTP POST | JSON body `{ provider, session, bram_token }`; `bram_token` must be this instance's menu token (`authenticated_menu_payload`), else 403; `provider` is `claude`, `codex` or `antigravity` and `session` must pass `session_id_is_safe`, else 400 | `{ ok, changed }`. The running CLI naming its own session (session spine rule 1, `docs/decisions/2026-10-27-bram-chooses-the-session.md`): when `provider` is the current provider, the host records `session` as that provider's named session (Antigravity: the live-session cell), remembers it as last active, traces `[agent-switch] op=live-session-set … source=agent-event`, claims a queued title for Antigravity, and emits `sessions-list-changed`. A different current provider, or the same session again, answers `changed:false` without side effects | `bram-guard` in its session-hook modes (`session_report`, `guard.rs`): Claude's and Codex's session hooks post `session_id` (skipped when an `agent_id` marks a subagent), Antigravity's posts `conversationId`; the port and token come from the terminal's `BRAM_PORT` / `BRAM_MENU_TOKEN`, never from the port file. OpenCode's plugin uses `/__opencode/event` instead |
 | `/__sessions/latest` | HTTP GET | `provider=` | full JSONL body, `text/plain` | agent pane iframe |
 | `/__sessions/latest-meta` | HTTP GET | `provider=` | `{ size, mtime, id }` | agent pane iframe |
 | `/__sessions/latest-pending` | HTTP GET | `provider=` | pending tool-use record, JSON | agent pane iframe |
 | `/__sessions/content` | HTTP GET | `provider=`, `id=` | full JSONL body for that session, `text/plain` | agent pane iframe |
 | `/__sessions/delete` | HTTP GET | `provider=`, `id=` | `{ ok: true }` | agent pane iframe |
 | `/__sessions/rename` | HTTP GET | `provider=`, `id=`, `title=` | `{ ok: true }` | agent pane iframe |
-| `/__turns` | HTTP GET | `provider=claude\|codex` (optional), `id=<session-id>` (optional; by-id fetch), `agent=<agentId>` (optional; subagent transcript), `latest=N` (optional; tail window for live refreshes) | `{ sid, provider, total, windowStart, turns: [...] }` — `total` is the full turn count; `windowStart` is the index of the first returned turn (0 for full fetches); with `latest=N` only the last N turns are returned so the iframe can splice the window onto accumulated history and detect rotation/shrink. | agent pane iframe (Transcript, Sessions) |
+| `/__sessions/pair` | HTTP GET | `from=<provider>` (optional), plus one `<provider>=<session id>` per side (exactly two sessions of different providers; placeholder ids refused with 409) | `{ ok: true }` — records the pair/group (the Sessions pair offer's Keep); with `from` also offers a catch-up. Emits `sessions-list-changed`. | agent pane iframe |
+| `/__sessions/unpair` | HTTP GET | `provider=`, `id=` | `{ ok: true }` — takes the session out of its group (the Sessions tab's Leave); 500 `provider required` without `provider`. | agent pane iframe |
+| `/__sessions/suggest` | HTTP POST | body `{ name, whatsNext? }` (`name` required, else 400) | `{ ok: true }` — asks the pane to open its New session dialog pre-filled; creates nothing. Emits a non-replayable `session-suggest` event. | agent (curl), agent pane iframe |
+| `/__sessions/<id>` | HTTP GET | `provider=` | any other `__sessions/` suffix is read as a session id and answers like `/__sessions/content` (full JSONL, `text/plain`). | agent pane iframe |
+| `/__turns` | HTTP GET | `provider=claude\|codex` (optional), `id=<session-id>` (optional; by-id fetch), `agent=<agentId>` (optional; subagent transcript), `latest=N` (optional; tail window for live refreshes) | `{ sid, provider, total, windowStart, turns: [...] }` — `total` is the full turn count; `windowStart` is the index of the first returned turn (0 for full fetches); with `latest=N` only the last N turns are returned so the iframe can splice the window onto accumulated history and detect rotation/shrink. Each turn carries `ts` (the ISO timestamp of the record it was built from) when the provider stamps one, as Claude and Codex do; the Transcript uses it to land a Log entry's `/transcript?at=<ms>` link (log-rows-baseline-and-spacing). | agent pane iframe (Transcript, Sessions) |
 | `/__send-ledger` | HTTP GET | — | `{ entries: [...], nowMs, staleTerminalInput, awaitingTurn }` — snapshot of the outbound-send ledger. `entries` carry `id/kind/state/cause/viaQueue/mode/preview/injectedAtMs/resolvedAtMs/retried`. `staleTerminalInput` = an Esc-aborted send's copy is known to sit in the terminal input; `awaitingTurn` = a pane-submitted turn is in flight (drives the composer gate). | agent pane iframe |
 | `/__current-turn-edits` | HTTP GET | — | `{ added, removed, filePath, kind, lastToolId }` for the current turn's edit aggregates. Same derive-at-the-boundary pattern: host parses the 64 KB tail once per request, iframe binds via DataSource instead of running `currentTurnEdits(lastJsonl)` on every fanout. | agent pane iframe (Workspace turn-edits hint) |
 | `/__waiting-for-assistant` | HTTP GET | — | `{ waiting: bool }` — true when the most recent meaningful JSONL record is a user message (`tool_result`-only records skipped). Mirror of the iframe `isWaitingForAssistant` helper. | agent pane iframe |
-| `/__tool-detail` | HTTP GET | `id=<toolId>` | `{ input, result }` or `null` for a single tool by id. Mirrors `getToolDetail(jsonlText, toolId)`. | agent pane iframe (Workspace in-flight edit detail / compatibility consumers) |
+| `/__conversation-state` | HTTP GET | — | `{ lastAssistantText, lastExchange, currentTurnEdits }` derived from the active session's JSONL, behind a `(path, mtime, len)` cache. | agent pane iframe (Workspace) |
+| `/__session-size` | HTTP GET | — | `{ bytes, humanBytes, state: green\|amber\|red, provider, guidance, … }` for the active session file (green ≤ 5 MB, amber ≤ 15 MB); `{}` with no active session. Informational, not a warning. | agent pane iframe (Status tab) |
+| `/__agents` | HTTP GET | — | `{ sid, mainModel, agents: [{ agentId, agentType, description, toolUseId, model, state: running\|waiting\|finished, … }] }` — roster of the active session's subagents for the footer chips. | agent pane iframe |
 | `/__describe-command` | HTTP POST | body `{ id, command, description?, name?, context?, result? }` | `{ ok: true, description, cached? }` on success; `{ ok: false, reason: "disabled"\|"no-key"\|... }` when the opt-in gates are closed or the API call fails. Synthesizes (or upgrades) a one-line intent header for a tool expansion via the Anthropic Messages API (Haiku). Native agent-authored descriptions (e.g. Claude's Bash `description` param) render on tool rows without this route; it is the enhancement tier — upgrades for Claude, coverage for Codex, whose tool calls carry no native description. Default off: the project must explicitly set `ai.describeCommands: true`, and `ANTHROPIC_API_KEY` must also be present in Bram's environment. Depending on the tool, `command` can carry command text, a diff or written content, or file/search material; `context` and `result` carry bounded excerpts. Every textual prompt field passes through the host credential redactor, backed by the pinned `loomweave-scanner` Rust crate, before request construction. Redaction is heuristic defense in depth, so explicit opt-in—not redaction—is the external-processing boundary. Results are cached in memory by redacted material and overlaid onto `/__turns` tool entries at serve time. `[ai-describe] op=call` records latency, token counts, presence flags, and `redactions=N`, never prompt content. | agent pane iframe (Transcript tool expansion) |
 
 - Provider directories: `~/.claude/projects/<encoded-cwd>/` for Claude
@@ -345,6 +378,10 @@ The HTTP routes shell out to `git`; the IPC command shells out to
 | `/__repo/origin` | HTTP GET | — | `{ remote, owner, name }` | agent pane iframe |
 | `/__git-diff` | HTTP GET | `path=` | `git diff -- <path>`, `text/plain` | agent pane iframe |
 | `/__file` | HTTP GET | `path=` | file body, `text/plain` | agent pane iframe |
+| `/__local-file-preview` | HTTP GET | `path=`, optional `line=`, `sha=`, `maxBytes=` (default 200 KB, ceiling 8 MB) | `{ ok, path, displayPath, repoPath, name, language, renderMode, content, truncated, size, line }`, or `{ ok: false, error, … }` (still 200). The path must resolve inside the project root (symlinks and `..` collapsed); binary files are refused. With `sha=` it serves the file as that commit had it (`git show`, local). | agent pane iframe (file previews, history links) |
+| `/__repo/tree` | HTTP GET | — | `{ rows, files }` — tracked plus untracked-not-ignored files as flat Tree rows, with Bram's own state files added; `{ rows: [], error: "not-a-git-repo" }` outside a repo. | agent pane iframe (Files page) |
+| `/__repo/tree/dir` | HTTP GET | `path=<dir>` | `{ rows }` for one of Bram's state folders (or a folder beneath one); **403** for any other directory, so it cannot browse arbitrary folders. | agent pane iframe (Files page lazy expand) |
+| `/__repo/grep` | HTTP GET | `q=<literal text>` | `{ hits, total, capped }` — literal, case-insensitive `git grep` over tracked and untracked-not-ignored text files plus Bram's state paths, per-file and total caps; empty `q` returns no hits. | agent pane iframe (Files page search) |
 | `/__git/status` | HTTP GET | — | `{ ahead, behind, dirty }`. Runs `git fetch origin` first so `behind` reflects current remote (without it the Pull button can be dimmed while origin has new commits). | agent pane iframe (Commits tab Pull-button gating, Worklist tab dirty-tree banner) |
 | `/__git/pull-rebase` | HTTP POST | — | `{ ok: true }` on success / 500 plain text on error. Runs the equivalent of `git pull --rebase --autostash`. | agent pane iframe (Commits tab Pull button) |
 | `/__diff/annotate` | HTTP POST | body `{ diff: "<unified-diff-text>" }` | `[{ kind: "context" \| "hunk" \| "fileheader" \| "add" \| "del", text, segments? }, …]`. `segments` is set on paired 1:1 (-,+) lines and carries per-segment `{ text, bg? }` runs from `similar::TextDiff::from_words` for intra-line word emphasis. `bg` is a theme-variable string (`$color-danger-200` / `$color-success-200`). Diffs over `DIFF_ANNOTATE_LINE_CAP` (1500 lines) skip word-diffing and return plain per-line rows. | agent pane iframe (`<DiffView>` consumers: Workspace TO COMMIT, Commits per-file patch) |
@@ -403,6 +440,7 @@ Context tab in the agent pane.
 | `/__context/list` | HTTP GET | `provider=` | `{ provider, summary, sections: [{ key, label, items: [{ path, display, kind }] }] }` | agent pane iframe |
 | `/__context/search` | HTTP GET | `provider=`, `q=` | `{ results: [{ path, display, category, hits: [{ line, snippet }] }] }` (≤ 50 hits) | agent pane iframe |
 | `/__context/file` | HTTP GET | `path=` | file body, `text/plain` | agent pane iframe |
+| `/__context/skills` | HTTP GET | — | `{ provider, skills: [...] }` — the project's skills from `.claude/skills/*/SKILL.md` (issue-221-skill-launcher). | agent pane iframe |
 
 ## 9. Voice / transcription
 
@@ -539,6 +577,8 @@ change.
 | `/__vendor/<path>` | HTTP GET | — | vendor JS/CSS, content-typed | both iframes |
 | `/__tools/<path>` | HTTP GET | — | agent pane XMLUI sources | agent pane iframe |
 | `/resources/worklist.json` | HTTP GET | — | file body, or `{description:"", items:[]}` if missing | agent pane iframe |
+| `/__project/<path>` | Tauri scheme only | — | proxied to the target app's upstream with the prefix stripped (loopback default or an external dev server). Not handled by the loopback server. The isolated `bramapp://` target scheme serves only this project content and refuses every `__*` route and shell asset. | target-app iframe |
+| `/<project path>` | HTTP GET | — | project file served from the project root (the loopback fallback after every reserved route); extensionless misses fall back to the root `index.html` when one exists (SPA fallback, issue-358), other misses 404. | target app, browser |
 
 - `app/__shell/` and `app/vendor/` changes trigger reload in both
   iframes; `app/tools/` changes reload only the agent pane iframe; the
@@ -622,18 +662,30 @@ file / event reference.
 ## 12. Agent message queue
 
 The Queue tab persists unsent messages in
-`resources/.bram-queue.json`. Entries remain user-controlled: saving
+`<state>/.bram-queue.json`. Each accepted save also retains message records in
+`<state>/queue-drafts/<id>.json`; sending or deleting removes them from the active
+queue but leaves these saved drafts for the Log. Older already-removed messages
+may have no draft. Message bodies are not written to the trace. Entries remain user-controlled: saving
 does not inject them into the terminal; the iframe calls the existing
 `toTurn` path only when the user clicks an item's **Send** button.
-Each edit also writes a synchronous `sessionStorage` recovery snapshot
+The message box's unsent draft is persisted the same way, in
+`resources/.bram-message-draft.json` behind `/__draft` and `/__draft/save`.
+Each queue edit also writes a synchronous `sessionStorage` recovery snapshot
 before the debounced host save. An iframe refresh restores that snapshot
-and retries `/__queue/save`; only acknowledgement of the identical
-payload clears it.
+and retries `/__queue/save`. The recovery snapshot remains until replaced by
+a later mutation or the browser session ends. Saves are serialized using the
+last acknowledged version. Removed entries carry their final editor values
+through the debounce window as `retainedEntries`; the host preserves those
+drafts before replacing the active queue. Old clients may omit this field;
+the host still retains their previously saved entries.
 
 | Surface | Kind | Query / params | Response | Consumer |
 | --- | --- | --- | --- | --- |
-| `/__queue` | HTTP GET | — | `{ entries: [{ id, text, sendMode, targetItemId, updatedAtMs }] }`; `sendMode` is `message` or `iterate`; missing file defaults to `{ entries: [] }` | agent pane iframe |
-| `/__queue/save` | HTTP POST | body `{ entries: [...] }` | `{ ok: true }`; validates that `entries` is an array, then replaces `resources/.bram-queue.json` | agent pane iframe |
+| `/__queue` | HTTP GET | — | `{ entries: [{ id, text, sendMode, targetItemId, updatedAtMs }], version }`; `sendMode` is `message` or `iterate`; missing file defaults to `{ entries: [] }` | agent pane iframe |
+| `/__queue/save` | HTTP POST | body `{ entries: [...], version, retainedEntries?: [...] }` | `{ ok: true, version }`; rejects a stale/missing base version with 409 before writing. Retains per-message drafts, then atomically replaces `<state>/.bram-queue.json`. `retainedEntries` is not kept in the active queue file. | agent pane iframe |
+| `/__queue/draft` | HTTP GET | `id` (a queue id, `q-…`) | `{ active: true, entry }` while the message is queued, `{ active: false, entry }` from its retained draft in `<state>/queue-drafts/` after a send or delete, or `{ missing: true }` (older message, unknown or path-shaped id). The entry carries `agent` (recorded when it was written), `sentToAgent` / `sentAtMs` or `deletedAtMs` when known. Read-only; never recreates an entry. Backs the Log's Open in Queue link (`log-queue-entry-opens-message`). | agent pane iframe (Queue tab) |
+| `/__draft` | HTTP GET | — | `{ text }` — the message box's unsent draft from `resources/.bram-message-draft.json` (empty string when none); 500 without a project root | agent pane iframe |
+| `/__draft/save` | HTTP POST | body `{ text }` | `{ ok: true }`; an empty `text` removes the file; 400 on bad JSON or missing `text`. Last writer wins, one message box per window. | agent pane iframe |
 
 `sendMode:"message"` uses the footer-equivalent `toTurn` path.
 `sendMode:"iterate"` requires a current `targetItemId` and delegates to
@@ -666,6 +718,41 @@ composer with Worklist items selected.
   transition points in `lib.rs`. Trace mirror: the `[prompt-lifecycle]`
   category.
 
+- **`POST /__hook-trace`** — `{ script, event, tool, target, cwd,
+  decision, reason }` from the hook scripts; the host writes one `[hook]`
+  trace line (newlines flattened) and answers `{ ok: true }`; 400 on bad
+  JSON. Trace-only: it decides and grants nothing.
+
+- **`POST /__opencode/event`** — turn boundaries from the OpenCode plugin
+  (`type`, `sessionID`, `at`). The host traces the event and, while OpenCode
+  is the active provider, moves the claim and refreshes the Transcript;
+  answers `{ ok: true, handled: bool }`, 400 on bad JSON. It grants no
+  authorization. The plugin sends `bram_token` (`BRAM_MENU_TOKEN`) when it
+  runs in Bram's terminal. A wrong token is dropped, as is a missing one once
+  this Bram has seen a valid one (`op=foreign-dropped`, still 200). Until then
+  a missing one is accepted, for a plugin older than the token.
+
+## 14. Search index
+
+Unified full-text search over the project's history (sessions, commits,
+issues, worklist history), served from the SQLite FTS5 index. The agent-side
+drill is described in `app/__shell/conventions.md` (Search-first).
+
+| Surface | Kind | Query / params | Response | Consumer |
+| --- | --- | --- | --- | --- |
+| `/__search` | HTTP GET | `q=`, `limit=` (default 50, clamped 1–500), `types=session,commit,issue,worklist-history` (optional), `mode=and\|phrase\|prefix\|raw` (default `and`) | `[{ type, source, date, link, snippet, rank, key, id, provider, extra }, …]`; **503** `{ error: "search index not ready", reason: holding\|initial-scan, hint, … }` until a first index cycle completes (never read it as "no history") | agent pane iframe (Search page), agents |
+| `/__search/doc` | HTTP GET | `key=<hit key>` | `{ content }` — the stored full content of one hit (empty when unknown); same 503 as `/__search` | agent pane iframe (inline expanders), agents |
+| `/__search-index-status` | HTTP GET | — | `{ active_buckets, total, issuesThrough, lastCycleMs, progress?, last_added }` — indexer state for the footer indicator and the Search page | agent pane iframe |
+
+## 15. Needs You inbox
+
+The Inbox tab's data: what is waiting on the user, in four lanes.
+
+| Surface | Kind | Query / params | Response | Consumer |
+| --- | --- | --- | --- | --- |
+| `/__needs-you` | HTTP GET | — | `{ verifiedAtMs, checking, lanes: { needsYouNow, yourDecision, othersHands, looseEnds }, notes }`. Forge rows carry `excerpt`: the first line of real content in the thread's latest comment (a Bram forge signature line, blank lines and leading `#`/`>` marks skipped; whitespace collapsed; capped at 160 chars with an ellipsis; empty when the comment is only a signature). It comes from the existing latest-comment fetch, with no extra `gh` call. Untrusted text: render as plain text, never Markdown. | agent pane iframe (Inbox tab) |
+| `/__needs-you/dismiss` | HTTP POST | `{ id, activityMarker }` (both required; 400 otherwise) | `{ ok: true }` — hides a forge item until new activity changes its marker; emits `needs-you-changed`. | agent pane iframe |
+
 ## Drift policy
 
 Code under `src-tauri/src/lib.rs` is authoritative. This catalog is the
@@ -673,7 +760,9 @@ announcement surface for backend APIs — update it whenever a route or
 IPC command is added, renamed, removed, or has its response shape
 changed. Approximate line ranges for orientation:
 
-- HTTP routes: `lib.rs:4800–5600` (the `route_request` function).
+- HTTP routes: the `route_request` function (GET-style routes) and the
+  `handle_http` function (POST-only routes, the Origin gate and the `__test/`
+  prefix), both in `lib.rs`.
 - IPC commands: `lib.rs:1279–1880` (individual `#[tauri::command]`
   functions) and `lib.rs:5654` (the `tauri::generate_handler!`
   registration).

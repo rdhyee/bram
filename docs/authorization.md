@@ -53,9 +53,17 @@ chat approval or external clients.
 Permission-menu callbacks use a separate per-Bram-instance credential,
 `BRAM_MENU_TOKEN`, inherited by the terminal child and echoed by its hook as
 `bram_token`. Missing or mismatched credentials receive HTTP 403; presenting a
-menu does not authorize the underlying tool or a Worklist operation. Bram
-feature-detects Codex's `--no-daemon` option and adds it to local launches so
-hooks run with this instance's environment rather than a shared server's.
+menu does not authorize the underlying tool or a Worklist operation.
+`POST /__agent/session`, where a Claude, Codex or Antigravity hook names the
+running session, takes the same credential (`handle_agent_session`). It
+moves which session Bram shows as current and authorizes nothing. OpenCode's
+`POST /__opencode/event` checks the same credential to tell this terminal's
+OpenCode from another (`handle_opencode_event`); it stays open to a missing
+token until this Bram has seen a valid one, so a project whose plugin predates
+the token keeps working until Setup refreshes it. Bram
+feature-detects Codex's `--no-daemon` option and OpenCode's `--standalone`
+option and adds them to local launches so hooks and plugins run with this
+instance's environment rather than a shared server's.
 Explicit remote connections are preserved and may require the terminal
 fallback. Existing same-user-process limits still apply; no project-readable
 credential file or unauthenticated callback fallback is introduced. Regression
@@ -81,14 +89,23 @@ their gaps. TTLs and the consumption distinction are explained below.
 | Iterate | Feedback on an unstarted item revises its proposal; feedback on begun work permits edits within its scope. | Host stamps addressed context and claim; guard narrows addressed writes. No new lifecycle grant. | Feedback history / claim intervals. Iterate alone does not advance, commit, or drop. |
 | Advance | After authorized application, mark the work applied. | `validate_worklist_mutate_authorization`: `approved`, all requested ids, reconciliation freshness; target status must be `applied`. | Worklist history; resolved claim/auth ids retire. |
 | Commit | Separate Commit approval, or explicit Start & commit. | `ensure_worklist_commit_authorized`: `approved`, ids, publish freshness; route checks work, paths, membership and commit-message restrictions. | SHA, audit ledger, history. The record does not retain a distinct apply-only versus commit-only kind; see gaps. |
+| Queued gate click (Start, Start & commit, Commit while a turn runs) | The user's click, deferred: taken while the agent's turn is in flight, it is held in the pane and delivered when the turn ends. | Nothing is recorded or typed at click time; delivery runs the ordinary path (`submitAuthorizedWorklistTurn` → `record_worklist_action_authorization`), so the record, its TTL and the claim start at delivery. Cancel is the user's too; stopping the turn delivers it sooner. | Pane-side and focus-scoped: a reload drops the click (`gate-click op=dropped reason=reload`), never delivers it later. The host is unchanged and still checks the record at commit. |
 | Drop with feedback | User chooses Drop; explain any bytes left on disk. | Host records `drop`; agent resolves and prunes; mutate checks ids and reconciliation freshness. | Drop history. Removes the row, not the edits. |
 | Drop without feedback | User chooses Drop in the pane. | `handle_worklist_drop_direct` records authorization itself, resolves and prunes in one HTTP call. | `worklist-drop op=host-direct`; caller identity is assumed, not established by the handler. |
 | Clear landed rows | Agent may clear rows for work it committed outside the gate; user may request cleanup. | `handle_worklist_clear_landed` checks repository evidence per id; no Drop grant required. | Landing SHA, `op=clear-landed`, history; partial refusal is possible. |
 | Do recommended | Agent posts a plan; user clicks to execute it. | Host validates plan ids/verbs and serves it only for the current board version; pane uses existing Drop/Commit/feedback paths. Feedback and commit cannot share a plan. | Plan and existing gate traces. Posting the plan grants nothing. |
 | Direct edit | Same-turn `just do it` or `skip-worklist:` opts out of proposal-first for the requested work. | Claude reads user-turn text; host writes a wildcard direct-edit sidecar for Codex / structured prefix. Guard checks its one-hour lifetime and paths. | Direct-edit audit breadcrumb. A matching phrase/sidecar is not a lifecycle grant. |
+| Pause enforcement (Claude only, v1) | The user turns on **Pause Worklist enforcement for Claude** in Settings: an advanced choice to manage work and commits without the Worklist. | `.bram.json` `worklist.enforcement: "paused"`, written by `POST /__settings`. `claude_decision` (`guard_policy.rs`) turns a coverage denial (`no-coverage…`, `bash-write-no-coverage…`) into an allow with reason `enforcement-paused:<original>`; every other deny reason stands. Claude's `SessionStart` / `UserPromptSubmit` hooks add a factual note saying so. Codex, OpenCode and Antigravity are unaffected. | `[worklist-enforcement] op=paused\|resumed` on the settings route; the guard's own `enforcement-paused:` reasons. Not a lifecycle grant: nothing is approved, claimed or committed by it. See the gap below. |
 | Plain git / forge work | Requires the user's request; issue-only work needs no Worklist item. | Separate guard rules, not `ensure_worklist_commit_authorized`; Bash coverage is coarse. Forge signatures and session-URL checks apply to inspectable writes. | Git / forge records. Worklist guarantees cannot be projected onto all shell commands. |
 | Push | User decides separately, normally with Push; agent pushes only when asked. | Host Push path and shell guard are different surfaces; the shell guard has a post-consumption push grace. | Remote reachability is separate from local commit success. Grace is not proof of push consent. |
 | Test-drive switch / reload / New session / turn | Only for `scripts/switch-matrix.py` on a disposable demo instance. | `POST /__test/{switch,reload,new-session,turn}` exist only when Bram starts with `BRAM_TEST_DRIVE=1` (else 404); they call the same command functions as the pane's IPC. `./bram` never sets it. | `[test-drive] op=enabled` at startup, `op=call route=…` per call. Any process in that instance's project can drive the agent while it's on, which is why it's confined to the demo. |
+| Self-update (`POST /__self-update`, `/__self-update/relaunch`) | The pane's update banner; the user decides to update. | No grant or token; the common loopback gate refuses a foreign `Origin` or `Host`. `/__self-update` ignores its request and downloads `install.sh` from the fixed GitHub release URL (or from `BRAM_BASE_URL` in Bram's own environment) and runs it; the 409 is a double-start guard on in-process state. `install.sh` verifies the artifact against `SHA256SUMS` from the same base; the script is not verified by the host. `/relaunch` restarts into the installed binary. | `loopback_gate_refusal`, `handle_self_update_start`, `run_self_update`, `handle_self_update_relaunch` (`lib.rs`); `install.sh`. Reachable by a same-user local process, the accepted residual. |
+| Paste image (`POST /__paste-image`) | The composer pastes an image to reference in a message. | No grant; the common loopback gate applies. Writes only under `~/.cache/bram/paste/` with a server-built name and an extension from a four-type allowlist; contents and size are unchecked. | `loopback_gate_refusal`, `handle_paste_image` (`lib.rs`). Affects disk space, not the project or authorization state. |
+| Release claim early / reorder (`POST /__worklist/end`, `/__worklist/reorder`) | `end`: the agent releases its claim; `reorder`: the user drags rows. | No grant; the common loopback gate applies. `end` shrinks the inflight claim for the named ids. `reorder` needs the current `version` and the exact id set, then changes order only. Neither touches a grant or an item's status. | `handle_iterate_end`, `handle_worklist_reorder` (`lib.rs`). A same-user local process can unlock a running item's claim early; it cannot approve, commit or drop. |
+| Flag misaddressed feedback / resend it as chat, or chat as feedback (`POST /__worklist/misaddressed`) | `flag`: the agent says the feedback it is answering isn't about its item; `resend` / `dismiss`: the user's click or next send. | No grant; the common loopback gate applies. `flag` requires a well-formed `<ms>-<itemId>` ref with a live draft in `feedback-drafts/` and an `iterate` turn context addressed to that item, so it can name only the message being answered. `resend` requires the pending ref. Neither touches a grant, a claim or an item's status; `resend` appends a note to the draft, never rewrites or deletes it. `flag-chat` requires the newest outbound turn, sent as chat, while a `general` turn runs, and an item on the board; `resend-as-feedback` requires the pending chat ref and only returns the turn's saved text and images. The feedback the pane then sends goes through the ordinary feedback path, so it is addressed feedback, establishing the claim any feedback does, on the user's click. | `handle_worklist_misaddressed` (`lib.rs`), `misaddressed_feedback_tests`. A same-user local process could flag the current feedback or append the resend note; it cannot approve, commit or drop, and the pane only sends what the user clicks. |
+| Reload the agent pane when it has degraded (`POST /__pane/flush`) | The pane's opt-in idle flush. | No grant; the common loopback gate applies. Refused (409) unless the project setting `ui.paneIdleFlush` is on. Goes through the same deferral as every forced pane reload, so it waits out a running turn. Touches no grant, claim, item or file. | `handle_pane_flush` (`lib.rs`). With the setting on, a same-user local process could reload the pane, losing unsaved scroll and expansion state (drafts survive); it cannot approve, commit or drop. |
+| Release a subagent's hold (`POST /__agent/subagent/release`) | The row's **Release**: the user frees an item held for a subagent whose stop never arrived. | No grant; the common loopback gate applies. Removes the named bindings (`agentIds`, `agentId` or `all`) and reconciles the claim in one transaction. | `handle_agent_subagent_release` (`lib.rs`); `[delegated] op=release reason=manual`. A same-user local process can release a hold early; the subagent's later lines then go unowned. It cannot approve, commit or drop. |
+| Choose the state-folder move (`POST /__state-dir/decision`) | The banner's **Move Bram's files** / **Not now**, or Status's **Move at next launch** (#469). | No grant; the common loopback gate applies. Writes `resources/.state-move` (`move` or `not-now`); refused with 409 once `.bram/` exists or there is no `resources/`. Nothing moves until the next startup, whose mover still checks tracked files, a live claim and the inventory. | `handle_state_move_decision` (`lib.rs`); `[state-dir] op=decision`. A same-user local process can schedule or decline the move; it cannot move tracked or foreign files, and a live claim still blocks the move. |
 | Queued issue close | User ticks the close choice; host queues against the new SHA and closes after push. | `enqueue_issue_closes_from_auth` and push-time processing; commit route rejects forge closing keywords that bypass the dialog. | `queuedCloses` / host close records. Direct forge issue actions follow the separate explicit-request policy. |
 
 ## Records, transport, and lifecycle
@@ -105,7 +122,7 @@ their gaps. TTLs and the consumption distinction are explained below.
 | Drop / verified cleanup | `handle_worklist_drop_direct`, `handle_worklist_clear_landed`, `worklist_item_landed_since` |
 | Recommendation | `validate_worklist_plan_steps`, `worklist_plan_current`; pane executes the current plan |
 | Codex filesystem transport | `drain_worklist_intent` dispatches to the same handlers |
-| Tool enforcement | [guard.rs](../src-tauri/src/guard.rs) dispatches hooks; [guard_policy.rs](../src-tauri/src/guard_policy.rs) implements decisions for both providers |
+| Tool enforcement | [guard.rs](../src-tauri/src/guard.rs) dispatches hooks and translates OpenCode's and Antigravity's tool calls into Claude's or Codex's shapes; [guard_policy.rs](../src-tauri/src/guard_policy.rs) implements the decisions for every provider. Registrations: Claude's `.claude/settings.local.json`, Codex's `~/.codex/config.toml`, OpenCode's seeded plugin, Antigravity's group in the project's `.agents/hooks.json` |
 | Retirement / interruption | `retire_worklist_authorization_record`, `shrink_inflight_claim_sentinel`, `invalidate_worklist_authorization`, `worklist_auth_freshness_ok` |
 
 The ordinary two-stage flow is:
@@ -229,6 +246,18 @@ The later #389 discussion already recognized this exposure. Its existence
 is not permission for an agent to bypass Drop approval. Protecting that
 route is separate runtime work, not accomplished by documenting it.
 
+**The loopback gate stops pages, not local processes.** `handle_http` applies `loopback_gate_refusal` before dispatch. A state change, meaning any non-GET/HEAD/OPTIONS request or a GET on `STATE_CHANGING_GET_PATHS`, needs no `Origin` or the shell origin, and every request needs a loopback `Host` at this port. CORS alone only stopped a cross-site page reading an answer, not sending the request. The gate adds no caller identity: a same-user local process can still call any route, the accepted residual, and the per-session token was deliberately dropped (`docs/security.md`, H6). `STATE_CHANGING_GET_PATHS` is hand-kept, so a new GET that changes state must be added to it. `/__paste-image` has no size cap, so such a process can fill disk under `~/.cache/bram/paste/`. Refusals are traced as `[loopback-refusal]`. Windows, OpenCode and Codex callers were read, not exercised, when this landed.
+
+**The loopback root serves the project, minus its dot-directories.** A path that matches no route is read from the project root (`route_request`'s terminal project-serve, for target-app preview and SPA fallback). Before 0.8.4 that included `.git/` (`/.git/config` answered 200), and `/resources/../src-tauri/Cargo.toml` and `/__bram/../.git/config` (sent as-is) slipped past the state-folder route's traversal check into it. `project_path_refusal` (`lib.rs`) now answers 404 to any segment that is `.` or `..` or starts with a dot, and to a backslash, drive colon or leading slash, traced `[project-serve] op=refused`. Bram's state stays at `/__bram/` (with its `/resources/` alias), which has its own traversal check (`state_url_rel`). No caller in the trace archives since 2026-07-20 requested a dot path. This narrows what a same-user local process can read through the port. It is not a boundary against that process, which can read the files directly anyway (loopback-root-serves-dotgit).
+
+**The enforcement pause has no human-only path (v1).** The setting lives in
+`.bram.json`, which the guard does not protect, so an agent could write
+`worklist.enforcement: "paused"` as easily as the Settings switch does. #466's
+first design question, whether the guard may stand down at all and who may
+make it, is open; v1 is an experiment with the setting deliberately exposed.
+A protected path (a host-owned flag, the agent's writes denied) is the
+recorded alternative if the pause survives the experiment.
+
 **Coverage is weaker than approval.** File-aware tools can pass because a
 proposed/applied item declares the path. `trace_would_deny_unaddressed`
 records stronger approval findings; `would_deny_reason` distinguishes
@@ -237,6 +266,22 @@ observations, not denials. The Bash branches are coarser still: any active
 coverage can satisfy the general write check. #387 added observation to
 previously unseen surfaces; logging did not turn the observation into a
 blocking rule. The policy to wait for approval still binds.
+
+**The subagent lifecycle check reads only inline command text.**
+`subagent_lifecycle_verdict` (`guard_policy.rs`) denies a subagent's Bash
+call when the payload carries an `agent_id` and the command string contains
+a worklist lifecycle route. It is a substring test. A route called from a
+script file, a shell function or an alias is not seen; a command whose text
+merely mentions a route (writing a message template that names it, grepping
+the docs for it) is denied. The host routes do not know the caller's
+`agent_id`, so a hidden call is caught only if another rule covers it, and
+the accepted residual is the same as for local processes above. Seen on
+2026-11-02 during #469 wave 1: a subagent's inline edit script carried
+`/__worklist/mutate` inside a deny-message template, was denied, and was
+then run from a file. The diff held no lifecycle call, but the detour is the
+routing-around the conventions forbid, whatever the content: a subagent that
+meets the denial reports it and stops. Trace: `[hook] … decision=deny
+reason=subagent-lifecycle-call`.
 
 **The grant does not encode every policy distinction.** Both Start and
 Commit use kind `approved`; only apply-and-commit adds `commitToo`.

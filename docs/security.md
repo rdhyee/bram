@@ -301,6 +301,55 @@ the slowest 0.03 ms), and 2.5–9 ms for the first call after a project loads.
 Code mode's `execute` itself couldn't write a file through Node's `fs` when
 tested, so the guard sees every write as a tool call.
 
+Antigravity's registration (antigravity-worklist-guard) is a named group,
+`bram-worklist-guard`, that Setup merges into the project's
+`.agents/hooks.json` wherever `agy` is on PATH, keeping the user's own groups.
+It runs the `antigravity-worklist` hook on agy's `write_file`, `edit_file`,
+`run_command` and `call_mcp_tool`, translating the first three to Claude's
+`Write`, `Edit` and `Bash` and `call_mcp_tool` (`ServerName`, `ToolName`,
+`Arguments`) to `mcp__<ServerName>__<ToolName>` in Claude's MCP branch before
+the shared policy decides (`agy-guard-mcp-coverage`, captured on 1.4.12 against
+both a global `xmlui` server and a throwaway plugin `filesystem` server in
+`PreToolUse.jsonl`; because agy spawns `.agents/hooks.json` hooks from
+`<workspace>/.agents`, the guard switches to `workspacePaths[0]` first so
+whitespace-free content strings aren't resolved as `.agents/<token>` candidate
+paths). A spike on agy 1.4.12 (2026-10-31)
+settled the failure modes: a hook that crashes, exits nonzero, hangs past its
+`timeout` or prints invalid JSON blocks the call, and only exit 0 with empty
+output lets it through. So the guard always prints a decision, and the
+self-test fails a guard that doesn't. That isn't enough on its own: a guard
+that predates this change answers `antigravity-worklist` with exit 0 and no
+output (measured on 0.8.1), and `~/.bram/bram-guard` follows whichever
+running Bram re-pointed it last. So the registered command wraps the guard in
+a shell test that turns empty output into a deny naming the cause, the same
+role OpenCode's plugin plays by denying any non-decision. Windows registers
+the bare command until a capture shows which shell agy uses there. The
+self-test runs the link directly, so with an older Bram running it can read
+red for the Antigravity cases (and for the signed forge cases, whose version
+the older guard rejects); that red is accurate about the link at that moment.
+An explicit `allow` doesn't skip agy's
+own permission check, and the guard never answers `auto_approve`, which would.
+Eight cases run agy-shaped payloads, for 25 in all, including a forge write
+signed as `Antigravity` (accepted as `<Agent>` since
+antigravity-signature-and-conventions) and uncovered and covered
+`call_mcp_tool` writes. Known
+limits: agy has no untracked local hooks file, so in a project that tracks
+`.agents/hooks.json`, Setup's group changes a tracked file. A file that isn't
+JSON is left alone and fails the self-test without raising the Setup banner,
+since no Setup run could fix it. Both global and plugin MCP servers on 1.4.12
+registered their tools lazily through `call_mcp_tool`; agy's system prompt also
+describes an eager `mcp_<server>_<tool>` form that neither server produced and
+that `agy mcp add` offers no flag for, so that shape remains uncaptured and
+outside the matcher.
+
+Subagents' tool calls do reach the hook. Live on agy 1.4.12 (2026-10-31), with
+nothing authorized, `write_file` was denied with a `decided=deny` line from a
+direct call, from `invoke_subagent`, from a `define_subagent` type with
+`EnableWriteTools`, and from a subagent whose `Workspace` pointed at another
+folder and whose path pointed into the project (the root stayed the project).
+agy's logs show the subagents ran. Only `write_file` was tried through a
+subagent, not `edit_file`, `run_command` or `call_mcp_tool`.
+
 ## Ranked action plan
 
 Severity is impact-weighted against the threat model. Effort: **S** = < half a
@@ -323,7 +372,7 @@ day, **M** = half to two days, **L** = more than two days.
 | H3 | Claude guard exits 0 for all `Bash`; write ops bypass the worklist. | **DONE (regressed 2026-07-23, re-fixed)** — `_BASH_WRITE_PATTERNS` landed in the guard, but the `Bash` matcher was dropped from the registration by unrelated collateral (`a8d2acb`), leaving the branch unreachable for three and a half weeks. The original DONE verified the script, not the artifact that runs. Re-fixed by registering the surface in `CLAUDE_GUARD_MATCHERS` and verifying by probe (#261). Root cause #4. |
 | H4 | Auth did not fail closed on interrupt. | **Original fix landed** (`d044b34`, `e75fea2`); #255 subsequently permits reconciliation (advance/prune) after interruption while publication stays blocked by a recorded interrupt. TTL applies to both. Already-consumed records are skipped by the invalidator; see [current limits](authorization.md#resolve-consumption-expiry-and-interruption). Under OpenCode the interrupt is recorded when OpenCode reports one (`session.execution.interrupted`), not on the Esc keystroke: OpenCode stops a turn only on a second Esc within 5 s, so recording the first press blocked publication of work that kept running (opencode-esc-interrupt). Without Bram's OpenCode plugin no such report arrives, and the keystroke still records it. |
 | H5 | Issue-close / push side effects ungated. | **DONE** — agent `/__issue/close` route removed; closing is a host consequence of the user's explicit Push (`8c64ef7`). |
-| H6 | Loopback wildcard CORS let any cross-origin browser page that learned the port read responses. | **DONE — browser vector** (`issue-113-h6-loopback-cors-and-token`). The blanket `Access-Control-Allow-Origin: *` is gone; ACAO is echoed only for the shell (agent-pane) origin and omitted for every other Origin and for no-Origin callers (`cors_allowed_origin`). Confirmed by soak that real pane traffic sends no Origin, so the change is transparent to it; a cross-origin browser page — and the target pane's `bramapp://` origin — can no longer read loopback responses. **Residual (accepted):** a same-user *local process* is not browser-CORS-bound; a per-session token was designed and deliberately dropped as low-value, since such a process could equally read the token (env via `ps eww`, or a port-adjacent file). |
+| H6 | Loopback wildcard CORS let any cross-origin browser page that learned the port read responses. | **DONE — browser vector** (`issue-113-h6-loopback-cors-and-token`). The blanket `Access-Control-Allow-Origin: *` is gone; ACAO is echoed only for the shell (agent-pane) origin and omitted for every other Origin and for no-Origin callers (`cors_allowed_origin`). Confirmed by soak that real pane traffic sends no Origin, so the change is transparent to it; a cross-origin browser page — and the target pane's `bramapp://` origin — can no longer read loopback responses. **Residual (accepted):** a same-user *local process* is not browser-CORS-bound; a per-session token was designed and deliberately dropped as low-value, since such a process could equally read the token (env via `ps eww`, or a port-adjacent file). **Send half closed (`loopback-state-changes-check-origin`):** one gate at the top of `handle_http` now applies M7's Origin rule to every state-changing request (non-GET/HEAD/OPTIONS methods, plus the GET routes that act, listed in `STATE_CHANGING_GET_PATHS`) and refuses any `Host` that isn't `127.0.0.1` or `localhost` at this instance's port, with 403 and a traced `loopback-refusal` line. The local-process residual and the decision not to add a token are unchanged. |
 
 ### Medium
 
@@ -335,7 +384,7 @@ day, **M** = half to two days, **L** = more than two days.
 | M4 | No durable, always-on record of commit/approval; a successful commit emits no trace line and the auth record is consumed-on-read. | **LEAN VERSION SHIPPED** (#229). Always-on, append-only JSONL ledger (`resources/audit-ledger.jsonl`, untracked) written at the authorization and commit chokepoints — metadata only (decision, item ids, source, sha, branch, staged paths), credential-redacted, best-effort (ungated by traces, but not fail-closed and not tamper-evident). Full version — hash chaining / tamper evidence, push + issue-close events, `/__audit` route, Status surface — remains deferred under #229. |
 | M5 | Codex Bash gate path-blindness. | **CONFIRMED — parity, resolved as documentation** (2026-09-09, from the Rust source). `codex_bash_branch` (`guard_policy.rs`) allows on any coverage (`!covered.is_empty() \|\| codex_fresh_bypass(cwd, "*")`) — the same documented semantics as the Claude Bash gate (see *Gate granularity* above) — while `apply_patch` and the MCP paths intersect the specific target with covered paths (`coverage_verdict`). Making either Bash gate per-file remains an unclaimed design change, not a defect. |
 | M6 | `open_url` opened any `file://` in its default app. | **DONE** — `open_url` enforces a URL allowlist; `file://` is not permitted (`lib.rs:14205`). |
-| M7 | `/__issue/comment` posts directly with only the frontend `enabled` binding as the gate. | **DONE** (2026-09-09, security-long-tail-cleanup) — the dispatch refuses the route when a foreign `Origin` header is present (`issue_comment_origin_allowed`, reusing H6's soaked platform-aware `SHELL_ORIGIN`), closing the browser vector; and every comment posted through the route writes an audit-ledger record (`kind=issue-comment`, number, byte count, forge outcome). No-Origin same-user local process remains H6's accepted residual; a per-session token was already rejected there as low-value. Synth-validated on a demo instance: foreign and `bramapp://` Origins 403 before any forge call; no-Origin passes the screen and ledgers. (The close path was resolved by H5.) |
+| M7 | `/__issue/comment` posts directly with only the frontend `enabled` binding as the gate. | **DONE** (2026-09-09, security-long-tail-cleanup) — the dispatch refuses the route when a foreign `Origin` header is present (now the common gate, `loopback_gate_refusal`, reusing H6's soaked platform-aware `SHELL_ORIGIN`), closing the browser vector; and every comment posted through the route writes an audit-ledger record (`kind=issue-comment`, number, byte count, forge outcome). No-Origin same-user local process remains H6's accepted residual; a per-session token was already rejected there as low-value. Synth-validated on a demo instance: foreign and `bramapp://` Origins 403 before any forge call; no-Origin passes the screen and ledgers. (The close path was resolved by H5.) |
 | M8 | Inspector-tap fields forwarded unsanitized. | **DONE** (`issue-114-secret-safe-observability`) — fields pass through `__bramTraceSafeValue` before IPC; host redacts again before persistence. |
 | M9 | `drop` auth lingered with no TTL. | **DONE** — the auth record (drop included) is rejected once past `WORKLIST_AUTH_TTL_MS` (`lib.rs:137`, `34490`), via the H4 work. |
 

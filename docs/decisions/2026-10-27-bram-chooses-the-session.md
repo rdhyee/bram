@@ -6,6 +6,29 @@ Status: decided 2026-10-27 · revisit when a CLI changes how it names or resumes
 
 **Decision:** Bram chooses the session, launches it by id, marks it current at launch, and groups sessions only through an explicit act tied to that id. Nothing in session switching takes a CLI's own "most recent", a cached guess, or a "file created inside a time window" as the identity of a session.
 
+**After launch (added 2026-11-02, `agy-current-session-on-resume`).** The decision above covers the launch. A CLI can also change conversation by itself after launch, and each provider had filled that gap differently. The rule: a session is current because something named it.
+
+1. **The running CLI names its own session in an event**, from this Bram's terminal. Authoritative: it replaces a pin.
+2. **Bram names it at launch.** It holds until (1) says otherwise.
+3. **Newest wins** only when neither has spoken, and never overrides (1) or (2).
+
+File times and database update times never replace a named session, and a failed read changes nothing.
+
+| Provider | (1) Its own event | (2) Bram's launch | Where it stands |
+|---|---|---|---|
+| Claude | `SessionStart` and `UserPromptSubmit` through the menu hook | named-session cell | Follows the rule (`current-session-from-events`). File times answer only when nothing has named a session |
+| Codex | the existing `PreToolUse` guard reports `session_id` | named-session cell | Follows the rule, with a lag: a change shows at the next tool call, because a new hook event raises Codex's "Hooks need review" prompt |
+| Antigravity | `PreInvocation` hook posts `conversationId` to `/__agent/session` | live cell, with a pinned session never falling back to newest | Follows the rule (`agy-reads-conversation-id`). A change with no turn taken is seen at the next invocation |
+| OpenCode | plugin events (`sessionID`), carrying `BRAM_MENU_TOKEN`, name the session on `/__opencode/event` | live cell, with a named session never falling back to newest | Follows the rule (`opencode-session-own-terminal`). Bram launches `opencode --standalone`, so the plugin runs in a private server under this terminal, not the shared service. Without that flag, a plain `opencode` typed in Bram's terminal is treated as another OpenCode once a tokened event has been seen, and a project with an older plugin stays as before until Setup |
+
+Audit, 2026-11-02, on a demo: an outside copy of each CLI in the same project took one turn. Before these changes it moved `current` on Claude, Codex and OpenCode. After them it holds on Claude, Codex and Antigravity, and with `opencode-session-own-terminal` on OpenCode too: an outside OpenCode's turn, through the shared service and through its own `--standalone`, left `current` alone, and its eight events were dropped (`op=foreign-dropped`). Claude followed `/clear` at once, and a Codex subagent turn didn't move `current`.
+
+**"From this Bram's terminal" is enforced by the terminal's environment.** Bram exports `BRAM_PORT` and `BRAM_MENU_TOKEN` to its terminal. A hook in another terminal has neither, so it can't report, and the route refuses a wrong token. Captured on agy 1.4.12, 2026-11-02, on a live demo: an agy with no such environment moved nothing; one with it moved `current` to a new conversation and then through `/resume` inside the TUI, with no launch by Bram.
+
+**A subagent isn't the session.** An agy subagent fires `PreInvocation` under its own `conversationId`, interleaved with its parent's, and its `lastUserInput` is empty, so the hook skips it. That's observed, not documented. If it stops holding, the Transcript follows the subagent until the parent's next invocation. Claude's and Codex's subagent hooks carry the parent's `session_id` plus an `agent_id`, and the guard skips any payload with one. Any provider moved onto rule 1 needs the same check.
+
+A fresh launch has no name until the CLI's first event, so rule 3 applies for that moment: Claude's `SessionStart` closes it at once, and Codex's at its first tool call.
+
 **Evidence:** one day of driving switches across the three agents broke this rule in a different place each time. Each break, its trace receipt and the commit that closed it:
 
 | Break | Receipt (2026-10-27 UTC) | Fix |
@@ -40,6 +63,10 @@ The consolidated live run at 22:21–22:23 exercised partner resume, unpair, rel
 **Switch matrix, to run once and record here:** Claude, Codex and OpenCode × partner resume, no-partner fallback, fresh partner (New session, then switch), Sessions-tab reload, delete (running refused, other allowed). A new failure is recorded in this note rather than filed as an item, unless it blocks a release.
 
 **Matrix runs** (`scripts/switch-matrix.py`):
+
+- *2026-11-02, `opencode-session-own-terminal`, Claude + OpenCode.* All cases pass but `fallback-by-id`, which is the matrix's own precondition: the session it picked as loose had been started with New session in an earlier run on the reused demo, so the switch correctly started a fresh partner (`op=fresh-partner reason=new-session`). Read from the trace, with no baseline on the old binary. A fresh demo should pass it.
+- *2026-11-02, `agy-session-rename`.* Antigravity members never took their group's name: every rename was refused and the failure stayed in the trace. A grouped row's rename says to leave the group, so two members left a minute apart (16:36:19 and 16:37:19) and the next switch landed in an unrelated loose session. Bram now writes agy's title file, reads it ahead of the lagging summaries database, shows a failed name as a toast, and applies names to Antigravity members at startup. The store is recorded in `docs/agent-specimens/antigravity/README.md`. New session stays refused for Antigravity: its queued name hasn't been tried.
+- *2026-10-31, `antigravity-partner-handoff` (offline; live check pending).* Antigravity joins session groups after OpenCode in member order. Switches can start/resume its sessions by id, brief fresh partners from the existing group, and publish digests from the Claude-shaped JSONL export. Its catch-up waits for the footer-anchored idle composer. Live pair/switch/catch-up checks remain pending.
 
 - *2026-10-27 22:45–23:04Z, Claude + OpenCode.* Plain switch, fallback by id with the offer up, reload clearing the offer, delete-running refused, and the New session brief released on the composer and flushed: all pass. **One break found:** after New session with a short first turn, Claude's new session `6920c90a` was named and became current only 2 minutes later, at the next switch. Its file existed from the brief onward (watcher `change=create` 23:02:05.4), but `latest_claude_session_path`'s hysteresis kept the outgoing session, whose exit write made it seconds old, and nothing re-evaluated once the short turn ended. This breaks (c), "marks it current at launch": New session knows the exact Claude id before launch and should mark it current when its file appears, as an explicit resume already does, rather than wait for file times to agree. **Fixed in the harness item** (`mark_reserved_claude_session_current`): once the reserved id's file exists it is current (`live-session-set … source=reserved-id`); the next run named the session 2.4 s after Create.
 - *2026-10-27 23:12Z.* **Second break, fixed:** a fresh OpenCode partner's catch-up was always held (`no-composer`). The logged tail (`0c37baf`) showed why: in a narrow pane OpenCode 2.1.4 drops its `ctrl+p commands` footer for the cwd and its "/update to install v2.2.0" notice. The idle input box's placeholder "Ask anything…" now counts as ready; the captured tail is pinned as a test.
