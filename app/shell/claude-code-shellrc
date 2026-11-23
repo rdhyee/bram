@@ -7,3 +7,53 @@
 # No shell functions wrap claude/codex any more: the host owns current-agent
 # state and types launch commands itself.
 echo "Bram manages the agent here - use the header switcher to change providers."
+
+# shell-reports-prompt-and-exit-status: report the shell's own foreground
+# edges to the host as private OSC 7779 sequences, which xterm.js ignores
+# (no handler is registered for 7779) and strip_ansi removes:
+#   ESC ] 7779 ; bram ; prompt ; <status> BEL  -- back at the prompt; the
+#                                                previous command exited <status>
+#   ESC ] 7779 ; bram ; exec BEL               -- a command line just started
+# The host reads these instead of guessing a prompt from the last line's
+# shape. The DEBUG trap fires per simple command; the flag limits it to the
+# first command after each prompt, and skips PROMPT_COMMAND itself and
+# completion. $? survives the trap into PROMPT_COMMAND (checked on bash 3.2).
+__bram_at_prompt=1
+__bram_preexec() {
+  [ -n "$__bram_at_prompt" ] || return 0
+  [ -n "$COMP_LINE" ] && return 0
+  case "$BASH_COMMAND" in __bram_prompt*) return 0 ;; esac
+  __bram_at_prompt=
+  printf '\033]7779;bram;exec\007'
+}
+# A launcher may hand us one command to run before the first prompt, in
+# BRAM_LAUNCHER_PROMPT_COMMAND (bram_herdr.py does, to run `herdr agent attach
+# <pane>`). It is opt-in on purpose: a PROMPT_COMMAND exported by the user's
+# own environment (e.g. `history -a`) is still replaced below, as it always
+# was, since running it would report a started command while autostart may be
+# typing a launch (judell/bram#442). Take the value and unset it at once, so
+# nested shells and the agent's subprocesses never inherit it. Run it once from
+# __bram_prompt; if it unsets PROMPT_COMMAND, ours is put back afterwards.
+__bram_launcher_pc="$BRAM_LAUNCHER_PROMPT_COMMAND"
+unset BRAM_LAUNCHER_PROMPT_COMMAND
+__bram_prompt() {
+  local s=$?
+  if [ -n "$__bram_launcher_pc" ]; then
+    local pc="$__bram_launcher_pc"
+    __bram_launcher_pc=
+    # The DEBUG trap does not fire for commands run inside a function, so say
+    # a command started ourselves; otherwise the host keeps believing a bare
+    # shell is in the foreground and refuses to type (reason=shell-foreground).
+    # No prompt is reported before it: the shell is not ready for input until
+    # the inherited command returns (e.g. an attach that ended).
+    __bram_at_prompt=
+    printf '\033]7779;bram;exec\007'
+    eval "$pc"
+    s=$?
+    PROMPT_COMMAND=__bram_prompt
+  fi
+  printf '\033]7779;bram;prompt;%s\007' "$s"
+  __bram_at_prompt=1
+}
+PROMPT_COMMAND=__bram_prompt
+trap '__bram_preexec' DEBUG

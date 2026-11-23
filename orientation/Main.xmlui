@@ -1,0 +1,170 @@
+<!-- bram-managed: orientation engine. Bram's Setup refreshes this file from the
+     template (app/__shell/reference/orientation-template/Main.xmlui in Bram),
+     keeping this site's PageMetaTitle. Change it in the template, never here. -->
+<!-- Orientation site: an overview and architecture diagrams (see index.html).
+     From Bram's orientation template, first built for tau-hub,
+     together-groups-beta and pwkm. Content lives in OVERVIEW.md and
+     architecture/; the diagram list and caption in arch.js's SITE block.
+     Markdown file via DataSource -> content: https://www.xmlui.org/docs/howto/render-markdown-content-as-a-page -->
+<!-- Line height 1.4 site-wide, for Markdown body text (lineHeight-Text-markdown,
+     the Text-markdown text family: Markdown.module.scss; see
+     https://www.xmlui.org/docs/howto/find-the-theme-variable-for-a-text), plain
+     Text and Link alike, so mixed rows share a baseline. Inline code
+     (Text variant "code", inline-block with padding and a border) gets 1.2 so
+     its box fits inside a 1.4 line instead of pushing lines apart. -->
+<Theme
+  backgroundColor="#fbfaf7"
+  backgroundColor-content-App="#fbfaf7"
+  textColor="#1d1d1b"
+  textColor-secondary="#5f5e58"
+  borderColor="#e3e0d8"
+  color-primary="#2f5d8a"
+  backgroundColor-primary="#ffffff"
+  lineHeight-Text-markdown="1.4"
+  lineHeight-Text="1.4"
+  lineHeight-Link="1.4"
+  lineHeight-Text-code="1.2">
+<App defaultTone="light">
+  <!-- One calm light palette, shared with the project homepage; the site
+       doesn't follow the OS color scheme (defaultTone):
+       https://www.xmlui.org/docs/howto/implement-a-dark-mode-toggle
+       https://www.xmlui.org/docs/howto/create-a-custom-color-theme -->
+  <!-- Browser tab title; without it XMLUI shows "XMLUI app":
+       https://www.xmlui.org/docs/howto/set-the-page-title-dynamically -->
+  <PageMetaTitle value="Bram" noSuffix="{true}" />
+  <!-- Three pages, three real URLs (the folder root, diagrams/, overview/):
+       the web's own mechanism, no router. The nav is plain HTML in each
+       index.html, outside this root; arch.js names the current page
+       (Arch.page) and this file renders that page's section. -->
+  <VStack gap="$space-4">
+    <VStack when="{Arch.page === 'start'}">
+      <!-- The owner's own words, from START.md. The agent never writes or
+           edits this file; everything after this tab is the agent's. -->
+      <DataSource id="start" url="START.md" />
+      <Markdown when="{start.loaded}" content="{start.value}" openLinkInNewTab="{true}" />
+    </VStack>
+    <!-- Shared by the Diagrams and Overview pages. A citation: the cited lines of one file, fetched raw at the pin.
+         State-driven: it follows ?cite= in the URL, set by a citation link
+         in a detail, and clears it on close so the next click reopens it.
+         https://www.xmlui.org/docs/howto/choose-between-imperative-and-state-driven-modal-dialogs
+         https://www.xmlui.org/docs/howto/deep-link-to-a-tab-or-section -->
+    <ModalDialog
+      when="{!!$queryParams.cite}"
+      onClose="navigate($pathname)"
+      width="70vw" maxWidth="70vw"
+      title="{Arch.cite($queryParams.cite)?.label}">
+      <VStack gap="$space-3" padding="$space-2" paddingTop="0">
+        <DataSource id="citeDoc" when="{Arch.cite($queryParams.cite)}" url="{Arch.rawUrl(Arch.cite($queryParams.cite).path)}" />
+        <Text when="{!citeDoc.loaded}" variant="caption">Fetching from the repo at this site's pin…</Text>
+        <Markdown when="{citeDoc.loaded}" content="{Arch.citeExcerpt(citeDoc.value, $queryParams.cite)}" />
+        <HStack><Button label="Close" onClick="navigate($pathname)" /></HStack>
+      </VStack>
+    </ModalDialog>
+    <VStack when="{Arch.page === 'diagrams'}">
+      <!-- Mermaid diagrams from architecture/*.mmd, rendered once on mount:
+           https://www.xmlui.org/docs/howto/run-a-one-time-action-on-page-load
+           Each renders as live SVG in an IFrame so labels can carry hover text:
+           https://www.xmlui.org/docs/reference/components/IFrame (srcdoc) -->
+      <VStack gap="$space-5"
+        var.svgs="{null}" var.detail="{null}"
+        onMount="svgs = Arch.diagrams()">
+        <!-- A link to one diagram (diagrams/#item-agent-session) lands on
+             it. The browser's own fragment scroll fires before anything is
+             rendered, and the frames above the target get their height only
+             once the diagrams are in, so the scroll waits for them:
+             https://www.xmlui.org/docs/reference/components/ChangeListener -->
+        <ChangeListener listenTo="{svgs}" onDidChange="() => Arch.scrollToHash()" />
+        <!-- A click on a box or arrow inside a diagram frame posts
+             {type: 'arch-detail', diagram, key}; open its Markdown section.
+             https://www.xmlui.org/docs/reference/components/MessageListener -->
+        <MessageListener
+          onMessageReceived="(msg) => {
+            if (!msg || msg.type !== 'arch-detail') return;
+            const d = Arch.detail(msg.diagram, msg.key);
+            if (d) { detail = d; detailDialog.open(); } }" />
+        <ModalDialog id="detailDialog" width="70vw" maxWidth="70vw" title="{detail?.title}">
+          <VStack gap="$space-3" padding="$space-2" paddingTop="0">
+            <!-- Citations in the body are ?cite= links (arch.js citeLinks): the
+                 Markdown routes them in-app, so they must not open a new tab. -->
+            <Markdown content="{detail?.body || ''}" openLinkInNewTab="{false}" />
+            <!-- Screenshots in the section (arch.js: image-only lines): a
+                 thumbnail with its alt text as the caption beneath;
+                 a click toggles full width in place.
+                 https://www.xmlui.org/docs/reference/components/Image (click) -->
+            <Items items="{detail?.shots || []}">
+              <VStack var.big="{false}">
+                <Text when="{$item.title}" fontWeight="bold">{$item.title}</Text>
+                <Image src="{$item.src}" alt="{$item.alt}"
+                  tooltip="{big ? 'Click to shrink' : 'Click to enlarge'}"
+                  width="{big ? '100%' : '240px'}" onClick="big = !big" />
+                <Text variant="caption">{$item.alt}</Text>
+              </VStack>
+            </Items>
+            <!-- The docs a section reads (arch.js: read directives), after the
+                 prose, one line each: "Read <doc> here or on GitHub", the forge
+                 link in a new tab, "here" the reader below, fetched at the pin. -->
+            <Items items="{detail?.reads || []}">
+              <!-- One link per doc the section reads: the whole label is the
+                   click target, opening the reader below (fetched at the pin).
+                   A Link's own text wraps like prose:
+                   https://www.xmlui.org/docs/howto/wrap-long-text-in-a-link
+                   With no `to` it renders as a span and still fires onClick
+                   (xmlui LinkReact.tsx); $item reaches the dialog as $param:
+                   https://www.xmlui.org/docs/howto/pass-data-to-a-modal-dialog -->
+              <Link label="{'Read ' + $item.label}" cursor="pointer" onClick="readerDialog.open($item)" />
+            </Items>
+            <HStack><Button label="Close" onClick="detailDialog.close()" /></HStack>
+          </VStack>
+        </ModalDialog>
+        <!-- The reader: one doc section, fetched from the forge at the pin
+             (the forge forbids framing, so the Markdown renders here).
+             DataSource -> Markdown: https://www.xmlui.org/docs/howto/render-markdown-content-as-a-page -->
+        <ModalDialog id="readerDialog" width="70vw" maxWidth="70vw" title="{$param?.label}">
+          <VStack gap="$space-3" padding="$space-2" paddingTop="0">
+            <DataSource id="readerDoc" when="{$param}" url="{$param ? Arch.rawUrl($param.path) : ''}" />
+            <Text when="{$param &amp;&amp; !readerDoc.loaded}" variant="caption">Fetching from the repo at this site's pin…</Text>
+            <Markdown when="{readerDoc.loaded}" content="{Arch.section(readerDoc.value, $param.heading, $param.path)}" openLinkInNewTab="{true}" />
+            <HStack gap="$space-3">
+              <Link when="{$param}" to="{$param.link}" target="_blank">Open on {Arch.forgeLabel}</Link>
+              <Button label="Close" onClick="readerDialog.close()" />
+            </HStack>
+          </VStack>
+        </ModalDialog>
+        <Text when="{Arch.site.signature}">{Arch.site.signature}</Text>
+        <Text variant="caption">{Arch.caption}</Text>
+        <Text when="{!svgs}" variant="caption">Rendering diagrams…</Text>
+        <Items items="{Arch.sections}">
+          <VStack gap="$space-2">
+            <!-- showAnchor: a hover # link carrying the diagram's address, the
+                 slug of its title (Arch.scrollToHash names the rule):
+                 https://www.xmlui.org/docs/reference/components/Heading#showanchor -->
+            <Heading level="h3" showAnchor="true">{$item.title}</Heading>
+            <Markdown content="{$item.note}" openLinkInNewTab="{true}" />
+            <Text when="{svgs &amp;&amp; svgs[$item.file] &amp;&amp; svgs[$item.file].error}" color="$color-danger-500">
+              {svgs[$item.file].error}
+            </Text>
+            <!-- The playbook's structural check: labels without sections and
+                 sections without labels. Absent when they agree. -->
+            <Items items="{(svgs &amp;&amp; svgs[$item.file] &amp;&amp; svgs[$item.file].mismatches) || []}">
+              <Text color="$color-warn-700" fontSize="$fontSize-sm">{$item}</Text>
+            </Items>
+            <IFrame when="{svgs &amp;&amp; svgs[$item.file] &amp;&amp; svgs[$item.file].srcdoc}"
+              srcdoc="{svgs[$item.file].srcdoc}" title="{'Diagram: ' + $item.title}"
+              width="100%" height="{svgs[$item.file].height + 'px'}" />
+            <!-- Key for the screenshot mark arch.js draws on boxes and arrows
+                 whose detail holds screenshots. Shown only when there are some. -->
+            <Text when="{svgs &amp;&amp; svgs[$item.file] &amp;&amp; svgs[$item.file].shotCount}" variant="caption">{Arch.shotMark} has screenshots: click it to see them</Text>
+            <Text variant="caption">architecture/{$item.file}</Text>
+          </VStack>
+        </Items>
+      </VStack>
+    </VStack>
+    <VStack when="{Arch.page === 'overview'}">
+      <DataSource id="overview" url="OVERVIEW.md" />
+      <!-- Citations open the citation dialog in-app (Arch.pageLinks); other
+           external links carry their own target=_blank. -->
+      <Markdown when="{overview.loaded}" content="{Arch.pageLinks(overview.value)}" openLinkInNewTab="{false}" />
+    </VStack>
+  </VStack>
+</App>
+</Theme>

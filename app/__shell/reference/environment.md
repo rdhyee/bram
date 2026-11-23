@@ -1,0 +1,506 @@
+# Bram reference: environment
+
+Seeded by Bram Setup as `.claude/bram-reference/environment.md`. Read
+the relevant section when your project's markup talks to the agent,
+binds project SQLite, uses the forge CLI, runs heavy test suites, hits a
+Windows block, or coordinates with a session across a project boundary.
+
+`<state>/` below is Bram's state folder: `.bram/` if it exists, else
+`resources/`.
+
+## Target app helpers
+
+Bram's own Worklist and Sessions tabs already use these helpers
+internally — the worklist Approve/Drop flow works with no extra setup.
+You only need them if **your own** project markup wants to talk back to
+the agent (custom Approve buttons, in-page forms that submit a fresh
+user turn).
+
+Include `<script src="/__shell/helpers.js"></script>` in your project's
+`index.html` to expose:
+
+| helper | usage |
+|---|---|
+| `toShell(text)` | inject text into stdin; user must press Enter |
+| `toTurn(text)` | submit text as a complete user turn (auto-Enter) |
+| `openExternal(url)` | open URL in the system browser |
+| `logToHost(payload)` | log to Bram stderr without bothering you |
+
+Use `toTurn` for one-shot form submissions (Approve, Confirm). Use
+`toShell` to inject text the user can edit before sending.
+
+> **Target-pane origin isolation.** The target pane is served at a
+> distinct `bramapp://localhost` origin, so `getTauriInvoke()` returns
+> `null` there and `toShell` / `toTurn` / `sendKeys` / `openExternal`
+> **no-op** inside an embedded target app — the pane is display-only.
+> `helpers.js` is still served (so XMLUI apps boot) but its host-driving
+> functions are inert; only Bram's own agent pane (Worklist/Sessions),
+> which stays same-origin, drives them. If an embedded app needs to talk
+> back to the agent, render the control in the agent pane instead. The
+> target scheme (`handle_target_scheme` in Bram's `lib.rs`) refuses the dynamic host routes (`__file`,
+> `__worklist/*`, `__settings`, …) and serves only project content plus
+> the static `__vendor/*` / `__shell/*` namespaces.
+
+Device APIs that Bram's app bundle can't grant — geolocation is the first
+one (judell/bram#386) — are made **absent** in the preview pane on
+purpose, not left present-but-failing: `navigator.geolocation` doesn't
+exist there, so `"geolocation" in navigator` and
+`if (navigator.geolocation)` both fail honestly and a well-written app
+takes its own no-location path instead of hitting a denial after its
+feature detection passes. Test those features in a real browser at the
+same URL, not in this pane.
+
+## Where the user opens the target app
+
+When the user asks how to see or share the app, give them the address.
+`GET /__app-info` → `targetAppUrl` is the browser-safe URL: the declared
+`.bram.json` project server (`http://localhost:<port><path>`), or Bram's
+built-in server when the project serves a root `index.html`. It's `null`
+when there's no target app. In the pane, the header's **Open app ↗** button
+opens it, and the ⓘ dialog shows it with **Copy**. Don't hand out the
+embedded pane's `bramapp://` URL; a normal browser can't open it. A project
+whose app is the point can launch Bram minimized with the app opened:
+`bram <dir> --minimized --open-app[=<path>]`, or `.bram.json`
+`"launch": { "minimized": true, "openApp": "/route" }`.
+
+## Live SQL views via `/query`
+
+When a managed project keeps data in SQLite, its target app (or the
+agent pane) can bind live views directly instead of consuming derived
+files: set `"db": "<relative path>"` in `.bram.json`, and Bram's
+loopback serves `POST /query` — the receiving end of XMLUI's
+`DataSource dataType="sql"`. Request body is `{ sql, params }`; the
+response is a JSON array of column-keyed row objects:
+
+```xml
+<DataSource id="txns" url="/query" method="POST" dataType="sql"
+  body="{{ sql: 'SELECT * FROM transactions ORDER BY txn_date', params: [] }}" />
+```
+
+- **Read-only, enforced at the engine** (read-only open plus `PRAGMA
+  query_only`): the UI can never mutate project data through this
+  route. The agent writes the database through ordinary gate-governed
+  file access (`sqlite3` CLI etc.) — that division of authority is the
+  design.
+- **Scratch-pad pattern**: the agent can materialize an analysis (a
+  normalized import, an aggregation, a cross-source join) as tables in a
+  project-local scratch database — e.g. a gitignored
+  `<state>/scratch.db` pointed at by `db` — and hand the user a live
+  table or chart in three lines of markup. Analyses that prove out get
+  promoted to project-owned data and, if the app ships, a project-owned
+  endpoint.
+- **Scope**: only the explicitly designated project file is reachable —
+  never Bram's own databases — and the path must resolve inside the
+  project root. No `db` configured → the route refuses with guidance.
+- **Limitation**: when the project runs its own dev server, relative
+  `/query` reaches that server, not Bram; such projects implement their
+  own endpoint against the same wire contract (the xmlui test server is
+  one existing implementation), and the markup carries over unchanged.
+
+## Updating forge issues via gh / glab
+
+Use the project's forge CLI directly — the Issues tab refetches on the
+indexer's `issues-changed` signal (no polling), so updates surface
+without a restart. There is no manual refresh; `/__issues?fresh=1`
+remains a curl-only diagnostic that live-builds and rewrites the cached
+list. The forge is detected from the `origin` remote (`.bram.json`
+`"forge"` override for ambiguous self-hosted remotes; `GET /__app-info`
+reports the detection). On GitHub projects:
+
+- `gh issue edit <n> --title "…" --body "…"`
+- `gh issue comment <n> --body "…"`
+- `gh issue close <n>` / `gh issue reopen <n>`
+
+On GitLab projects the parallel `glab` commands apply (`glab issue note
+<n> -m "…"` for comments). The worklist contract around issues
+(`closesIssues`, `issue-<N>-` ids, automatic close-on-push) is
+forge-agnostic and identical on both. Every body you post needs the
+signature (see the core conventions); build it in a body file first.
+
+**Edit a comment by its id, never with `gh issue comment --edit-last`.**
+Bram posts its own forge comments (the close-on-push "Closed by …" note,
+lifecycle mirrors) through the same account you post through, so "the last
+comment by this account" can be Bram's, not yours. On 2026-09-29 an
+`--edit-last` meant for an agent's comment on judell/bram#413 overwrote
+Bram's close comment, which the user pushed a minute before. Keep the id
+from the URL `gh issue comment` prints, and edit with
+`gh api -X PATCH repos/<owner>/<repo>/issues/comments/<id> -F body=@<file>`;
+on GitLab, `glab api` against the note's id. Before editing, confirm the id
+is yours: its body opens with your signature.
+
+Bram internals, for diagnosing Bram itself — the forge adapter:
+https://github.com/judell/bram/blob/main/docs/forge-adapter.md
+
+**When filing or commenting on an issue against Bram itself
+(judell/bram), cite the Bram version.** Triage of a version-less report
+starts with "which build is this?", which is unanswerable after the
+fact. Two cheap lookups: the `<!-- bram vX.Y.Z -->` marker on the first
+line of `.claude/bram-conventions.md` (stamped by Setup at seed time), or
+the version field of `GET /__app-info` on the loopback port. If neither
+is available — an old seed, no running instance — say so in the report
+rather than omitting the version silently.
+
+## Resource-heavy test suites
+
+When running a multi-worker browser test suite (Playwright, or anything
+else that spawns a browser per worker) from an agent session, cap
+parallelism explicitly — e.g. `npx playwright test --workers=2` —
+instead of accepting the default worker-per-core. Machine-wide memory
+pressure from default parallelism can freeze **every** webview on the
+machine, including Bram's panes, for tens of seconds or more.
+
+The worst multiplier is the fail-retry loop: a failing test that retries
+with tracing enabled spawns extra browsers *and* records traces.
+Iterating on a failing spec is exactly when the cap matters most — and
+exactly when an agent is most likely to be re-running the suite over and
+over.
+
+## Windows: Smart App Control
+
+Bram ships unsigned binaries, and on some Windows 11 machines Smart App
+Control (SAC) blocks them. Most users see no problem; when a block does
+hit, this is the advice protocol (user-facing twin: the Bram README's
+*Smart App Control* section):
+
+- **Recognize both symptom shapes.** (1) Bram itself refused at launch —
+  a Windows Security dialog naming Smart App Control. (2) The reentrant
+  `bram-guard` hook binary (`~/.bram`, spawned on every hook event):
+  hook invocations failing while the app runs fine — the signature is
+  missing `claude-rs` / `codex-rs` breadcrumbs in
+  `<state>/bram-traces/hook-events.log`, or hook timeouts/errors, with
+  no visible launch failure.
+- **Verify before advising.**
+  - Confirm the block dialog actually names Smart App Control. Defender
+    and SmartScreen blocks read differently, and their remedies differ.
+  - Check the machine's state. It needs no admin rights:
+    `(Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy').VerifiedAndReputablePolicyState`
+    returns `0` for Off, `1` for On (enforcing) and `2` for Evaluation.
+    Only `1` blocks.
+  - A refusal leaves events 3077 in the Code Integrity log (Event
+    Viewer → Microsoft → Windows → CodeIntegrity → Operational).
+- **Each release is judged on its own.** For an unsigned file, SAC's
+  verdict is Microsoft's cloud reputation for that exact file. So "the
+  last version worked" says nothing about the next one: on
+  judell/bram#470, v0.8.0 was allowed and v0.8.1 and v0.8.2 were refused
+  on the same machine, minutes apart.
+- **State the trade-off honestly, then let the user decide.** Use
+  Microsoft's own words, from the Microsoft Support page
+  [What is Smart App Control](https://support.microsoft.com/en-us/topic/what-is-smart-app-control-285ea03d-fa88-4d56-882e-6698afdb7003):
+  - **Developer default.** Windows turns SAC off on its own when it
+    detects "a corporate user, developer, or similar", "so you can work
+    with fewer interruptions". It is also off when "Your device is
+    enterprise-managed or developer-mode has been configured".
+  - **Two remedies.** "There is currently no way to bypass Smart App
+    Control protection for individual apps." Microsoft's remedies are to
+    turn SAC off or to use a signed build. Signing is not currently
+    planned (judell/bram#6 holds the plan).
+  - **Defender is unaffected.** "Smart App Control works alongside your
+    other security software, such as Microsoft Defender."
+  - **Reversible, mostly.** The support page says "Recent Windows
+    updates allow Smart App Control to be re‑enabled without requiring
+    a clean installation" (since the April 2026 update for 25H2). Its
+    developer page,
+    [Test App Signatures with Smart App Control](https://learn.microsoft.com/en-us/windows/apps/develop/smart-app-control/test-your-app-with-smart-app-control),
+    still calls the switch "a one-way operation". Say both.
+  - **The October 2026 bug.** The October 2026 update (KB5127648) can
+    grey out the toggle on 24H2, 25H2 and 26H2.
+
+  Name the UI path: **Windows Security → App & browser control → Smart
+  App Control settings**.
+- **Never flip the setting on the user's behalf.** It is a machine-level
+  security decision; the agent names the control and the consequences,
+  the user clicks.
+
+## Voice input setup
+
+Bram's 🎤 dictation needs three things on the user's machine:
+
+- **`whisper-server`**, the speech engine (from whisper.cpp);
+- **the model**, `~/.local/share/whisper-models/ggml-small.en.bin`
+  (466 MB), which the engine loads at start;
+- **`ffmpeg`**, used only for the safety pass: when live dictation fails,
+  Bram transcribes the whole compressed recording, which `ffmpeg` converts
+  first. Without it dictation works; the rescue doesn't.
+
+When a 🎤 click finds one missing, Bram opens a setup dialog. Its
+**Install with the agent** button sends you a turn:
+
+```
+voice-setup: {"missing":["model","ffmpeg"],"found":{"whisper-server":"/opt/homebrew/bin/whisper-server"},"platform":"macos","arch":"aarch64","modelPath":"…","searched":["…"],"loginShell":"used"}
+```
+
+It means: the user asked you to install what's missing. Handle it this way:
+
+- **It's environment work, not a repo change.** No worklist item.
+- **Confirm first.** Re-check each missing component in the user's shell:
+  `command -v whisper-server`, `command -v ffmpeg`, and `ls` the
+  `modelPath`. If something the turn calls missing is installed after all,
+  say where. Bram looked in its own PATH plus the well-known directories
+  for the platform — `/opt/homebrew/bin` and `/usr/local/bin` on Unix, the
+  winget and scoop locations on Windows — and, on Unix only, the login
+  shell (`searched`, `loginShell`). A tool it missed there is a Bram bug to
+  report, not something to install twice. **A copy inside WSL does not
+  count as installed:** the engine runs natively on every platform, and
+  Bram cannot reach anything inside a WSL distro.
+- **Show the commands, then ask once** before running them. Installing
+  software and downloading 466 MB are the user's to approve.
+  - macOS: `brew install whisper-cpp` for the engine, `brew install ffmpeg`.
+    If `brew` itself is missing, say so and stop: installing Homebrew is
+    the user's call.
+  - The model, any platform:
+    `mkdir -p ~/.local/share/whisper-models && curl -L -o ~/.local/share/whisper-models/ggml-small.en.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin`
+  - Linux: the package manager for `ffmpeg`; the README's source build
+    (Voice input section) for `whisper-server`.
+  - Windows: `winget install Gyan.FFmpeg` for `ffmpeg`; for the engine,
+    the whisper.cpp release asset `whisper-blas-bin-x64.zip` extracted to a
+    directory on PATH (`%LOCALAPPDATA%\Programs\whisper\` is a reasonable
+    home — the exe needs its DLLs beside it, so it can't sit loose in a
+    searched directory). The CUDA assets are NVIDIA-only; don't suggest
+    them without checking the GPU. **A PATH change needs Bram relaunched**
+    before the 🎤 sees it, since a running process keeps its launch-time
+    environment.
+- **Report what happened,** then ask the user to click 🎤 again.
+- **If it still fails,** read the trace: each click writes
+  `[whisper] preflight binary=… model=… ffmpeg=… searched=… path=…` and
+  `[whisper] start convert=…` to `<state>/bram-traces/bram-trace.log`,
+  and the pane writes `[iframe] subkind=voice-setup` lines for the dialog.
+  Those lines name what was found and where Bram looked.
+
+The same steps apply when a user says voice input won't start and no
+`voice-setup:` turn came (an older Bram, or the dialog was closed): grep
+the trace for `[whisper]` lines first.
+
+## Handing Bram's terminal a first command (launchers)
+
+A launcher that starts Bram for an agent it manages elsewhere (for example,
+herdr) can give Bram's terminal one command to run before its first prompt:
+set `BRAM_LAUNCHER_PROMPT_COMMAND` in Bram's environment, say
+`BRAM_LAUNCHER_PROMPT_COMMAND='herdr agent attach <pane>'`. The terminal's
+shell (`app/shell/claude-code-shellrc`) reads it, unsets it at once so nested
+shells and the agent's subprocesses never inherit it, and runs it before the
+first prompt. While it runs, Bram sees a started command (`exec`), and it
+sees `prompt;<status>` when the command returns. Pair it with **Do not start
+an agent** (`shell.startupPolicy: "none"` in `.bram.json`), so Bram never
+types a launch command into a terminal the launcher's command owns.
+
+Every new terminal shell Bram starts runs it again: one at launch, and
+another after a reload that respawns the terminal. Make the command safe to
+repeat. With herdr, `herdr agent attach <pane> --takeover` lets the newest
+shell win instead of being refused while an older one still holds the pane.
+
+An ordinary exported `PROMPT_COMMAND` (say, `history -a` from your bashrc) is
+not a way in. The shell replaces it, as it always has, because running it
+would report a started command while autostart may be typing a launch.
+
+## Working across project boundaries
+
+Some of the best work happens between two sessions that each hold
+evidence the other cannot reach, coordinating through issue threads.
+Three shapes recur, and the practices are the same in all three — only
+the asymmetry differs:
+
+- **Downstream ↔ upstream.** Your project consumes a library; a bug or
+  gap here is a change there.
+- **Machine ↔ machine.** The same repo running on two platforms, where a
+  failure reproduces on only one of them.
+- **Agent ↔ agent.** The same repo, two agents, each able to reach
+  things the other can't.
+
+(Pivoting *this* session's attention to another project is covered by
+*Cross-project pivots* in the core conventions; this section is for two
+sessions that both stay put and coordinate.)
+
+### Name the boundary
+
+Say which side of the boundary you are on, and scope every claim to it.
+The signature that carries this is not boundary-scoped — it is required
+on every agent-authored forge artifact, in every repo.
+
+### Scope claims to what your side can observe
+
+Say "from this side" and mean it. State what you verified and how; name
+what you *cannot* check from here rather than letting silence imply it's
+fine. *Local absence is not disproof* (in `diagnostics.md` §Log-first
+development) is the special case of this rule for machine-specific
+artifacts; this is the general one.
+
+### Coordinate on the record, not session to session
+
+Some agents can message other running sessions directly. Don't, by
+default. The user can't see that exchange, and it leaves nothing for
+later readers: no issue, no Worklist item, no Bram turn.
+
+- Put a request for another session on the relevant forge issue, signed
+  as usual, or tell the user what to relay.
+- Message a session directly only when the user says to for that case,
+  and tell the user that it happened and by what channel.
+- If it has already happened, put the request and its outcome on the
+  issue so the record is whole.
+- Reading another session's transcript, trace or repo is observation,
+  not messaging. It stays allowed.
+
+### The thread is the design document
+
+Chat dies with the session; the thread is what the other side reads,
+and months later it's the only record of why. So file at mechanism
+depth — symptom, the mechanism cited at the *other* side's `file:line`,
+blast radius, and the trace or measurement receipts — not "this seems
+broken."
+
+One issue, one mechanism. When a second mechanism surfaces mid-thread,
+split it into its own issue and say in both places what moved and what
+remains.
+
+### Make the ask specific, and report gates by name
+
+Ask for something answerable: a litmus test to run, a build to
+validate, a specific gate to clear. When work is gated, enumerate the
+gates and report their status per side ("gate 2 is green; from this
+side, remaining: ..."), so neither session has to guess what the other
+is waiting on.
+
+### Green-light before irreversible or expensive steps
+
+Vendoring a candidate build, merging, restarting something shared —
+request the go-ahead across the boundary explicitly, and grant it
+explicitly. An assumed green light is how two sessions end up half-way
+through incompatible states.
+
+### Reproduce before fixing; correct the record in public
+
+On the other side of a boundary the currency is a reproduction — a
+failing test pins the decision so prose doesn't have to. Build it before
+proposing a fix, because it frequently contradicts the filing.
+
+When it does, post a **correction comment** carrying the measurements.
+Do not quietly edit the original body: the other side may have already
+acted on it, and the correction is the most useful thing in the thread.
+
+### Recompute rather than defer
+
+Being upstream, or being the side where the bug reproduces, is not
+authority over arithmetic. When the other session's claim conflicts
+with yours, re-run the numbers and read the source before conceding —
+then concede once, to the evidence, and move on. Deference and digging
+in are the same failure.
+
+### Verify the artifact you run, not the source diff
+
+A merged fix, a green CI run, and a source diff are not the build in
+your hands. Verify the artifact you actually execute (checksum, marker
+string, behavioral probe), and when you report results, label which of
+your instruments are authoritative and which are only corroborating.
+
+### The user is the eyes for rendered output
+
+For changes whose deliverable is something a human reads or sees — a
+docs page, a pane surface, a rendered table — the person looks and you
+show. A passing spec verifies behavior, not communication, and judging
+communication is the user's call, not something to decide for them.
+
+Automated rendering can fail where a person's browser works fine — a
+headless run can come back blank on a page that renders correctly for
+a real user — so a self-check can report a phantom defect that has
+nothing to do with the actual change.
+
+Checks that can't be done by eye are still fine: computed widths, DOM
+assertions, and existing headless spec suites (xmlui's
+`tests-e2e/how-to-examples/*.spec.ts`, for example). They verify
+behavior and stay in place; they just don't stand in for the look. A
+liveness check before handing over a URL — the server responds, no
+console errors — is fine too; that confirms the thing exists, it
+doesn't judge how it reads.
+
+Serve the artifact, hand over the exact URL (or say where to click),
+say what changed, and wait for the verdict. When the user is away, say
+the rendered review is pending on them rather than substituting your
+own judgment in the meantime.
+
+When delegating such work, tell the subagent to report where to look,
+not to render-check it: "here's the URL, here's what changed" is the
+right shape of instruction, not "verify this renders correctly."
+
+### Close every hard stretch with two questions
+
+This is the engine that turns local pain into shared improvement. When
+a struggle ends, ask:
+
+- *What documentation would have short-circuited this?* → name the
+  question you couldn't answer and where you looked.
+- *What feature would have obviated this workaround?* → carry the
+  workaround itself as the evidence.
+
+Then file each one on the other side. If that boundary doesn't take
+issues from you, write the ask up locally anyway, fully formed and
+evidence-backed, so it exists the day a channel opens.
+
+Any workaround you land carries the issue number it's waiting on, and
+its retirement is its own worklist item. A workaround with no filed
+issue is a decision to keep the pain.
+
+Where the other side publishes a searchable doc corpus, the
+documentation half has a stricter form — validate the gap against the
+current corpus before filing, since the fastest way to lose standing is
+to report a gap that closed last week. See `diagnostics.md`
+§Coordinating MCP demand with search.
+
+### Carry gated follow-ups, and don't edit across the boundary
+
+Actions gated on the other side (a merge, a release, a verdict) become
+**reminder items**, `reminder-` prefix and all (see *Reminder items* in
+the core conventions).
+
+Act only in the repo whose session you're in. The thread is the
+transport, not a shortcut for reaching across and editing the other
+project directly.
+
+## Suggest a fresh session
+
+A long session that wanders across topics is hard to find and hard to
+resume. Bram's **+ New session** dialog (Sessions tab) starts a fresh
+session with a brief, but the user has to think of it. You are the one
+who sees a new line of work begin, so offer it.
+
+**When.** Read `GET /__settings` and look at `sessions`. Each trigger
+has its own switch:
+
+- `suggestOnNewItem`: you are about to propose a worklist item.
+- `suggestOnNewIssue`: you are about to file an issue.
+- `suggestOnTopicShift`: the conversation has moved to a significantly
+  different topic.
+
+If the switch is on **and** the new work is a different line from what
+this session has been doing, ask in one line whether to continue it in
+a fresh session. Work that belongs to the session's existing line gets
+no question. Ask in prose, whichever agent you are: a provider's own
+question tool would make Claude and Codex behave differently.
+
+**Limits.** Ask at most once per topic. After a no, don't ask again
+about that topic. Don't ask in a session that is still short. Ask
+**before** you propose the item or file the issue, not after.
+
+**On yes, hand the work over; don't start it here.** Do not propose the
+item or file the issue in this session: the new session is where it gets
+discussed and created. `POST /__sessions/suggest` with
+`{"name": …, "whatsNext": …}` (same curl shape as the other POST
+routes). The Sessions tab opens the New session dialog filled in with
+both. **They are suggestions for the user to edit, and nothing is
+created until the user clicks Create.** Say so: "I've filled in a
+suggested name and brief; edit them to say it your way, then click
+**Create**." Write `whatsNext` in the user's terms, framing the new
+work, not as instructions from you. Put in it what this session already
+settled about the work, so the new session doesn't have to rediscover
+it.
+
+**On no**, carry on here: propose the item or file the issue as usual.
+
+**Names are how sessions are found later.** A later search for a
+session to resume reads titles, so err toward verbose and descriptive:
+
+- Name the subject and the activity, with the distinctive terms someone
+  would search for months later: "screencast storyboarding: rough scene
+  list from a session transcript", not "test session" or "follow-up".
+- Include the stable nouns the work is about (a feature, a component, an
+  issue number such as `#412`), not only verbs.
+- Leave out ephemera (today's date, "part 2") unless they distinguish
+  the session.

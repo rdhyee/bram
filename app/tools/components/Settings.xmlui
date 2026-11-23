@@ -8,7 +8,10 @@
     id="saveSettings"
     method="post"
     url="/__settings"
-    body="{$param}" />
+    body="{$param}"
+    onBeforeRequest="window.__bramApiTiming('saveSettings', 'before')"
+    onSuccess="window.__bramApiTiming('saveSettings', 'success')"
+    onError="window.__bramApiTiming('saveSettings', 'error')" />
 
   <DataSource
     id="traceArchiveStatus"
@@ -92,6 +95,8 @@
             orientation="horizontal">
             <Option value="claude" label="Claude" />
             <Option value="codex" label="Codex" />
+            <Option value="opencode" label="OpenCode" />
+            <Option value="antigravity" label="Antigravity" />
           </RadioGroup>
           <Select
             id="startupPolicyBox"
@@ -103,7 +108,8 @@
             data="{[
               { value: 'agentRecent', label: 'Resume selected agent’s most recent session' },
               { value: 'lastActive', label: 'Resume most-recently-active agent’s session' },
-              { value: 'newSession', label: 'Start a new session' }
+              { value: 'newSession', label: 'Start a new session' },
+              { value: 'none', label: 'Do not start an agent (manage the terminal yourself)' }
             ]}">
             <!-- Long labels wrap flush-left instead of centered: the same
                  valueTemplate + width-bound Text as the Worklist's issue
@@ -112,6 +118,14 @@
               <Text width="100%" textAlign="start" value="{$item.label}" />
             </property>
           </Select>
+          <!-- issue-389: under "none" the agent choice above no longer
+               picks what Bram launches — it tells Bram which agent YOU run in
+               the terminal (herdr etc.), so turn-end detection reads the right
+               transcripts. -->
+          <Text
+            when="{startupPolicyBox.value === 'none'}"
+            variant="caption"
+            value="With this setting, the agent choice above tells Bram which agent you are running in the terminal. Bram will not launch it." />
           <Theme paddingLeft-summary-ExpandableItem="0">
             <ExpandableItem
               summary="Advanced"
@@ -147,6 +161,66 @@
 
       <ContentSeparator />
 
+      <!-- suggest-fresh-session: the host serves sessions.{suggestOnNewItem,
+           suggestOnNewIssue,suggestOnTopicShift} from GET /__settings. Same
+           save-on-change shape as the hot-reload switch below; the read goes
+           through window.__bramSuggestSetting so the defaults (true/true/false)
+           live in one place. https://www.xmlui.org/docs/reference/components/Checkbox -->
+      <VStack gap="$space-2">
+        <!-- settings-info-says-storage-and-default: the same heading-with-info
+             chip as the other cards, so this card's settings say their kind
+             and default too. -->
+        <HStack
+          width="fit-content"
+          gap="$space-1"
+          verticalAlignment="center"
+          paddingHorizontal="$space-2"
+          paddingVertical="$space-1"
+          borderRadius="$borderRadius"
+          backgroundColor="$color-surface-100">
+          <Button
+            icon="info"
+            size="xs"
+            variant="ghost"
+            tooltip="About Suggest a fresh session"
+            onClick="infoTitle = 'Suggest a fresh session'; infoBody = window.settingsInfoBodies.sessions; settingInfoDialog.open()" />
+          <Heading level="h3">Suggest a fresh session</Heading>
+        </HStack>
+        <Text
+          color="$textColor-secondary"
+          fontSize="$fontSize-sm"
+          value="The agent can offer to continue new work in a fresh session. It always asks first." />
+        <Checkbox
+          label="When the agent is about to propose a new worklist item"
+          labelPosition="end"
+          initialValue="{window.__bramSuggestSetting(settingsValue, 'suggestOnNewItem')}"
+          onDidChange="(v) => saveSettings.execute({ sessions: { suggestOnNewItem: v } })" />
+        <Checkbox
+          label="When the agent is about to file a new issue"
+          labelPosition="end"
+          initialValue="{window.__bramSuggestSetting(settingsValue, 'suggestOnNewIssue')}"
+          onDidChange="(v) => saveSettings.execute({ sessions: { suggestOnNewIssue: v } })" />
+        <Checkbox
+          label="When the conversation shifts to a significantly different topic"
+          labelPosition="end"
+          initialValue="{window.__bramSuggestSetting(settingsValue, 'suggestOnTopicShift')}"
+          onDidChange="(v) => saveSettings.execute({ sessions: { suggestOnTopicShift: v } })" />
+        <!-- provider-session-pair-offer: a Switch, not a fourth checkbox,
+             because it isn't a "when to suggest" trigger: it turns the pair
+             offer after a provider switch on or off. Default on, read through
+             __bramSuggestSetting like its neighbours. label/labelPosition as
+             on the Mirror switch below: input-level label props, per
+             https://www.xmlui.org/docs/howto/arrange-form-fields-side-by-side
+             https://www.xmlui.org/docs/reference/components/Switch -->
+        <Switch
+          label="Pair new sessions across providers"
+          labelPosition="end"
+          initialValue="{window.__bramSuggestSetting(settingsValue, 'pairAcrossProviders')}"
+          onDidChange="(v) => saveSettings.execute({ sessions: { pairAcrossProviders: v } })" />
+      </VStack>
+
+      <ContentSeparator />
+
       <VStack gap="$space-4">
         <HStack
           width="fit-content"
@@ -173,8 +247,27 @@
         <Switch
           id="mirrorIssuesSwitch"
           label="Mirror Worklist lifecycle to GitHub issues"
+          labelPosition="end"
           initialValue="{!!(settingsValue &amp;&amp; settingsValue.mirrorWorklistLifecycleToIssue)}"
           onDidChange="(v) => saveSettings.execute({ mirrorWorklistLifecycleToIssue: v })" />
+        <!-- issue-466-pause-install-uninstall (v1): worklist.enforcement,
+             Claude only. Same Switch pattern as the mirror switch above;
+             the info note is in settingsInfoBodies.batchCommitActions.
+             https://www.xmlui.org/docs/reference/components/Switch -->
+        <!-- The header's "Enforcement paused" link lands here via
+             ?highlight=worklistEnforcement (settings-highlight-deeplink). -->
+        <VStack
+          testId="setting-worklistEnforcement"
+          padding="$space-1"
+          borderRadius="$borderRadius"
+          backgroundColor="{highlightKey === 'worklistEnforcement' ? '$color-primary-100' : 'transparent'}">
+          <Switch
+            id="pauseEnforcementSwitch"
+            label="Pause Worklist enforcement for Claude (advanced)"
+            labelPosition="end"
+            initialValue="{window.__bramEnforcementPaused(settingsValue)}"
+            onDidChange="(v) => saveSettings.execute(window.__bramEnforcementUpdate(v))" />
+        </VStack>
       </VStack>
 
       <ContentSeparator />
@@ -199,25 +292,45 @@
         <Switch
           id="targetAppSwitch"
           label="Show target app"
+          labelPosition="end"
           initialValue="{settingsShowTargetApp(settingsValue)}"
           onDidChange="(v) => saveSettings.execute({ ui: { showTargetApp: v } })" />
+        <!-- terminal-open-at-startup-setting: per-user preference,
+             localStorage-backed like the tips and beep switches below. The
+             parent shell reads it at launch; the toolbar toggle is
+             session-only. -->
+        <Switch
+          label="Terminal open at startup"
+          labelPosition="end"
+          initialValue="{window.__bramTerminalOpenAtStartup ? window.__bramTerminalOpenAtStartup() : false}"
+          onDidChange="(v) => window.__bramSetTerminalOpenAtStartup(v)" />
         <Switch
           id="hotReloadSwitch"
           label="Agent-pane hot-reload"
+          labelPosition="end"
           initialValue="{settingsToolsPaneHotReload(settingsValue)}"
           onDidChange="(v) => saveSettings.execute({ ui: { toolsPaneHotReload: v } })" />
+        <!-- pane-idle-flush-when-degraded: opt-in workaround for an unexplained
+             pane slowdown (judell/bram#482 for the underlying leak). -->
+        <Switch
+          label="Reload a slowed pane when idle"
+          labelPosition="end"
+          initialValue="{settingsValue &amp;&amp; settingsValue.ui &amp;&amp; settingsValue.ui.paneIdleFlush === true}"
+          onDidChange="(v) => saveSettings.execute({ ui: { paneIdleFlush: v } })" />
         <!-- issue-231: per-user preferences, localStorage-backed (not project
              settings) — tips dismissal state is per-user too. The interval
              governs how long a dismissed tip stays hidden; the footer's
              dismiss tooltip echoes it. -->
         <Switch
           label="Show tips in the footer"
+          labelPosition="end"
           initialValue="{window.__bramTipsEnabled ? window.__bramTipsEnabled() : true}"
           onDidChange="(v) => window.__bramSetTipsEnabled(v)" />
         <!-- turn-complete-beep: per-user (localStorage) audio cue; toggling
              on plays the beep once as confirmation. -->
         <Switch
           label="Soft beep on menus and turn completion"
+          labelPosition="end"
           initialValue="{window.__bramBeepEnabled ? window.__bramBeepEnabled() : false}"
           onDidChange="(v) => window.__bramSetBeepEnabled(v)" />
         <VStack
@@ -241,8 +354,19 @@
              Search tab opens with all facet badges selected or none. -->
         <Switch
           label="Search badges start all on"
+          labelPosition="end"
           initialValue="{window.__bramSearchBadgesInitialAllOn ? window.__bramSearchBadgesInitialAllOn() : true}"
           onDidChange="(v) => window.__bramSetSearchBadgesInitialAllOn(v)" />
+        <!-- issue-470-compaction-summary-collapsed: per-user (localStorage,
+             bram.compactSummaryExpanded). Off: the Transcript shows Claude
+             Code's compaction summary as one line with a Show toggle; on:
+             those rows start expanded. Same shape as the switches above.
+             https://www.xmlui.org/docs/reference/components/Switch -->
+        <Switch
+          label="Show compaction summaries in full"
+          labelPosition="end"
+          initialValue="{window.__bramCompactSummaryExpanded ? window.__bramCompactSummaryExpanded() : false}"
+          onDidChange="(v) => window.__bramSetCompactSummaryExpanded(v)" />
       </VStack>
 
       <ContentSeparator />
@@ -272,6 +396,7 @@
           <Switch
             id="descriptionsSwitch"
             label="Tool Descriptions"
+            labelPosition="end"
             initialValue="{settingsDescribeCommands(settingsValue)}"
             onDidChange="(v) => saveSettings.execute({ ai: { describeCommands: v } })" />
         </VStack>
@@ -299,11 +424,13 @@
         <Switch
           id="tracingSwitch"
           label="Tracing enabled"
+          labelPosition="end"
           initialValue="{settingsTracingEnabled(settingsValue)}"
           onDidChange="(v) => saveSettings.execute({ traces: { enabled: v } })" />
         <Switch
           id="inspectorTapSwitch"
           label="Inspector trace tap"
+          labelPosition="end"
           initialValue="{settingsInspectorTap(settingsValue)}"
           onDidChange="(v) => saveSettings.execute({ traces: { inspectorTap: v } })" />
         <Form

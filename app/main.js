@@ -215,12 +215,40 @@ window.submitTerminalTurn = function (text) {
   }
 };
 
+// xterm-renderer (#441): which renderer xterm draws with, and whether the
+// WebGL context was lost. A loss used to be disposed silently, so the trace
+// couldn't say when xterm had switched renderers. One line at boot,
+// otherwise only on a loss.
+const logXtermRenderer = (fields) => {
+  invoke("log_from_right_pane", {
+    payload: {
+      kind: "iframe-trace",
+      subkind: "xterm-renderer",
+      context: "parent",
+      ...fields,
+    },
+  }).catch(() => {});
+};
 try {
   const webgl = new WebglAddon.WebglAddon();
   term.loadAddon(webgl);
-  webgl.onContextLoss(() => webgl.dispose());
+  logXtermRenderer({ op: "active", renderer: "webgl" });
+  webgl.onContextLoss(() => {
+    logXtermRenderer({
+      op: "context-lost",
+      terminal_hidden: document.body.classList.contains("terminal-hidden"),
+      uptime_ms: Math.round(performance.now()),
+    });
+    webgl.dispose();
+    logXtermRenderer({ op: "fallback", renderer: "dom" });
+  });
 } catch (e) {
   console.warn("webgl addon failed, falling back to canvas/dom renderer", e);
+  logXtermRenderer({
+    op: "load-failed",
+    renderer: "fallback",
+    error: String((e && e.message) || e).slice(0, 200),
+  });
 }
 
 const captureViewport = () => {
@@ -446,6 +474,27 @@ term.attachCustomKeyEventHandler((ev) => {
   // etc. on non-US layouts).
   if (ev.altKey) return true;
 
+  // #411: Shift-Enter inserts a newline in the agent's prompt instead of
+  // submitting. xterm.js sends a bare \r for Shift-Enter, the same byte as
+  // Enter, so send \n (Ctrl+J) instead: Claude Code lists Ctrl+J as the
+  // multiline key that "works in any terminal without configuration"
+  // (https://code.claude.com/docs/en/interactive-mode#multiline-input), and
+  // Codex treats it as newline too. It's a plain control byte, so a
+  // multiplexer in between (herdr) is less likely to act on it than on the
+  // ESC CR of Option-Enter. term.input goes through term.onData → pty_write,
+  // the same path as a typed key. At a bare shell prompt \n still submits.
+  if (
+    ev.key === "Enter" &&
+    ev.shiftKey &&
+    !ev.ctrlKey &&
+    !ev.metaKey &&
+    !ev.isComposing
+  ) {
+    ev.preventDefault();
+    term.input("\n", true);
+    return false;
+  }
+
   // Non-macOS terminal copy/paste:
   //   - Plain Ctrl+C: copies the selection when one exists (Windows Terminal
   //     behavior); falls through to xterm.js → SIGINT when there's no
@@ -502,8 +551,11 @@ document
   ?.addEventListener("click", () => setTerminalFontSize(term.options.fontSize + 1));
 
 (() => {
-  const TERMINAL_HIDDEN_KEY = "bram.terminal.hidden";
-  const LEGACY_TERMINAL_HIDDEN_KEY = "xmlui-desktop.terminal.hidden";
+  // terminal-open-at-startup-setting: the Settings tab's "Terminal open at
+  // startup" switch (window.__bramSetTerminalOpenAtStartup in helpers.js)
+  // owns "bram.terminal.openAtStartup"; the toolbar toggle is session-only.
+  // The retired bram.terminal.hidden / xmlui-desktop.terminal.hidden keys
+  // are not read.
   const btn = document.getElementById("toggle-terminal");
   if (!btn) return;
   let dismissedSuspiciousEpisode = "";
@@ -586,17 +638,12 @@ document
     }, 4000);
   };
 
-  const apply = (hidden, source, persist) => {
+  const apply = (hidden, source) => {
     const wasHidden = document.body.classList.contains("terminal-hidden");
     document.body.classList.toggle("terminal-hidden", hidden);
     if (!hidden) {
       // Re-measure xterm.js once the layout settles.
       scheduleTerminalFit();
-    }
-    if (persist) {
-      try {
-        localStorage.setItem(TERMINAL_HIDDEN_KEY, hidden ? "1" : "0");
-      } catch {}
     }
     postTerminalVisibility(source);
     if (wasHidden !== hidden) {
@@ -612,20 +659,23 @@ document
     }
   };
 
-  let initial = false;
+  // Closed unless the user opted in: the agent pane is the primary surface.
+  // helpers.js's __bramWriteLS stores dotted keys nested and JSON-encoded:
+  // "bram.terminal.openAtStartup" lives at localStorage["bram"] ->
+  // .terminal.openAtStartup, so read it the same way __bramReadLS does.
+  let initial = true;
   try {
-    initial =
-      (localStorage.getItem(TERMINAL_HIDDEN_KEY) ??
-        localStorage.getItem(LEGACY_TERMINAL_HIDDEN_KEY)) === "1";
+    const root = JSON.parse(localStorage.getItem("bram") || "null");
+    initial = root?.terminal?.openAtStartup !== "1";
   } catch {}
-  apply(initial, "startup", false);
+  apply(initial, "startup");
   if (!initial) {
     scheduleStartupTerminalFit();
   }
 
   btn.addEventListener("click", (event) => {
     const hidden = !document.body.classList.contains("terminal-hidden");
-    apply(hidden, "toolbar-toggle", true);
+    apply(hidden, "toolbar-toggle");
     // A deliberate, inert self-test for the closed-terminal recovery path.
     // It exercises the parent/tools bridge and real footer action without
     // modifying the live turn or weakening the host detector.
@@ -660,7 +710,7 @@ document
       postTerminalVisibility("silence-dismissed");
       return;
     }
-    apply(false, "suspicious-silence-button", true);
+    apply(false, "suspicious-silence-button");
   });
 })();
 
@@ -1767,7 +1817,14 @@ const ptyShell = isWindows
 const _spawnPty = async () => {
   // Fit right before reading cols/rows so the PTY inherits the actual
   // container dimensions, not the xterm.js defaults.
+  // terminal-open-at-startup-setting: a closed terminal is display:none,
+  // so fit() has nothing to measure and the agent would start at 80x24.
+  // Lay the pane out for the measurement and hide it again in the same
+  // synchronous task — no frame paints in between, so nothing flickers.
+  const startsHidden = document.body.classList.contains("terminal-hidden");
+  if (startsHidden) document.body.classList.remove("terminal-hidden");
   fitAddon.fit();
+  if (startsHidden) document.body.classList.add("terminal-hidden");
   try {
     await invoke("pty_spawn", {
       ...ptyShell,
@@ -1885,6 +1942,9 @@ listen("pty-send-sent", (e) => {
     TOOLS_PANE_SRC = toolsSrc;
     const projectKey =
       appInfo && typeof appInfo.projectKey === "string" ? appInfo.projectKey : "";
+    // Set before the tools pane loads, so its per-project localStorage keys
+    // (helpers.js __bramProjectScopedKey) can read it synchronously.
+    window.__bramProjectKey = projectKey;
     if (projectKey) {
       toolsRouteKey = toolsRouteKeyFor(projectKey);
       migrateToolsRouteKey(localStorage, toolsRouteKey);
@@ -2208,22 +2268,38 @@ listen("pty-send-sent", (e) => {
   });
 })();
 
-// Click-to-toggle voice. The toolbar 🎤 button toggles its own recording;
-// iframes (Workspace, etc.) drive the same recorder via voice-start/voice-stop
-// messages. Auto-starts whisper-server on first record click.
+// Click-to-toggle voice for the agent pane's 🎤 buttons, which drive this
+// recorder via voice-start/voice-stop messages. Auto-starts whisper-server on
+// first record click. (issue-407 retired the parent toolbar's 🎤, which
+// dictated into the terminal: little used, and confusing next to the pane's.)
 (() => {
-  const WHISPER_HOST = "http://127.0.0.1:18080";
-  const WHISPER_URL = WHISPER_HOST + "/inference";
-  // Host-native macOS/Linux launch expands this on the host. Windows launch
-  // sends it to WSL so it resolves under the WSL user's home directory.
-  const MODEL_PATH = "~/.local/share/whisper-models/ggml-small.en.bin";
+  // Speech-to-text engines. The live loop, the boundary repair and the
+  // reserve full pass talk only to the selected engine; what is specific to
+  // one engine (endpoint, request format, model, quirks) lives in its
+  // adapter, in __shell/dictation.js (loaded by index.html before this
+  // file). Whisper is the only engine today. localStorage
+  // bram.voice.engine (a decision, no UI yet) selects one; an unknown name
+  // falls back to Whisper with a trace line. The local-server lifecycle
+  // below (ensureServerRunning, whisper_status / whisper_start) is the
+  // Whisper adapter's too; a hosted engine would skip it.
+  const VOICE_ENGINES = window.BramDictation.engines;
+  const VOICE_ENGINE_DEFAULT = "whisper";
+  const voiceEngine = (() => {
+    let name = VOICE_ENGINE_DEFAULT;
+    try {
+      name = localStorage.getItem("bram.voice.engine") || VOICE_ENGINE_DEFAULT;
+    } catch (_) {}
+    if (VOICE_ENGINES[name]) return VOICE_ENGINES[name];
+    setTimeout(() => voiceLog("voice-engine-unknown", { requested: name, using: VOICE_ENGINE_DEFAULT }), 0);
+    return VOICE_ENGINES[VOICE_ENGINE_DEFAULT];
+  })();
+  const WHISPER_HOST = voiceEngine.host;
+  const WHISPER_URL = voiceEngine.url;
+  const MODEL_PATH = voiceEngine.modelPath;
   const READY_TIMEOUT_MS = 15000;
   const READY_POLL_MS = 300;
   const IFRAME_ORPHAN_GRACE_MS = 10000;
   const IFRAME_RECORDING_WATCHDOG_MS = 5 * 60 * 1000;
-
-  const toolbarBtn = document.getElementById("voice-toggle");
-  if (!toolbarBtn) return;
 
   // Structured voice-pipeline logging via the existing log_from_right_pane
   // command, so every stage shows up in cargo run stderr tagged with the
@@ -2252,8 +2328,7 @@ listen("pty-send-sent", (e) => {
   let audioChunks = [];
   let stream = null;
   // active === null         → idle
-  // active === "toolbar"    → toolbar mic; transcript → pty_write
-  // active === { source, requestId } → iframe round-trip; transcript → postMessage
+  // active === { source, requestId, voiceTarget } → pane round-trip; transcript → postMessage
   let active = null;
   let activeStopAtMs = null;
   let activeStopReceivedAtMs = null;
@@ -2261,17 +2336,9 @@ listen("pty-send-sent", (e) => {
   let activeRecorderStarted = false;
   let activeStopRequested = false;
   let activeWatchdogTimer = null;
-  // Synthetic requestId for toolbar sessions — keeps log entries correlated
-  // even though the toolbar path never receives an iframe-supplied id.
-  let toolbarRequestId = null;
   const currentRequestId = () =>
-    active === "toolbar"
-      ? toolbarRequestId
-      : active && typeof active === "object"
-        ? active.requestId
-        : null;
-  const activeKind = () =>
-    active === null ? null : active === "toolbar" ? "toolbar" : "iframe";
+    active && typeof active === "object" ? active.requestId : null;
+  const activeKind = () => (active === null ? null : "iframe");
   const activeAgeMs = () =>
     typeof activeStartedAtMs === "number" ? Date.now() - activeStartedAtMs : null;
 
@@ -2283,7 +2350,7 @@ listen("pty-send-sent", (e) => {
   };
 
   const postIframeVoiceState = (state, extra) => {
-    if (!active || active === "toolbar" || !active.source) return;
+    if (!active || !active.source) return;
     try {
       active.source.postMessage(
         Object.assign(
@@ -2308,13 +2375,13 @@ listen("pty-send-sent", (e) => {
 
   const resetActiveState = () => {
     clearActiveWatchdog();
+    abortLive();
     active = null;
     activeStopAtMs = null;
     activeStopReceivedAtMs = null;
     activeStartedAtMs = null;
     activeRecorderStarted = false;
     activeStopRequested = false;
-    toolbarRequestId = null;
   };
 
   const recoverStaleActiveRecording = (reason) => {
@@ -2351,13 +2418,12 @@ listen("pty-send-sent", (e) => {
     stopStream();
     audioChunks = [];
     resetActiveState();
-    if (toolbarBtn.dataset.state !== "idle") setToolbarState("idle");
   };
 
   const armIframeRecordingWatchdog = () => {
     clearActiveWatchdog();
     activeWatchdogTimer = setTimeout(() => {
-      if (active && active !== "toolbar" && !activeStopRequested) {
+      if (active && !activeStopRequested) {
         recoverStaleActiveRecording("iframe-watchdog-timeout");
       }
     }, IFRAME_RECORDING_WATCHDOG_MS);
@@ -2365,26 +2431,12 @@ listen("pty-send-sent", (e) => {
 
   const canRecoverStaleIframeForNewStart = (target) =>
     active &&
-    active !== "toolbar" &&
     target &&
     typeof target === "object" &&
     target.source &&
     active.source !== target.source &&
     typeof activeStartedAtMs === "number" &&
     Date.now() - activeStartedAtMs >= IFRAME_ORPHAN_GRACE_MS;
-
-  const setToolbarState = (state) => {
-    toolbarBtn.dataset.state = state;
-    toolbarBtn.innerHTML =
-      state === "recording"
-        ? "&#x23F9;"
-        : state === "processing"
-          ? '<span class="voice-spinner" aria-label="Processing voice input"></span>'
-        : state === "starting"
-          ? "&#x23F3;"
-          : "&#x1F3A4;";
-  };
-  setToolbarState("idle");
 
   const mediaRecorderConfig = () => {
     const opusWebm = "audio/webm;codecs=opus";
@@ -2446,6 +2498,25 @@ listen("pty-send-sent", (e) => {
       });
       return { ready: true, reason: "status" };
     }
+    // voice-setup-check-and-log: check whisper-server, the model and ffmpeg
+    // before starting (the host traces what it found and where it looked).
+    // Engine or model missing: don't start; the pane opens its setup dialog.
+    // Only ffmpeg missing: the host starts without --convert, so dictation
+    // works, and the pane says the safety pass is off.
+    let setup = null;
+    try {
+      setup = await invoke("whisper_preflight", { modelPath: MODEL_PATH });
+    } catch (e) {
+      voiceLog("setup-check-error", { error: String(e) });
+    }
+    if (setup && setup.checked) {
+      const missing = voiceSetupMissing(setup);
+      voiceLog("setup-check", { missing });
+      if (missing.length) notifyVoiceSetup(setup, missing);
+      if (missing.includes("whisper-server") || missing.includes("model")) {
+        return { ready: false, reason: "setup-missing" };
+      }
+    }
     try {
       voiceLog("ensure-server-start-invoked", { modelPath: MODEL_PATH });
       const pid = await invoke("whisper_start", { modelPath: MODEL_PATH });
@@ -2494,9 +2565,38 @@ listen("pty-send-sent", (e) => {
 
   // Send startup and transcription failures to the agent-pane iframe
   // (same-origin tools-pane), which owns the toast surface. This covers every
-  // mic origin — toolbar, agent pane, and any target-app iframe. Startup
+  // mic origin — the agent pane or any target-app iframe. Startup
   // failures retain the original reason-only payload; post-recording failures
   // add a kind and server detail so the toast can explain what broke.
+  // The components a preflight report found missing, by the names the
+  // setup dialog shows.
+  const voiceSetupMissing = (setup) =>
+    [
+      ["whisper-server", setup.binary],
+      ["model", setup.model],
+      ["ffmpeg", setup.ffmpeg],
+    ]
+      .filter(([, c]) => !(c && c.found))
+      .map(([name]) => name);
+
+  // Send the setup report to the agent pane, which opens its setup dialog.
+  // `blocking` is true when dictation can't start.
+  const notifyVoiceSetup = (setup, missing) => {
+    const blocking = missing.includes("whisper-server") || missing.includes("model");
+    voiceLog("setup-notice", { missing, blocking });
+    try {
+      const tools = document.getElementById("tools-pane");
+      if (tools && tools.contentWindow) {
+        tools.contentWindow.postMessage(
+          { type: "bram-voice-setup", missing, blocking, report: setup },
+          "*",
+        );
+      }
+    } catch (e) {
+      voiceLog("setup-notice-error", { error: String(e) });
+    }
+  };
+
   const notifyWhisperUnavailable = (reason, kind, detail) => {
     voiceLog("whisper-unavailable-notice", {
       reason: String(reason || ""),
@@ -2559,10 +2659,95 @@ listen("pty-send-sent", (e) => {
     }
   };
 
+  // issue-407: live dictation. While the MediaRecorder records (unchanged,
+  // and still the source of the reserve full pass), the live loop in
+  // __shell/dictation.js (judell/bram#417) taps the same stream and
+  // transcribes a sliding window; this file is its host: the engine
+  // lifecycle, the single in-flight recording and the postMessage transport
+  // to the pane. On stop the live text is what gets delivered; localStorage
+  // bram.voice.fullPass === "1" (no UI, kept in reserve) sends the whole
+  // recording in one request instead, as before. If live capture can't
+  // start, the full pass is used automatically. localStorage
+  // bram.voice.pauseMs (no UI) overrides the loop's default pause for
+  // speakers who pause longer or shorter.
+  // The current dictation's loop (BramDictation.createLoop), with the frame
+  // that started it as `.target`; null when none is live.
+  let live = null;
+
+  const livePauseMs = () => {
+    try {
+      const v = Number(localStorage.getItem("bram.voice.pauseMs"));
+      if (v >= 300 && v <= 5000) return v;
+    } catch (_) {}
+    return window.BramDictation.LIVE_PAUSE_MS;
+  };
+
+  const fullPassReserved = () => {
+    try {
+      return localStorage.getItem("bram.voice.fullPass") === "1";
+    } catch (_) {
+      return false;
+    }
+  };
+
+  // Start the live loop on the recording's stream. Its partials go to the
+  // pane editor that owns the recording.
+  const startLive = async (mediaStream, target, requestId) => {
+    const loop = window.BramDictation.createLoop({
+      engine: voiceEngine,
+      trace: voiceLog,
+      requestId,
+      pauseMs: livePauseMs(),
+      workletUrl: "__shell/dictation-capture-worklet.js",
+      // A stop that arrived while the worklet loaded has already taken the
+      // full-pass path; don't attach a capture nobody will finish.
+      shouldAttach: () => !(activeStopRequested || currentRequestId() !== requestId),
+      onAttach: () => {
+        live = loop;
+      },
+      onPartial: (p) => {
+        if (!target || !target.source) return;
+        try {
+          target.source.postMessage(
+            {
+              type: "voice-into-partial",
+              requestId: target.requestId,
+              target: target.voiceTarget || "",
+              committed: p.committed,
+              provisional: p.provisional,
+              parts: p.parts,
+              openSeq: p.openSeq,
+              // A boundary repair is due or in flight: a send waits for it
+              // (helpers.js __bramVoiceRepairWait).
+              repairing: p.repairing,
+            },
+            "*",
+          );
+        } catch (_) {}
+      },
+    });
+    loop.target = target;
+    if (!(await loop.start(mediaStream)) && live === loop) live = null;
+  };
+
+  // Stop capturing, commit what's left, and return the live text.
+  const finishLive = async () => {
+    const loop = live;
+    if (!loop) return null;
+    const result = await loop.finish();
+    if (live === loop) live = null;
+    return result;
+  };
+
+  const abortLive = () => {
+    if (!live) return;
+    live.abort();
+    live = null;
+  };
+
   const deliverTranscript = (transcript) => {
     const reqId = currentRequestId();
     const text = String(transcript || "");
-    const focusTerminalAfterDelivery = active === "toolbar";
     const deliveredAtMs = Date.now();
     const stopToDeliverMs =
       typeof activeStopAtMs === "number" ? deliveredAtMs - activeStopAtMs : null;
@@ -2570,12 +2755,7 @@ listen("pty-send-sent", (e) => {
       requestId: reqId,
       stopAtMs: activeStopAtMs,
       stopToDeliverMs: stopToDeliverMs,
-      target:
-        active === "toolbar"
-          ? "toolbar"
-          : active && typeof active === "object"
-            ? "iframe"
-            : "none",
+      target: active && typeof active === "object" ? "iframe" : "none",
       transcriptLength: text.length,
       transcriptPreview: text.slice(0, 80),
     });
@@ -2600,49 +2780,19 @@ listen("pty-send-sent", (e) => {
           error: String(e),
         });
       }
-    } else if (active === "toolbar" && text) {
-      // Prefix with "voice: " so the receiving agent (typically Claude Code)
-      // can distinguish dictated content from typed input — see the
-      // verbal-vs-structured guardrail in app/__shell/conventions.md.
-      invoke("pty_write", {
-        data: "\x1b[200~voice: " + text + "\x1b[201~\r",
-      }).catch((e) => {
-        console.error("pty_write voice", e);
-        voiceLog("deliverTranscript-pty-error", {
-          requestId: reqId,
-          error: String(e),
-        });
-      });
     }
     postIframeVoiceState("idle", { transcriptLength: text.length });
     active = null;
     mediaRecorder = null;
     resetActiveState();
-    if (toolbarBtn.dataset.state !== "idle") setToolbarState("idle");
-    if (focusTerminalAfterDelivery) {
-      requestAnimationFrame(() => {
-        try {
-          term.focus();
-          voiceLog("deliverTranscript-terminal-focus", { requestId: reqId });
-        } catch (e) {
-          voiceLog("deliverTranscript-terminal-focus-error", {
-            requestId: reqId,
-            error: String(e),
-          });
-        }
-      });
-    }
   };
 
   const startRecording = async (target) => {
-    const incomingId =
-      target === "toolbar"
-        ? "toolbar-" + Date.now() + "-" + Math.random().toString(36).slice(2)
-        : target && target.requestId;
+    const incomingId = target && target.requestId;
     voiceLog("startRecording-enter", {
       requestId: incomingId,
-      target: target === "toolbar" ? "toolbar" : "iframe",
-      activeWas: active === null ? null : active === "toolbar" ? "toolbar" : "iframe",
+      target: "iframe",
+      activeWas: activeKind(),
     });
     if (active) {
       if (canRecoverStaleIframeForNewStart(target)) {
@@ -2654,7 +2804,7 @@ listen("pty-send-sent", (e) => {
           activeAgeMs: activeAgeMs(),
           activeWas: activeKind(),
         });
-        notifyVoiceBusy(target === "toolbar" ? "toolbar" : "iframe");
+        notifyVoiceBusy("iframe");
         // Already busy: tell the new requester nothing came of it.
         if (target && typeof target === "object" && target.source) {
           try {
@@ -2682,9 +2832,6 @@ listen("pty-send-sent", (e) => {
     activeStopRequested = false;
     activeStopAtMs = null;
     activeStopReceivedAtMs = null;
-    const isToolbar = target === "toolbar";
-    if (isToolbar) toolbarRequestId = incomingId;
-    if (isToolbar) setToolbarState("starting");
     postIframeVoiceState("starting");
     const serverResult = await ensureServerRunning();
     if (!serverResult.ready) {
@@ -2693,11 +2840,12 @@ listen("pty-send-sent", (e) => {
         requestId: incomingId,
         reason: serverResult.reason,
       });
-      notifyWhisperUnavailable(serverResult.reason);
+      // A missing component already opened the setup dialog; the generic
+      // "not running" toast would only repeat it less usefully.
+      if (serverResult.reason !== "setup-missing") notifyWhisperUnavailable(serverResult.reason);
       postIframeVoiceState("idle", { reason: serverResult.reason || "whisper-unavailable" });
       const t = active;
       resetActiveState();
-      if (isToolbar) setToolbarState("idle");
       if (t && typeof t === "object" && t.source) {
         try {
           t.source.postMessage(
@@ -2729,7 +2877,6 @@ listen("pty-send-sent", (e) => {
       postIframeVoiceState("idle", { reason: "getUserMedia-error" });
       const t = active;
       resetActiveState();
-      if (isToolbar) setToolbarState("idle");
       if (t && typeof t === "object" && t.source) {
         try {
           t.source.postMessage(
@@ -2760,7 +2907,6 @@ listen("pty-send-sent", (e) => {
       stopStream();
       const t = active;
       resetActiveState();
-      if (isToolbar) setToolbarState("idle");
       if (t && typeof t === "object" && t.source) {
         try {
           t.source.postMessage(
@@ -2783,6 +2929,18 @@ listen("pty-send-sent", (e) => {
       const reqId = currentRequestId();
       const onstopAtMs = Date.now();
       stopStream();
+      // issue-407: the live text is what gets sent. The recorded blob is
+      // only the reserve: used when live produced nothing and had request
+      // errors (so a failed live pass doesn't lose the dictation).
+      if (live) {
+        const result = await finishLive();
+        if (result && (result.text || result.errors === 0)) {
+          audioChunks = [];
+          deliverTranscript(result.text);
+          return;
+        }
+        voiceLog("voice-live-fallback-full-pass", { requestId: reqId, errors: result ? result.errors : null });
+      }
       const blobType =
         (mediaRecorder && mediaRecorder.mimeType) ||
         (recorderConfig.options && recorderConfig.options.mimeType) ||
@@ -2807,9 +2965,7 @@ listen("pty-send-sent", (e) => {
       let transcript = "";
       let httpStatus = null;
       try {
-        const formData = new FormData();
-        formData.append("file", blob, "recording.webm");
-        formData.append("response_format", "json");
+        const formData = voiceEngine.form(blob, "recording.webm", {});
         const reqStart = Date.now();
         voiceLog("whisper-request", {
           requestId: reqId,
@@ -2822,7 +2978,7 @@ listen("pty-send-sent", (e) => {
         httpStatus = res.status;
         if (res.ok) {
           const data = await res.json();
-          transcript = (data.text || "").trim();
+          transcript = voiceEngine.text(data).trim();
         } else {
           let responseBody = "";
           let serverError = "";
@@ -2887,9 +3043,8 @@ listen("pty-send-sent", (e) => {
     mediaRecorder.start();
     activeRecorderStarted = true;
     voiceLog("mediaRecorder-start", { requestId: incomingId });
-    if (isToolbar) {
-      setToolbarState("recording");
-    } else if (active && typeof active === "object" && active.source) {
+    if (!fullPassReserved()) startLive(stream, target, incomingId);
+    if (active && typeof active === "object" && active.source) {
       armIframeRecordingWatchdog();
       postIframeVoiceState("recording");
       try {
@@ -2933,28 +3088,6 @@ listen("pty-send-sent", (e) => {
     }
   };
 
-  toolbarBtn.addEventListener("click", () => {
-    const state = toolbarBtn.dataset.state;
-    if (active && active !== "toolbar") {
-      notifyVoiceBusy("toolbar");
-      return;
-    }
-    if (state === "recording") {
-      setToolbarState("processing");
-      stopRecording(Date.now(), "toolbar-click");
-    } else if (state === "idle") {
-      startRecording("toolbar");
-    }
-    // ignore clicks while starting or processing
-  });
-
-  window.addEventListener("keydown", (ev) => {
-    if (ev.key === "d" && ev.shiftKey && (ev.metaKey || ev.ctrlKey)) {
-      ev.preventDefault();
-      toolbarBtn.click();
-    }
-  });
-
   // iframe-driven flow: voice-start begins recording on the iframe's behalf;
   // voice-stop stops the (single in-flight) recording.
   window.addEventListener("message", (ev) => {
@@ -2963,6 +3096,24 @@ listen("pty-send-sent", (e) => {
     if (d.kind === "voice-start") {
       voiceLog("iframe-voice-start", { requestId: d.requestId });
       startRecording({ source: ev.source, requestId: d.requestId, voiceTarget: d.target || "" });
+    } else if (d.kind === "voice-edit-boundary") {
+      // The pane's field adopted an edit (dictation.js createField): windows
+      // below fromSeq are the user's text now. Only the frame that started
+      // the current dictation may set it, and it only moves forward.
+      const loop = live;
+      const fromOwner =
+        !!loop &&
+        !!loop.target &&
+        !!ev.source &&
+        loop.target.source === ev.source &&
+        loop.requestId === d.requestId;
+      const r = fromOwner ? loop.setEditBoundary(d.fromSeq) : { accepted: false, segmentClosed: false };
+      voiceLog("voice-edit-boundary", {
+        requestId: d.requestId,
+        fromSeq: d.fromSeq,
+        accepted: r.accepted,
+        segmentClosed: r.segmentClosed,
+      });
     } else if (d.kind === "voice-stop") {
       const stopAtMs = typeof d.stopAtMs === "number" ? d.stopAtMs : Date.now();
       voiceLog("iframe-voice-stop", {
@@ -2972,7 +3123,6 @@ listen("pty-send-sent", (e) => {
       });
       if (
         !active ||
-        active === "toolbar" ||
         !d.requestId ||
         !ev.source ||
         active.source !== ev.source ||
@@ -2982,7 +3132,7 @@ listen("pty-send-sent", (e) => {
           requestId: d.requestId,
           stopAtMs: stopAtMs,
           activeWas:
-            active === null ? null : active === "toolbar" ? "toolbar" : "iframe",
+            activeKind(),
           activeRequestId: currentRequestId(),
           hasSource: !!ev.source,
           sourceMatches:

@@ -1,8 +1,10 @@
 <Component
   name="Commits"
   var.commitsExpanded="{false}"
+  var.linkedSha="{$queryParams.sha || ''}"
   var.searchQuery="{getLastSearchQuery()}"
   var.pullError="{null}"
+  var.pullWarningDismissed="{false}"
   var.pushError="{null}"
   var.searchNeedle="{searchQuery.trim().toLowerCase()}"
   var.filteredCommits="{filterCommitList(commits.value, searchNeedle)}"
@@ -17,6 +19,19 @@
   <!-- Browse list with a local metadata filter and inline CommitDetail.
        Unified Search remains the cross-bucket/full-text path. -->
   <DataSource id="commits" url="/__commits" />
+  <!-- /commits?sha=<sha>: one commit's local view, from the Log's link on a
+       commit no remote has yet (the forge would 404). The var default covers
+       landing here fresh and the ChangeListener a second link while mounted,
+       as History's entry param does
+       (https://www.xmlui.org/docs/howto/deep-link-to-a-tab-or-section).
+       CommitDetail in a modal is ResultList's shape for a row's detail. -->
+  <ChangeListener listenTo="{$queryParams.sha || ''}"
+    onDidChange="(c) => linkedSha = c.newValue" />
+  <Theme maxWidth-ModalDialog="95vw">
+    <ModalDialog when="{!!linkedSha}" onClose="linkedSha = ''" title="{'Commit ' + linkedSha}">
+      <CommitDetail sha="{linkedSha}" url="" height="70vh" />
+    </ModalDialog>
+  </Theme>
   <!-- The filter is local-fields only: sha, author, and the FULL commit
        message (subject + body). The former FTS union (commits-issues-
        filter-use-fts) was retired at the browse-tabs-adopt-searchresults
@@ -34,12 +49,18 @@
        variables computed with '' and admitted all rows). Issues uses the
        root-attr shape and never exhibited the staleness. Filtering itself
        is filterCommitList (Globals.xs) with the needle passed explicitly. -->
-  <APICall
-    id="pullRebase"
-    method="post"
-    url="/__git/pull-rebase"
-    onSuccess="pullError = null; commits.refetch(); gitStatus.refetch()"
-    onError="(e) => pullError = (e &amp;&amp; e.message) ? e.message : String(e)" />
+  <!-- pane-buttons-acknowledge-clicks: was an APICall, whose onSuccess
+       reached the pane ~30 s after the host answered, holding the Pull
+       button disabled that long. window.__bramPaneAction (a plain fetch)
+       publishes busy / done here; the ChangeListener runs what onSuccess /
+       onError ran, and the autostash warning reads the response's data. -->
+  <PushSource
+    id="pullRebaseAct"
+    initial="{null}"
+    subscribe="{window.__bramSubscribePaneAction('pullRebase')}" />
+  <ChangeListener
+    listenTo="{pullRebaseAct.value &amp;&amp; pullRebaseAct.value.tick}"
+    onDidChange="() => { const a = pullRebaseAct.value; if (a &amp;&amp; !a.busy) { if (a.ok) { pullError = null; pullWarningDismissed = false; commits.refetch(); gitStatus.refetch(); } else { pullError = a.error; } } }" />
 
   <!-- rung9-publish-surface: the close queue's post-push state. The
        pre-push half ("Push will close #N") reads pendingCloses on unpushed
@@ -53,11 +74,26 @@
   <ChangeListener
     listenTo="{gitStatusEvt.value &amp;&amp; gitStatusEvt.value.tick}"
     onDidChange="window.__bramRefetchOnLiveEvent(gitStatusEvt.value, commits, gitStatus, closeQueue)" />
+  <!-- close-queue-host-removals-announced-not-withdrawn: a Push fires
+       git-status-changed seconds BEFORE the flush closes anything, so the
+       queue (and the commit rows' pendingCloses) went stale until reload.
+       The host's queue-file watcher now announces every change. -->
+  <PushSource
+    id="closeQueueEvt"
+    initial="{null}"
+    subscribe="{window.bramSubscribeTauriEvent('issue-close-queue-changed', false)}" />
+  <ChangeListener
+    listenTo="{closeQueueEvt.value &amp;&amp; closeQueueEvt.value.tick}"
+    onDidChange="window.__bramRefetchOnLiveEvent(closeQueueEvt.value, closeQueue, commits)" />
   <ChangeListener
     listenTo="{gitStatus.value &amp;&amp; gitStatus.value.branch}"
     onDidChange="() => { commitsExpanded = false; }" />
 
-  <VStack padding="$space-4" gap="$space-4" overflowY="auto" height="100%">
+  <!-- result-list-tabs-virtualize: no overflowY / height wrapper — a second
+       scroll container here defeats ResultList's virtualization (every row
+       mounted; see Issues.xmlui, issues-status-lightweight, for the receipts).
+       https://www.xmlui.org/docs/howto/pin-a-toolbar-above-a-bounded-scroll-region -->
+  <VStack padding="$space-4" gap="$space-4">
     <HStack gap="$space-3" verticalAlignment="center">
       <Heading level="h2">Commits</Heading>
       <SearchBox
@@ -78,7 +114,8 @@
         when="{(commits.value || []).filter(c => !c.pushed).length > 0}"
         label="Push {(commits.value || []).filter(c => !c.pushed).length}{gitStatus.value &amp;&amp; gitStatus.value.branch ? ' to ' + gitStatus.value.branch : ''}"
         size="xs"
-        tooltip="{gitStatus.value &amp;&amp; gitStatus.value.upstream ? 'Push unpublished commits to ' + gitStatus.value.upstream : 'Push unpublished commits and set upstream on origin'}"
+        enabled="{!window.__bramPushWithheld(gitStatus.value)}"
+        tooltipMarkdown="{window.__bramPushTooltip(gitStatus.value)}"
         onClick="pushError = null; gitPush(commits, gitStatus, gitStatus.value &amp;&amp; gitStatus.value.branch, (e) => pushError = e)" />
       <!-- local-repo-no-origin-first-class: with no remote, unpushed is
            undefined (the host marks no commit unpushed, so Push never
@@ -92,13 +129,33 @@
       <Button
         label="{gitStatus.value &amp;&amp; gitStatus.value.behind > 0 ? 'Pull ' + gitStatus.value.behind : 'Pull'}"
         size="xs"
-        enabled="{!pullRebase.inProgress &amp;&amp; gitStatus.value &amp;&amp; gitStatus.value.behind > 0}"
-        onClick="pullError = null; pullRebase.execute()" />
+        enabled="{!(pullRebaseAct.value &amp;&amp; pullRebaseAct.value.busy) &amp;&amp; gitStatus.value &amp;&amp; gitStatus.value.behind > 0}"
+        onClick="pullError = null; window.__bramPaneAction('pullRebase', '/__git/pull-rebase', { method: 'POST' })" />
     </HStack>
+
+    <!-- push-withheld-when-commits-ride-a-pr: on the default branch, when
+         the unpushed commits also ride another branch, that branch's PR is
+         how they reach it. On its own line below the header: beside the
+         disabled Push it widened the header row past the pane and forced a
+         horizontal scrollbar. The Push hover carries the full explanation. -->
+    <Text
+      when="{window.__bramPushWithheld(gitStatus.value)}"
+      fontSize="$fontSize-sm"
+      color="$textColor-secondary"
+      value="{window.__bramPushWithheldNote(gitStatus.value)}" />
 
     <HStack when="{pullError}" backgroundColor="$color-danger-100" padding="$space-2" gap="$space-2" verticalAlignment="start">
       <Text fontSize="$fontSize-sm" color="$color-danger-700" width="*">Pull failed: {pullError}</Text>
       <Button label="✕" variant="ghost" size="xs" tooltip="Dismiss" onClick="pullError = null" />
+    </HStack>
+    <!-- pull-rebase-stash-safety: the pull succeeded but reapplying the
+         autostash conflicted, so git kept the changes in the stash and left
+         conflict markers. Stays until dismissed, not a transient toast.
+         Reads the response from the pane action's published data
+         (pane-buttons-acknowledge-clicks). -->
+    <HStack when="{!pullWarningDismissed &amp;&amp; pullRebaseAct.value &amp;&amp; pullRebaseAct.value.ok &amp;&amp; pullRebaseAct.value.data &amp;&amp; pullRebaseAct.value.data.autostashRetained}" backgroundColor="$color-warning-100" padding="$space-2" gap="$space-2" verticalAlignment="start">
+      <Text fontSize="$fontSize-sm" color="$color-warning-800" width="*" value="{pullRebaseAct.value.data.message}" />
+      <Button label="✕" variant="ghost" size="xs" tooltip="Dismiss" onClick="pullWarningDismissed = true" />
     </HStack>
     <!-- issue-383: pushError can now be genuinely multi-line (stdout+stderr,
          a pre-push hook's whole explanation ahead of git's one-line
@@ -113,15 +170,32 @@
          props on one Text loses the linebreak preservation the whole fix is
          for — see https://www.xmlui.org/docs/howto/display-preformatted-text#overflow:-preformatted-text-doesn't-wrap,-so-bound-it-and-scroll,
          whose bounded-container idiom this mirrors for vertical instead of
-         horizontal overflow. -->
+         horizontal overflow.
+         issue-383-push-error-scroll-cue: the bounded container is a
+         ScrollViewer with scrollStyle="overlay", because a plain overflow
+         VStack scrolls with no cue: Walt read the capped message as
+         truncated, with the remedy and the no-verify override below the
+         fold. showScrollerFade (default true, overlay modes only) draws a
+         bottom fade while more lies below and a top fade once scrolled
+         (https://www.xmlui.org/docs/reference/components/ScrollViewer#showscrollerfade,
+         https://www.xmlui.org/docs/reference/components/ScrollViewer#scrollstyle). -->
     <HStack when="{pushError}" backgroundColor="$color-danger-100" padding="$space-2" gap="$space-2" verticalAlignment="start">
-      <VStack width="*" maxHeight="240px" overflowY="auto">
-        <Text
-          fontSize="$fontSize-sm"
-          color="$color-danger-700"
-          preserveLinebreaks="true"
-          value="{'Push failed: ' + pushError}" />
-      </VStack>
+      <!-- The fade defaults to the page surface
+           (backgroundColor-fade-Scroller = rgb(from $color-surface-0 r g b /
+           0.75)), which reads as a white smear over this danger-tinted box;
+           tint it to the box, and halve its 64px default height for a 240px
+           cap. -->
+      <Theme
+        backgroundColor-fade-Scroller="rgb(from $color-danger-100 r g b / 0.9)"
+        height-fade-Scroller="32px">
+        <ScrollViewer width="*" maxHeight="240px" scrollStyle="overlay">
+          <Text
+            fontSize="$fontSize-sm"
+            color="$color-danger-700"
+            preserveLinebreaks="true"
+            value="{'Push failed: ' + pushError}" />
+        </ScrollViewer>
+      </Theme>
       <Button label="✕" variant="ghost" size="xs" tooltip="Dismiss" onClick="pushError = null" />
     </HStack>
 
@@ -172,25 +246,59 @@
            author, +/- stats, pending-close annotation) stays Commits-owned
            in the slot. Inline CommitDetail expansion and selectedSha retire
            in favor of the shell's modal. -->
-      <ResultList data="{commitRows}" query="{searchQuery.trim()}">
+      <!-- pinKey: a search change replaces the rows wholesale; pin the page
+           to top so virtua's re-anchor can't drag it down the new list. -->
+      <Text fontSize="$fontSize-xs" color="$textColor-secondary"
+        value="Tagged commits came from a Worklist item. Others have no Worklist record: direct edits, releases, outside commits." />
+      <ResultList data="{commitRows}" query="{searchQuery.trim()}"
+        pinKey="{searchNeedle}" pinVia="commits">
         <property name="rowTemplate">
           <HStack gap="$space-3" verticalAlignment="center">
             <Text when="{$item.pushed}" value="✓" color="$color-success-600" fontSize="$fontSize-xs" width="12px" />
             <Text when="{!$item.pushed}" value=" " width="12px" />
-            <Text value="{$item.sha.slice(0, 7)}" variant="code" fontSize="$fontSize-xs" color="$textColor-secondary" width="64px" />
+            <Text value="{$item.sha.slice(0, 7)}" variant="code" fontSize="$fontSize-xs" color="$textColor-secondary" width="64px" when-xl />
             <Text value="{formatDateTime($item.commit.author.date, 'MM-dd HH:mm')}" fontSize="$fontSize-xs" color="$textColor-secondary" overflowMode="none" width="88px" />
-            <HStack width="232px" gap="$space-1" verticalAlignment="center">
-              <Text value="{$item.commit.author.login || $item.commit.author.name}" fontSize="$fontSize-sm" color="$textColor-secondary" width="*" maxLines="1" />
-              <HStack gap="8px" verticalAlignment="center">
-                <Text value="{'+' + ($item.additions || 0)}" textAlign="right" width="64px" fontFamily="$fontFamily-monospace" fontSize="$fontSize-xs" color="$color-success-700" />
-                <Text value="{($item.deletions || 0) > 0 ? '-' + $item.deletions : ''}" textAlign="right" width="64px" fontFamily="$fontFamily-monospace" fontSize="$fontSize-xs" color="$color-danger-700" />
-              </HStack>
+            <!-- commits-item-tags-wrap: below xl (1200px pane width) the sha
+                 and +/- counts hide, giving the subject room; the row's
+                 detail still shows both.
+                 https://www.xmlui.org/docs/howto/show-different-content-per-breakpoint
+                 Fixed widths plus when-* only: width-lg was ignored in these
+                 rows while when-lg applied (suspected XMLUI bug, 2026-10-21). -->
+            <Text value="{$item.commit.author.login || $item.commit.author.name}" fontSize="$fontSize-sm" color="$textColor-secondary" width="80px" breakMode="word" />
+            <HStack gap="8px" width="104px" verticalAlignment="center" when-xl>
+              <Text value="{'+' + ($item.additions || 0)}" textAlign="right" width="48px" fontFamily="$fontFamily-monospace" fontSize="$fontSize-xs" color="$color-success-700" />
+              <Text value="{($item.deletions || 0) > 0 ? '-' + $item.deletions : ''}" textAlign="right" width="48px" fontFamily="$fontFamily-monospace" fontSize="$fontSize-xs" color="$color-danger-700" />
             </HStack>
             <Text
               value="{$item.commit.message.split('\n')[0]}"
               fontSize="$fontSize-sm"
-              width="*"
-              maxLines="1" />
+              width="2*" />
+            <!-- commits-list-shows-worklist-item: one tag per Worklist item
+                 the commit landed (itemIds, joined host-side in
+                 attach_history_item_ids). Opens the item in History the way
+                 CommitDetail's "Worklist history:" link does; the
+                 row-control testId keeps the click from also opening the
+                 row's detail (__bramRowClickHit).
+                 commits-item-tags-wrap: a one-third star column on every row,
+                 tagged or not, sharing the leftover width 2:1 with the subject
+                 (https://www.xmlui.org/docs/howto/make-a-set-of-equal-width-cards)
+                 so the subject column lines up; tags stack one
+                 per line and long ids wrap at their hyphens. The id is the
+                 Link's own label, not a nested Text, which would not wrap
+                 (https://www.xmlui.org/docs/howto/wrap-long-text-in-a-link). -->
+            <VStack width="*" gap="$space-1">
+              <Items data="{$item.itemIds || []}">
+                <Link
+                  noIndicator
+                  testId="row-control-worklist-item"
+                  tooltip="Open this Worklist item in History"
+                  label="{$item}"
+                  breakMode="word"
+                  fontFamily="$fontFamily-monospace"
+                  fontSize="$fontSize-xs"
+                  onClick="navigate('/history', { queryParams: { entry: $item } })" />
+              </Items>
+            </VStack>
             <Text
               when="{!$item.pushed &amp;&amp; $item.pendingCloses &amp;&amp; $item.pendingCloses.length > 0}"
               value="{'closes ' + $item.pendingCloses.map(p => '#' + p.issue).join(' ') + ' on push'}"

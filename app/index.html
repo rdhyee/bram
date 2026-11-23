@@ -27,9 +27,6 @@
       <button id="font-larger" title="Increase terminal font size (Cmd+=)">
         A+
       </button>
-      <button id="voice-toggle" data-state="idle" title="Voice input via local Whisper (Cmd+Shift+D)">
-        &#x1F3A4;
-      </button>
     </div>
     <div class="split">
       <div id="terminal" class="pane pane-left"></div>
@@ -69,7 +66,11 @@
           .catch(function () {});
       }
       // Cache-bust main.js on every load so JS edits are picked up after a
-      // restart without fighting the webview cache.
+      // restart without fighting the webview cache. dictation.js comes
+      // first: main.js calls its live loop (BramDictation.createLoop).
+      document.write(
+        '<script src="__shell/dictation.js?v=' + Date.now() + '"></' + 'script>'
+      );
       document.write(
         '<script src="main.js?v=' + Date.now() + '"></' + 'script>'
       );

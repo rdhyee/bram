@@ -1,0 +1,300 @@
+// bram-managed: Bram Setup seeds this file as .opencode/plugins/bram.js and
+// refreshes it on every Setup, so edits to the installed copy don't last.
+// Source: app/__shell/opencode/bram-plugin.js in the Bram repo.
+//
+// opencode-worklist-guard: OpenCode's counterpart of the PreToolUse hook Bram
+// registers for Claude and Codex. Before each tool call that can change the
+// project, it asks Bram's guard (~/.bram/bram-guard guard opencode-worklist)
+// and throws when the answer is not an allow; a throwing execute.before
+// refuses the call and the model reads the message. It fails closed: no
+// guard, no answer, or an unreadable answer is a deny.
+//
+// opencode-turn-lifecycle: it also forwards this project's turn boundaries
+// from OpenCode's event bus to Bram (POST /__opencode/event), since OpenCode
+// writes no transcript file Bram can watch for them. opencode-permission-menu
+// added its permission prompts and their answers, so the pane can show the
+// question OpenCode is asking in the terminal.
+//
+// opencode-edit-advisory: after an edit lands, execute.after asks the guard
+// (`guard opencode-after`) whether it touched a file outside the items this
+// turn is addressed to, and adds Bram's note to the result OpenCode's model
+// reads. Advisory only: it never blocks.
+import { spawn } from "node:child_process";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join, sep } from "node:path";
+import { fileURLToPath } from "node:url";
+
+// <root>/.opencode/plugins/bram.js. Plugins run inside OpenCode's background
+// service, whose cwd and environment belong to whatever started it, so the
+// project root comes from this file's own location (symlinks resolved, as
+// OpenCode reports session directories).
+const ROOT = (() => {
+  const root = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
+  try { return realpathSync(root); } catch { return root; }
+})();
+const GUARD = join(
+  homedir(),
+  ".bram",
+  process.platform === "win32" ? "bram-guard.exe" : "bram-guard",
+);
+const GUARD_TIMEOUT_MS = 15000;
+// Bram's per-project state folder: `.bram/` when it exists, else the older
+// `resources/` (issue #469). A path in `.bram/` wins only if that file is there.
+function statePath(name) {
+  const moved = join(ROOT, ".bram", name);
+  return existsSync(moved) ? moved : join(ROOT, "resources", name);
+}
+// Built-in tools that can't change the project. Everything else goes to the
+// guard, which allows what it has no rule for; MCP calls go as MCP calls
+// (mcpIdentity below), so its MCP rule applies.
+const READ_ONLY_TOOLS = new Set([
+  "read",
+  "glob",
+  "grep",
+  "list",
+  "webfetch",
+  "websearch",
+  "todowrite",
+  "todoread",
+  "question",
+  "skill",
+  "lsp",
+]);
+
+function deny(message) {
+  return { allow: false, message };
+}
+
+// A committed copy of this file reaches clones where Bram was never set up.
+// There, with no guard and no Bram marker, it stays out of the way, as the
+// guard itself does in an unmanaged repo. With the marker present a missing
+// guard is a broken install, and that denies.
+function bramManagedHere() {
+  return existsSync(statePath(".worklist-authorization.json"));
+}
+
+// opencode-mcp-guard: OpenCode 2.1.4 runs MCP tools through code mode, and
+// each MCP call reaches execute.before as `<server>_<tool>`. The tool list
+// gives a tool's namespace, but built-ins have namespaces too ("opencode",
+// "browser"), so it counts as MCP only when the namespace is a server the
+// MCP list names. Then the guard judges it as Claude's MCP calls are judged.
+// A failed lookup leaves the call as it was before this check.
+async function mcpIdentity(api, toolId) {
+  try {
+    const entry = ((await api.tool.list()) || []).find((t) => t && t.id === toolId);
+    const namespace = entry && entry.options && entry.options.namespace;
+    if (!namespace || typeof entry.name !== "string") return null;
+    const listed = await api.mcp.list();
+    const servers = Array.isArray(listed) ? listed : (listed && listed.data) || [];
+    return servers.some((s) => s && s.name === namespace)
+      ? { server: namespace, tool: entry.name }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function askGuard(evt, mcp) {
+  if (!existsSync(GUARD) && !bramManagedHere()) {
+    return Promise.resolve({ allow: true, message: "" });
+  }
+  const payload = JSON.stringify({
+    tool: evt.tool,
+    input: evt.input,
+    sessionID: evt.sessionID,
+    agent: evt.agent,
+    cwd: ROOT,
+    ...(mcp ? { mcp } : {}),
+  });
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(GUARD, ["guard", "opencode-worklist"], {
+        cwd: ROOT,
+        stdio: ["pipe", "pipe", "pipe"],
+        timeout: GUARD_TIMEOUT_MS,
+      });
+    } catch (e) {
+      resolve(deny(`Blocked: Bram's worklist guard could not start (${e.message}). Run Setup in Bram, then retry.`));
+      return;
+    }
+    let out = "";
+    let err = "";
+    child.stdout.on("data", (d) => { out += d; });
+    child.stderr.on("data", (d) => { err += d; });
+    child.on("error", (e) => {
+      resolve(deny(`Blocked: Bram's worklist guard could not run (${e.message}). Run Setup in Bram, then retry.`));
+    });
+    child.on("close", () => {
+      const line = out.trim().split("\n").pop() || "";
+      let answer = null;
+      try { answer = JSON.parse(line); } catch {}
+      if (!answer || (answer.decision !== "allow" && answer.decision !== "deny")) {
+        const detail = err.trim().slice(0, 300);
+        resolve(deny(
+          "Blocked: Bram's worklist guard gave no decision, so the call is denied by default. " +
+          "This is a guard or install problem, not a policy decision; run Setup in Bram." +
+          (detail ? ` Guard said: ${detail}` : ""),
+        ));
+        return;
+      }
+      resolve({ allow: answer.decision === "allow", message: answer.message || "Blocked by Bram's worklist guard." });
+    });
+    child.stdin.on("error", () => {});
+    child.stdin.end(payload);
+  });
+}
+
+// --- edit advisory -------------------------------------------------------------
+
+// opencode-edit-advisory: Claude and Codex are told, once an edit lands, when it
+// touched a file the items this turn is addressed to don't list (their
+// PostToolUse additionalContext). OpenCode's model reads a tool result's
+// `content` parts: in the 2026-10-26 spike a text part appended here was quoted
+// back as part of the write's and edit's output. So the guard's note goes
+// there. The edit has already happened, so nothing here blocks, and any failure
+// adds nothing.
+const EDIT_TOOLS = new Set(["edit", "write", "patch"]);
+// The model waits on this after every edit; the guard answers in milliseconds.
+const ADVISORY_TIMEOUT_MS = 3000;
+
+function askAdvisory(evt) {
+  if (!existsSync(GUARD)) return Promise.resolve(null);
+  const payload = JSON.stringify({
+    tool: evt.tool,
+    input: evt.input,
+    sessionID: evt.sessionID,
+    agent: evt.agent,
+    cwd: ROOT,
+  });
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(GUARD, ["guard", "opencode-after"], {
+        cwd: ROOT,
+        stdio: ["pipe", "pipe", "ignore"],
+        timeout: ADVISORY_TIMEOUT_MS,
+      });
+    } catch {
+      resolve(null);
+      return;
+    }
+    let out = "";
+    child.stdout.on("data", (d) => { out += d; });
+    child.on("error", () => resolve(null));
+    child.on("close", () => {
+      let answer = null;
+      try { answer = JSON.parse(out.trim().split("\n").pop() || ""); } catch {}
+      resolve(answer && typeof answer.advisory === "string" && answer.advisory ? answer.advisory : null);
+    });
+    child.stdin.on("error", () => {});
+    child.stdin.end(payload);
+  });
+}
+
+// --- turn boundaries ---------------------------------------------------------
+
+const FORWARDED = new Set([
+  "session.execution.started",
+  "session.inbox.delivered",
+  // opencode-sessions-browser: each completed step adds to the transcript
+  // Bram shows, so it refreshes as the turn goes rather than only at its end.
+  "session.step.ended",
+  "session.execution.succeeded",
+  "session.execution.failed",
+  "session.execution.interrupted",
+  // opencode-permission-menu: the request (sent whole, as Bram builds the
+  // pane's menu from it) and its answer, which clears that menu.
+  "permission.asked",
+  "permission.replied",
+  // opencode-question-card: a question tool's form, whole, and how it closed.
+  "form.created",
+  "form.replied",
+  "form.cancelled",
+]);
+
+// Read per event: Bram writes a new port each time it starts.
+function bramPort() {
+  try {
+    return Number(readFileSync(statePath(".bram-port"), "utf8").trim()) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function postEvent(body) {
+  const port = bramPort();
+  if (!port) return;
+  try {
+    await fetch(`http://127.0.0.1:${port}/__opencode/event`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(2000),
+    });
+  } catch {
+    // Bram is down or restarting; a missed boundary is recovered by the next.
+  }
+}
+
+function inProject(dir) {
+  return typeof dir === "string" && (dir === ROOT || dir.startsWith(ROOT + sep));
+}
+
+// Only this project's top-level sessions count. A subagent runs as a child
+// session (session.created with a parentID) with executions of its own
+// inside the parent's turn, and the bus may carry other projects' sessions.
+// Execution events carry no directory; a session's created and enqueued
+// events do, and come first.
+async function forwardTurns(api) {
+  const ours = new Set();
+  const children = new Set();
+  let chain = Promise.resolve();
+  for await (const evt of api.event.subscribe()) {
+    const data = (evt && evt.data) || {};
+    // form.created nests its session inside the form.
+    const sid = data.sessionID || (data.form && data.form.sessionID);
+    if (!sid) continue;
+    if (evt.type === "session.created" && data.parentID) children.add(sid);
+    const dir = (evt.location && evt.location.directory) || (data.location && data.location.directory);
+    if (inProject(dir)) ours.add(sid);
+    if (!FORWARDED.has(evt.type) || !ours.has(sid) || children.has(sid)) continue;
+    // Chained so the host sees boundaries in order; never awaited here, so
+    // a slow or absent Bram can't hold up OpenCode's event stream.
+    const body = { type: evt.type, sessionID: sid, at: evt.created };
+    // opencode-session-own-terminal: Bram launches OpenCode --standalone, so
+    // this plugin inherits its terminal's token, and another OpenCode has
+    // none. The shared service (ppid 1) can hold a token too, from whichever
+    // terminal started it, while serving every OpenCode, so it never sends one.
+    if (process.env.BRAM_MENU_TOKEN && process.ppid !== 1) {
+      body.bram_token = process.env.BRAM_MENU_TOKEN;
+    }
+    if (evt.type.startsWith("permission.")) body.permission = data;
+    if (evt.type.startsWith("form.")) body.form = data;
+    chain = chain.then(() => postEvent(body));
+  }
+}
+
+export default {
+  id: "bram.worklist-guard",
+  setup(api) {
+    api.tool.hook("execute.before", async (evt) => {
+      if (READ_ONLY_TOOLS.has(evt.tool)) return;
+      const verdict = await askGuard(evt, await mcpIdentity(api, evt.tool));
+      if (!verdict.allow) throw new Error(verdict.message);
+    });
+    // Never throws: a failing execute.after must not turn a finished edit
+    // into a failed one.
+    api.tool.hook("execute.after", async (evt) => {
+      try {
+        if (!EDIT_TOOLS.has(evt.tool) || evt.status !== "completed") return;
+        const content = evt.result && evt.result.content;
+        if (!Array.isArray(content)) return;
+        const note = await askAdvisory(evt);
+        if (note) content.push({ type: "text", text: note });
+      } catch {}
+    });
+    forwardTurns(api).catch(() => {});
+  },
+};

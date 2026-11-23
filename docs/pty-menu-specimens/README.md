@@ -14,7 +14,13 @@ Curated model vs. raw corpus:
 
 Both terminate here, then feed curated rows in `../pty-menu-shapes.md`:
 
-1. **Machine** — the `[pty-menu-scan]` trace in
+1. **Machine** — _retired 2026-07-06 (#214): the `[pty-menu-scan]` trace
+   and the byte scanner that emitted it were deleted, so this intake
+   produces nothing today. Recent specimens are taken from `[pty-out]` and
+   `send-capture` trace lines, and from `iframe-trace
+   subkind=xterm-grid-miss` lines when the grid gate rejects a menu-shaped
+   block (see `../pty-menu-tools.md`). The original description follows._
+   The `[pty-menu-scan]` trace in
    `resources/bram-traces/bram-trace.log`. On `op=fire` it carries a
    stripped `excerpt='…'`; on `op=skip` it carries `menu_bearing=` and,
    when that is `true`, an `excerpt='…'` (the "looks cataloged but the
@@ -40,11 +46,12 @@ Both terminate here, then feed curated rows in `../pty-menu-shapes.md`:
 ```yaml
 ---
 observed: 2026-06-17        # date seen
-provider: claude            # claude | codex
+provider: claude            # claude | codex | antigravity
 cli_version: 2.1.169        # `claude --version` / `codex --version`
 shape: askuserquestion      # catalog id, or `unknown`
-source: screenshot          # screenshot | paste | trace-excerpt
+source: screenshot          # screenshot | paste | trace-excerpt | terminal-capture
 screenshot: 2026-06-17-claude-askuserquestion.png   # optional
+raw: ../agent-specimens/antigravity/permission-prompt.raw # optional terminal capture
 ---
 ```
 

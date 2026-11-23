@@ -1,7 +1,8 @@
 <Component
   name="Worklist"
   var.expandedKeys="{window.__bramRestoreWorklist2Expansion($queryParams.expand)}"
-  var.diffKeys="{[]}"
+  var.worklistPendingOrder="{null}"
+  var.diffKeys="{window.__bramRestoreWorklist2DiffKeys()}"
   var.diffScopes="{{}}"
   var.hunkNavKeys="{{}}"
   var.worklist2Feedback="{{}}"
@@ -26,6 +27,13 @@
        state transfer, 2026-08-20). Chevron Button + when-bound body per
        https://www.xmlui.org/docs/howto/keep-per-item-state-in-a-loop —
        the old tab's proven shape. -->
+  <!-- issue-419-header-from-membership: the files table's ⓘ explanations.
+       One dialog for every cell; each ⓘ passes {title, body} to open(),
+       read here as $param
+       (https://www.xmlui.org/docs/reference/components/ModalDialog#open). -->
+  <ModalDialog id="fileCellInfoDialog" title="{$param &amp;&amp; $param.title}">
+    <Markdown content="{($param &amp;&amp; $param.body) || ''}" />
+  </ModalDialog>
   <DataSource
     id="worklist"
     url="/__worklist"
@@ -177,6 +185,13 @@
         label="+ New item"
         size="xs"
         onClick="worklist2NewItemOpen = !worklist2NewItemOpen" />
+      <!-- nav-primary-list-and-more-group: History lives under More in the
+           nav; this is the discoverable way in. -->
+      <Button
+        label="History"
+        size="xs"
+        tooltip="Open the Worklist history: what landed and why (also under More in the nav)"
+        onClick="navigate('/history')" />
       <!-- issue-278 rung 1: the board states its own overlap total, so a
            reader knows the per-row marks are exhaustive without reading every
            row. Says "no shared files" when there are none - the absence is
@@ -387,7 +402,33 @@
       color="$textColor-secondary">
       (no items)
     </Text>
-    <Items data="{worklist.value &amp;&amp; worklist.value.items ? worklist.value.items : []}">
+    <!-- issue-406-offer-to-clear-landed-rows: rows whose work was committed
+         outside the Worklist, offered for clearing in one click. The host
+         re-verifies each (POST /__worklist/clear-landed) and prunes only
+         those; the board refetches on worklist-changed. The rows it would
+         clear are tinted whenever the offer shows (Jon: "we need a stronger
+         indication of which row or rows apply"; then "we should not be
+         relying on hovering the button"). Peer for the binding:
+         Context.xmlui's warn-100 / transparent backgroundColor. -->
+    <HStack
+      when="{!!window.__bramLandedNote(worklist.value)}"
+      gap="$space-2"
+      verticalAlignment="center">
+      <!-- landed-row-clear-button: the count only; each flagged row has its
+           own Clear. -->
+      <Text color="$textColor-secondary" value="{window.__bramLandedNote(worklist.value)}" />
+    </HStack>
+    <!-- worklist-drag-reorder-and-link-labels: drag the ⋮⋮ grip to reorder.
+         DndItems is the vendored xmlui-dnd-list extension the Queue uses
+         (dce8049); it keys rows by item id, so a row's checkbox and
+         expansion follow its item through a drag. The host persists the
+         order (POST /__worklist/reorder). Until the board refetches,
+         worklistPendingOrder holds the dropped order so the row doesn't
+         snap back; it's ignored once the board's version moves on. -->
+    <DndItems
+      data="{window.__bramWorklistOrdered(worklist.value, worklistPendingOrder)}"
+      dragHandle="true"
+      onReorder="(newOrder) => worklistPendingOrder = window.__bramWorklistReorder(newOrder, worklist.value)">
       <!-- Row separation (review 2026-08-20): breathing room between
            items, which matters most when rows are expanded. Tightened
            2026-08-24 from $space-4 to $space-2 — with the stage glyph column
@@ -398,6 +439,7 @@
       <VStack
         gap="$space-1"
         paddingBottom="$space-2"
+        backgroundColor="{window.__bramLandedRowTint($item)}"
         testId="worklist-row-{$item.id}">
         <!-- worklist2-remove-expander-chrome: no indicator glyphs (History's
              chrome-free section headers are the precedent); the header line
@@ -507,8 +549,14 @@
                L449) always pointed to; the earlier attempt's two-line-id
                regression is avoided by maxLines=1 + ellipsis truncation, with
                the full id recoverable in the tooltip it already carries. -->
-          <Text
-            value="{$item.id}"
+          <!-- The id reads as a link (Jon: "render the labels to look like
+               links"), so the row invites the click that expands it. No
+               onClick here: the enclosing HStack already flips expansion,
+               and a second handler would flip it back. Peer: the Link
+               toggle in Commits.xmlui.
+               https://www.xmlui.org/docs/reference/components/Link -->
+          <Link
+            label="{$item.id}"
             tooltip="{$item.id}"
             width="17rem"
             maxLines="1"
@@ -528,13 +576,26 @@
                the strip carried colorized amber text that needed ink to
                register; those colors are gone, so -sm reads fine and reclaims
                vertical space. -->
-          <Text
-            width="*"
-            fontSize="$fontSize-sm"
-            color="$textColor-secondary"
-            overflowMode="flow"
-            tooltipMarkdown="{window.__bramWorklist2StripTooltip($item, inflightClaim.value, worklist.value &amp;&amp; worklist.value.items, worklist.value &amp;&amp; worklist.value.attributionTotals)}"
-            value="{window.__bramWorklist2Strip($item, inflightClaim.value, worklist.value &amp;&amp; worklist.value.items, worklist.value &amp;&amp; worklist.value.attribution, worklist.value &amp;&amp; worklist.value.attributionTotals, agentStatus.value)}" />
+          <!-- strip-tooltip-wraps-via-template: XMLUI's Tooltip is as wide as
+               its longest line and has no width cap, so every long strip
+               tooltip has been broken by hand. A Tooltip component with a
+               tooltipTemplate renders a component instead of a string, and a
+               width-bound Markdown wraps like any other text; the same
+               string function feeds it.
+               https://www.xmlui.org/docs/reference/components/Tooltip#using-the-tooltip-component -->
+          <Tooltip width="*">
+            <property name="tooltipTemplate">
+              <Markdown
+                maxWidth="44ch"
+                content="{window.__bramWorklist2StripTooltip($item, inflightClaim.value, worklist.value &amp;&amp; worklist.value.items)}" />
+            </property>
+            <Text
+              width="*"
+              fontSize="$fontSize-sm"
+              color="$textColor-secondary"
+              overflowMode="flow"
+              value="{window.__bramWorklist2Strip($item, inflightClaim.value, worklist.value &amp;&amp; worklist.value.items, window.__bramOwnershipRunsByPath(worklist.value), agentStatus.value)}" />
+          </Tooltip>
           <!-- issue-278: the row backlink is GONE, on live evidence.
                It was redundant and, worse, it put a SECOND meaning of "shared"
                on a line that already had one. Live board, 2026-08-24:
@@ -555,6 +616,20 @@
                file table is where it belongs; the scan line keeps one sentence
                with one meaning. Board-level total stays in the header. -->
           </HStack>
+          <!-- landed-row-clear-button: a row whose work landed outside the
+               Worklist carries its own Clear, beside the text that says "if it
+               is, Clear it". Outside the expansion toggle, so clicking it
+               never expands the row. It replaces the banner's button, which
+               was visible but dimmed until a flagged row was ticked (Jon: "I
+               don't like the fact that the mechanism to clear it exists here,
+               but is inactive"). -->
+          <Button
+            when="{!!$item.landed}"
+            label="Clear"
+            variant="outlined"
+            size="xs"
+            tooltip="{window.__bramLandedRowClearTooltip($item)}"
+            onClick="window.__bramClearLandedOne($item.id)" />
         </HStack>
         <VStack
           when="{(expandedKeys || []).includes($item.id)}"
@@ -605,24 +680,43 @@
                  one body — and turns a 2,000-line untracked file into a row you
                  may decline to open rather than a wall. -->
             <!-- issue-327 file-table experiment: header row and file rows are
-                 a real Table, so the columns align by construction. Table has
-                 no single-click row event (only rowDoubleClick and hover —
-                 the Review-overlaps table above uses the hover pair), so
-                 "click the file row to open it" is single-row selection per
-                 the master-detail pattern:
-                 https://www.xmlui.org/docs/howto/build-a-master-detail-layout
-                 Selecting a row opens its Tabs below the table; selecting
-                 another switches. diffKeys stays the expansion source of
-                 truth — the Table's own selection is internal, positional
-                 state (the ExpandableItem class), trusted only for the
-                 highlight. -->
+                 a real Table, so the columns align by construction. A file's
+                 diff opens from the disclosure triangle in the first column,
+                 not from row selection (which needed a visible checkbox and
+                 gave no cue that rows were clickable). diffKeys is the one
+                 expansion state, keyed by item and path, never by position. -->
+            <!-- While a file's diff is open, the table narrows to that row;
+                 closing it brings the others back. -->
             <Table
               when="{$item.changedFiles}"
-              data="{$item.changedFiles}"
-              idKey="path"
-              rowsSelectable="{rowBegun}"
-              enableMultiRowSelection="{false}"
-              onSelectionDidChange="(sel) => diffKeys = window.__bramTableSelectDiff(diffKeys, rowId, sel)">
+              data="{window.__bramFilesTableRows($item.changedFiles, diffKeys, rowId)}"
+              idKey="path">
+              <!-- Disclosure triangle, the click target: ▶ closed, ▼ open,
+                   absent where the row can't expand. It replaces row
+                   selection as the way to open a diff (Jon: "hide the
+                   checkbox completely … treat the triangle as the active
+                   site"). A ghost Button gives the pointer cursor on hover;
+                   nested children replace its label, so the Text sets the
+                   size. Peer: the ghost ✕ in Commits.xmlui.
+                   https://www.xmlui.org/docs/reference/components/Button
+                   https://www.xmlui.org/docs/reference/components/Column -->
+              <!-- files-table-bigger-triangle-no-hidden-note: xl in 44px (was md
+                   in 36px). Jon: the triangle is the control, so it should
+                   read as one; the "Showing 1 of N files" caption that
+                   explained it is gone. -->
+              <Column header="" width="44px">
+                <Button
+                  when="{!!window.__bramDiffDisclosure(diffKeys, rowId, $item.path, rowBegun, rowItem)}"
+                  variant="ghost"
+                  size="xs"
+                  tooltip="{window.__bramDiffToggleTooltip(diffKeys, rowId, $item.path)}"
+                  onClick="diffKeys = window.__bramDiffToggleFile(diffKeys, rowId, $item.path)">
+                  <Text
+                    fontSize="$fontSize-xl"
+                    color="$textColor-secondary"
+                    value="{window.__bramDiffDisclosure(diffKeys, rowId, $item.path, rowBegun, rowItem)}" />
+                </Button>
+              </Column>
               <!-- "expected to change" is the planning tense; on a begun row
                    whose work is done it should read "changed". Same
                    static-header constraint as the overlaps table — waits on
@@ -640,12 +734,25 @@
                      +404 −18") so the header is visibly the sum of the
                      column's first numbers — the addends were invisible
                      before (Jon, 2026-09-04: "still does not add up"). -->
-                <Text
-                  variant="code"
-                  fontSize="$fontSize-sm"
-                  value="{window.__bramFileChangesCell($item, rowBegun)}" />
+                <HStack gap="$space-1" verticalAlignment="center">
+                  <Text
+                    variant="code"
+                    fontSize="$fontSize-sm"
+                    value="{window.__bramFileChangesCell($item, rowBegun)}" />
+                  <!-- issue-419-header-from-membership: the ⓘ explanation,
+                       the Context tab's ghost-button pattern; one shared
+                       dialog takes the text as its open() parameter. -->
+                  <Button label="ⓘ" variant="ghost" size="xs"
+                    when="{!$item.ignored}"
+                    tooltip="Explain these changes"
+                    onClick="fileCellInfoDialog.open(window.__bramFileChangesExplain($item, rowItem, worklist.value &amp;&amp; worklist.value.items, inflightClaim.value))" />
+                </HStack>
               </Column>
-              <Column header="shared with" width="3*" headerHorizontalAlignment="start">
+              <!-- worklist-files-column-wider: 1* (was 3*), so the files column's 2*
+                   gets two thirds of the flexible width, about half the table
+                   at the usual pane width. Column width takes no percentages
+                   (https://www.xmlui.org/docs/reference/components/Column#width). -->
+              <Column header="shared with" width="1*" headerHorizontalAlignment="start">
                 <!-- worklist-surface-planned-overlap: two tenses, carried by
                      LEADING LABELS in plain text, not by style (Jon,
                      2026-09-04: "don't use color. lead with done: or
@@ -653,23 +760,48 @@
                      file now; `planned:` = it merely declares this file —
                      zero of the CHANGES-column lines are its. Style-only
                      distinction failed twice: muting read as accident, and
-                     the counts read as belonging to the sharers. -->
-                <VStack gap="$space-0">
+                     the counts read as belonging to the sharers.
+                     issue-419-header-from-membership (Jon, 2026-10-13):
+                     relabelled `has lines here:` / `declares it, no lines
+                     here:`, from membership. The tense words described
+                     progress, while the column is about lines in this file:
+                     an item whose lines were all rewritten by another read
+                     `planned:`, as if it had never started.
+                     shared-with-one-line (Jon, 2026-10-30): counts on one line.
+                     Lists of long ids wrapped to three lines. The ⓘ names them.
+                     https://www.xmlui.org/docs/reference/components/Text#overflowmode -->
+                <HStack when="{!$item.ignored}" gap="$space-1" verticalAlignment="center">
                   <Text
-                    when="{window.__bramSharedWithBegun($item, worklist.value &amp;&amp; worklist.value.items, inflightClaim.value).length > 0}"
-                    overflowMode="flow"
-                    value="{'done: ' + window.__bramJoinIds(window.__bramSharedWithBegun($item, worklist.value &amp;&amp; worklist.value.items, inflightClaim.value))}" />
-                  <Text
-                    when="{window.__bramSharedWithPlanned($item, worklist.value &amp;&amp; worklist.value.items, inflightClaim.value).length > 0}"
-                    overflowMode="flow"
-                    value="{'planned: ' + window.__bramJoinIds(window.__bramSharedWithPlanned($item, worklist.value &amp;&amp; worklist.value.items, inflightClaim.value))}" />
-                </VStack>
+                    width="*"
+                    maxLines="1"
+                    overflowMode="ellipsis"
+                    value="{window.__bramSharedWithSummary($item, worklist.value &amp;&amp; worklist.value.items, inflightClaim.value)}" />
+                <Button label="ⓘ" variant="ghost" size="xs"
+                  tooltip="Explain who else lists this file"
+                  onClick="fileCellInfoDialog.open(window.__bramFileSharedExplain($item, rowItem, worklist.value &amp;&amp; worklist.value.items, inflightClaim.value))" />
+                </HStack>
               </Column>
             </Table>
             <Items
               when="{$item.changedFiles}"
               data="{$item.changedFiles}">
               <VStack gap="$space-0" width="100%">
+                <!-- Display-only ignored files use the existing bounded local
+                     preview, fetched on expand. Conditional rendering follows
+                     https://www.xmlui.org/docs/howto/hide-an-element-until-its-datasource-is-ready -->
+                <VStack
+                  when="{$item.ignored &amp;&amp; !$item.ignoredSummary &amp;&amp; window.__bramDiffExpanded(diffKeys, rowId, $item.path)}"
+                  gap="$space-1" paddingBottom="$space-2">
+                  <Text variant="caption" value="Local contents — ignored by git; these lines will not be committed." />
+                  <DataSource id="ignoredPreview" url="/__local-file-preview" queryParams="{{ path: $item.path }}" />
+                  <Text when="{ignoredPreview.inProgress}" variant="caption" value="Loading file…" />
+                  <Text when="{ignoredPreview.value &amp;&amp; !ignoredPreview.value.ok}" value="{ignoredPreview.value.error}" />
+                  <Text when="{ignoredPreview.value &amp;&amp; ignoredPreview.value.ok &amp;&amp; !ignoredPreview.value.content}" variant="caption" value="Empty file." />
+                  <Text when="{ignoredPreview.value &amp;&amp; ignoredPreview.value.truncated}" variant="caption" value="Preview limited to the first 200 KB." />
+                  <DiffView
+                    when="{ignoredPreview.value &amp;&amp; ignoredPreview.value.ok &amp;&amp; !!ignoredPreview.value.content}"
+                    text="{cappedDiffText(window.__bramIgnoredFilePatch($item.path, ignoredPreview.value))}" />
+                </VStack>
                 <!-- Gated on rowBegun, carried down from the section that used
                      to hold the single Diff view: a plan row that has begun
                      nothing must offer no diffs, or it would display a
@@ -678,7 +810,9 @@
                   when="{rowBegun &amp;&amp; window.__bramDiffExpanded(diffKeys, rowId, $item.path) &amp;&amp; window.__bramDiffForPath(rowItem, $item.path)}"
                   paddingBottom="$space-2"
                   var.filePatch="{(window.__bramDiffForPath(rowItem, $item.path) || {}).patch || ''}"
-                  var.fileRuns="{((worklist.value &amp;&amp; worklist.value.attribution) || {})[$item.path]}">
+                  var.fileRuns="{window.__bramFileRuns(worklist.value, $item.path)}"
+                  var.fileRemovedRuns="{window.__bramFileRemovedRuns(worklist.value, $item.path)}"
+                  var.scopeBasePatch="{window.__bramScopeBasePatch(rowItem, $item.path)}">
                   <!-- issue-327: two views of one file. keepMounted because Tabs
                        mounts only the active panel by default, and DiffView owns
                        a DataSource posting to /__diff/annotate: without it every
@@ -686,26 +820,25 @@
                        https://www.xmlui.org/docs/reference/components/Tabs -->
                   <Tabs keepMounted="true">
                     <TabItem label="Diff">
-                      <!-- issue-327 scoped diff: scope, don't annotate. Every
-                           rendered diff has ONE owner — "All changes" is the
-                           combined patch (commit truth: whole-file staging takes
-                           all of it), and each claimant scope is that item's own
-                           interval diff, fetched lazily on selection. The
-                           Gerrit patch-set / GitHub per-commit convention; a
-                           scoped diff is against the item's own base, so its
-                           line numbers may not match the current file — that is
-                           what lets it show superseded work.
-                           https://www.xmlui.org/docs/reference/components/DataSource -->
+                      <!-- issue-327 scoped diff: scope, don't annotate. "All"
+                           is the combined patch (commit truth: whole-file
+                           staging takes all of it). issue-425-retire-replay:
+                           each claimant scope is cut from that SAME current
+                           patch, keeping the hunks holding lines membership
+                           credits to it (__bramScopedPatch), so it shows what
+                           the item's commit takes rather than its claim-interval
+                           history. scopedPatch sits on an inner VStack because
+                           it reads fileScope, declared on this one; variables
+                           reach descendants.
+                           https://www.xmlui.org/docs/howto/communicate-between-sibling-components -->
                       <VStack
                         gap="$space-1"
                         var.fileScope="{window.__bramDiffScope(diffScopes, rowId, $item.path, fileRuns)}">
-                          <DataSource
-                            id="scopedDiff"
-                            when="{fileScope !== '__all'}"
-                            url="/__worklist/interval-diff"
-                            queryParams="{{ id: fileScope, path: $item.path }}" />
+                        <VStack
+                          gap="$space-1"
+                          var.scopedPatch="{window.__bramScopedPatch(scopeBasePatch, fileRuns, fileRemovedRuns, fileScope, filePatch)}">
                           <HStack
-                            when="{(fileRuns || []).length > 0}"
+                            when="{(fileRuns || []).length + (fileRemovedRuns || []).length > 0}"
                             gap="$space-2"
                             verticalAlignment="center">
                             <Text variant="caption" value="Changes:" />
@@ -716,7 +849,7 @@
                                  https://www.xmlui.org/docs/howto/customize-a-selects-selected-value -->
                             <Select
                               width="30rem"
-                              data="{window.__bramDiffScopeOptions(filePatch, fileRuns, rowId)}"
+                              data="{window.__bramDiffScopeOptions(scopeBasePatch, fileRuns, rowId, fileRemovedRuns)}"
                               initialValue="{fileScope}"
                               onDidChange="(v) => diffScopes = window.__bramSetDiffScope(diffScopes, rowId, $item.path, v)">
                               <property name="valueTemplate">
@@ -731,22 +864,23 @@
                                id-keyed in hunkNavKeys; scroll finds the hunk
                                header inside the wrapper below. -->
                           <HunkNav
-                            when="{window.__bramHunkCount(cappedDiffText(fileScope === '__all' ? filePatch : ((scopedDiff.value || {}).patch || ''))) > 0}"
-                            matchCount="{window.__bramHunkCount(cappedDiffText(fileScope === '__all' ? filePatch : ((scopedDiff.value || {}).patch || '')))}"
+                            when="{window.__bramHunkCount(cappedDiffText(scopedPatch)) > 0}"
+                            matchCount="{window.__bramHunkCount(cappedDiffText(scopedPatch))}"
                             current="{window.__bramHunkNavGet(hunkNavKeys, rowId, $item.path, 'diff')}"
-                            onStep="(d) => hunkNavKeys = window.__bramDiffHunkStep(hunkNavKeys, rowId, $item.path, d, cappedDiffText(fileScope === '__all' ? filePatch : ((scopedDiff.value || {}).patch || '')), fileScope === '__all' ? diffAllView : diffScopedView)" />
+                            onStep="(d) => hunkNavKeys = window.__bramDiffHunkStep(hunkNavKeys, rowId, $item.path, d, cappedDiffText(scopedPatch), fileScope === '__all' ? diffAllView : diffScopedView)" />
                           <DiffView
                             id="diffAllView"
                             when="{fileScope === '__all'}"
                             text="{cappedDiffText(filePatch)}" />
                           <DiffView
                             id="diffScopedView"
-                            when="{fileScope !== '__all' &amp;&amp; !!(scopedDiff.value &amp;&amp; scopedDiff.value.patch)}"
-                            text="{cappedDiffText(scopedDiff.value.patch)}" />
+                            when="{fileScope !== '__all' &amp;&amp; !!scopedPatch}"
+                            text="{cappedDiffText(scopedPatch)}" />
                           <Text
-                            when="{fileScope !== '__all' &amp;&amp; scopedDiff.value &amp;&amp; !scopedDiff.value.patch}"
+                            when="{fileScope !== '__all' &amp;&amp; !scopedPatch}"
                             variant="caption"
-                            value="No changes recorded in this scope's claim intervals for this file." />
+                            value="No changes in this file are credited to this scope." />
+                        </VStack>
                       </VStack>
                     </TabItem>
                     <!-- Ownership is a SUMMARY from the row item's point of
@@ -774,9 +908,13 @@
                           queryParams="{{ path: $item.path }}" />
                         <Table data="{window.__bramOwnershipSummary(filePatch, fileRuns, rowId, pathIndependence.value)}">
                           <Column header="claimant" width="3*" headerHorizontalAlignment="start">
+                            <!-- flow: a joint row lists every member; wrap it
+                                 rather than truncate (Text's default).
+                                 https://www.xmlui.org/docs/reference/components/Text -->
                             <Text
                               variant="code"
                               fontSize="$fontSize-sm"
+                              overflowMode="flow"
                               value="{window.__bramClaimantCell($item, rowId)}" />
                           </Column>
                           <Column header="unique" width="90px" headerHorizontalAlignment="start">
@@ -797,7 +935,7 @@
                          each item's lines tinted in place — the big picture the
                          scoped Diff and the Ownership summary lose. Reuses
                          /__local-file-preview (working-tree content, 200 KB cap)
-                         and the payload's attribution runs. Fetches on expand;
+                         and the payload's ownership runs (__bramFileRuns). Fetches on expand;
                          one local read per opened file. -->
                     <TabItem label="File">
                       <VStack gap="$space-0" paddingVertical="$space-2">
@@ -976,7 +1114,7 @@
                as information, not a control. -->
         </VStack>
       </VStack>
-    </Items>
+    </DndItems>
     <!-- worklist2-batch-selection (as clarified): ONE control row serves
          one or several — the Iterate-N principle applied to every verb.
          Appears when anything is ticked; the message is about the set and

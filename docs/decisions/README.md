@@ -1,0 +1,44 @@
+# Decisions
+
+One short file per decision: a choice between alternatives, with the evidence behind it, that someone would otherwise re-argue or re-derive. Decisions live here rather than in issues, so the tracker stays for work and reports, and a decision doesn't sit open waiting for someone to close it.
+
+A decision note is not a design doc. Design docs (`docs/*.md`) describe how something works. A decision note records what was chosen, what was rejected, and the numbers that settled it.
+
+## Writing one
+
+Name it `YYYY-MM-DD-<slug>.md`, dated the day the decision was made, and add it to the index below, newest first. Keep it short. Five minutes is the target.
+
+```markdown
+# <the decision, as a statement>
+
+Status: decided YYYY-MM-DD · revisit <when>
+
+**Question:** what was being decided.
+
+**Decision:** what we chose.
+
+**Evidence:** the numbers and where they came from (a report, a trace query, a commit).
+
+**Alternatives:** each option not taken, and why.
+
+**Revisit when:** the condition that should reopen it, if any.
+```
+
+**Superseding.** Don't rewrite an old note. Write a new one, and change the old one's status line to `Status: superseded by <file> (YYYY-MM-DD)`. The history of why is the point.
+
+**Finding them.** Grep this directory, or `/__search` (the commit that adds a note is indexed with its diff).
+
+## Index
+
+- [2026-11-06 — The Transcript session-menu experiment is dropped; switching stays on the Sessions tab for now](2026-11-06-sessions-menu-experiment-dropped.md)
+- [2026-11-04 — Delegated work binds to the claim it was spawned under, and is released only on evidence](2026-11-04-delegated-work-binds-to-the-spawning-claim.md)
+- [2026-11-02 — Bram's per-project state folder becomes `.bram/`, moved in three releases](2026-11-02-bram-state-folder-is-dot-bram.md)
+- [2026-10-30 — Bram finds subagent transcripts from each provider's own parent link](2026-10-30-subagent-transcript-provider-discovery.md)
+- [2026-10-27 — Bram chooses the session; nothing else names it](2026-10-27-bram-chooses-the-session.md)
+- [2026-10-21 — Authorization becomes one pipeline, designed for a cooperative agent that makes mistakes](2026-10-21-authorization-one-pipeline.md)
+- [2026-10-17 — Bram vendors xmlui#3941 candidate 4 before it is released, and keeps measuring](2026-10-17-xmlui-3941-candidates.md)
+- [2026-10-13 — The gate walkthrough runs on demand; field reports are the release check](2026-10-13-gate-walkthrough-on-demand.md)
+- [2026-10-12 — Membership's cost budget, set before the replay is deleted](2026-10-12-membership-cost-budget.md)
+- [2026-10-07 — No wider automatic switching to the Transcript](2026-10-07-no-wider-transcript-autoswitch.md)
+- [2026-09-24 — Finish crediting each item's own lines; freeze same-tree hunk separation](2026-09-24-freeze-same-tree-hunk-separation.md)
+- [2026-09-22 — Line ownership comes from HEAD-diff membership, not the positional replay](2026-09-22-membership-over-replay.md)

@@ -1,4 +1,4 @@
-<Component name="WorklistGateBar" var.gateSent="{[]}" var.startMode="{'one'}" var.gateLockTick="{0}">
+<Component name="WorklistGateBar" var.gateSent="{[]}" var.gateLockTick="{0}" var.gateLastSessionTick="{0}">
   <!-- issue-278: the Worklist gate, in the Footer.
        The gate row cannot be pinned where it lived - `position: sticky` cannot
        escape its containing block, and `dock` needs a bounded parent height
@@ -10,6 +10,17 @@
   <DataSource id="gateWorklist" url="/__worklist" transformResult="{(d) => window.__bramWorklistAccept(d)}" />
   <DataSource id="gateConfig" url="/__worklist-config" />
   <DataSource id="gateClaim" url="/__inflight" />
+  <!-- issue-404-serial-gate-bar-first-cut: the current branch, for
+       Commit's hover ("where does this land"), refetched on the same host
+       event the Commits tab uses. -->
+  <DataSource id="gateGit" url="/__git/status" />
+  <PushSource
+    id="gateGitEvt"
+    initial="{null}"
+    subscribe="{window.bramSubscribeTauriEvent('git-status-changed', false)}" />
+  <ChangeListener
+    listenTo="{gateGitEvt.value &amp;&amp; gateGitEvt.value.tick}"
+    onDidChange="window.__bramRefetchOnLiveEvent(gateGitEvt.value, gateGit)" />
   <PushSource id="gateSel" subscribe="{window.bramSubscribeW2Selection()}" />
   <!-- The composer is an isolated sibling component. Reading its window
        mirror through a helper is not reactive, so Refine stayed dim after
@@ -22,6 +33,26 @@
   <ChangeListener
     listenTo="{gateWorklistChanged.value}"
     onDidChange="() => { gateWorklist.refetch(); gateClaim.refetch(); }" />
+  <!-- delegated-work-action-gates: a subagent binding or release changes the
+       claim without a worklist write, so refetch on the claim event too.
+       Same PushSource + ChangeListener idiom as Worklist.xmlui:90-96. -->
+  <PushSource
+    id="gateClaimEvt"
+    initial="{null}"
+    subscribe="{window.bramSubscribeTauriEvent('inflight-claim-changed')}" />
+  <ChangeListener
+    listenTo="{gateClaimEvt.value &amp;&amp; gateClaimEvt.value.tick}"
+    onDidChange="window.__bramRefetchOnLiveEvent(gateClaimEvt.value, gateClaim)" />
+  <!-- item-last-session-switch-there: the current session, for the "Last
+       worked on in" line. The footer's small list fetch, refetched on the
+       same event, so a switch updates the line without a board refetch. -->
+  <DataSource id="gateSessions" url="/__sessions/list" queryParams="{{ limit: 20 }}" />
+  <PushSource
+    id="gateSessionsChanged"
+    subscribe="{window.bramSubscribeTauriEvent('sessions-list-changed')}" />
+  <ChangeListener
+    listenTo="{gateSessionsChanged.value}"
+    onDidChange="() => gateSessions.refetch()" />
   <!-- instrument-w2-selection-handoff (observe only, TRIPWIRE): the receiving
        half. `render` is the actual gate on the button row below - buttons are
        ABSENT when it is false, as opposed to greyed, since they gate on
@@ -73,20 +104,60 @@
   <HStack
     when="{!!window.__bramStartConsequence(gateWorklist.value &amp;&amp; gateWorklist.value.items, gateSel.value, gateClaim.value)}"
     horizontalAlignment="center"
+    verticalAlignment="center"
+    gap="$space-2"
     paddingHorizontal="$space-8"
     paddingTop="$space-1">
+    <!-- next-move-button-inline-and-quiet: the text hugs its words (it was
+         width="100%") so the next-move button can sit right after it. -->
     <Text
-      width="100%"
       value="{window.__bramStartConsequence(gateWorklist.value &amp;&amp; gateWorklist.value.items, gateSel.value, gateClaim.value)}" />
+    <Theme borderColor-Button-primary-outlined="$textColor-secondary"
+      textColor-Button-primary-outlined="$textColor-secondary"
+      borderColor-Button-primary-outlined--hover="$textColor-secondary"
+      textColor-Button-primary-outlined--hover="$textColor-primary"
+      fontSize-Button="$fontSize-sm">
+      <Button
+        when="{window.__bramNextMoveSlot(gateWorklist.value, gateSel.value, gateClaim.value, gateTake.value) === 'consequence'}"
+        label="What's my next move?"
+        variant="outlined"
+        size="xs"
+        tooltip="If unclear, ask the agent."
+        enabled="{!window.__bramAgentWorking(gateAgent.value)}"
+        onClick="window.__bramAskSequence(gateSel.value)" />
+    </Theme>
   </HStack>
-  <!-- commit-granularity share-mode choice, moved here from the page body
-       (0.5.3 gate run: "the radio group belongs above the buttons in the
-       footer otherwise can get lost below the fold like the buttons did").
-       Writes the window store the gate actions already read
-       (__bramW2ShareMode / __bramW2SetShareMode); the page no longer renders
-       it. Original design rationale (why the control exists whenever 2+
-       committable items are selected, entangled or not) lives in git history
-       at Worklist.xmlui, commit-granularity A+B. -->
+  <!-- item-last-session-switch-there: a ticked item last worked on in
+       another session offers to switch there. lastSession is computed by the
+       host from the state-mirror ledger; the switch is the Sessions tab's,
+       and lands on the Transcript. -->
+  <HStack
+    when="{!!window.__bramGateLastSession(gateWorklist.value &amp;&amp; gateWorklist.value.items, gateSel.value, gateSessions.value, gateLastSessionTick)}"
+    horizontalAlignment="center"
+    verticalAlignment="center"
+    gap="$space-2"
+    paddingHorizontal="$space-8"
+    paddingTop="$space-1">
+    <Text value="{window.__bramGateLastSessionLine(gateWorklist.value &amp;&amp; gateWorklist.value.items, gateSel.value, gateSessions.value, gateLastSessionTick)}" />
+    <Button
+      label="Switch there"
+      size="xs"
+      variant="outlined"
+      icon="swap"
+      onClick="window.__bramGateSwitchToLastSession(gateWorklist.value &amp;&amp; gateWorklist.value.items, gateSel.value, gateSessions.value, toast)" />
+    <!-- gate-last-session-line-dismissable: × declines the offer for this
+         selection and session; same ghost × as the composer's. -->
+    <Button label="×" variant="ghost" size="xs"
+      tooltip="Dismiss: stay in this session"
+      onClick="gateLastSessionTick = window.__bramGateLastSessionDismissClick(gateWorklist.value &amp;&amp; gateWorklist.value.items, gateSel.value, gateSessions.value, gateLastSessionTick)" />
+  </HStack>
+  <!-- gate-remove-commit-share-radio: the commit-time "One commit / A commit
+       each" radio is gone. For disjoint selections it changed nothing (the
+       payload was identical, one worklist-commit, one commit), one approval
+       can't yield N commits anyway (#272), and its only live effect was the
+       split-shared-files hunk separation #273 froze. Commit on N ticked items
+       makes one commit; __bramStartConsequence says so, and separate commits
+       are the serial path: commit one at a time. -->
   <!-- `when` carries the full expression rather than a same-element var:
        a `var.` declared on an element scopes to its CHILDREN, so a `when`
        on that element referencing it fails silently and the control never
@@ -98,81 +169,55 @@
        handlers stay single-call. -->
   <ChangeListener
     listenTo="{(gateSel.value || []).join(',')}"
-    onDidChange="() => { startMode = window.__bramW2ResetStartMode() }" />
-  <!-- gate-withholds-futile-joint-commit-offer, Start side: starting a
-       shared file together in ONE click writes one claim and one capture
-       boundary — a permanent foreclosure of per-item commits (#356). The
-       old passive caption rendered beside an armed Start and was read past
-       ("i would not have wanted to start two items that could not be
-       committed separately"), so the foreclosure is now a CHOICE in the
-       click path, mirroring the commit side's radio. The safe option (one at a
-       time) is the preselected default — no-preselection proved
-       unenforceable (RadioGroup auto-selects its first Option; field
-       receipt in start-choice-safe-default-commit-language) — so choosing
-       the combined commit is the deliberate act. "One at a time" narrows
-       each Start click to the first selected item (its own
-       claim/boundary); the rest stay ticked for the next click. Self-retiring with #269
-       (per-item claims empty the condition) — see the item draft. -->
+    onDidChange="window.__bramW2ResetStartMode()" />
+  <!-- gate-withholds-futile-joint-commit-offer, commit side: Commit is still
+       withheld when a still-begun same-click partner is unselected (the host
+       would refuse it, op=refuse-joint-interval), but the "Committable
+       together with … — select both." line that explained it is gone (Jon,
+       2026-11-08: "we can lose this verbiage now"); What's my next move? and
+       its plan answer what to tick. -->
+  <!-- issue-425-retire-replay (Codex review): what Commit takes for two or
+       more ticked items. Each row's "Will commit" assumes that item commits
+       alone; together they can route differently (both owners of a file
+       ticked leaves no outside owner, so the gate takes the whole file,
+       unowned lines included). The host runs the gate's routing for the
+       selection. Freshness is push, not polling: the key in queryParams is
+       the selection plus the host's membership state key and its freshness,
+       which change with anything ownership derives from and when a pending
+       compute lands; the host emits worklist-changed when
+       a new partition is ready. A stale answer, or one for another state or
+       selection, is not shown.
+       https://www.xmlui.org/docs/reference/components/DataSource -->
+  <DataSource
+    id="gateTake"
+    when="{!!window.__bramSelectionPredictionKey(gateWorklist.value, gateSel.value)}"
+    url="/__worklist/will-commit"
+    queryParams="{{ ids: window.__bramSelectionIdsParam(gateSel.value), k: window.__bramSelectionPredictionKey(gateWorklist.value, gateSel.value) }}" />
   <HStack
-    when="{(gateSel.value || []).length >= 2 &amp;&amp; window.__bramSelectionAllNeedStart(gateWorklist.value &amp;&amp; gateWorklist.value.items, gateSel.value, gateClaim.value) &amp;&amp; window.__bramStartChoiceNeeded(gateWorklist.value &amp;&amp; gateWorklist.value.items, gateSel.value, gateClaim.value)}"
+    when="{!!window.__bramSelectionTakeLine(gateTake.value, gateSel.value, gateWorklist.value)}"
     horizontalAlignment="center"
-    paddingHorizontal="$space-8"
-    paddingTop="$space-1">
-    <RadioGroup
-      initialValue="{startMode}"
-      onDidChange="(v) => { startMode = window.__bramW2SetStartMode(v) }">
-      <Option value="one" label="Start one at a time — separate commits" />
-      <Option value="together" label="{window.__bramStartAllLabel(gateSel.value)}" />
-    </RadioGroup>
-  </HStack>
-  <!-- gate-withholds-futile-joint-commit-offer, commit side: when Commit is
-       withheld because a still-begun same-click partner is unselected, say
-       so as an instruction — the host would refuse this selection every
-       time (op=refuse-joint-interval), so the missing button must read as
-       guidance, not regression (the __bramItemShareBlockers precedent). -->
-  <HStack
-    when="{(window.__bramSelectionJointMissing(gateWorklist.value &amp;&amp; gateWorklist.value.items, gateSel.value, gateClaim.value) || []).length > 0}"
-    horizontalAlignment="center"
+    verticalAlignment="center"
+    gap="$space-2"
     paddingHorizontal="$space-8"
     paddingTop="$space-1">
     <Text
       fontSize="$fontSize-sm"
       color="$textColor-secondary"
-      value="{'Committable together with ' + window.__bramNameList(window.__bramSelectionJointMissing(gateWorklist.value &amp;&amp; gateWorklist.value.items, gateSel.value, gateClaim.value)) + ' — select both, or ask the agent to separate them (park, drop, re-propose).'}" />
-  </HStack>
-  <!-- avoid-futile-joint-commit: shareJointShared reads the host-computed
-       `jointWith` field (/__worklist per-item, same change) via
-       __bramSelectionJointShared -- true when a selected item was approved
-       together with another in one click and their shared-path edits carry
-       a single capture boundary. Unlike shareChoiceEntangled (a declared-
-       files prediction), this is the field-tested fact that the split
-       option is UNAVAILABLE, not merely consequential: a split commit
-       attempt on these items is refused host-side (409
-       op=refuse-joint-interval, src-tauri/src/lib.rs) every time, so the
-       Option is disabled here rather than left clickable and silently
-       failing later. `enabled` per
-       https://www.xmlui.org/docs/reference/components/Option#enabled
-       (and confirmed on RadioGroup's own `enabled`,
-       https://www.xmlui.org/docs/reference/components/RadioGroup#enabled).
-       shareInitial forces the group's own selection off "split" when the
-       selection is joint-shared, so a `together`/`split` preference saved
-       from an earlier, non-joint selection can't silently carry an
-       unusable choice into this one. -->
-  <HStack
-    var.shareChoiceEntangled="{window.__bramSelectionSharesFiles(gateWorklist.value &amp;&amp; gateWorklist.value.items, gateSel.value, gateClaim.value)}"
-    var.shareJointShared="{window.__bramSelectionJointShared(gateWorklist.value &amp;&amp; gateWorklist.value.items, gateSel.value)}"
-    var.shareSplitLabel="{shareJointShared ? 'A commit each — not available: these items were started together' : (shareChoiceEntangled ? 'A commit each — the agent will separate them' : 'A commit each — selected items land separately')}"
-    var.shareInitial="{shareJointShared ? 'together' : window.__bramW2ShareMode}"
-    when="{(gateSel.value || []).length >= 2 &amp;&amp; window.__bramSelectionAllCommittable(gateWorklist.value &amp;&amp; gateWorklist.value.items, gateSel.value, gateClaim.value)}"
-    horizontalAlignment="center"
-    paddingHorizontal="$space-8"
-    paddingTop="$space-1">
-    <RadioGroup
-      initialValue="{shareInitial}"
-      onDidChange="(v) => window.__bramW2SetShareMode(v)">
-      <Option value="together" label="One commit — selected items land together" />
-      <Option value="split" label="{shareSplitLabel}" enabled="{!shareJointShared}" />
-    </RadioGroup>
+      value="{window.__bramSelectionTakeLine(gateTake.value, gateSel.value, gateWorklist.value)}" />
+    <Theme borderColor-Button-primary-outlined="$textColor-secondary"
+      textColor-Button-primary-outlined="$textColor-secondary"
+      borderColor-Button-primary-outlined--hover="$textColor-secondary"
+      textColor-Button-primary-outlined--hover="$textColor-primary"
+      fontSize-Button="$fontSize-sm">
+      <Button
+        when="{window.__bramNextMoveSlot(gateWorklist.value, gateSel.value, gateClaim.value, gateTake.value) === 'take'}"
+        label="What's my next move?"
+        variant="outlined"
+        size="xs"
+        tooltip="If unclear, ask the agent."
+        enabled="{!window.__bramAgentWorking(gateAgent.value)}"
+        onClick="window.__bramAskSequence(gateSel.value)" />
+    </Theme>
   </HStack>
   <!-- issue-328: close consent AT THE GATE. When the selection carries
        closesIssues, one real checkbox per issue renders here — where the
@@ -237,6 +282,12 @@
        (helpers.js, bramSubscribeGateCaution). Same warn styling as the
        close-contradiction row above. -->
   <PushSource id="gateCaution" subscribe="{window.bramSubscribeGateCaution()}" />
+  <!-- gate-click-queues-behind-running-turn: a Start / Start & commit /
+       Commit click taken mid-turn is queued and delivered when the turn ends
+       (helpers.js, bramSubscribeGateQueue). It replaces #368's ask-twice
+       caution for those kinds. The queued button is disabled; the row's
+       Cancel is the only control. Stopping the turn delivers it sooner. -->
+  <PushSource id="gateQueue" subscribe="{window.bramSubscribeGateQueue()}" />
   <!-- issue-368-addressed-turn-context, rung 2: when the RUNNING turn is
        addressed to an id in the selection (an approved:/iterate:/drop: turn
        naming it, per the host's turn-context events), the commit-emitting
@@ -258,15 +309,48 @@
       value="{window.__bramAddressedBlockMessage(gateSel.value, gateTurnCtx.value)}" />
   </HStack>
   <HStack
-    when="{!!gateCaution.value}"
+    when="{!!gateQueue.value}"
+    wrapContent="true"
     horizontalAlignment="center"
+    verticalAlignment="center"
     gap="$space-2"
     paddingHorizontal="$space-2"
     paddingTop="$space-1">
     <Text
       fontSize="$fontSize-sm"
       color="$color-warn-700"
-      value="{window.__bramGateCautionMessage(gateCaution.value)}" />
+      value="{window.__bramGateQueueMessage(gateQueue.value)}" />
+    <Button
+      size="xs"
+      variant="outlined"
+      label="Cancel"
+      onClick="window.__bramGateQueueCancel()" />
+  </HStack>
+  <!-- delegated-work-action-gates: shown only while the selection touches an
+       item a bound subagent is still working on. Mirrors the queued-click row
+       above: one line saying why the buttons are off, one control. Release
+       frees the binding when the subagent's stop never arrived. -->
+  <!-- wrapContent: in a narrow pane the reason and Release must wrap, or the
+       button runs off the edge unseen (Jon, 2026-11-04 demo).
+       https://www.xmlui.org/docs/reference/components/Stack#wrapcontent -->
+  <HStack
+    when="{!!window.__bramDelegatedBlocker(gateClaim.value, gateSel.value)}"
+    wrapContent="true"
+    horizontalAlignment="center"
+    verticalAlignment="center"
+    gap="$space-2"
+    paddingHorizontal="$space-2"
+    paddingTop="$space-1">
+    <Text
+      fontSize="$fontSize-sm"
+      color="$color-warn-700"
+      value="{window.__bramDelegatedWhy(gateClaim.value, gateSel.value)}" />
+    <Button
+      size="xs"
+      variant="outlined"
+      label="Release"
+      tooltip="Release the subagent's hold, e.g. if it was cancelled and never reported stopping"
+      onClick="window.__bramDelegatedRelease(gateClaim.value, gateSel.value)" />
   </HStack>
   <!-- locked-board-names-its-own-exit: the escape, stated where the dead
        buttons are. Deliberately NOT gated on a selection, unlike the button
@@ -305,6 +389,88 @@
       color="$textColor-secondary"
       value="{window.__bramGateStrandedExitLine(gateClaim.value, gateAgent.value, gateLockTick)}" />
   </HStack>
+  <!-- issue-413: the agent's recommended next steps (POST /__worklist/plan),
+       shown while they still apply to the board and two or more items are
+       ticked (whats-my-sequence-button: a sequence only matters then). Do
+       recommended runs the same Drop, Commit and Start paths as the buttons
+       below, for exactly the ids the line names; it grants nothing the
+       buttons don't. Dimmed while the agent is working, like Commit's
+       caution. × dismisses. -->
+  <HStack
+    when="{window.__bramPlanVisible(gateWorklist.value, gateSel.value)}"
+    horizontalAlignment="center"
+    verticalAlignment="center"
+    gap="$space-2"
+    paddingHorizontal="$space-2"
+    paddingTop="$space-1">
+    <Text fontSize="$fontSize-sm" value="{window.__bramPlanLine(gateWorklist.value)}" />
+    <!-- A hover only for a feedback step's text, the one thing the line
+         can't show; the reasoning is Why?'s (Jon, 2026-11-08: the old
+         summary + feedback + decide-lines hover was "total overkill"). -->
+    <Tooltip when="{!!window.__bramPlanTooltip(gateWorklist.value)}">
+      <property name="tooltipTemplate">
+        <Markdown maxWidth="44ch" content="{window.__bramPlanTooltip(gateWorklist.value)}" />
+      </property>
+      <Button
+        label="Do recommended"
+        size="sm"
+        enabled="{!window.__bramInflightBlocker(gateClaim.value) &amp;&amp; !window.__bramAgentWorking(gateAgent.value)}"
+        onClick="window.__bramDoRecommended(gateWorklist.value, gateClaim.value)" />
+    </Tooltip>
+    <Button
+      when="{!window.__bramPlanTooltip(gateWorklist.value)}"
+      label="Do recommended"
+      size="sm"
+      enabled="{!window.__bramInflightBlocker(gateClaim.value) &amp;&amp; !window.__bramAgentWorking(gateAgent.value)}"
+      onClick="window.__bramDoRecommended(gateWorklist.value, gateClaim.value)" />
+    <!-- whats-my-sequence-button: Why? opens the agent's reasoning for the
+         plan (its `why`, else its summary) in a modal; nothing else happens.
+         https://www.xmlui.org/docs/reference/components/ModalDialog -->
+    <Button
+      label="Why?"
+      variant="outlined"
+      size="sm"
+      tooltip="Why this order"
+      onClick="planWhyDialog.open()" />
+    <Button
+      label="×"
+      variant="ghost"
+      size="sm"
+      tooltip="Dismiss the recommendation"
+      onClick="window.__bramDismissPlan()" />
+  </HStack>
+  <ModalDialog id="planWhyDialog" title="Why this order">
+    <Markdown content="{window.__bramPlanWhy(gateWorklist.value)}" />
+  </ModalDialog>
+  <!-- whats-my-sequence-button (Jon, 2026-11-08: "What's my sequence here?
+       ... put that on the surface of the app"). In the plan line's slot,
+       while two or more items are ticked and no plan is showing: it asks the
+       agent about those items, as chat, and the answer arrives as a plan on
+       this line. Dimmed while the agent works, like Do recommended, since it
+       starts a turn. -->
+  <HStack
+    when="{window.__bramNextMoveSlot(gateWorklist.value, gateSel.value, gateClaim.value, gateTake.value) === 'own'}"
+    horizontalAlignment="center"
+    verticalAlignment="center"
+    paddingHorizontal="$space-2"
+    paddingTop="$space-1">
+    <!-- next-move-button-inline-and-quiet: small and gray, like the gate's
+         secondary lines, here and where it joins one of them (above). Button
+         theme variables: https://www.xmlui.org/docs/reference/components/Button -->
+    <Theme borderColor-Button-primary-outlined="$textColor-secondary"
+      textColor-Button-primary-outlined="$textColor-secondary"
+      borderColor-Button-primary-outlined--hover="$textColor-secondary"
+      textColor-Button-primary-outlined--hover="$textColor-primary"
+      fontSize-Button="$fontSize-sm">
+      <Button
+        label="What's my next move?"
+        variant="outlined"
+        size="xs"
+        tooltip="If unclear, ask the agent."
+        enabled="{!window.__bramAgentWorking(gateAgent.value)}"
+        onClick="window.__bramAskSequence(gateSel.value)" />
+    </Theme>
+  </HStack>
   <HStack
     when="{(gateSel.value || []).length > 0}"
     verticalAlignment="center"
@@ -329,22 +495,44 @@
          control, "is always a bad smell".
          So this is deliberately a bounded signal that points, not a complete
          one that describes. -->
-    <Button
-      label="{window.__bramStartButtonLabel(gateWorklist.value.items, gateSel.value, gateClaim.value, startMode)}"
-      size="sm"
-      enabled="{!window.__bramInflightBlocker(gateClaim.value) &amp;&amp; window.__bramSelectionAllNeedStart(gateWorklist.value.items, gateSel.value, gateClaim.value)}"
-      onClick="window.__bramGateAct('start', gateWorklist.value.items, gateSel.value, window.__bramW2ShareMode, gateClaim.value)" />
-    <Button
-      label="{window.__bramStartVerb(gateWorklist.value.items, gateSel.value, gateClaim.value) + ' &amp; commit ' + (gateSel.value || []).length}"
-      size="sm"
-      enabled="{!window.__bramInflightBlocker(gateClaim.value) &amp;&amp; !window.__bramSelectionAddressedBlocked(gateSel.value, gateTurnCtx.value) &amp;&amp; (gateSel.value || []).length === 1 &amp;&amp; window.__bramSelectionAllNeedStart(gateWorklist.value.items, gateSel.value, gateClaim.value)}"
-      tooltip="One click: start, then commit when done. One item at a time — see #272"
-      onClick="window.__bramGateAct('start-commit', gateWorklist.value.items, gateSel.value, window.__bramW2ShareMode, gateClaim.value)" />
-    <Button
-      label="{'Commit ' + (gateSel.value || []).length}"
-      size="sm"
-      enabled="{!window.__bramInflightBlocker(gateClaim.value) &amp;&amp; !window.__bramSelectionAddressedBlocked(gateSel.value, gateTurnCtx.value) &amp;&amp; window.__bramSelectionAllCommittable(gateWorklist.value.items, gateSel.value, gateClaim.value)}"
-      onClick="window.__bramGateAct('commit', gateWorklist.value.items, gateSel.value, window.__bramW2ShareMode, gateClaim.value)" />
+    <!-- strip-tooltip-wraps-via-template: each gate button's tooltip is a
+         Tooltip template (a width-bound Markdown) instead of tooltipMarkdown,
+         so a long reason wraps instead of running off the pane; see the
+         strip in Worklist.xmlui.
+         https://www.xmlui.org/docs/reference/components/Tooltip#using-the-tooltip-component -->
+    <Tooltip>
+      <property name="tooltipTemplate">
+        <Markdown maxWidth="44ch" content="{window.__bramGateScopeTooltip(gateSel.value, 'start', null, gateClaim.value, gateWorklist.value.items)}" />
+      </property>
+      <Button
+        label="{window.__bramGateQueuedLabel('start', window.__bramStartButtonLabel(gateWorklist.value.items, gateSel.value, gateClaim.value), gateQueue.value)}"
+        size="sm"
+        enabled="{!window.__bramInflightBlocker(gateClaim.value) &amp;&amp; !window.__bramDelegatedBlocker(gateClaim.value, gateSel.value) &amp;&amp; window.__bramSelectionAllNeedStart(gateWorklist.value.items, gateSel.value, gateClaim.value) &amp;&amp; !window.__bramGateQueuedAs(gateQueue.value, 'start')}"
+        onClick="window.__bramGateAct('start', gateWorklist.value.items, gateSel.value, 'together', gateClaim.value)" />
+    </Tooltip>
+    <!-- gate-one-way-to-continue-one-to-finish: dimmed whenever Commit can be
+         lit. On a begun `proposed` item both send apply-and-commit, so the row
+         offers one way to continue (Resume) and one way to finish (Commit). -->
+    <Tooltip>
+      <property name="tooltipTemplate">
+        <Markdown maxWidth="44ch" content="{window.__bramGateScopeTooltip(gateSel.value, 'start-commit', gateGit.value &amp;&amp; gateGit.value.branch, gateClaim.value, gateWorklist.value.items)}" />
+      </property>
+      <Button
+        label="{window.__bramGateQueuedLabel('start-commit', window.__bramStartVerb(gateWorklist.value.items, gateSel.value, gateClaim.value) + ' &amp; commit', gateQueue.value)}"
+        size="sm"
+        enabled="{!window.__bramInflightBlocker(gateClaim.value) &amp;&amp; !window.__bramDelegatedBlocker(gateClaim.value, gateSel.value) &amp;&amp; !window.__bramSelectionAddressedBlocked(gateSel.value, gateTurnCtx.value) &amp;&amp; (gateSel.value || []).length === 1 &amp;&amp; window.__bramSelectionAllNeedStart(gateWorklist.value.items, gateSel.value, gateClaim.value) &amp;&amp; !window.__bramSelectionAllCommittable(gateWorklist.value.items, gateSel.value, gateClaim.value) &amp;&amp; !window.__bramGateQueuedAs(gateQueue.value, 'start-commit')}"
+        onClick="window.__bramGateAct('start-commit', gateWorklist.value.items, gateSel.value, 'together', gateClaim.value)" />
+    </Tooltip>
+    <Tooltip>
+      <property name="tooltipTemplate">
+        <Markdown maxWidth="44ch" content="{window.__bramGateCommitTooltip(gateSel.value, gateGit.value &amp;&amp; gateGit.value.branch, gateWorklist.value.items, gateClaim.value, gateTurnCtx.value)}" />
+      </property>
+      <Button
+        label="{window.__bramGateQueuedLabel('commit', 'Commit', gateQueue.value)}"
+        size="sm"
+        enabled="{!window.__bramInflightBlocker(gateClaim.value) &amp;&amp; !window.__bramDelegatedBlocker(gateClaim.value, gateSel.value) &amp;&amp; !window.__bramSelectionAddressedBlocked(gateSel.value, gateTurnCtx.value) &amp;&amp; window.__bramSelectionAllCommittable(gateWorklist.value.items, gateSel.value, gateClaim.value) &amp;&amp; !window.__bramGateQueuedAs(gateQueue.value, 'commit')}"
+        onClick="window.__bramGateAct('commit', gateWorklist.value.items, gateSel.value, 'together', gateClaim.value)" />
+    </Tooltip>
     <!-- switch-to-transcript-on-action: Refine retired. It was never an
          authorization — the other gate buttons write auth records; Refine
          wrote none, it was conversation squatting among the signatures from
@@ -354,10 +542,15 @@
          __bramWorklist2BatchIterate — one mechanism, same wire payload,
          guards and host untouched). The gate row is pure lifecycle:
          Start / Start & commit / Commit / Drop. -->
-    <Button
-      label="{'Drop ' + (gateSel.value || []).length}"
-      size="sm"
-      enabled="{!window.__bramInflightBlocker(gateClaim.value)}"
-      onClick="window.__bramGateAct('drop', gateWorklist.value.items, gateSel.value, window.__bramW2ShareMode, gateClaim.value)" />
+    <Tooltip>
+      <property name="tooltipTemplate">
+        <Markdown maxWidth="44ch" content="{window.__bramGateScopeTooltip(gateSel.value, 'drop', null, gateClaim.value)}" />
+      </property>
+      <Button
+        label="Drop"
+        size="sm"
+        enabled="{!window.__bramInflightBlocker(gateClaim.value) &amp;&amp; !window.__bramDelegatedBlocker(gateClaim.value, gateSel.value)}"
+        onClick="window.__bramGateAct('drop', gateWorklist.value.items, gateSel.value, 'together', gateClaim.value)" />
+    </Tooltip>
   </HStack>
 </Component>

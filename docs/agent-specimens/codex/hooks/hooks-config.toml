@@ -1,0 +1,46 @@
+# Appended to a CODEX_HOME config.toml (or passed as -c overrides).
+# Same events and matchers Bram registers (lib.rs codex_hook_toml_block),
+# plus SessionStart / UserPromptSubmit / Stop for comparison with Cursor.
+[[hooks.SessionStart]]
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "<scripts>/log-hook.sh SessionStart"
+timeout = 10
+
+[[hooks.UserPromptSubmit]]
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "<scripts>/log-hook.sh UserPromptSubmit"
+timeout = 10
+
+[[hooks.PreToolUse]]
+matcher = "^(apply_patch|Bash|Write|Edit|mcp__.*)$"
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "<scripts>/log-hook.sh PreToolUse"
+timeout = 10
+
+[[hooks.PermissionRequest]]
+matcher = "^(Bash|apply_patch|Write|Edit|mcp__.*)$"
+[[hooks.PermissionRequest.hooks]]
+type = "command"
+command = "<scripts>/log-hook.sh PermissionRequest"
+timeout = 10
+
+[[hooks.PostToolUse]]
+matcher = "^(Bash|apply_patch|Write|Edit|mcp__.*)$"
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = "<scripts>/log-hook.sh PostToolUse"
+timeout = 10
+
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+type = "command"
+command = "<scripts>/log-hook.sh Stop"
+timeout = 10
+
+# Added for the 2026-10-28 alignment: other events used in captures.
+# SubagentStart / SubagentStop / SessionEnd take no matcher.
+# notify is a top-level key, not a hook: notify = ["bash", "<scripts>/notify.sh"]
+# (notify.sh appended its first argument, the JSON payload, to a log file).

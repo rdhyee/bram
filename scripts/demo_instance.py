@@ -14,11 +14,13 @@ from __future__ import annotations
 import argparse
 import atexit
 import contextlib
+import fnmatch
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -26,14 +28,30 @@ import tempfile
 import time
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import bram_state  # noqa: E402
+
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REPO = SOURCE_ROOT.parent / "bram-demo-instance"
 MARKER = ".bram-demo.json"
 SCENARIO_META = ".bram-demo-scenario.json"
-WORKLIST = "resources/worklist.json"
-CLAIMS = "resources/.claim-intervals.json"
-AUTH = "resources/.worklist-authorization.json"
+# Board files, relative to the live state folder (bram_state.state_dir). A
+# scenario branch always stores them under SCENARIO_STATE, the 0.8.3 layout, so
+# captures made by either binary stay valid; hydration maps them into the
+# live layout and capture maps them back (judell/bram#474).
+WORKLIST = "worklist.json"
+CLAIMS = ".claim-intervals.json"
+AUTH = ".worklist-authorization.json"
+DRAFTS = "worklist-drafts"
+SCENARIO_STATE = bram_state.STATE_DIR_LEGACY
+# The live layouts: `.bram/` (0.8.4, the default) or `resources/` (0.8.3, kept
+# so the real mover can be exercised on a demo).
+LAYOUT_NEW = "dot-bram"
+LAYOUT_LEGACY = "legacy"
+# State-folder entries that are never scenario state: the new layout's own
+# bookkeeping, and settings (the fixture's settings are its tracked .bram.json).
+UNCAPTURED_STATE = {".gitignore", ".migrated-from", ".state-move", "settings.json"}
 RUNTIME_DIR = "bram-demo"
 FORMAT_VERSION = 1
 SCENARIO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -57,7 +75,127 @@ STARTERS = (
     "expired-authorization",
     "ambiguous-duplicate",
     "reedit-own-lines",
+    "multi-file",
+    "committed-outside",
+    "new-file-left-out",
+    "chat-edit-in-item-file",
+    "joint-owner-committed",
+    "entangled-with-unowned",
+    "membership-unanswerable",
 )
+
+# What membership should answer for each starter, checked by
+# scripts/membership-starter-check.py against a live demo's /__worklist.
+# Paths are relative to the repo with "{p}" for the starter's prefix. Per path:
+# `owners` (the sorted owner ids), and the (added, removed) line counts in
+# `single`, `joint` and `unowned`. A path listed under `absent` must have no
+# membership entry. `will_commit` pins an item's (added, removed) take where the
+# starter exists to pin that count. Each entry restates its starter's own
+# comment; when the engine and this table disagree, read the starter first.
+EXPECTATIONS: dict[str, dict[str, Any]] = {
+    # Two begun items each own one hunk of one file.
+    "disjoint-entanglement": {
+        "paths": {
+            "demo/{p}.txt": {"owners": ["{p}-bottom", "{p}-top"], "single": (2, 2)},
+        },
+    },
+    # prepare rewrote the line (its removal is prepare's); consume rewrote it
+    # again (the surviving addition is consume's).
+    "dependency": {
+        "paths": {
+            "demo/{p}.txt": {"owners": ["{p}-consume", "{p}-prepare"], "single": (1, 1)},
+        },
+    },
+    # replace rewrote draft's added line, so the surviving line is replace's and
+    # draft owns nothing (attribution-model.md, "Supersession and drift").
+    "supersession": {
+        "paths": {"demo/{p}.txt": {"owners": ["{p}-replace"], "single": (1, 0)}},
+    },
+    # Written with no claim open: nobody's.
+    "unattributed": {
+        "paths": {"demo/{p}.txt": {"owners": [], "unowned": (1, 1)}},
+    },
+    # Six items approved in one click share one claim: one jointly owned line.
+    "many-claimants": {
+        "paths": {
+            "demo/{p}.txt": {
+                "owners": [f"{{p}}-{n}" for n in range(1, 7)],
+                "joint": (1, 1),
+            },
+        },
+    },
+    # A proposed, never-begun item: nothing to attribute.
+    "expired-authorization": {"absent": ["demo/{p}.txt"]},
+    # Identical-context duplicates: the line rule is positional, so both edits
+    # are the aligning item's, and nothing is ambiguous.
+    "ambiguous-duplicate": {
+        "paths": {"demo/{p}.txt": {"owners": ["{p}-align"], "single": (2, 2)}},
+    },
+    # #367: a file created in one window and re-edited in a second counts its
+    # five lines once, not once per window.
+    "reedit-own-lines": {
+        "paths": {"demo/{p}-created.txt": {"owners": ["{p}-author"], "single": (5, 0)}},
+        "will_commit": {"{p}-author": (5, 0)},
+    },
+    # One begun item over five files; the listed-but-untouched one has no entry.
+    "multi-file": {
+        "paths": {
+            "demo/{p}/README.md": {"owners": ["{p}-feature"], "single": (80, 1)},
+            "demo/{p}/app.js": {"owners": ["{p}-feature"], "single": (3, 2)},
+            "demo/{p}/format.js": {"owners": ["{p}-feature"], "single": (3, 0)},
+            "demo/{p}/styles.css": {"owners": ["{p}-feature"], "single": (1, 1)},
+        },
+        "absent": ["demo/{p}/untouched.txt"],
+    },
+    # #406: the landed row's work is in HEAD, the reverted row left nothing.
+    "committed-outside": {"absent": ["demo/{p}-landed.txt", "demo/{p}-reverted.txt"]},
+    # #419: the author owns its new file and its top-line edit. The neighbour's
+    # edit to the shared file is unowned, because the neighbour doesn't declare
+    # that file (membership credits only begun items that declare the path).
+    "new-file-left-out": {
+        "paths": {
+            "demo/{p}-new.txt": {"owners": ["{p}-author"], "single": (3, 0)},
+            "demo/{p}-shared.txt": {
+                "owners": ["{p}-author"],
+                "single": (1, 1),
+                "unowned": (1, 1),
+            },
+        },
+    },
+    # #273: the item keeps its surviving lines (2, 3 and two appended, plus its
+    # removals of 2, 3 and 5); the chat turn's lines 5 and 8 are unowned.
+    "chat-edit-in-item-file": {
+        "paths": {
+            "demo/{p}-file.txt": {
+                "owners": ["{p}-author"],
+                "single": (4, 3),
+                "unowned": (2, 1),
+            },
+        },
+    },
+    # #432: the owner committed and left; the later item owns the shared file.
+    "joint-owner-committed": {
+        "paths": {"demo/{p}-shared.txt": {"owners": ["{p}-later"], "single": (1, 1)}},
+        "absent": ["demo/{p}-vendor.txt"],
+    },
+    # Two owners of one file plus one hunk nobody owns.
+    "entangled-with-unowned": {
+        "paths": {
+            "demo/{p}.txt": {
+                "owners": ["{p}-bottom", "{p}-top"],
+                "single": (2, 2),
+                "unowned": (1, 1),
+            },
+        },
+        "will_commit": {"{p}-top": (1, 1), "{p}-bottom": (1, 1)},
+    },
+    # #437: a declared file not yet created and an ignored declared file must
+    # not stop the compute; the planner owns its edit.
+    "membership-unanswerable": {
+        "paths": {"demo/{p}/code.txt": {"owners": ["{p}-planner"], "single": (1, 1)}},
+        "will_commit": {"{p}-planner": (1, 1)},
+    },
+}
 
 # The ambiguous-duplicate fixture's stanza pair. Geometry is load-bearing:
 # with git's default 3-line hunk context, the claim-era edit below produces
@@ -91,6 +229,104 @@ class DemoError(RuntimeError):
     """A safe, user-facing refusal or fixture error."""
 
 
+# The multi-file fixture's baseline: one begun item whose table needs rows of
+# every kind (modified, new, large, untouched) to show the file-row
+# disclosure triangle in all its states.
+def _multi_file_seeds(prefix: str) -> list[tuple[str, str]]:
+    root = f"demo/{prefix}"
+    return [
+        (
+            f"{root}/app.js",
+            "".join(f"function step{n}() {{ return {n}; }}\n" for n in range(1, 21)),
+        ),
+        (
+            f"{root}/styles.css",
+            "".join(f".row-{n} {{ padding: {n}px; }}\n" for n in range(1, 11)),
+        ),
+        (f"{root}/README.md", "# Demo\n\nA short readme.\n"),
+        (f"{root}/untouched.txt", "Listed by the item, never changed.\n"),
+    ]
+
+
+# The new-file-left-out fixture's shared file: ten lines, with the author's
+# region at the top and the neighbour's at the bottom so the two hunks stay
+# separable. `edits` is 0 (HEAD), 1 (author's edit), 2 (author's and neighbour's).
+def _new_file_left_out_shared(prefix: str, edits: int) -> str:
+    lines = ["top: base"] + ["middle"] * 8 + ["bottom: base"]
+    if edits >= 1:
+        lines[0] = f"top: changed by {prefix}-author"
+    if edits >= 2:
+        lines[-1] = f"bottom: changed by {prefix}-neighbour"
+    return "".join(f"{line}\n" for line in lines)
+
+
+# The chat-edit-in-item-file fixture's file: ten distinct lines. `stage` is 0
+# (HEAD), 1 (the author's first window), 2 (a chat turn, no claim live) or 3
+# (the author's second window). Each changed line says who wrote it.
+def _chat_edit_file(stage: int) -> str:
+    lines = [f"line {n}: base" for n in range(1, 11)]
+    if stage >= 1:
+        lines[1] = "line 2: changed by the author"
+        lines[4] = "line 5: changed by the author"
+        lines += ["line 11: appended by the author", "line 12: appended by the author"]
+    if stage >= 2:
+        lines[4] = "line 5: rewritten in chat"
+        lines[7] = "line 8: changed in chat"
+    if stage >= 3:
+        lines[2] = "line 3: changed by the author, second window"
+    return "".join(f"{line}\n" for line in lines)
+
+
+def _joint_owner_shared(prefix: str, owner_edit: bool, later_edit: bool = False) -> str:
+    lines = ["shared: base\n", "middle\n" * 6]
+    lines.append(f"{prefix}-owner: committed step URL\n" if owner_edit else "owner: base\n")
+    lines.append("middle\n" * 6)
+    lines.append(f"{prefix}-later: token terms\n" if later_edit else "later: base\n")
+    return "".join(lines)
+
+
+def _entangled_unowned(top: bool, middle: bool, bottom: bool) -> str:
+    # 17 lines: the three changed lines (1, 9, 17) are 7 lines apart, more
+    # than git's 2 x 3 lines of context, so each lands in its own hunk.
+    lines = ["top: changed by A" if top else "top: base"]
+    lines += ["middle"] * 7
+    lines += ["middle: changed with no claim" if middle else "middle: base"]
+    lines += ["middle"] * 7
+    lines += ["bottom: changed by B" if bottom else "bottom: base"]
+    return "\n".join(lines) + "\n"
+
+
+def starter_seeds(starter: str, prefix: str) -> list[tuple[str, str]]:
+    if starter == "multi-file":
+        return _multi_file_seeds(prefix)
+    if starter == "committed-outside":
+        return [
+            (f"demo/{prefix}-landed.txt", "landed: committed with plain git\n"),
+            (f"demo/{prefix}-reverted.txt", "reverted: nothing of the item survives\n"),
+        ]
+    if starter == "new-file-left-out":
+        return [
+            (f"demo/{prefix}-shared.txt", _new_file_left_out_shared(prefix, 0)),
+            (f"demo/{prefix}-own.txt", "own: never changed by the neighbour\n"),
+        ]
+    if starter == "chat-edit-in-item-file":
+        return [(f"demo/{prefix}-file.txt", _chat_edit_file(0))]
+    if starter == "membership-unanswerable":
+        # Its own folder, so the ignore rule below reaches no other starter.
+        return [
+            (f"demo/{prefix}/.gitignore", "/*.md\n"),
+            (f"demo/{prefix}/code.txt", "code: base\n"),
+        ]
+    if starter == "joint-owner-committed":
+        # HEAD already holds the owner's edit: it "committed" before the board
+        # was captured, so the joint window below replays base -> edited.
+        return [
+            (f"demo/{prefix}-shared.txt", _joint_owner_shared(prefix, owner_edit=True)),
+            (f"demo/{prefix}-vendor.txt", "vendor: runtime 1.0\n"),
+        ]
+    return [starter_seed(starter, prefix)]
+
+
 def starter_seed(starter: str, prefix: str) -> tuple[str, str]:
     seeds = {
         "disjoint-entanglement": (
@@ -117,6 +353,7 @@ def starter_seed(starter: str, prefix: str) -> tuple[str, str]:
             f"demo/{prefix}.txt",
             "reedit: the created sibling arrives under two claim windows\n",
         ),
+        "entangled-with-unowned": (f"demo/{prefix}.txt", _entangled_unowned(False, False, False)),
     }
     try:
         return seeds[starter]
@@ -153,19 +390,24 @@ def run_git(
     merged = os.environ.copy()
     if env:
         merged.update(env)
+    # demo-git-stdin-keeps-lf-on-windows: bytes, not text=True. Text mode on
+    # Windows writes each "\n" of stdin as "\r\n", so `update-index
+    # --index-info` read every path with a trailing "\r", and Git for Windows
+    # dropped them all ("Ignoring path") while exiting 0.
     proc = subprocess.run(
         ["git", "-C", str(repo), *args],
-        input=input_text,
-        text=True,
+        input=None if input_text is None else input_text.encode("utf-8"),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=merged,
         check=False,
     )
+    stdout = proc.stdout.decode("utf-8", errors="replace")
+    stderr = proc.stderr.decode("utf-8", errors="replace")
     if check and proc.returncode:
-        detail = proc.stderr.strip() or proc.stdout.strip()
+        detail = stderr.strip() or stdout.strip()
         raise DemoError(f"git {' '.join(args)} failed: {detail}")
-    return proc.stdout.strip()
+    return stdout.strip()
 
 
 def scenario_ref(name: str) -> str:
@@ -305,27 +547,63 @@ def temporary_index(repo: Path, base: str) -> Iterator[dict[str, str]]:
             os.unlink(raw)
 
 
-def capture_tree(repo: Path, base: str = "HEAD", force_paths: Iterable[str] = ()) -> str:
+def capture_tree(
+    repo: Path,
+    base: str = "HEAD",
+    force_paths: Iterable[str] = (),
+    board: Sequence[tuple[str, Path]] = (),
+) -> str:
+    """The worktree as a tree on top of `base`. `board` adds files from
+    outside their tree path: (path in the tree, file on disk) pairs, hashed
+    into the temporary index, so the live `.bram/` board is stored at its
+    `resources/` scenario paths without copying anything in the worktree."""
     with temporary_index(repo, base) as env:
         run_git(repo, "add", "-A", "--", ".", env=env)
         existing = [p for p in force_paths if (repo / p).exists()]
         if existing:
             run_git(repo, "add", "-f", "--", *existing, env=env)
+        if board:
+            shas = run_git(
+                repo,
+                "hash-object",
+                "-w",
+                "--stdin-paths",
+                input_text="".join(f"{disk}\n" for _, disk in board),
+            ).splitlines()
+            if len(shas) != len(board):
+                raise DemoError("git hash-object did not hash every board file")
+            run_git(
+                repo,
+                "update-index",
+                "--add",
+                "--index-info",
+                env=env,
+                input_text="".join(
+                    f"100644 {sha}\t{rel}\n" for (rel, _), sha in zip(board, shas)
+                ),
+            )
         tree = run_git(repo, "write-tree", env=env)
     if not tree:
         raise DemoError("git produced an empty tree id")
     return tree
 
 
+def state_path(repo: Path, rel: str) -> Path:
+    """A board file in the live state folder, `.bram/` or `resources/`."""
+    return bram_state.state_dir(repo) / rel
+
+
 def _load_controls(repo: Path) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    worklist_path = state_path(repo, WORKLIST)
+    claims_path = state_path(repo, CLAIMS)
     worklist = (
-        read_json(repo / WORKLIST)
-        if (repo / WORKLIST).exists()
+        read_json(worklist_path)
+        if worklist_path.exists()
         else {"description": "Synthetic Bram worklist", "items": [], "version": 1}
     )
     claims = (
-        read_json(repo / CLAIMS)
-        if (repo / CLAIMS).exists()
+        read_json(claims_path)
+        if claims_path.exists()
         else {"intervals": [], "version": 1}
     )
     meta = (
@@ -339,8 +617,8 @@ def _load_controls(repo: Path) -> tuple[dict[str, Any], dict[str, Any], dict[str
 def _write_controls(
     repo: Path, worklist: dict[str, Any], claims: dict[str, Any], meta: dict[str, Any]
 ) -> None:
-    write_json(repo / WORKLIST, worklist)
-    write_json(repo / CLAIMS, claims)
+    write_json(state_path(repo, WORKLIST), worklist)
+    write_json(state_path(repo, CLAIMS), claims)
     write_json(repo / SCENARIO_META, meta)
 
 
@@ -363,15 +641,18 @@ class StarterBuilder:
     def item(
         self,
         item_id: str,
-        path: str,
+        path: str | Sequence[str],
         before: str,
         after: str,
         status: str = "applied",
+        begun_at_ms: int | None = None,
     ) -> None:
-        self.worklist.setdefault("items", []).append(
-            {"files": [path], "id": item_id, "status": status}
-        )
-        draft = self.repo / "resources/worklist-drafts" / f"{item_id}.md"
+        files = [path] if isinstance(path, str) else list(path)
+        entry: dict[str, Any] = {"files": files, "id": item_id, "status": status}
+        if begun_at_ms is not None:
+            entry["begunAtMs"] = begun_at_ms
+        self.worklist.setdefault("items", []).append(entry)
+        draft = state_path(self.repo, DRAFTS) / f"{item_id}.md"
         draft.parent.mkdir(parents=True, exist_ok=True)
         draft.write_text(f"# Before\n\n{before}\n\n# After\n\n{after}\n", encoding="utf-8")
 
@@ -487,6 +768,225 @@ class StarterBuilder:
         self.file(path, "".join(f"line {n}: second pass\n" for n in range(1, 6)))
         self.boundary([])
 
+    def starter_multi_file(self, prefix: str) -> None:
+        # One begun item over five files, one of each kind the files table
+        # renders: two modified, one new, one large diff, one listed but
+        # untouched (no diff, so no disclosure triangle).
+        root = f"demo/{prefix}"
+        item_id = f"{prefix}-feature"
+        files = [
+            f"{root}/app.js",
+            f"{root}/styles.css",
+            f"{root}/format.js",
+            f"{root}/README.md",
+            f"{root}/untouched.txt",
+        ]
+        self.item(
+            item_id,
+            files,
+            "A small app with a short readme.",
+            "Add a formatter, tweak two steps and a style, and write the readme out properly.",
+        )
+        self.boundary([item_id])
+        app = "".join(f"function step{n}() {{ return {n}; }}\n" for n in range(1, 21))
+        app = app.replace("return 3;", "return format(3);").replace("return 12;", "return format(12);")
+        self.file(f"{root}/app.js", "import { format } from './format.js';\n" + app)
+        css = "".join(f".row-{n} {{ padding: {n}px; }}\n" for n in range(1, 11))
+        self.file(f"{root}/styles.css", css.replace("padding: 4px", "padding: 6px"))
+        self.file(
+            f"{root}/format.js",
+            "export function format(n) {\n  return `#${n}`;\n}\n",
+        )
+        self.file(
+            f"{root}/README.md",
+            "# Demo\n\n"
+            + "".join(f"## Section {n}\n\nParagraph {n} of the longer readme.\n\n" for n in range(1, 21)),
+        )
+        self.boundary([])
+
+    def starter_new_file_left_out(self, prefix: str) -> None:
+        # judell/bram#419's shape: the author item started a NEW, never-tracked
+        # file and also changed a tracked file. A neighbour item edited that
+        # same file during its own claim window WITHOUT declaring it, as
+        # issue-406-chat-commit-everything-ready did with helpers.js. That
+        # omission is load-bearing: the pane sees no shared declared path, so
+        # it sends no isolate instruction with the Commit click, while the
+        # host's replay still credits the neighbour with lines there and
+        # routes the author's commit to hunk-by-hunk staging - where a new
+        # file was silently left out of commits 30aa4d0 and fe84674. (With
+        # the path declared by both, the agent isolates by hand and the
+        # commit takes the whole-file path, which stages new files.) The
+        # author's second window re-edits the new file so it carries two
+        # windows of evidence, as in the real case.
+        new = f"demo/{prefix}-new.txt"
+        shared = f"demo/{prefix}-shared.txt"
+        own = f"demo/{prefix}-own.txt"
+        author, neighbour = f"{prefix}-author", f"{prefix}-neighbour"
+        self.item(
+            author,
+            [new, shared],
+            "The new file does not exist; the shared file's top line is unchanged.",
+            "Create the new file and change the shared file's top line.",
+        )
+        self.item(
+            neighbour,
+            own,
+            "The neighbour's own file is unchanged.",
+            "Declares only its own file, which it never changes; its one edit "
+            "lands in the author's shared file instead.",
+        )
+        self.boundary([author])
+        self.file(new, "".join(f"line {n}: first pass\n" for n in range(1, 4)))
+        self.file(shared, _new_file_left_out_shared(prefix, 1))
+        self.boundary([])
+        self.boundary([neighbour])
+        self.file(shared, _new_file_left_out_shared(prefix, 2))
+        self.boundary([])
+        self.boundary([author])
+        self.file(new, "".join(f"line {n}: second pass\n" for n in range(1, 4)))
+        self.boundary([])
+
+    def starter_chat_edit_in_item_file(self, prefix: str) -> None:
+        # judell/bram#273's 2026-10-02 ruling. An item edits a file in its own
+        # claim window, a chat turn then edits the same file with no claim
+        # live, and the item edits it again in a second window. The membership
+        # engine used to credit the item with nothing in such a file, because
+        # the item's whole patch no longer reverse-applied; the line-level
+        # rule credits the item with its surviving lines (2, 3 and the two
+        # appended) and leaves the chat-turn lines (5 and 8) unowned. Each
+        # changed line's text names its writer, so the diff checks the board.
+        path = f"demo/{prefix}-file.txt"
+        author = f"{prefix}-author"
+        self.item(
+            author,
+            path,
+            "The file is unchanged.",
+            "Change lines 2, 3 and 5 and append two lines, across two claim "
+            "windows; a chat turn between them rewrites line 5 and line 8.",
+        )
+        self.boundary([author])
+        self.file(path, _chat_edit_file(1))
+        self.boundary([])
+        self.file(path, _chat_edit_file(2))
+        self.boundary([author])
+        self.file(path, _chat_edit_file(3))
+        self.boundary([])
+
+    def starter_membership_unanswerable(self, prefix: str) -> None:
+        # judell/bram#437: two ordinary board shapes that made the membership
+        # engine's scratch-index `add -A -- <declared entries>` fail, so every
+        # gate commit on the board was refused as "no membership answer"
+        # (`op=membership paths=0 spawns=7`). One begun item declares a file it
+        # has not created yet; another declares a new file that the folder's
+        # `/*.md` rule ignores, as CodeExam's THIRD-PARTY-NOTICES.md was.
+        # Expected since the fix: Commit on the planner goes through, and
+        # `op=membership` at the gate reads `fresh=true` with paths > 0. The
+        # notices item's own commit still meets the ignore rule at `git add`
+        # (#373's refuse-ignored-path) unless the file is force-staged; that is
+        # a separate, deliberate refusal. A scenario is stored as git trees,
+        # so the ignored NOTICES.md does not survive `use`/`reset`: until it
+        # is recreated by hand, the notices item is a second declared file
+        # not yet created, which breaks the old seed just as well.
+        code = f"demo/{prefix}/code.txt"
+        planned = f"demo/{prefix}/planned.txt"
+        notices = f"demo/{prefix}/NOTICES.md"
+        planner, noticer = f"{prefix}-planner", f"{prefix}-notices"
+        self.item(
+            planner,
+            [code, planned],
+            "code.txt reads base; planned.txt does not exist yet.",
+            "Change code.txt now; create planned.txt later.",
+        )
+        self.item(
+            noticer,
+            notices,
+            "There is no NOTICES.md.",
+            "Create NOTICES.md, which the folder's /*.md rule ignores.",
+        )
+        self.boundary([planner])
+        self.file(code, "code: changed by the planner\n")
+        self.boundary([])
+        self.boundary([noticer])
+        self.file(notices, "notices: a new file an ignore rule hides\n")
+        self.boundary([])
+
+    def starter_entangled_with_unowned(self, prefix: str) -> None:
+        # issue-425-retire-replay (Codex review): two begun owners of one file
+        # plus a third hunk nobody owns. Each row alone is interval-staged and
+        # predicts only its own hunk; committing both together leaves no
+        # outside owner, so the gate takes the whole file, unowned hunk
+        # included. The per-row numbers then don't add up to the commit.
+        path = f"demo/{prefix}.txt"
+        a, b = f"{prefix}-top", f"{prefix}-bottom"
+        self.item(a, path, "The top line is unchanged.", "The top line identifies item A.")
+        self.item(b, path, "The bottom line is unchanged.", "The bottom line identifies item B.")
+        self.boundary([a])
+        self.file(path, _entangled_unowned(True, False, False))
+        self.boundary([])
+        self.file(path, _entangled_unowned(True, True, False))
+        self.boundary([b])
+        self.file(path, _entangled_unowned(True, True, True))
+        self.boundary([])
+
+    def starter_joint_owner_committed(self, prefix: str) -> None:
+        # judell/bram#432. `owner` and `partner` were approved in one click
+        # (one joint claim interval). Their files don't overlap: owner edited
+        # the shared file, partner the vendor file. Owner has since committed
+        # and been pruned (its edit is in HEAD; it is not on the board), and
+        # partner's edit was reverted (no changes, still begun). A later,
+        # separately approved item edits the shared file. Committing `later`
+        # must succeed: the replay re-resolved the joint interval to partner
+        # once owner left the board and refused it (op=refuse-joint-interval
+        # ids=[partner]).
+        shared = f"demo/{prefix}-shared.txt"
+        vendor = f"demo/{prefix}-vendor.txt"
+        owner, partner, later = f"{prefix}-owner", f"{prefix}-partner", f"{prefix}-later"
+        self.item(
+            partner,
+            vendor,
+            "Approved in one click with the (since committed) owner; its own edit was reverted.",
+            "Has no changes; should not block anything. Drop it.",
+        )
+        self.item(
+            later,
+            shared,
+            "Approved separately, after the owner committed the shared file.",
+            "Should commit: it was never approved together with the partner.",
+        )
+        self.file(shared, _joint_owner_shared(prefix, owner_edit=False))
+        self.boundary([owner, partner])
+        self.file(shared, _joint_owner_shared(prefix, owner_edit=True))
+        self.file(vendor, "vendor: runtime 2.0\n")
+        self.file(vendor, "vendor: runtime 1.0\n")
+        self.boundary([])
+        self.boundary([later])
+        self.file(shared, _joint_owner_shared(prefix, owner_edit=True, later_edit=True))
+        self.boundary([])
+
+    def starter_committed_outside(self, prefix: str) -> None:
+        # judell/bram#406: work committed with plain git, outside the gate.
+        # Fixture commits are dated from 1_700_000_000 (_fixed_git_env), so:
+        # - landed: begun before the baseline commit that created its file,
+        #   which therefore counts as its landing commit;
+        # - reverted: begun after every fixture commit, file clean. Also
+        #   "clean", but no commit touched it since it began, so it must NOT
+        #   read as landed (it's a Drop).
+        self.item(
+            f"{prefix}-landed",
+            f"demo/{prefix}-landed.txt",
+            "The change was committed with plain git, outside the Worklist.",
+            "Should read as committed outside the Worklist, and clear in one click.",
+            begun_at_ms=1_699_999_000_000,
+        )
+        self.item(
+            f"{prefix}-reverted",
+            f"demo/{prefix}-reverted.txt",
+            "The item began, but its change was reverted before any commit.",
+            "Should not read as landed: nothing committed it since it began.",
+            status="proposed",
+            begun_at_ms=1_700_001_000_000,
+        )
+
     def starter_expired_authorization(self, prefix: str) -> None:
         path = f"demo/{prefix}.txt"
         item_id = f"{prefix}-approval"
@@ -499,7 +999,7 @@ class StarterBuilder:
         )
         self.file(path, "authorization: expired\n")
         write_json(
-            self.repo / AUTH,
+            state_path(self.repo, AUTH),
             {
                 "commitToo": False,
                 "consumedAtMs": None,
@@ -513,15 +1013,44 @@ class StarterBuilder:
         )
 
 
-def _control_paths(repo: Path) -> list[str]:
-    paths = [SCENARIO_META, WORKLIST, CLAIMS, AUTH, "resources/worklist-drafts"]
-    return [path for path in paths if (repo / path).exists()]
+def _board_entries(repo: Path) -> list[tuple[str, Path]]:
+    """The live board as (scenario path, file) pairs, whichever folder holds it.
+
+    The board files are always taken (the demo's .gitignore hides them).
+    Anything else in the state folder is taken when the same file under
+    `resources/` would not be ignored, which is what `git add -A` took from a
+    0.8.3-layout board. So a capture is the same tree in either layout."""
+    state = bram_state.state_dir(repo)
+    if not state.is_dir():
+        return []
+    files = sorted(
+        path
+        for path in state.rglob("*")
+        if path.is_file() and path.relative_to(state).parts[0] not in UNCAPTURED_STATE
+    )
+    entries = [(f"{SCENARIO_STATE}/{path.relative_to(state).as_posix()}", path) for path in files]
+    forced = {f"{SCENARIO_STATE}/{rel}" for rel in (WORKLIST, CLAIMS, AUTH)}
+    drafts = f"{SCENARIO_STATE}/{DRAFTS}/"
+    optional = [rel for rel, _ in entries if rel not in forced and not rel.startswith(drafts)]
+    ignored: set[str] = set()
+    if optional:
+        out = run_git(
+            repo,
+            "check-ignore",
+            "--no-index",
+            "--stdin",
+            input_text="".join(f"{rel}\n" for rel in optional),
+            check=False,
+        )
+        ignored = set(out.splitlines())
+    return [(rel, path) for rel, path in entries if rel not in ignored]
 
 
 def _claim_records(repo: Path) -> list[dict[str, Any]]:
-    if not (repo / CLAIMS).exists():
+    claims_path = state_path(repo, CLAIMS)
+    if not claims_path.exists():
         return []
-    claims = read_json(repo / CLAIMS).get("intervals", [])
+    claims = read_json(claims_path).get("intervals", [])
     if not isinstance(claims, list):
         raise DemoError(f"expected an intervals array in {CLAIMS}")
     records: list[dict[str, Any]] = []
@@ -548,8 +1077,11 @@ def _commit_tree(repo: Path, tree: str, parent: str, message: str, step: int) ->
     )
 
 
-def capture_scenario(repo: Path, name: str, force: bool = False) -> str:
+def capture_scenario(
+    repo: Path, name: str, force: bool = False, layout: str | None = None
+) -> str:
     repo = validate_demo(repo)
+    layout = _resolve_layout(repo, layout)
     ref = scenario_ref(name)
     old = run_git(repo, "rev-parse", "--verify", "--quiet", ref, check=False)
     if old and not force:
@@ -565,7 +1097,7 @@ def capture_scenario(repo: Path, name: str, force: bool = False) -> str:
         "starters": list(live_meta.get("starters", [])),
     }
     write_json(repo / SCENARIO_META, scenario_doc)
-    final_tree = capture_tree(repo, boundary, _control_paths(repo))
+    final_tree = capture_tree(repo, boundary, [SCENARIO_META], _board_entries(repo))
 
     parent = boundary
     for index, record in enumerate(records, 1):
@@ -580,7 +1112,7 @@ def capture_scenario(repo: Path, name: str, force: bool = False) -> str:
         repo, final_tree, parent, f"Scenario {name}: parked pending work", len(records) + 1
     )
     run_git(repo, "update-ref", ref, pending, *( [old] if old else [] ))
-    use_scenario(repo, name)
+    use_scenario(repo, name, layout)
     return pending
 
 
@@ -613,8 +1145,73 @@ def _runtime_root(repo: Path) -> Path:
     return path
 
 
-def use_scenario(repo: Path, name: str) -> None:
+def _resolve_layout(repo: Path, layout: str | None) -> str:
+    """An explicit layout, else the one the active scenario was hydrated
+    with, else `.bram/`."""
+    if layout is not None:
+        if layout not in (LAYOUT_NEW, LAYOUT_LEGACY):
+            raise DemoError(f"unknown layout {layout!r}")
+        return layout
+    active_path = _runtime_root(repo) / "active.json"
+    if active_path.exists():
+        remembered = read_json(active_path).get("layout")
+        if remembered in (LAYOUT_NEW, LAYOUT_LEGACY):
+            return str(remembered)
+    return LAYOUT_NEW
+
+
+def _merge_move(src: Path, dst: Path) -> None:
+    """Move `src` to `dst`, merging into an existing directory so the live
+    port and traces already there survive; a scenario file wins a clash."""
+    if src.is_dir() and not src.is_symlink() and dst.is_dir() and not dst.is_symlink():
+        for child in list(src.iterdir()):
+            _merge_move(child, dst / child.name)
+        src.rmdir()
+        return
+    if dst.is_dir() and not dst.is_symlink():
+        shutil.rmtree(dst)
+    os.replace(src, dst)
+
+
+def _settle_state_folder(repo: Path, layout: str) -> None:
+    """Put the hydrated board (always checked out under `resources/`) and the
+    live port and traces into the layout's state folder.
+
+    `.bram/` is laid out as the mover lays it out: `.gitignore` = `*` first,
+    so the folder is never stageable, then the entries, then
+    `.migrated-from`, so a 0.8.4 binary sees a moved folder and never runs
+    the mover on a demo."""
+    legacy = repo / bram_state.STATE_DIR_LEGACY
+    new = repo / bram_state.STATE_DIR_NEW
+    if run_git(repo, "ls-files", "--", f"{bram_state.STATE_DIR_LEGACY}/", f"{bram_state.STATE_DIR_NEW}/"):
+        raise DemoError("refusing to move a state folder with tracked files")
+    if layout == LAYOUT_LEGACY:
+        if new.is_dir():
+            # A previous `.bram/` hydrate: carry the live port and traces back.
+            for entry in list(new.iterdir()):
+                if entry.name in (".gitignore", ".migrated-from"):
+                    entry.unlink()
+                else:
+                    _merge_move(entry, legacy / entry.name)
+            new.rmdir()
+        return
+    new.mkdir(exist_ok=True)
+    (new / ".gitignore").write_bytes(b"*\n")
+    if legacy.is_dir():
+        for entry in sorted(legacy.iterdir()):
+            if entry.name in (".gitignore", ".migrated-from"):
+                entry.unlink()
+            else:
+                _merge_move(entry, new / entry.name)
+        legacy.rmdir()
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    (new / ".migrated-from").write_bytes(f"{legacy} {stamp} demo-hydrate\n".encode("utf-8"))
+
+
+def use_scenario(repo: Path, name: str, layout: str | None = LAYOUT_NEW) -> None:
+    """Hydrate `name` into the given layout; None repeats the active one."""
     repo = validate_demo(repo)
+    layout = _resolve_layout(repo, layout)
     tip, doc = _scenario_doc(repo, name)
     boundary = str(doc.get("boundary", ""))
     run_git(repo, "cat-file", "-e", f"{boundary}^{{commit}}")
@@ -630,6 +1227,14 @@ def use_scenario(repo: Path, name: str) -> None:
     # Process/session infrastructure is not scenario state. Preserve the live
     # port and trace while a human is driving the second instance, along with
     # Setup's active agent files. Everything else untracked is disposable.
+    # The live instance's files are in its state folder, and the hydrate may
+    # be switching layouts, so keep them in either one; _settle_state_folder
+    # then moves them into the layout's folder. The checked-out board under
+    # resources/ is tracked at this point, so the clean leaves it alone.
+    live: list[str] = []
+    for state in (bram_state.STATE_DIR_NEW, bram_state.STATE_DIR_LEGACY):
+        live += ["-e", f"{state}/.bram-port", "-e", f"{state}/.bram-port.json"]
+        live += ["-e", f"{state}/bram-traces/"]
     run_git(
         repo,
         "clean",
@@ -641,14 +1246,10 @@ def use_scenario(repo: Path, name: str) -> None:
         "AGENTS.md",
         "-e",
         "CLAUDE.md",
-        "-e",
-        "resources/.bram-port",
-        "-e",
-        "resources/.bram-port.json",
-        "-e",
-        "resources/bram-traces/",
+        *live,
     )
     run_git(repo, "reset", "--mixed", "-q", boundary)
+    _settle_state_folder(repo, layout)
 
     _clear_claim_refs(repo)
     for record in doc.get("claimIntervals", []):
@@ -661,17 +1262,24 @@ def use_scenario(repo: Path, name: str) -> None:
 
     write_json(
         _runtime_root(repo) / "active.json",
-        {"boundary": boundary, "name": name, "ref": scenario_ref(name), "tip": tip},
+        {
+            "boundary": boundary,
+            "layout": layout,
+            "name": name,
+            "ref": scenario_ref(name),
+            "tip": tip,
+        },
     )
 
 
-def reset_scenario(repo: Path) -> str:
+def reset_scenario(repo: Path, layout: str | None = None) -> str:
+    """Rehydrate the active scenario, in its remembered layout unless given."""
     repo = validate_demo(repo)
     active_path = _runtime_root(repo) / "active.json"
     if not active_path.exists():
         raise DemoError("no active scenario; run 'use <name>' first")
     name = str(read_json(active_path).get("name", ""))
-    use_scenario(repo, name)
+    use_scenario(repo, name, layout)
     return name
 
 
@@ -689,22 +1297,33 @@ def add_starter(repo: Path, starter: str) -> None:
     builder = StarterBuilder(repo, scenario)
     occurrence = builder._occurrence(starter)
     prefix = builder._prefix(starter, occurrence)
-    path, seed = starter_seed(starter, prefix)
-    builder.file(path, seed)
+    seeds = starter_seeds(starter, prefix)
+    for path, seed in seeds:
+        builder.file(path, seed)
     # Extend the clean boundary with only this starter's baseline. Existing
     # dirty scenario work stays out of the new commit and remains in place.
     with temporary_index(repo, "HEAD") as env:
-        run_git(repo, "add", "--", path, env=env)
+        run_git(repo, "add", "--", *(path for path, _ in seeds), env=env)
         tree = run_git(repo, "write-tree", env=env)
     parent = run_git(repo, "rev-parse", "HEAD")
     boundary = _commit_tree(
         repo, tree, parent, f"Starter {starter}: clean baseline", occurrence + 100
     )
     run_git(repo, "update-ref", "HEAD", boundary)
+    # The baseline was committed through a temporary index, so the real index
+    # still lacks these paths: git status read them as staged deletions plus
+    # untracked files, never clean. Sync just these paths to the new HEAD.
+    run_git(repo, "reset", "-q", "--", *(path for path, _ in seeds))
     builder.add(starter)
 
 
-def new_scenario(repo: Path, name: str, starters: Sequence[str], force: bool = False) -> str:
+def new_scenario(
+    repo: Path,
+    name: str,
+    starters: Sequence[str],
+    force: bool = False,
+    layout: str = LAYOUT_NEW,
+) -> str:
     scenario_ref(name)
     repo = initialize_repo(repo)
     process_path = _runtime_root(repo) / "process.json"
@@ -714,6 +1333,8 @@ def new_scenario(repo: Path, name: str, starters: Sequence[str], force: bool = F
             raise DemoError(f"stop the running demo PID {pid} before creating a new scenario")
     base = run_git(repo, "rev-parse", "refs/heads/demo/base")
     run_git(repo, "reset", "--hard", "-q", base)
+    # Removes any `.bram/` too, so the starters build in resources/ and the
+    # capture's hydrate below moves them into the chosen layout.
     run_git(repo, "clean", "-fdx", "-q")
     run_git(repo, "checkout", "--detach", "--force", "-q", base)
     _clear_claim_refs(repo)
@@ -731,10 +1352,10 @@ def new_scenario(repo: Path, name: str, starters: Sequence[str], force: bool = F
         occurrences[starter] = occurrences.get(starter, 0) + 1
         n = occurrences[starter]
         prefix = starter if n == 1 else f"{starter}-{n}"
-        path, seed = starter_seed(starter, prefix)
-        target = repo / path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(seed, encoding="utf-8")
+        for path, seed in starter_seeds(starter, prefix):
+            target = repo / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(seed, encoding="utf-8")
     run_git(repo, "add", "--", "demo")
     run_git(
         repo,
@@ -752,7 +1373,7 @@ def new_scenario(repo: Path, name: str, starters: Sequence[str], force: bool = F
     builder = StarterBuilder(repo, name)
     for starter in expanded:
         builder.add(starter)
-    return capture_scenario(repo, name, force=force)
+    return capture_scenario(repo, name, force=force, layout=layout)
 
 
 def scrub_agent_environment(env: Mapping[str, str]) -> dict[str, str]:
@@ -764,21 +1385,96 @@ def scrub_agent_environment(env: Mapping[str, str]) -> dict[str, str]:
     return clean
 
 
-def assert_binary_current(binary: Path) -> None:
-    """Refuse evidence from a debug binary older than the checked-out HEAD."""
-    head_raw = run_git(SOURCE_ROOT, "log", "-1", "--format=%ct", check=False)
-    if not head_raw.isdigit():
-        return
-    binary_mtime = binary.stat().st_mtime
-    head_time = int(head_raw)
-    if binary_mtime < head_time:
+def newest_rust_source(root: Path) -> tuple[float, str]:
+    """The newest modification time among git-tracked files under src-tauri/,
+    and that file. Under the ./bram symlink launch the binary depends only on
+    src-tauri/ (app/** is served from disk), so this is the yardstick for a
+    stale binary.
+
+    demo-launcher-stale-check-fails-closed: raises when git can't list the
+    files. This used to return None, and the caller then skipped the check, so
+    wherever git couldn't run (Codex's sandbox, 2026-10-28: "unable to access
+    .../.config/git/ignore: Permission denied") a stale binary launched."""
+    try:
+        listing = run_git(root, "ls-files", "-z", "src-tauri")
+    except DemoError as e:
         raise DemoError(
-            "stale Bram binary: "
-            f"{binary} predates HEAD; rebuild before measuring this checkout"
+            f"can't check for a stale Bram binary: {e}; fix git access and retry"
+        ) from e
+    newest: tuple[float, str] | None = None
+    for rel in filter(None, listing.split("\0")):
+        try:
+            mtime = (root / rel).stat().st_mtime
+        except OSError:
+            continue  # deleted in the worktree
+        if newest is None or mtime > newest[0]:
+            newest = (mtime, rel)
+    if newest is None:
+        raise DemoError(
+            f"can't check for a stale Bram binary: git lists no src-tauri/ files under {root}"
+        )
+    return newest
+
+
+def assert_binary_current(binary: Path) -> None:
+    """Refuse evidence from a debug binary older than its Rust sources.
+
+    The test used to be "older than HEAD's commit time", which was wrong both
+    ways: any commit tripped it, scripts- and docs-only ones included, and an
+    uncommitted Rust edit, which never moves HEAD, slipped through. Comparing
+    against the newest tracked file under src-tauri/ catches committed and
+    uncommitted Rust changes and ignores everything else."""
+    newest_mtime, newest_path = newest_rust_source(SOURCE_ROOT)
+    if binary.stat().st_mtime < newest_mtime:
+        changed = time.strftime("%Y-%m-%d %H:%M", time.localtime(newest_mtime))
+        raise DemoError(
+            f"stale Bram binary: {binary} is older than {newest_path} "
+            f"(changed {changed}); rebuild with cargo build"
         )
 
 
 def _process_alive(pid: int) -> bool:
+    """Whether `pid` names a live process.
+
+    True when the process exists, including when it exists but cannot be
+    queried; False when it does not. Both branches keep that contract, because
+    callers treat False as "safe to proceed without stopping anything".
+
+    demo-instance-liveness-on-windows: signal 0 has no meaning on Windows, so
+    the POSIX probe below raised OSError [WinError 87] there — neither of the
+    exceptions it catches — and propagated. Both `stop` and `launch` call this
+    before doing anything useful, so each died before acting; `stop` failed
+    *without stopping anything*, which read as a broken verb rather than a
+    broken check. The rest of the file already branches on os.name (the SIGKILL
+    escalation in _stop_recorded is guarded that way for the same reason); this
+    call site was missed.
+    """
+    if os.name == "nt":
+        import ctypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        ERROR_ACCESS_DENIED = 5
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            # Exists but not queryable → alive, matching the PermissionError
+            # arm below. Any other failure (notably ERROR_INVALID_PARAMETER,
+            # which is what a dead PID gives) means gone.
+            return ctypes.get_last_error() == ERROR_ACCESS_DENIED
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return True
+            # A process that exited with code 259 is indistinguishable from a
+            # running one here — the standard STILL_ACTIVE wart. For a launcher
+            # of one known binary that is not worth a WaitForSingleObject call;
+            # swap to that if a real 259 ever shows up.
+            return code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -786,6 +1482,32 @@ def _process_alive(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def trace_in_source(op: str, **fields: Any) -> None:
+    """log-records-demo-instances: one `[demo-instance]` line in the working
+    Bram's trace (the checkout this script runs from), so its Log can say a
+    demo instance ran. Appended the way the guard appends its lines (append
+    mode, one write); skipped when that trace doesn't exist (tracing off, or
+    no Bram has run here). A failure to write never fails the launch."""
+    path = bram_state.state_dir(SOURCE_ROOT) / "bram-traces" / "bram-trace.log"
+    if not path.is_file():
+        return
+    now = time.time()
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now)) + f".{int(now * 1000) % 1000:03d}Z"
+    body = " ".join(f"{k}={v}" for k, v in fields.items() if v not in (None, ""))
+    try:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(f"[{ts}] [demo-instance] op={op} {body}".rstrip() + "\n")
+    except OSError:
+        pass
+
+
+def _active_scenario(repo: Path) -> str:
+    active_path = _runtime_root(repo) / "active.json"
+    if not active_path.exists():
+        return ""
+    return str(read_json(active_path).get("name", "")).replace(" ", "_")
 
 
 def launch_demo(repo: Path, binary: Path) -> dict[str, Any]:
@@ -834,6 +1556,7 @@ def launch_demo(repo: Path, binary: Path) -> dict[str, Any]:
     }
     _LAUNCHED_PROCESSES[proc.pid] = proc
     write_json(pid_path, record)
+    trace_in_source("launch", scenario=_active_scenario(repo), pid=proc.pid, repo=repo.name)
     return record
 
 
@@ -871,6 +1594,7 @@ def stop_demo(repo: Path, timeout: float = 5.0) -> int:
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=1)
     pid_path.unlink(missing_ok=True)
+    trace_in_source("stop", scenario=_active_scenario(repo), pid=pid, repo=repo.name)
     return pid
 
 
@@ -885,13 +1609,16 @@ def status(repo: Path) -> dict[str, Any]:
     refs = run_git(
         repo, "for-each-ref", "--format=%(refname) %(objectname)", "refs/bram/claims"
     ).splitlines()
-    worklist = read_json(repo / WORKLIST) if (repo / WORKLIST).exists() else {"items": []}
+    live_worklist = bram_state.state_dir(repo) / "worklist.json"
+    worklist = read_json(live_worklist) if live_worklist.exists() else {"items": []}
     process_path = runtime / "process.json"
     process = read_json(process_path) if process_path.exists() else {}
     pid = int(process.get("pid", 0) or 0)
     return {
         "activeScenario": active.get("name"),
         "claimRefs": refs,
+        "layout": active.get("layout"),
+        "stateDir": bram_state.state_dir_name(repo),
         "dirty": run_git(repo, "status", "--short").splitlines(),
         "items": len(worklist.get("items", [])),
         "log": str(runtime / "bram.log"),
@@ -899,6 +1626,51 @@ def status(repo: Path) -> dict[str, Any]:
         "repo": str(repo),
         "scenarios": branches,
     }
+
+
+def prune_scenarios(
+    repo: Path, matches: Sequence[str], keep: int, dry_run: bool, gc: bool
+) -> tuple[list[str], list[str]]:
+    """Remove scenario branches matching any glob in `matches`, keeping the
+    newest `keep` of them and never the active scenario. Returns (removed,
+    skipped). "Newest" is by name, not commit date: scenario commits carry
+    fixed dates (`_fixed_git_env`) so their trees are reproducible, and the
+    starter check's `check-YYYYMMDD-HHMMSS` names sort in time order."""
+    repo = validate_demo(repo)
+    active_path = _runtime_root(repo) / "active.json"
+    active = (read_json(active_path) if active_path.exists() else {}).get("name")
+    names = run_git(
+        repo, "for-each-ref", "--format=%(refname:strip=3)", "refs/heads/scenario"
+    ).splitlines()
+    matched = sorted(
+        (n for n in names if any(fnmatch.fnmatchcase(n, m) for m in matches)), reverse=True
+    )
+    removed: list[str] = []
+    skipped: list[str] = []
+    for i, name in enumerate(matched):
+        if name == active:
+            skipped.append(f"{name} (active)")
+            continue
+        if i < keep:
+            skipped.append(f"{name} (kept)")
+            continue
+        if not dry_run:
+            run_git(repo, "branch", "-D", f"scenario/{name}")
+        removed.append(name)
+    if gc and not dry_run:
+        run_git(repo, "gc", "--prune=now", "--quiet")
+    return removed, skipped
+
+
+def _layout_flag(parser: argparse.ArgumentParser, help_text: str) -> None:
+    parser.add_argument(
+        "--legacy-layout",
+        dest="layout",
+        action="store_const",
+        const=LAYOUT_LEGACY,
+        default=None,
+        help=help_text,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -915,15 +1687,19 @@ def build_parser() -> argparse.ArgumentParser:
     new.add_argument("name")
     new.add_argument("--from", dest="starters", action="append", choices=(*STARTERS, "all"))
     new.add_argument("--force", action="store_true")
+    _layout_flag(new, "hydrate into resources/, the 0.8.3 layout (default: .bram/)")
 
     use = sub.add_parser("use", help="hydrate a parked scenario exactly")
     use.add_argument("name")
+    _layout_flag(use, "hydrate into resources/, the 0.8.3 layout (default: .bram/)")
 
     capture = sub.add_parser("capture", help="park the current stumbled-into state")
     capture.add_argument("name")
     capture.add_argument("--force", action="store_true")
+    _layout_flag(capture, "rehydrate into resources/ (default: the active layout)")
 
-    sub.add_parser("reset", help="rehydrate the active scenario")
+    reset = sub.add_parser("reset", help="rehydrate the active scenario")
+    _layout_flag(reset, "rehydrate into resources/ (default: the active layout)")
 
     add = sub.add_parser("add", help="add a starter to the live dirty fixture")
     add.add_argument("starter", choices=STARTERS)
@@ -940,6 +1716,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     status_parser = sub.add_parser("status", help="show scenarios and live fixture state")
     status_parser.add_argument("--json", action="store_true")
+
+    prune = sub.add_parser(
+        "prune",
+        help="remove scenario branches (default: the starter check's check-* boards)",
+    )
+    prune.add_argument(
+        "--match",
+        action="append",
+        help="glob over scenario names; repeatable (default: check-*)",
+    )
+    prune.add_argument(
+        "--keep", type=int, default=0, help="keep the newest N matches, newest by name"
+    )
+    prune.add_argument("--dry-run", action="store_true", help="list, change nothing")
+    prune.add_argument(
+        "--gc", action="store_true", help="then git gc --prune=now to reclaim the space"
+    )
     return parser
 
 
@@ -947,16 +1740,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         if args.command == "new":
-            tip = new_scenario(args.repo, args.name, args.starters or ["all"], args.force)
+            tip = new_scenario(
+                args.repo, args.name, args.starters or ["all"], args.force, args.layout or LAYOUT_NEW
+            )
             print(f"created and hydrated scenario/{args.name} ({tip[:12]})")
         elif args.command == "use":
-            use_scenario(args.repo, args.name)
+            use_scenario(args.repo, args.name, args.layout or LAYOUT_NEW)
             print(f"hydrated scenario/{args.name}")
         elif args.command == "capture":
-            tip = capture_scenario(args.repo, args.name, args.force)
+            tip = capture_scenario(args.repo, args.name, args.force, args.layout)
             print(f"captured and hydrated scenario/{args.name} ({tip[:12]})")
         elif args.command == "reset":
-            print(f"reset scenario/{reset_scenario(args.repo)}")
+            print(f"reset scenario/{reset_scenario(args.repo, args.layout)}")
         elif args.command == "add":
             add_starter(args.repo, args.starter)
             print(f"added {args.starter}; capture it to make it durable")
@@ -972,11 +1767,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(json.dumps(value, indent=2, sort_keys=True))
             else:
                 print(f"repo: {value['repo']}")
-                print(f"active: {value['activeScenario'] or '-'}")
+                print(f"active: {value['activeScenario'] or '-'}  state folder: {value['stateDir']}/")
                 print(f"scenarios: {', '.join(value['scenarios']) or '-'}")
                 print(f"items: {value['items']}  claims: {len(value['claimRefs'])}")
                 print(f"dirty paths: {len(value['dirty'])}  pid: {value['pid'] or '-'}")
                 print(f"log: {value['log']}")
+        elif args.command == "prune":
+            removed, skipped = prune_scenarios(
+                args.repo, args.match or ["check-*"], args.keep, args.dry_run, args.gc
+            )
+            verb = "would remove" if args.dry_run else "removed"
+            for name in removed:
+                print(f"{verb} scenario/{name}")
+            for note in skipped:
+                print(f"kept scenario/{note}")
+            print(f"{verb} {len(removed)} scenario(s)" + (" and ran gc" if args.gc and not args.dry_run else ""))
         return 0
     except DemoError as exc:
         print(f"demo-instance: {exc}", file=sys.stderr)

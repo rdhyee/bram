@@ -1,9 +1,10 @@
 # Releasing Bram
 
-Debug builds are the shipping format. The Rust side is thin glue (PTY
-relay, loopback HTTP file server, small git/sessions queries); the
-heavy lifting is XMLUI's TypeScript runtime in the WebView, which is
-identical between debug and release. The audience is XMLUI developers,
+Debug builds are the shipping format. The Rust host is large and
+carries most of Bram's logic (the PTY, the loopback server, git and
+session queries, the Worklist gate and its guards). The pane runs on
+XMLUI's TypeScript runtime in the WebView, which is identical between
+debug and release. The audience is XMLUI developers,
 who benefit from devtools being accessible. Don't propose `cargo build
 --release`, code signing, notarization, or installer pipelines.
 
@@ -50,6 +51,55 @@ dispatching the workflow against an existing tag, etc.
    builds debug binaries for linux-amd64, macos-arm64, macos-intel,
    and windows-amd64, generates SHA256SUMS, and attaches `install.sh`
    / `install.ps1`.
+
+## Release notes
+
+**Who does what.** Jon runs `bump.sh`. The agent writes the notes in
+`~/Desktop/release.md`, keeping `# Bram v<VERSION>` as the title, and
+Jon pastes them into the GitHub release. The release body's fixed parts
+(prerequisite, install, troubleshooting) come from
+`.github/release-body-template.md`.
+
+**Shape.**
+
+1. A lead that says what the release means for users.
+2. Sections by user-facing change, not by commit.
+3. `### Known rough edges`.
+4. `### Credits`.
+
+**Readiness, before the notes are final:**
+
+- all tests pass (`cargo test` in `src-tauri/`);
+- `cargo fmt --check` is clean;
+- CI has passed on the tip;
+- nothing is unpushed;
+- the tracked tree is clean (`bump.sh` refuses a dirty tree; an
+  installed `.claude/bram-reference/` copy that Setup refreshed counts);
+- the issues the notes list as closed really are closed.
+
+After any Push-button rebase, expect `bump.sh` to warn about
+worklist-history entries whose commits aren't ancestors of `HEAD`
+(#277). That's expected, not a failure.
+
+**Credits,** gathered from the record, not from memory (added in
+v0.7.0, when Bram gained real collaborators):
+
+- **Code:** `git log --format='%h %an %s' v<prev>..v<new>`, minus the
+  maintainer's own commits. Group by contributor and pull request, and
+  describe what each contribution does.
+- **Reports and discussion:** everyone except the maintainer who
+  - opened an issue in the cycle:
+    `gh issue list --state all --search "created:>=<prev tag date>"`;
+  - or commented on an issue or pull request since the previous tag:
+    `gh api "repos/judell/bram/issues/comments?since=<prev tag ISO time>"`.
+
+  Name each person, list the issues they raised or discussed, and say
+  which ones this release fixes.
+- **Names:** use the display name from `gh api users/<login>`. When a
+  profile has none, use the name the maintainer uses for that person,
+  plus their handle.
+- **Scope:** the bram repository only, unless the maintainer names
+  other places.
 
 ## Testing the update banner
 

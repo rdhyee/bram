@@ -2,7 +2,7 @@
 
 ## What is it?
 
-A desktop app that wraps Claude Code and Codex in a GUI and embeds them in a structured, audited, and search-enabled workflow that connects to GitHub or GitLab.
+Agentic software development on human terms: legible, orderly, transparent, accountable, and collaborative.
 
 ## Why the name?
 
@@ -10,52 +10,19 @@ Bram runs agents mindfully.
 
 ## Who is it for?
 
-Anyone who uses Claude Code and/or Codex.
+Anyone who uses Claude Code, Codex, OpenCode and/or Antigravity.
 
-<img width="1078" height="1034" alt="v0 6 6" src="https://github.com/user-attachments/assets/cac26927-a65a-4e11-b72c-78be758fd19c" />
-
-
-## Demo
-
-This storyboard shows Bram and XMLUI co-evolving on August 26, 2026. In the ~/xmlui repo we burn down a set of issues and stress-test Bram's ability to manage file entanglement across items being handled by parallel subagents. In the ~/bram repo we burn down issues raised in response to findings from ~/xmlui. Real work happened on both sides while each helped improve the other.
-
-https://gist.github.com/judell/663ac00adf36a01096f2bdcdd08642ae
-
-
-## Blog
-
-<a href="https://blog.jonudell.net/2026/06/02/how-to-make-best-use-of-git-and-github-for-ai-assisted-software-development/">How to make best use of git and GitHub for AI-assisted software development</a>
-
-<a href="https://blog.jonudell.net/2026/06/17/vibe-coding-as-a-team-sport/">Vibe coding as a team sport</a>
-
-<a href="https://blog.jonudell.net/2026/06/28/doctor-it-hurts-when-agents-create-unreviewable-prs-dont-do-that/">“Doctor, it hurts when agents create unreviewable PRs.” “Don’t do that.”</a>
-
-<a href="https://blog.jonudell.net/2026/07/01/what-is-the-terminal/">"What is the terminal?"</a>
-
-<a href="https://blog.jonudell.net/2026/07/08/dont-infer-behavior-from-code-observe-it-in-logs/">Don’t infer behavior from code, observe it in logs</a>
-
-<a href="https://blog.jonudell.net/2026/07/16/talking-to-claude-code-and-codex/">Talking to Claude Code and Codex</a>
-
-<a href="https://blog.jonudell.net/2026/07/12/small-models-can-solve-big-problems/">Small models can solve big problems</a>
-
-<a href="https://blog.jonudell.net/2026/07/23/agents-that-narrate-their-work-are-the-best-team-players/">Agents that narrate their work are the best team players</a>
-
-<a href="https://blog.jonudell.net/2026/08/01/make-agent-memory-searchable/">Make agent memory searchable</a>
-
-### Elsewhere
-
-<a href="https://www.infoworld.com/article/4211198/when-an-ai-agent-goes-off-the-rails-file-a-bug-to-fix-the-documentation-then-test-the-fix.html">When an AI agent goes off the rails, file a bug to fix the documentation – then test the fix</a>
-
-<a href="https://waltzweb.wordpress.com/2026/07/02/github-for-todays-hybrid-teams/">Technical or not, human or AI – could Bram be the missing link?</a>
-
-<a href="https://arxiv.org/abs/2607.25975">Who is scientific code for? Maintaining human-readable landmarks in agent-written code</a>
+<a href="https://judell.github.io/bram/"><img alt="Bram demo video: a six-minute tour of Bram tackling and completing a GitHub issue. Click to watch on the Bram homepage." src="site/poster.jpg" /></a>
 
 ## How does it work?
 
 ### Terminal (optional)
 
-A terminal where you run `claude` or `codex`. It can be hidden in favor of the
-agent pane's Worklist, Transcript, and Queue views.
+A terminal where you run `claude`, `codex`, `opencode` or `agy` (Antigravity). It starts closed, in favor of the
+agent pane's Worklist, Transcript, and Queue views. The **terminal** button in
+the toolbar opens and closes it for the current session; to have it open every
+time Bram launches, turn on **Terminal open at startup** in the Settings tab's
+UI section.
 
 ### Agent pane
 
@@ -74,6 +41,8 @@ agent pane's Worklist, Transcript, and Queue views.
 - Sessions: Lists your sessions; rename, delete, or switch between them.
 
 - History: Lists and searches your Worklist items.
+
+- Log: Under **More**, tells what Bram did around your work (Start, Commit and Push, your searches, queued messages, session switches, a kept selection after a pane reload, demo instances) over the last five hours and across relaunches. Entries expand and link to History, Commits and the Transcript.
 
 - Settings: Shows and changes global (repo-independent) settings.
 
@@ -116,15 +85,20 @@ items, moving them from proposal to commit, coordinating commits and issues)
 live in [`app/__shell/conventions.md`](./app/__shell/conventions.md). Each agent
 loads that file automatically: Claude through `CLAUDE.md` and the installed
 `.claude` hook/config path, Codex through a repo-local `AGENTS.md` block that
-setup installs. These aren't merely advisory: a `PreToolUse` hook on each agent
-enforces the core rule, rejecting file edits that aren't covered by an approved
+setup installs, OpenCode through an `instructions` entry in
+`.opencode/opencode.json`, Antigravity through always-on rules in
+`.agents/rules/`. These aren't merely advisory: a `PreToolUse` hook
+(for OpenCode, a plugin; for Antigravity, a hook group in `.agents/hooks.json`) on each agent enforces the core rule, rejecting file edits that aren't covered by an approved
 Worklist item — so the convention enforces itself rather than relying on the
 agent's goodwill.
 
 
 ## Prerequisites
 
-1. A local git repo in which you develop your app
+1. A local git repo in which you develop your app. Start Bram from that
+   repo's root folder: `cd` there in your terminal and run `bram`.
+   Anywhere else (your home directory, a folder that isn't a git repo, or
+   a subfolder of one), Bram starts nothing and says where to start from.
 
 2. **`git`** — usually preinstalled on macOS and Linux; install via
    your package manager if missing.
@@ -137,8 +111,8 @@ agent's goodwill.
 
 4. **XMLUI CLI - optional.** If you are developing an XMLUI app, or if you are developing `Bram` itself (the agent pane UI is an embedded XMLUI app) you will want the XMLUI MCP server. Follow the steps [here](https://xmlui.org/get-started) to get it.
 
-5. **`whisper-server` — optional.** Powers the 🎤 voice button in the
-   parent-shell toolbar and the agent pane. Tested on macOS and Windows/WSL, see [Voice input](#voice-input) below for install and per-platform
+5. **`whisper-server` — optional.** Powers the 🎤 dictation buttons in
+   the agent pane. Tested on macOS and Windows, see [Voice input](#voice-input) below for install and per-platform
    status.
 
 ## [Download the latest release →](https://github.com/judell/bram/releases/latest)
@@ -171,19 +145,38 @@ Downloads `bram-windows-amd64.zip`, verifies its SHA256, extracts `bram.exe` to 
 
 #### Smart App Control
 
-On some Windows 11 setups, Smart App Control may block the unsigned binary — most users report no problem. If you do hit a block, you can disable SAC under **Windows Security → App & browser control → Smart App Control settings**. Before flipping the switch, read Microsoft's [Smart App Control FAQ](https://support.microsoft.com/en-us/windows/smart-app-control-frequently-asked-questions-285ea03d-fa88-4d56-882e-6698afdb7003) so you understand the consequences for your machine — the re-enable path has changed across Windows updates.
+Bram's Windows binaries are unsigned. On a machine where Smart App Control (SAC) is on, Windows may refuse to run them. Most users never see this.
+
+Smart App Control is a reputation filter that Windows turns off on its own for developer and enterprise-managed machines ("so you can work with fewer interruptions," per Microsoft). If it's on and blocks Bram, Microsoft's documented remedies are to turn it off or to use a signed build ("There is currently no way to bypass Smart App Control protection for individual apps"). Defender keeps protecting the machine either way ("Smart App Control works alongside your other security software, such as Microsoft Defender"), and current Windows builds can turn SAC back on later. Because SAC judges each file by its reputation, one Bram release can be allowed and the next refused.
+
+To check your machine (0 = Off, 1 = On, 2 = Evaluation):
+
+```powershell
+(Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy').VerifiedAndReputablePolicyState
+```
+
+To turn it off: **Windows Security → App & browser control → Smart App Control settings**.
+
+Two caveats:
+
+- **Turning it back on.** Microsoft's support page says "Recent Windows updates allow Smart App Control to be re‑enabled without requiring a clean installation" (since the April 2026 update for 25H2). Its developer page still calls the switch "a one-way operation".
+- **The October 2026 update.** KB5127648 can grey out the toggle on 24H2, 25H2 and 26H2, until Microsoft fixes it.
+
+Sources: [What is Smart App Control](https://support.microsoft.com/en-us/topic/what-is-smart-app-control-285ea03d-fa88-4d56-882e-6698afdb7003) (Microsoft Support); [Test App Signatures with Smart App Control](https://learn.microsoft.com/en-us/windows/apps/develop/smart-app-control/test-your-app-with-smart-app-control) (Microsoft Learn); [re-enabling without reinstalling](https://blog-en.topedia.com/2026/04/smart-app-control-in-windows-11-can-now-be-re-enabled-without-reinstalling/) (topedia); [KB5127648 greys out the toggle](https://www.it-connect.tech/windows-11-kb5127648-breaks-smart-app-control-in-october-2026-update/) (IT-Connect).
 
 ### First-run setup
 
-The first time you launch `claude` or `codex` in a repo, Bram checks what that provider needs and prompts once if anything is missing — no prompt on later launches. Accepting Bram's setup prompt installs the Worklist conventions the agent reads each session plus provider-specific hooks that enforce the Worklist and show permission menus. A provider-neutral authorization record and watcher-revert fallback back up those hooks.
+The first time you launch `claude`, `codex`, `opencode` or `agy` in a repo, Bram checks what that provider needs and prompts once if anything is missing — no prompt on later launches. Accepting Bram's setup prompt installs the Worklist conventions the agent reads each session plus provider-specific hooks that enforce the Worklist and show permission menus. A provider-neutral authorization record and watcher-revert fallback back up those hooks.
 
-Claude and Codex differ in the trust step you see after Bram writes those files:
+The agents differ in the trust step you see after Bram writes those files:
 
-- **Claude setup** is repo-local. Bram writes `.claude/bram-conventions.md`, `.claude/hooks/claude-worklist-guard.py`, `.claude/hooks/claude-permission-menu-hook.py`, and `.claude/settings.json` registrations. Claude reads that project config on launch; there is no separate Codex-style hook trust menu. The Claude `PreToolUse` hook is the safety gate for `Write`, `Edit`, and `Bash`; the permission hook shows Claude permission and AskUserQuestion prompts in Bram's agent pane.
-- **Codex setup** has an explicit trust/approval step. Bram writes user-global hook scripts under `~/.bram`, updates `~/.codex/config.toml`, writes Bram `developer_instructions`, and adds a repo-local `AGENTS.md` block. Codex then shows its hook approval screen; approve it only when it points at Bram-owned paths such as `~/.bram/codex-worklist-guard.py`, `~/.bram/codex-permission-menu-hook.py`, `~/.codex/config.toml`, and this repo's `AGENTS.md`. The Codex `PreToolUse` hook gates `apply_patch`, `Bash`, `Write`, `Edit`, and mutation-shaped MCP tools; the Codex permission hook shows `PermissionRequest` / `PostToolUse` menus in Bram's agent pane.
-- **Do not approve unexpected Codex paths.** If the Codex approval screen lists hook scripts somewhere other than `~/.bram` or config changes somewhere other than the expected Codex/project files, stop and inspect them first.
+- **Claude setup** is repo-local. Bram writes `.claude/bram-conventions.md` and `.claude/settings.json` hook registrations that point at `~/.bram/bram-guard`. Claude reads that project config on launch; there is no separate Codex-style hook trust menu. The Claude `PreToolUse` hook is the safety gate for `Write`, `Edit`, and `Bash`; the permission hook shows Claude permission and AskUserQuestion prompts in Bram's agent pane.
+- **Codex setup** has an explicit trust/approval step. Bram updates `~/.codex/config.toml` with hook registrations that point at `~/.bram/bram-guard`, writes Bram `developer_instructions`, and adds a repo-local `AGENTS.md` block. Codex then shows its hook approval screen; approve it only when it points at Bram-owned paths such as `~/.bram/bram-guard`, `~/.codex/config.toml`, and this repo's `AGENTS.md`. The Codex `PreToolUse` hook gates `apply_patch`, `Bash`, `Write`, `Edit`, and mutation-shaped MCP tools; the Codex permission hook shows `PermissionRequest` / `PostToolUse` menus in Bram's agent pane.
+- **OpenCode setup** is repo-local, with no trust screen. Bram writes `.opencode/plugins/bram.js` and adds an `instructions` entry to `.opencode/opencode.json` so OpenCode loads the conventions every session. It does this only where OpenCode can run: its CLI is on your PATH, it is the active agent, or the plugin is already installed. The plugin is OpenCode's counterpart of the `PreToolUse` hook: before each tool call that can change the project, it asks `~/.bram/bram-guard`, and it refuses the call unless the answer is an allow, including when the guard can't be reached. It also forwards OpenCode's turns and permission prompts to Bram's agent pane. Setup keeps a `.opencode/plugins/bram.js` you wrote yourself (one without Bram's marker) and reports that it did.
+- **Antigravity setup** is repo-local; the trust screen you see is agy's own folder-trust prompt the first time it opens a workspace. Bram merges a `bram-worklist-guard` group into `.agents/hooks.json`, keeping your own groups, and writes the conventions as always-on rules in `.agents/rules/bram-conventions-<n>.md`. It does this only where Antigravity can run: `agy` is on your PATH, it is the active agent, or Bram's group is already installed. The group runs `~/.bram/bram-guard` as a `PreToolUse` hook before agy's `write_file`, `edit_file`, `run_command` and `call_mcp_tool`, and the call is refused unless the answer is an allow. Setup keeps a rule you wrote yourself under one of those names, and leaves alone a `.agents/hooks.json` that isn't JSON; it reports both. Where `.agents/` has no tracked files and no `.gitignore`, Setup writes a `.agents/.gitignore` naming what it seeded.
+- **Do not approve unexpected Codex paths.** If the Codex approval screen lists hook commands other than `~/.bram/bram-guard` or config changes somewhere other than the expected Codex/project files, stop and inspect them first.
 
-Hook names mean the same thing in both providers:
+Hook names mean the same thing in Claude and Codex:
 
 - **`PreToolUse`** runs before a tool executes and blocks mutations that are not covered by the Worklist or by an explicit direct-edit authorization.
 - **`PermissionRequest`** lets Bram render permission prompts from structured hook payloads instead of scraping the terminal grid.
@@ -202,57 +195,65 @@ Current behavior:
 - **Claude in a repo that is already set up** — no prompt.
 - **Codex in a fresh repo** — prompt once. Setup installs the provider-neutral core, the codex hook adapter, and the codex `developer_instructions`, and it also refreshes the shared Claude-side artifacts that live in the repo.
 - **Codex in a repo where setup has already run** — no prompt. The repo and user-global Codex setup artifacts are already in place.
+- **OpenCode in a fresh repo** — prompt once. Setup installs the provider-neutral core, the OpenCode plugin, and the `instructions` entry in `.opencode/opencode.json`.
+- **OpenCode in a repo where setup has already run** — no prompt.
+- **Antigravity in a fresh repo** — prompt once. Setup installs the provider-neutral core, Bram's hook group in `.agents/hooks.json`, and the always-on rules in `.agents/rules/`.
+- **Antigravity in a repo where setup has already run** — no prompt.
 
 When the prompt runs, Bram installs two layers:
 
 - A provider-neutral core: Bram records the latest structured `approved:` / `drop:` payload in `resources/.worklist-authorization.json` and uses that local record when validating Worklist removals. The desktop watcher can revert an invalid prune as a defense-in-depth fallback if a hook ever fails to fire.
-- A Claude adapter: `.claude/hooks/claude-worklist-guard.py`, registered in `.claude/settings.json` as a `PreToolUse` hook for `Write|Edit|Bash`. The hook denies edits to project files not covered by a proposed/applied worklist item (with the explicit opt-out phrase "just do it" in the last user message as the escape hatch), validates worklist-prune authorization for changes to `resources/worklist.json` itself, and blocks mutation-shaped Bash commands without worklist coverage. Setup also installs `.claude/hooks/claude-permission-menu-hook.py` for Claude permission and AskUserQuestion surfacing in the agent pane.
-- A Codex adapter: `~/.bram/codex-worklist-guard.py`, registered in `~/.codex/config.toml` as a `PreToolUse` hook with matcher `^(apply_patch|Bash|Write|Edit|mcp__.*)$`. Same coverage logic as the Claude hook, broadened to catch Codex's `apply_patch` tool and MCP filesystem write/edit/create/move calls. Setup also writes `developer_instructions` into the Codex config so the gate prose lands in the developer-role context part of every session, not just the user-role `AGENTS.md`, and installs `~/.bram/codex-permission-menu-hook.py` for `PermissionRequest` / `PostToolUse` menu surfacing with the xterm grid retained as fallback. Existing `~/.xmlui-desktop/codex-worklist-guard.py` installs remain accepted during migration; rerunning Setup rewrites the config to the Bram path.
+- A Claude adapter: `~/.bram/bram-guard guard claude-worklist`, registered in `.claude/settings.json` as a `PreToolUse` hook for `Write`, `Edit`, `Bash`, and `mcp__.*`. The hook denies edits to project files not covered by a proposed/applied worklist item (with the explicit opt-out phrase "just do it" in the last user message as the escape hatch), validates worklist-prune authorization for changes to `resources/worklist.json` itself, and blocks mutation-shaped Bash commands without worklist coverage. Setup also registers `~/.bram/bram-guard guard claude-permission-menu` for Claude permission and AskUserQuestion surfacing in the agent pane.
+- A Codex adapter: `~/.bram/bram-guard guard codex-worklist`, registered in `~/.codex/config.toml` as a `PreToolUse` hook with matcher `^(apply_patch|Bash|Write|Edit|mcp__.*)$`. Same coverage logic as the Claude hook, broadened to catch Codex's `apply_patch` tool and MCP filesystem write/edit/create/move calls. Setup also writes `developer_instructions` into the Codex config so the gate prose lands in the developer-role context part of every session, not just the user-role `AGENTS.md`, and registers `~/.bram/bram-guard guard codex-permission-menu` for `PermissionRequest` / `PostToolUse` menu surfacing with the xterm grid retained as fallback.
 
-In the Bram source repo, every provider hook lives under
-`app/provider-hooks/` with a provider-prefixed name, and that is the
-source of truth. The copies Setup installs are runtime artefacts,
-refreshed from those sources by Setup and by `src-tauri/build.rs`
-during Cargo builds:
+Every hook is the same compiled Rust binary, `bram-guard`, built from
+`src-tauri/src/bin/bram-guard.rs` (the logic lives in
+`src-tauri/src/guard.rs`) and shipped beside the `bram` executable. The
+first argument after `guard` picks the hook: `claude-worklist`,
+`claude-permission-menu`, `codex-worklist`, `codex-permission-menu`,
+`opencode-worklist` or `antigravity-worklist`.
+Hook configs never reference the binary's own location. They reference
+`~/.bram/bram-guard`, which Bram re-points at its own `bram-guard` on
+every launch: a symlink on macOS and Linux, a hardlink (or copy) of
+`bram-guard.exe` on Windows. Moving or updating the app therefore never
+orphans the registration. Earlier releases installed Python hook scripts
+(`.claude/hooks/*.py`, `~/.bram/codex-*.py`); Setup deletes each one once
+no Claude settings file (or, for the Codex scripts, `~/.codex/config.toml`)
+still references it.
 
-| canonical | installed |
-|---|---|
-| `app/provider-hooks/claude-worklist-guard.py` | `.claude/hooks/claude-worklist-guard.py` |
-| `app/provider-hooks/claude-permission-menu-hook.py` | `.claude/hooks/claude-permission-menu-hook.py` |
-| `app/provider-hooks/codex-worklist-guard.py` | `~/.bram/codex-worklist-guard.py` |
-| `app/provider-hooks/codex-permission-menu-hook.py` | `~/.bram/codex-permission-menu-hook.py` |
+PreToolUse hooks are the generic extension point — both Claude Code and codex expose them — so the two adapters share the same shape: each runs *before* the agent invokes a tool, receives a JSON payload describing the pending call on stdin, and can exit 0 to allow, return a deny decision to block (stderr/permissionDecisionReason goes back to the agent as a tool error), or fail to launch. OpenCode has no such hook, so its adapter is a plugin (`.opencode/plugins/bram.js`) whose `execute.before` tool hook asks the same guard (`~/.bram/bram-guard guard opencode-worklist`) and throws to refuse the call; OpenCode's model reads the message as the refusal. The plugin fails closed: no guard, no answer, or an unreadable answer is a deny. Antigravity does expose `PreToolUse`, in `.agents/hooks.json`; its group runs `~/.bram/bram-guard guard antigravity-worklist`, which maps agy's tools onto Claude's before the shared policy decides. Because agy runs a call when a hook exits 0 with empty output, the registered command turns empty output into a deny.
 
-Functional edits belong in the canonical copy. Editing an installed one
-creates setup drift and may be overwritten by the next build.
+That means first-run setup is provider-aware in when it prompts but provider-symmetric in what it installs: launching either `claude` or `codex` and accepting the prompt sets up the shared core, the Codex-side `AGENTS.md` guidance block, the Codex `developer_instructions`, the Worklist guard hooks, and the permission-menu surfacing hooks. The OpenCode plugin and its `instructions` entry are the exception: Setup writes them only where OpenCode can run, so projects whose users never run OpenCode get no `.opencode/` directory. Antigravity's hook group and rules are the same kind of exception: projects whose users never run `agy` get no `.agents/hooks.json` or `.agents/rules/`.
 
-PreToolUse hooks are the generic extension point — both Claude Code and codex expose them — so the two adapters share the same shape: each runs *before* the agent invokes a tool, receives a JSON payload describing the pending call on stdin, and can exit 0 to allow, return a deny decision to block (stderr/permissionDecisionReason goes back to the agent as a tool error), or fail to launch.
-
-That means first-run setup is provider-aware in when it prompts but provider-symmetric in what it installs: launching either `claude` or `codex` and accepting the prompt sets up the shared core, the Codex-side `AGENTS.md` guidance block, the Codex `developer_instructions`, the Worklist guard hooks, and the permission-menu surfacing hooks.
-
-#### How `conventions.md` governs both agents
+#### How `conventions.md` governs each agent
 
 `app/__shell/conventions.md` is the canonical project convention file.
-It governs Claude and Codex in different ways:
+It governs Claude, Codex, OpenCode and Antigravity in different ways:
 
-- **Claude: direct prompt binding plus enforcement.** Setup copies that file to `.claude/bram-conventions.md`, adds an `@`-import block to `CLAUDE.md`, and installs the `worklist-guard.py` PreToolUse hook. A new Claude session therefore reads the conventions file directly and is also mechanically blocked from unsafe worklist edits. Existing projects with the legacy `.claude/xmlui-desktop-conventions.md` path are migrated to the new name on the next Setup run.
+- **Claude: direct prompt binding plus enforcement.** Setup copies that file to `.claude/bram-conventions.md`, adds an `@`-import block to `CLAUDE.md`, and registers the `bram-guard` PreToolUse hook. A new Claude session therefore reads the conventions file directly and is also mechanically blocked from unsafe worklist edits. Existing projects with the legacy `.claude/xmlui-desktop-conventions.md` path are migrated to the new name on the next Setup run.
 - **Codex: repo-local AGENTS.md plus native hook enforcement.** Setup writes a marked Bram block into repo-root `AGENTS.md`, installs top-level `developer_instructions` in `~/.codex/config.toml`, and registers the Codex Worklist guard as a native `PreToolUse` hook. Codex launches also receive the same concise Worklist guidance as a startup seed. The app reinforces that with the shared local authorization record in `resources/.worklist-authorization.json` and the watcher-revert fallback as defense in depth.
+- **OpenCode: an `instructions` entry plus plugin enforcement.** Setup adds the conventions to the `instructions` list in `.opencode/opencode.json`, which OpenCode loads every session, and seeds the plugin described above as the Worklist guard.
+- **Antigravity: always-on rules plus hook enforcement.** Setup cuts the conventions into always-on rules (`.agents/rules/bram-conventions-<n>.md`, each under agy's 24,000-byte rule limit), which agy loads every session, and registers the hook group described above as the Worklist guard.
 
-So the practical rule is: both agents are governed by the same Worklist
-conventions, with Claude reading the imported conventions file directly
-and Codex receiving the equivalent guidance through AGENTS, top-level
-`developer_instructions`, and its native hook adapter.
+So the practical rule is: every agent is governed by the same Worklist
+conventions, with Claude reading the imported conventions file directly,
+Codex receiving the equivalent guidance through AGENTS, top-level
+`developer_instructions`, and its native hook adapter, OpenCode
+loading them as instructions under its plugin, and Antigravity loading
+them as always-on rules under its hook group.
 
-Claude and Codex also differ in how they *call* Bram's Worklist
-lifecycle routes. Claude uses the loopback HTTP endpoints directly.
+The agents also differ in how they *call* Bram's Worklist
+lifecycle routes. Claude, OpenCode and Antigravity use the loopback HTTP endpoints directly
+(for Antigravity, behind agy's own command permission).
 Codex's sandbox refuses loopback connections (`curl: (7)` even when
 Bram is listening, #130), so it drives the identical lifecycle over a
 filesystem channel instead — writing `resources/.worklist-intent.json`
 and reading `resources/.worklist-result.json`, which the host
 dispatches through the same handlers as the HTTP routes.
 
-The provider hooks validate direct edits to `resources/worklist.json`. Proposal authoring and iterate-time prose refinement are allowed there; mechanical prune / status-advance operations are expected to go through `POST /__worklist/mutate` instead. Both providers now reject direct Worklist edits that remove items or change their `status`, which keeps the shared backend endpoint as the canonical state machine for `advance` / `prune`. The watcher-based fallback (compare old/new worklist snapshots, consult `resources/.worklist-authorization.json`, restore prior contents if the prune wasn't authorized) remains as defense-in-depth — it fires later than a native hook, but it covers the case where a hook fails to launch (e.g., Python missing) or where a future provider integration lacks a comparable extension point.
+The provider hooks validate direct edits to `resources/worklist.json`. Proposal authoring and iterate-time prose refinement are allowed there; mechanical prune / status-advance operations are expected to go through `POST /__worklist/mutate` instead. Every provider's guard rejects direct Worklist edits that remove items or change their `status`, which keeps the shared backend endpoint as the canonical state machine for `advance` / `prune`. The watcher-based fallback (compare old/new worklist snapshots, consult `resources/.worklist-authorization.json`, restore prior contents if the prune wasn't authorized) remains as defense-in-depth — it fires later than a native hook, but it covers the case where a hook fails to launch (e.g., the `~/.bram/bram-guard` link is missing or points at a deleted build) or where a future provider integration lacks a comparable extension point.
 
-The hook is a Python script and needs Python 3 to run. On macOS and Linux it's invoked directly via its shebang (`#!/usr/bin/env python3`), so `python3` must be on PATH — almost always the case. On Windows it's invoked via `py -3 <path>`; the `py` launcher ships with the python.org installer and resolves Python via the Windows registry, independent of PATH. If Python isn't installed at all, Claude Code shows "Failed with non-blocking status code" for every Write/Edit and the validator is silently inert — writes still proceed, but the worklist guard isn't actually checking them. Install Python 3 to enable enforcement.
+The guard has no runtime dependencies: no Python, no interpreter on PATH. If `~/.bram/bram-guard` is missing, Bram's Setup status reports the project as needing Setup, because the expected hook commands are derived from that link.
 
 </details>
 
@@ -274,17 +275,48 @@ Bram autostarts an agent in the terminal at launch. Configure it under
 }
 ```
 
-- `agent` — which provider to launch, `claude` or `codex` (defaults to `claude`).
+- `agent` — which provider to launch, `claude`, `codex`, `opencode` or `antigravity` (defaults to `claude`).
 - `args` — optional extra arguments appended to the launch command.
 - `continueLast` — when `true`, resume the most recent session
-  (`claude --continue` / `codex resume --last`) instead of starting fresh.
+  (`claude --continue` / `codex resume --last` / `opencode --continue` /
+  `agy --continue`)
+  instead of starting fresh.
 - `firstCommand` — optional command typed into the agent once it's ready.
+
+### Launch options
+
+For projects where the app is the point and Bram is plumbing, for example a
+repo teammates clone to read and annotate an XMLUI app, Bram can start
+minimized and open the app in your browser:
+
+```sh
+bram PROJECT_DIR --minimized --open-app=/architecture
+```
+
+- `--minimized` starts with the Bram window minimized.
+- `--open-app[=<route>]` waits until the target app is being served, then
+  opens it in the system browser, optionally at a route. The address is the
+  project's declared `server` (`http://localhost:<port><path>`), or Bram's
+  built-in server when the project has a root `index.html`.
+
+The same, per project, in `.bram.json`, so a plain `bram PROJECT_DIR` does
+it (command-line flags win):
+
+```json
+{
+  "launch": { "minimized": true, "openApp": "/architecture" }
+}
+```
+
+`openApp` is `true` for the app's own address, or a route. In the running
+app, the header's **Open app ↗** button opens the same address, and the ⓘ
+dialog shows it with a **Copy** button.
 
 ## Voice input
 
 Bram supports two ways to dictate instead of type:
 
-- **🎤 Whisper buttons (recommended).** Local, low-latency dictation via [`whisper-server`](https://github.com/ggml-org/whisper.cpp/tree/master/examples/server). Click the 🎤 button in the parent-shell toolbar (or the agent pane) to start recording, click again to send; the transcript arrives in the terminal as a `voice: ...` line so it's distinguishable from typed input. This is the better experience — lower latency, your choice of model, good transcription quality — but it needs local setup.
+- **🎤 Whisper buttons (recommended).** Local, low-latency dictation via [`whisper-server`](https://github.com/ggml-org/whisper.cpp/tree/master/examples/server). Click a 🎤 button in the agent pane (next to the message box, a feedback box, an issue comment) to start recording, and click again when you're done. Your words appear in the box as you speak, so when you stop there's no wait: the text is already there to edit or send. Live text uses the same `whisper-server` and model, so there's nothing extra to install. This is the better experience — lower latency, your choice of model, good transcription quality — but it needs local setup.
 - **The agent's native `/voice` command.** No local setup, but support varies by agent and platform. It's the zero-install fallback, and the working path where the Whisper button isn't proven yet.
 
 Bram spawns the local `whisper-server` on the first record click and kills it on app exit — you don't manage the process; you just need the binary, `ffmpeg`, and a model file installed.
@@ -300,39 +332,48 @@ curl -L -o ~/.local/share/whisper-models/ggml-small.en.bin \
 
 `small.en` is ~466 MB, English-only, real-time on Apple Silicon. Swap in a different model from the same Hugging Face repo for other size/accuracy/language tradeoffs. The bundled `Info.plist` declares `NSMicrophoneUsageDescription`, so first use triggers the standard macOS mic-permission prompt. The model path the app loads is `~/.local/share/whisper-models/ggml-small.en.bin`.
 
-### Windows / WSL
+### Windows
 
-On Windows, Bram launches `whisper-server` inside WSL via `wsl.exe bash -lc` and talks to it through `http://127.0.0.1:18080` from the WebView. WSL2 forwards that loopback port to Windows automatically, so the request path is the same as on macOS once the server is running.
+On Windows, Bram launches `whisper-server` natively and talks to it through `http://127.0.0.1:18080` from the WebView, exactly as it does on macOS. **WSL is not used and not required.** Earlier versions ran the engine inside WSL via `wsl.exe bash -lc`; if you set that up for a previous release, nothing inside the distro is reachable any more and the components below have to exist on the Windows side.
 
-**Prerequisite: WSL2 with Ubuntu.** If you don't already have it, open PowerShell and run `wsl --install`, which installs WSL and the default Ubuntu distro. Restart when prompted, then complete Ubuntu's first-run setup (pick a Linux username and password). Microsoft's full install doc: <https://learn.microsoft.com/en-us/windows/wsl/install>.
+**One-time setup.** In PowerShell:
 
-**One-time setup inside Ubuntu.** Open Ubuntu (Start menu → Ubuntu, or run `wsl` from PowerShell), then paste this whole block. The `cmake` build takes a few minutes on modern hardware; the model download is ~466 MB.
+```powershell
+winget install Gyan.FFmpeg
 
-```bash
-sudo apt update
-sudo apt install -y build-essential cmake ffmpeg git curl
-git clone https://github.com/ggml-org/whisper.cpp.git
-cd whisper.cpp
-cmake -B build
-cmake --build build -j --config Release
-sudo cp build/bin/whisper-server /usr/local/bin/
-mkdir -p ~/.local/share/whisper-models
-curl -L -o ~/.local/share/whisper-models/ggml-small.en.bin \
+# whisper-server: take whisper-blas-bin-x64.zip from a whisper.cpp release
+# that publishes Windows binaries (the tagged vN.N.N releases often carry
+# none; the dated build tags do). Extract it somewhere permanent and put
+# that directory on your PATH — the exe needs its DLLs beside it.
+mkdir "$env:LOCALAPPDATA\Programs\whisper"
+# ...extract the zip's contents there, then:
+[Environment]::SetEnvironmentVariable(
+  'Path',
+  [Environment]::GetEnvironmentVariable('Path','User') + ";$env:LOCALAPPDATA\Programs\whisper",
+  'User')
+
+# the model (~466 MB)
+mkdir "$env:USERPROFILE\.local\share\whisper-models"
+curl.exe -L -o "$env:USERPROFILE\.local\share\whisper-models\ggml-small.en.bin" `
   https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin
 ```
 
-That's the whole install. Bram handles starting/stopping `whisper-server` on its own — first 🎤 click after launching Bram spawns it inside WSL (the button shows ⏳ for ~2-3 s while the model loads), and every click after that is fast until Bram exits.
+**Relaunch Bram after changing PATH** — a running process keeps the environment it started with, so the 🎤 will keep reporting `whisper-server` missing until you do.
+
+That's the whole install. Bram handles starting and stopping `whisper-server` on its own — the first 🎤 click after launching Bram spawns it (the button shows ⏳ for a few seconds while the model loads), and every click after that is fast until Bram exits.
+
+**On speed.** The `blas` build runs on the CPU. On a machine without a fast CPU this is noticeably slower than macOS, where whisper.cpp uses the GPU through Metal. If transcription drags, a smaller model (`ggml-base.en`, `ggml-tiny.en`) buys back most of the time for some accuracy. The `cublas`/`cuda` release assets are considerably faster but need an NVIDIA GPU; they do nothing on Intel or AMD integrated graphics.
 
 **Notes:**
 
 - **Mic permission.** WebView2 inherits the standard Windows microphone prompt. On first 🎤 click Windows asks to allow mic access; click **Yes**.
-- **Multiple WSL distros.** If Ubuntu isn't your default distro, set `BRAM_WSL_DISTRO=Ubuntu` (or whatever distro name) in your Windows environment before launching Bram. Single-distro setups need no env var.
 - **Already running?** If you happen to have `whisper-server` listening on port `18080` (e.g., started manually in another terminal), Bram detects it via a preflight probe and uses it instead of spawning a new one — no conflict.
-- **Sanity check after install.** From inside Ubuntu, `which whisper-server` should print `/usr/local/bin/whisper-server`, and `ls ~/.local/share/whisper-models/` should show `ggml-small.en.bin`. If both look right, you're done.
+- **Sanity check after install.** In a *new* PowerShell window, `where.exe whisper-server` and `where.exe ffmpeg` should each print a path, and `ls "$env:USERPROFILE\.local\share\whisper-models\"` should show `ggml-small.en.bin`. If all three look right, relaunch Bram and you're done.
+- **Upgrading from a WSL setup.** The `BRAM_WSL_DISTRO` environment variable is gone and is ignored if set. A model inside your distro can be copied out rather than downloaded again: `wsl cp ~/.local/share/whisper-models/ggml-small.en.bin /mnt/c/Users/<you>/.local/share/whisper-models/ggml-small.en.bin`.
 
 ### Linux
 
-The same setup is expected to work on non-WSL Linux, using the host process path and port `18080`.
+The same setup is expected to work on Linux, using the host process path and port `18080`.
 
 ## Target app
 
@@ -584,8 +625,8 @@ the running agent.
 
 ## Layout
 
-- `Main.xmlui`, `components/`, `resources/`, `Globals.xs`,
-  `config.json`, `index.html` — the XMLUI app at the repo root.
+- `orientation/` — this repo's target app, an overview and architecture
+  site. The root `index.html` redirects to it.
 - `app/` — parent shell (Tauri webview entry, terminal wiring, vendor
   scripts, and `__shell/helpers.js` that the target app includes).
 - `src-tauri/` — Rust backend (PTY for the terminal, custom `tauri://`

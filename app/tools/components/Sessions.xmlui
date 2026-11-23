@@ -8,6 +8,10 @@
   var.renameDraft=""
   var.newSessionOpen="{false}"
   var.newSessionDraft=""
+  var.newSessionNext=""
+  var.newSessionSuggested="{false}"
+  var.newSessionSuggestedName=""
+  var.newSessionSuggestedNext=""
   var.pendingDeletes="{loadPendingSessionDeletes()}"
   var.pendingRenames="{loadPendingSessionRenames()}"
   var.lastDeleteId="{null}"
@@ -67,23 +71,29 @@
     listenTo="{sessionsSource}"
     onDidChange="pendingDeletes = pendingDeletes.filter(id => !(sessionsSource || []).some(s => s.id === id)); savePendingSessionDeletes(pendingDeletes)" />
 
-  <APICall
-    id="deleteSession"
-    url="/__sessions/delete"
-    method="get"
-    queryParams="{{ id: $param.id, provider: $param.provider }}"
-    confirmTitle="Delete session?"
-    confirmMessage="This cannot be undone."
-    completedNotificationMessage="Session deleted."
-    onSuccess="pendingDeletes = pendingDeletes.concat([lastDeleteId]); savePendingSessionDeletes(pendingDeletes); if (expandedId === lastDeleteId) { expandedId = null; } sessionsFirstPage.refetch(); if (sessionsExpanded || searchNeedle) sessionsFull.refetch();" />
+  <!-- pane-buttons-acknowledge-clicks: delete and rename were APICalls,
+       whose onSuccess reached the pane ~30 s after the host answered, so a
+       deleted row lingered that long. window.__bramPaneAction (a plain
+       fetch) publishes busy / done; these ChangeListeners run what onSuccess
+       / onError ran, including the toasts APICall showed
+       (https://www.xmlui.org/docs/howto/show-toast-notifications-from-code).
+       The delete confirmation is the global confirm()
+       (https://www.xmlui.org/docs/howto/open-a-confirmation-before-delete). -->
+  <PushSource
+    id="deleteSessionAct"
+    initial="{null}"
+    subscribe="{window.__bramSubscribePaneAction('deleteSession')}" />
+  <ChangeListener
+    listenTo="{deleteSessionAct.value &amp;&amp; deleteSessionAct.value.tick}"
+    onDidChange="() => { const a = deleteSessionAct.value; if (a &amp;&amp; !a.busy) { if (a.ok) { toast('Session deleted.'); pendingDeletes = pendingDeletes.concat([lastDeleteId]); savePendingSessionDeletes(pendingDeletes); if (expandedId === lastDeleteId) { expandedId = null; } sessionsFirstPage.refetch(); if (sessionsExpanded || searchNeedle) sessionsFull.refetch(); } else { toast.error('Could not delete: ' + a.error); } } }" />
 
-  <APICall
-    id="renameSession"
-    url="/__sessions/rename"
-    method="get"
-    queryParams="{{ id: $param.id, provider: $param.provider, title: $param.title }}"
-    onSuccess="sessionsFirstPage.refetch(); if (sessionsExpanded || searchNeedle) sessionsFull.refetch();"
-    onError="pendingRenames = pendingRenames.filter(id => id !== lastRenameId); savePendingSessionRenames(pendingRenames); renamingSession = { id: lastRenameId, provider: lastRenameProvider, title: lastRenameOriginalTitle }; renameDraft = lastRenameTitle" />
+  <PushSource
+    id="renameSessionAct"
+    initial="{null}"
+    subscribe="{window.__bramSubscribePaneAction('renameSession')}" />
+  <ChangeListener
+    listenTo="{renameSessionAct.value &amp;&amp; renameSessionAct.value.tick}"
+    onDidChange="() => { const a = renameSessionAct.value; if (a &amp;&amp; !a.busy) { if (a.ok) { sessionsFirstPage.refetch(); if (sessionsExpanded || searchNeedle) sessionsFull.refetch(); } else { pendingRenames = pendingRenames.filter(id => id !== lastRenameId); savePendingSessionRenames(pendingRenames); renamingSession = { id: lastRenameId, provider: lastRenameProvider, title: lastRenameOriginalTitle }; renameDraft = lastRenameTitle; } } }" />
 
   <ModalDialog
     id="renameDialog"
@@ -109,36 +119,80 @@
         <Button
           label="Rename"
           enabled="{renameDraft &amp;&amp; renameDraft.trim().length > 0}"
-          onClick="let target = renamingSession; let title = renameDraft; lastRenameId = target.id; lastRenameProvider = target.provider; lastRenameOriginalTitle = target.title || ''; lastRenameTitle = title; pendingRenames = pendingRenames.includes(target.id) ? pendingRenames : pendingRenames.concat([target.id]); savePendingSessionRenames(pendingRenames); renamingSession = null; renameDraft = ''; toast('Session renamed. Reload Bram to see the new title in the session list.'); renameSession.execute({ id: target.id, provider: target.provider, title: title })" />
+          onClick="let target = renamingSession; let title = renameDraft; lastRenameId = target.id; lastRenameProvider = target.provider; lastRenameOriginalTitle = target.title || ''; lastRenameTitle = title; pendingRenames = pendingRenames.includes(target.id) ? pendingRenames : pendingRenames.concat([target.id]); savePendingSessionRenames(pendingRenames); renamingSession = null; renameDraft = ''; toast('Session renamed. Reload Bram to see the new title in the session list.'); window.__bramPaneAction('renameSession', '/__sessions/rename', { query: { id: target.id, provider: target.provider, title: title } })" />
       </HStack>
     </VStack>
   </ModalDialog>
 
+  <!-- suggest-fresh-session: an agent suggestion (session-suggest) opens the
+       dialog pre-filled. The vars are set BEFORE newSessionOpen flips, because
+       the dialog mounts only when newSessionOpen and the fields take them as
+       initialValue (real editable text, not placeholders). Delivery is via a
+       helpers.js factory that also hands over a suggestion that arrived before
+       this tab mounted; consumed once, never replayed on reload.
+       https://www.xmlui.org/docs/reference/components/PushSource
+       https://www.xmlui.org/docs/reference/components/ChangeListener -->
+  <PushSource
+    id="sessionSuggestEvt"
+    initial="{null}"
+    subscribe="{window.__bramSubscribeSessionSuggest()}" />
+  <ChangeListener
+    listenTo="{sessionSuggestEvt.value &amp;&amp; sessionSuggestEvt.value.at}">
+    <event name="didChange">
+      const s = sessionSuggestEvt.value || null;
+      if (s) {
+        newSessionDraft = s.name;
+        newSessionNext = s.whatsNext;
+        newSessionSuggestedName = s.name;
+        newSessionSuggestedNext = s.whatsNext;
+        newSessionSuggested = true;
+        newSessionOpen = true;
+        window.__bramSuggestTrace('suggest-opened', true, s.name, s.whatsNext, s.name, s.whatsNext);
+      }
+    </event>
+  </ChangeListener>
+
   <ModalDialog
     id="newSessionDialog"
     when="{newSessionOpen}"
-    onClose="newSessionOpen = false; newSessionDraft = ''"
+    onClose="window.__bramClearPairOfferForCreate(); window.__bramSuggestTrace('suggest-cancelled', newSessionSuggested, newSessionDraft, newSessionNext, newSessionSuggestedName, newSessionSuggestedNext); newSessionOpen = false; newSessionSuggested = false; newSessionDraft = ''; newSessionNext = ''; window.__bramVoiceStopOnSend('new-session'); setWorklistVoiceTarget('message-agent')"
     title="New session">
     <VStack gap="$space-3" padding="$space-4">
+      <Text
+        when="{newSessionSuggested}"
+        fontWeight="$fontWeight-bold"
+        fontSize="$fontSize-sm"
+        value="Suggested by the agent. Edit the name and what's next to say it your way, then click Create." />
       <TextBox
         id="newSessionBox"
         width="*"
-        placeholder="Session name"
+        placeholder="Session name (descriptive: it's how you'll find this session later)"
+        initialValue="{newSessionDraft}"
         autoComplete="off"
         autoCorrect="{false}"
         spellCheck="{false}"
         autoCapitalize="off"
         onDidChange="(v) => newSessionDraft = v" />
+      <IsolatedDraftEditor
+        id="newSessionNextEditor"
+        placeholder="What's next? (optional, in your own words)"
+        initialValue="{newSessionNext}"
+        resize="vertical"
+        minRows="4"
+        maxRows="16"
+        width="100%"
+        voiceTarget="new-session"
+        voiceTooltip="Dictate what's next" />
       <Text
         color="$textColor-secondary"
         fontSize="$fontSize-sm"
-        value="Stops the running agent and starts a fresh session with this exact name. The name is session metadata, not a message to the agent; your next message will be the first conversation turn. The prior session stays in the list, resumable." />
+        value="Create stops the running agent and starts a new session with this name. If you say what's next, the new session builds its context from your words (project history, and the session you're leaving), reports what it found, and waits for you to settle the framing together. The current session stays in the list, resumable." />
       <HStack horizontalAlignment="end" gap="$space-2">
-        <Button label="Cancel" variant="outlined" onClick="newSessionOpen = false; newSessionDraft = ''" />
+        <Button label="Cancel" variant="outlined" onClick="window.__bramClearPairOfferForCreate(); window.__bramSuggestTrace('suggest-cancelled', newSessionSuggested, newSessionDraft, newSessionNextEditor.getValue(), newSessionSuggestedName, newSessionSuggestedNext); newSessionOpen = false; newSessionSuggested = false; newSessionDraft = ''; newSessionNext = ''; window.__bramVoiceStopOnSend('new-session'); setWorklistVoiceTarget('message-agent')" />
         <Button
           label="Create"
           enabled="{newSessionDraft &amp;&amp; newSessionDraft.trim().length > 0}"
-          onClick="let name = newSessionDraft; newSessionOpen = false; newSessionDraft = ''; window.__bramCreateNewSessionClick(currentProvider, name, toast)" />
+          onClick="let name = newSessionDraft; let next = newSessionNextEditor.getValue(); window.__bramSuggestTrace('suggest-created', newSessionSuggested, name, next, newSessionSuggestedName, newSessionSuggestedNext); newSessionOpen = false; newSessionSuggested = false; newSessionDraft = ''; newSessionNext = ''; window.__bramVoiceStopOnSend('new-session'); setWorklistVoiceTarget('message-agent'); window.__bramCreateNewSessionClick(currentProvider, name, toast, next, window.__bramCurrentSessionOf(sessionsFirstPage.value))" />
       </HStack>
     </VStack>
   </ModalDialog>
@@ -170,7 +224,7 @@
         variant="solid"
         size="sm"
         tooltip="Start a fresh session and make it current"
-        onClick="newSessionDraft = ''; newSessionOpen = true" />
+        onClick="newSessionSuggested = false; newSessionDraft = ''; newSessionNext = ''; newSessionOpen = true" />
     </HStack>
     <Text
       when="{sessionsMeta.value}"
@@ -207,27 +261,44 @@
             paddingVertical="$space-2"
             verticalAlignment="start"
             opacity="{(pendingDeletes.includes($item.id) || pendingRenames.includes($item.id)) ? 0.5 : 1}">
+            <!-- sessions-switch-icon-and-land-on-transcript: icon-only switch/reload button -->
             <Button
-              label="⟳"
+              icon="{$item.current ? 'restart' : 'swap'}"
               variant="ghost"
               size="xs"
               enabled="{!$item.pending &amp;&amp; !(pendingDeletes.includes($item.id) || pendingRenames.includes($item.id))}"
-              tooltip="{$item.pending ? 'Available after the first message creates the Codex session' : (pendingDeletes.includes($item.id) ? 'delete pending' : (pendingRenames.includes($item.id) ? 'rename pending' : 'Reload: kill the running agent and resume this session'))}"
+              tooltip="{$item.pending ? 'Available after the first message creates the Codex session' : (pendingDeletes.includes($item.id) ? 'delete pending' : (pendingRenames.includes($item.id) ? 'rename pending' : ($item.current ? 'Reload this session (restarts the agent)' : 'Switch to this session (restarts the agent on it)')))}"
               onClick="window.__bramReloadAgentSessionClick($item.provider, $item.id, toast)" />
             <Button
-              label="✕"
+              label="{deleteSessionAct.value &amp;&amp; deleteSessionAct.value.busy &amp;&amp; lastDeleteId === $item.id ? '…' : '✕'}"
               variant="ghost"
               size="xs"
-              enabled="{!$item.pending &amp;&amp; !(pendingDeletes.includes($item.id) || pendingRenames.includes($item.id))}"
-              tooltip="{$item.pending ? 'Available after the first message creates the Codex session' : (pendingDeletes.includes($item.id) ? 'delete pending' : (pendingRenames.includes($item.id) ? 'rename pending' : 'Delete session'))}"
-              onClick="lastDeleteId = $item.id; deleteSession.execute({ id: $item.id, provider: $item.provider })" />
+              enabled="{window.__bramSessionEditEnabled($item, 'delete', pendingDeletes, pendingRenames) &amp;&amp; !(deleteSessionAct.value &amp;&amp; deleteSessionAct.value.busy)}"
+              tooltip="{window.__bramSessionEditTooltip($item, 'delete', pendingDeletes, pendingRenames)}"
+              onClick="lastDeleteId = $item.id; if (confirm('Delete session?', 'This cannot be undone.', 'Delete')) window.__bramPaneAction('deleteSession', '/__sessions/delete', { query: { id: $item.id, provider: $item.provider } })" />
             <Button
               label="✎"
               variant="ghost"
               size="xs"
-              enabled="{!$item.pending &amp;&amp; !(pendingDeletes.includes($item.id) || pendingRenames.includes($item.id))}"
-              tooltip="{$item.pending ? 'Available after the next message creates the session' : (pendingDeletes.includes($item.id) ? 'delete pending' : (pendingRenames.includes($item.id) ? 'rename pending' : 'Rename session'))}"
+              enabled="{window.__bramSessionEditEnabled($item, 'rename', pendingDeletes, pendingRenames)}"
+              tooltip="{window.__bramSessionEditTooltip($item, 'rename', pendingDeletes, pendingRenames)}"
               onClick="renamingSession = { id: $item.id, provider: $item.provider, title: ($item.title || '') }; renameDraft = ($item.title || '')" />
+            <!-- session-groups: a loose session can join a group that has no
+                 session on this agent yet, and takes the group's name. Each
+                 entry carries this row's id (inside Items, $item is the
+                 entry). Peer: the agent overflow menu in Main.xmlui;
+                 https://www.xmlui.org/docs/reference/components/DropdownMenu -->
+            <DropdownMenu
+              when="{!$item.group &amp;&amp; ($item.joinable || []).length > 0}"
+              label="+"
+              tooltip="Add to a group (it takes the group's name)"
+              triggerButtonVariant="ghost">
+              <Items data="{$item.joinable}">
+                <MenuItem
+                  label="{window.__bramSessionAddToGroupLabel($item)}"
+                  onClick="window.__bramSessionAddToGroup($item, toast)" />
+              </Items>
+            </DropdownMenu>
             <Link
               when="{!$item.pending}"
               width="*"
@@ -242,9 +313,29 @@
               when="{$item.pending}"
               width="*"
               color="$textColor-secondary"
-              value="{($item.current ? '[current] ' : '') + ($item.title || '(untitled)') + ' — starting, will switch on next conversation turn'}" />
+              value="{'[requested] ' + ($item.title || '(untitled)') + ' — session not yet confirmed'}" />
             <Text width="140px" fontSize="$fontSize-sm" value="{formatDateTime(new Date($item.mtime * 1000), 'yyyy-MM-dd HH:mm')}" />
             <Text width="70px" fontSize="$fontSize-sm" value="{$item.pending ? 'Pending' : (Math.round($item.size / 1024) + ' KB')}" />
+          </HStack>
+          <!-- session-groups: the session's group (switching agents moves
+               among its members), with Leave for when one has drifted. -->
+          <HStack
+            when="{!!$item.group}"
+            gap="$space-2"
+            paddingHorizontal="$space-3"
+            paddingBottom="$space-2"
+            verticalAlignment="center">
+            <Text
+              width="*"
+              fontSize="$fontSize-sm"
+              color="$textColor-secondary"
+              value="{window.__bramSessionGroupLabel($item)}" />
+            <Button
+              label="Leave"
+              variant="ghost"
+              size="xs"
+              tooltip="{window.__bramSessionLeaveTooltip($item)}"
+              onClick="window.__bramUnpairSession($item.provider, $item.id, toast)" />
           </HStack>
           <VStack when="{expandedId === $item.id}" paddingBottom="$space-2">
             <SessionDetail sessionId="{$item.id}" provider="{$item.provider}"

@@ -6,6 +6,22 @@
 
   <DataSource id="status" url="/__coordination-status?t={refreshTick}" />
   <DataSource id="sessionSize" url="/__session-size?t={refreshTick}" pollIntervalInSeconds="30" />
+  <!-- issue-415: live guard self-test. Runs the installed guard chain
+       against a throwaway project when the tab opens and on Refresh; no
+       polling (docs/developing-bram.md, Push over polling). -->
+  <DataSource id="guardSelftest" url="/__guard/selftest?t={refreshTick}" />
+  <!-- issue-469-status-dry-run: what the 0.8.4 state-folder move would do.
+       Read-only; refetched on Refresh, no polling. -->
+  <DataSource id="stateDirPlan" url="/__state-dir/plan?t={refreshTick}" />
+  <!-- issue-469-mixed-folder-dialog: Status's way back from Not now. The
+       button calls window.__bramStateMoveDecide (a plain fetch); the host
+       pushes state-dir-changed and the plan refetches on it, the PushSource
+       idiom of AlertsPulse.xmlui. Not an APICall: its completion reached the
+       pane ~30 s late (issue-469-state-move-pane-fixes). -->
+  <PushSource id="stateDirPlanEvt" initial="{null}"
+    subscribe="{window.bramSubscribeTauriEvent('state-dir-changed')}" />
+  <ChangeListener listenTo="{stateDirPlanEvt.value &amp;&amp; stateDirPlanEvt.value.tick}"
+    onDidChange="window.__bramRefetchOnLiveEvent(stateDirPlanEvt.value, stateDirPlan)" />
 
   <VStack padding="$space-6" gap="$space-4">
     <HStack gap="$space-3" verticalAlignment="center">
@@ -19,17 +35,90 @@
       <Button
         label="Refresh"
         size="sm"
-        onClick="refreshTick = refreshTick + 1; status.refetch(); sessionSize.refetch();" />
+        onClick="refreshTick = refreshTick + 1; status.refetch(); sessionSize.refetch(); guardSelftest.refetch(); stateDirPlan.refetch();" />
     </HStack>
+
+    <!-- issue-415: whether the worklist guard actually runs and decides as
+         expected, probed rather than presumed. Pass, or the failing cases
+         with the guard's own decision and reason. -->
+    <VStack when="{guardSelftest.value}" gap="$space-2">
+      <HStack gap="$space-3" verticalAlignment="center">
+        <Heading level="h3">Guard</Heading>
+        <Text
+          fontWeight="$fontWeight-bold"
+          color="{guardSelftest.value.ok ? '$color-success-700' : '$color-danger-700'}"
+          value="{window.__bramGuardSelftestSummary(guardSelftest.value)}" />
+      </HStack>
+      <Text
+        fontSize="$fontSize-sm"
+        color="$textColor-secondary"
+        value="{window.__bramGuardRegistrationLine(guardSelftest.value)}" />
+      <Text
+        fontSize="$fontSize-sm"
+        color="$textColor-secondary"
+        value="{window.__bramGuardRoutingLine(guardSelftest.value)}" />
+      <Table data="{guardSelftest.value.cases || []}">
+        <Column header="case" width="230px" bindTo="id" />
+        <Column header="expected" width="90px" bindTo="expect" />
+        <Column header="guard said" width="100px">
+          <Text
+            fontWeight="$fontWeight-bold"
+            color="{$item.pass ? '$color-success-700' : '$color-danger-700'}"
+            value="{$item.got}" />
+        </Column>
+        <Column header="reason">
+          <Text fontSize="$fontSize-sm" value="{$item.reason}" overflowMode="flow" breakMode="word" />
+        </Column>
+      </Table>
+    </VStack>
+
+    <!-- issue-469-status-dry-run: the state folder's plan, formatted by the
+         window.__bramStateDirPlan* helpers. Items, not List: short lists
+         (tracked is capped at 200 by the host). -->
+    <VStack when="{stateDirPlan.value}" gap="$space-2">
+      <Heading level="h3">State folder</Heading>
+      <!-- status-reports-a-completed-move: once moved, say what happened;
+           the dry run below describes a move that is done, so it hides. -->
+      <Text when="{window.__bramStateDirPlanMoved(stateDirPlan.value, 'show')}" fontWeight="$fontWeight-bold" value="{window.__bramStateDirPlanMoved(stateDirPlan.value, 'line')}" />
+      <Text when="{window.__bramStateDirPlanMoved(stateDirPlan.value, 'show')}" value="{window.__bramStateDirPlanMoved(stateDirPlan.value, 'left')}" />
+      <Text when="{window.__bramStateDirPlanMoved(stateDirPlan.value, 'show')}" value="{window.__bramStateDirPlanMoved(stateDirPlan.value, 'settings')}" />
+      <Text when="{!window.__bramStateDirPlanMoved(stateDirPlan.value, 'show')}" fontSize="$fontSize-sm" color="$textColor-secondary" value="{stateDirPlan.value.note}" />
+      <Text fontWeight="$fontWeight-bold" value="{window.__bramStateDirPlanFolderLine(stateDirPlan.value)}" />
+      <Text value="{window.__bramStateDirPlanLiveClaimLine(stateDirPlan.value)}" />
+      <HStack when="{window.__bramStateMoveBanner(window.__bramStateDirPlanKept(stateDirPlan.value), 'pending')}" verticalAlignment="center" wrapContent="true" gap="$space-2">
+        <Text value="{window.__bramStateMoveBanner(window.__bramStateDirPlanKept(stateDirPlan.value), 'text')}" />
+        <Button
+          when="{window.__bramStateMoveBanner(window.__bramStateDirPlanKept(stateDirPlan.value), 'offer')}"
+          label="Move at next launch"
+          variant="outlined"
+          size="xs"
+          tooltip="{window.__bramStateMoveBanner(window.__bramStateDirPlanKept(stateDirPlan.value), 'stays')}"
+          onClick="window.__bramStateMoveDecide('move')" />
+      </HStack>
+      <VStack when="{!window.__bramStateDirPlanMoved(stateDirPlan.value, 'show')}" gap="$space-2">
+        <Text fontWeight="$fontWeight-bold" value="{window.__bramStateDirPlanHeading(stateDirPlan.value, 'wouldMove')}" />
+        <Items data="{stateDirPlan.value.wouldMove || []}">
+          <Text fontSize="$fontSize-sm" value="{window.__bramStateDirPlanRow($item)}" />
+        </Items>
+        <Text fontWeight="$fontWeight-bold" value="{window.__bramStateDirPlanHeading(stateDirPlan.value, 'foreign')}" />
+        <Items data="{stateDirPlan.value.foreign || []}">
+          <Text fontSize="$fontSize-sm" value="{window.__bramStateDirPlanRow($item)}" />
+        </Items>
+      </VStack>
+      <Text fontWeight="$fontWeight-bold" value="{window.__bramStateDirPlanHeading(stateDirPlan.value, 'tracked')}" />
+      <Items data="{window.__bramStateDirPlanTrackedPaths(stateDirPlan.value)}">
+        <Text fontSize="$fontSize-sm" value="{window.__bramStateDirPlanRow($item)}" />
+      </Items>
+      <Text fontWeight="$fontWeight-bold" value="{window.__bramStateDirPlanHeading(stateDirPlan.value, 'nested')}" />
+      <Items data="{stateDirPlan.value.nested || []}">
+        <Text fontSize="$fontSize-sm" value="{window.__bramStateDirPlanRow($item)}" />
+      </Items>
+    </VStack>
 
     <VStack when="{sessionSize.value &amp;&amp; sessionSize.value.humanBytes}" gap="$space-2">
       <Heading level="h3">Session size</Heading>
       <HStack gap="$space-3" verticalAlignment="center">
         <Text fontWeight="$fontWeight-bold" value="{sessionSize.value.humanBytes}" />
-        <Text
-          fontWeight="$fontWeight-bold"
-          color="{sessionSize.value.state === 'red' ? '$color-danger-700' : (sessionSize.value.state === 'amber' ? '$color-warn-700' : '$color-success-700')}"
-          value="{sessionSize.value.state}" />
         <Text
           when="{sessionSize.value.provider}"
           fontSize="$fontSize-sm"

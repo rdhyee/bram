@@ -1,7 +1,8 @@
 <Component
   name="MessageAgentComposer"
   var.voiceRecording="{false}"
-  var.skillsRequestTick="{0}">
+  var.skillsRequestTick="{0}"
+  var.toChat="{false}">
   <!-- A user-defined component is the deliberate performance boundary: the
        TextArea's high-frequency internal state cannot invalidate Main.xmlui's
        App-scope footer sources, listeners, pages, or status bindings. See
@@ -9,84 +10,134 @@
   <!-- issue-278: one message box. The Worklist's own "Message about the
        selection" box is gone; this one names its target instead. -->
   <PushSource id="w2Sel" subscribe="{window.bramSubscribeW2Selection()}" />
+  <!-- misaddressed-feedback-resends-as-chat: the agent's flag on the feedback
+       it is answering, refetched on the host's push (push over polling,
+       developing-bram.md). transformResult mirrors it for the Enter path's
+       dismiss. https://www.xmlui.org/docs/reference/components/DataSource -->
+  <DataSource id="misaddressed" url="/__worklist/misaddressed"
+    transformResult="{(d) => window.__bramMisaddressedAccept(d)}" />
+  <PushSource id="misaddressedEvt" initial="{null}"
+    subscribe="{window.bramSubscribeTauriEvent('feedback-misaddressed-changed')}" />
+  <ChangeListener
+    listenTo="{misaddressedEvt.value &amp;&amp; misaddressedEvt.value.tick}"
+    onDidChange="() => misaddressed.refetch()" />
+  <!-- composer-addressee-line: the per-message chat override resets when the
+       selection changes, so a fresh tick defaults to feedback. -->
+  <ChangeListener
+    listenTo="{(w2Sel.value || []).join(',')}"
+    onDidChange="toChat = false" />
   <PushSource
     id="composerClear"
     initial="{0}"
     subscribe="{window.bramSubscribeComposerClear()}" />
+  <!-- ChangeListener fires once at mount with the initial value (0); only a
+       real clear request (tick 1 or more) may empty the box. Without that
+       guard, every reload and relaunch cleared a restored draft (Inspector
+       export, 2026-09-29: composerBox.setValue("") at mount). -->
   <ChangeListener
     listenTo="{composerClear.value}"
-    onDidChange="() => composerBox.setValue('')" />
+    onDidChange="(change) => window.__bramComposerClearOnTick(composerBox, change)" />
+  <!-- message-box-on-draft-editor-pattern: the host's saved draft arrives
+       after mount; it fills the box only if the box is still empty. -->
+  <PushSource
+    id="draftHydrated"
+    initial="{0}"
+    subscribe="{window.bramSubscribeDraftHydrated()}" />
+  <ChangeListener
+    listenTo="{draftHydrated.value}"
+    onDidChange="() => window.__bramApplyDraftHydration(composerBox)" />
   <PushSource
     id="voiceArrival"
     initial="{null}"
     subscribe="{window.bramSubscribeVoiceArrival()}" />
   <ChangeListener
     listenTo="{voiceArrival.value &amp;&amp; voiceArrival.value.at}"
-    onDidChange="() => { const ev = voiceArrival.value || null; const t = (ev &amp;&amp; ev.transcript) || ''; const target = (ev &amp;&amp; ev.meta &amp;&amp; ev.meta.target) || ''; if (target === 'message-agent') { if (t &amp;&amp; composerBox) window.__bramAppendVoiceToBox(composerBox, t); voiceRecording = false; worklistVoiceRecordingActive = false; } }" />
+    onDidChange="() => { const ev = voiceArrival.value || null; const t = (ev &amp;&amp; ev.transcript) || ''; const target = (ev &amp;&amp; ev.meta &amp;&amp; ev.meta.target) || ''; if (target === 'message-agent') { window.__bramVoiceFinalizeInto(composerBox, 'message-agent', t); voiceRecording = false; worklistVoiceRecordingActive = false; } }" />
   <PushSource
     id="sendRestore"
     initial="{null}"
     subscribe="{window.bramSubscribeTauriEvent('send-restore')}" />
   <ChangeListener
     listenTo="{sendRestore.value &amp;&amp; sendRestore.value.tick}"
-    onDidChange="() => window.__bramApplySendRestore(sendRestore.value, composerBox)" />
+    onDidChange="() => window.__bramApplySendRestore(sendRestore.value, composerBox, toast)" />
 
   <!-- Form is retained only for TextArea.enterSubmits. Draft persistence is
        debounced in helpers.js; blur and submit flush/clear explicitly. -->
   <Form
     width="100%"
-    onSubmit="window.__bramComposerEnterSubmit(composerBox)">
+    onSubmit="window.__bramComposerEnterSubmit(composerBox, toChat)">
     <property name="buttonRowTemplate"><Fragment/></property>
-    <HStack width="100%" gap="$space-2" verticalAlignment="center">
+    <!-- composer-addressee-line: where Enter will send, shown BEFORE sending.
+         Replaces the Chat button: with items ticked, "Send as chat instead"
+         switches this one message to chat without unticking anything.
+         Wrapped with the input row in one tight VStack: as separate Form
+         children they sat gap-Form ($space-4) apart and the line read as
+         unrelated to the box (https://www.xmlui.org/docs/reference/components/Form). -->
+    <VStack width="100%" gap="0">
+    <!-- misaddressed-feedback-resends-as-chat: one click unticks the item,
+         resends the message as chat, and notes the record. -->
+    <HStack when="{window.__bramMisaddressedLabel(misaddressed.value)}"
+      testId="composer-misaddressed" width="100%" gap="$space-2"
+      verticalAlignment="center" paddingLeft="3rem">
+      <Text fontSize="$fontSize-sm" color="$textColor-secondary"
+        value="{window.__bramMisaddressedLabel(misaddressed.value)}" />
+      <!-- misaddressed-chat-resends-as-feedback: the same row serves both
+           directions; the flag's kind picks the words. -->
+      <Button label="{window.__bramMisaddressedButton(misaddressed.value)}" variant="outlined" size="xs"
+        tooltip="{window.__bramMisaddressedTooltip(misaddressed.value)}"
+        onClick="window.__bramMisaddressedResend(misaddressed)" />
+      <!-- misaddressed-offer-dismissable: × declines the offer without
+           resending; the gate bar's plan line has the same ×. -->
+      <Button label="×" variant="ghost" size="xs"
+        tooltip="Dismiss: keep it where it was sent"
+        onClick="window.__bramMisaddressedDismissClick(misaddressed)" />
+    </HStack>
+    <!-- composer-addressee-in-placeholder: the placeholder always names the
+         addressee (composer-addressee-always-in-box, Jon: the "To: Claude"
+         line "lives inside the message box"). This line shows only with
+         items ticked, and holds only the chat/feedback toggle. -->
+    <HStack when="{window.__bramComposerShowAddresseeLine(w2Sel.value || [])}"
+      width="100%" gap="$space-2" verticalAlignment="center" paddingLeft="3rem">
       <Button
-        label="{voiceRecording ? (worklistVoiceRecordingActive ? '⏹' : '⏳') : '🎤'}"
+        when="{(w2Sel.value || []).length > 0 &amp;&amp; !toChat}"
+        label="Send as chat instead"
+        tooltip="{window.__bramComposerAddresseeTooltip(w2Sel.value || [], toChat)}"
         variant="ghost"
         size="xs"
-        width="2.5rem"
-        tooltip="Voice message"
-        enabled="{!isWorklistVoiceProcessingTarget('message-agent') &amp;&amp; (!voiceRecording || worklistVoiceRecordingActive)}">
-        <event name="click">
-          setWorklistVoiceTarget('message-agent');
-          voiceRecording = toggleVoiceForCurrentTarget(voiceRecording);
-        </event>
-      </Button>
-      <!-- switch-to-transcript-on-action: quieter placeholder — it carries
-           the addressee signal now, and instruction-sized text read as
-           content. Theme var per
-           https://www.xmlui.org/docs/reference/components/TextArea#styling -->
-      <Theme fontSize-placeholder-TextArea="$fontSize-sm" width="*">
-        <TextArea
-          id="composerBox"
-          initialValue="{window.__bramRestoreWorklistDraft()}"
-          placeholder="{window.__bramComposerPlaceholder($props.route, w2Sel.value || [])}"
-          enterSubmits="true"
-          autoSize="true"
-          minRows="2"
-          maxRows="4"
-          width="*"
-          onDidChange="(value) => window.__bramMessageAgentInputChanged(value)">
-          <event name="gotFocus">
-            setWorklistVoiceTarget('message-agent');
-            setFocusedFeedbackItemId('');
-          </event>
-          <event name="lostFocus">
-            window.__bramMessageAgentBlur();
-          </event>
-        </TextArea>
-      </Theme>
-      <!-- switch-to-transcript-on-action: was 8rem, sized for the retired
-           "skip worklist" label; Chat/Esc are short and stable, so
-           fit-content closes the dead gap before the ▲/▼ column (whose own
-           end-anchored spread is deliberate — position carries meaning). -->
-      <VStack width="fit-content" horizontalAlignment="start" itemWidth="fit-content" gap="$space-1">
+        onClick="toChat = true" />
+      <Button
+        when="{(w2Sel.value || []).length > 0 &amp;&amp; toChat}"
+        label="Back to feedback"
+        tooltip="{window.__bramComposerAddresseeTooltip(w2Sel.value || [], toChat)}"
+        variant="ghost"
+        size="xs"
+        onClick="toChat = false" />
+    </HStack>
+    <!-- composer-addressee-hugs-box: the gap under the addressee line was
+         this row centering the box against a taller 6rem ▲/▼ column (found
+         by a plain-XMLUI bisect, 2026-10-08). Both side columns are now
+         tight stacks shorter than the box, so the row is the box's height
+         and centering them on it leaves no gap.
+         https://www.xmlui.org/docs/reference/components/HStack -->
+    <HStack width="100%" gap="$space-2" verticalAlignment="center">
+      <!-- composer-addressee-hugs-box (Jon): mic with Esc under it, one
+           tight stack, centered on the box. -->
+      <VStack width="2.5rem" gap="$space-2" horizontalAlignment="center">
         <Button
-          when="{(w2Sel.value || []).length > 0}"
-          label="Chat"
+          label="{voiceRecording ? (worklistVoiceRecordingActive ? '⏹' : '⏳') : '🎤'}"
           variant="ghost"
           size="xs"
-          tooltip="Message the agent about anything"
-          onClick="window.__bramSubmitMessageAgentComposer(composerBox, '')" />
-        <!-- switch-to-transcript-on-action: the Feedback button retired one
+          width="2.5rem"
+          tooltip="Voice message"
+          enabled="{!isWorklistVoiceProcessingTarget('message-agent') &amp;&amp; (!voiceRecording || worklistVoiceRecordingActive)}">
+          <event name="click">
+            setWorklistVoiceTarget('message-agent');
+            voiceRecording = toggleVoiceForCurrentTarget(voiceRecording);
+          </event>
+        </Button>
+        <!-- composer-addressee-line: the Chat button retired; the addressee
+             line above the box ("Send as chat instead") replaces it.
+             switch-to-transcript-on-action: the Feedback button retired one
              round after it arrived — with a selection, Enter and every gate
              button already send the message as feedback, so a third
              affordance was redundant (Jon: "clicking any button already
@@ -118,25 +169,35 @@
           </event>
         </Button>
       </VStack>
-      <!-- ▲ and ▼ ride opposite ends of the footer column so position
-           carries the meaning, instead of leaving it entirely to the two
-           glyphs. SpaceFiller is the sanctioned idiom for this
-           (https://docs.xmlui.org/howto/align-items-to-row-ends-with-spacefiller),
-           and it needs a container with a REAL height to grow into
-           (https://docs.xmlui.org/howto/push-a-footer-to-the-bottom).
-
-           height="100%" does not supply one here. The footer row is
-           <HStack verticalAlignment="center">, and Stack alignment takes
-           only start | center | end — there is no `stretch`, so no row
-           child ever matches the row height, and a percentage resolves
-           against a parent that never had one. The column collapsed to
-           its two buttons and SpaceFiller had nothing to absorb, which
-           read as "the change did not land" twice over.
-
-           So the height is explicit. The cost: it does not track the
-           composer, which grows from minRows=2 to maxRows=4, so past
-           that the arrows stay 6rem apart rather than spanning. Visible
-           stable separation beats a silent collapse.
+      <!-- switch-to-transcript-on-action: quieter placeholder — it carries
+           the addressee signal now, and instruction-sized text read as
+           content. Theme var per
+           https://www.xmlui.org/docs/reference/components/TextArea#styling -->
+      <Theme fontSize-placeholder-TextArea="$fontSize-sm" width="*">
+        <TextArea
+          id="composerBox"
+          initialValue="{window.__bramRestoreWorklistDraft()}"
+          placeholder="{window.__bramComposerPlaceholder($props.route, w2Sel.value || [], toChat, $props.activeProvider)}"
+          enterSubmits="true"
+          autoSize="true"
+          minRows="3"
+          maxRows="5"
+          width="*"
+          onDidChange="(value) => window.__bramMessageAgentInputChanged(value)">
+          <event name="gotFocus">
+            setWorklistVoiceTarget('message-agent');
+            setFocusedFeedbackItemId('');
+          </event>
+          <event name="lostFocus">
+            window.__bramMessageAgentBlur();
+          </event>
+        </TextArea>
+      </Theme>
+      <!-- composer-addressee-hugs-box (Jon): ▲ and ▼ as one tight stack,
+           centered on the box like the mic/Esc stack on the left. They used
+           to ride opposite ends of a 6rem column (SpaceFiller, explicit
+           height); that column was taller than the box, and centering the box
+           against it opened the gap under the addressee line.
 
            The glyph size does NOT come from the `size` prop. Button's
            `size` selects padding only — the docs define
@@ -147,29 +208,51 @@
            hug the ends means zero padding. Both go through this Theme
            wrapper, which is why size stays xs.
            https://docs.xmlui.org/components/Button -->
-      <Theme fontSize-Button="$fontSize-xl"
-             paddingVertical-Button-xs="0" paddingHorizontal-Button-xs="0">
-        <VStack
-          when="{$pathname === '/transcript'}"
-          width="2rem"
-          height="6rem"
-          horizontalAlignment="center">
-          <Button
-            label="▲"
-            variant="ghost"
-            size="xs"
-            tooltip="Scroll transcript to top"
-            onClick="window.__bramTranscriptScroll('top')" />
-          <SpaceFiller />
-          <Button
-            label="▼"
-            variant="ghost"
-            size="xs"
-            tooltip="Scroll transcript to bottom"
-            onClick="window.__bramTranscriptScroll('bottom')" />
-        </VStack>
-      </Theme>
+      <!-- transcript-you-message-nav (Peggy; Jon 2026-11-05: "lose the
+           buttons next to the message box, put the new ones there"): the
+           find bar's buttons (FindBar.xmlui: outlined, xs, same glyphs),
+           stacked. ⤒/⤓ keep the old arrows' job, transcript top and bottom
+           (⤓ re-arms following); ▲/▼ step to your previous/next message
+           through the Transcript's registered closure. Enablement arrives by
+           PushSource from the Transcript (helpers.js bramSubscribeYouNav).
+           The old ghost ▲/▼ used a Theme wrapper for size; these keep the
+           default xs size so they match the find bar.
+           https://www.xmlui.org/docs/reference/components/Button -->
+      <VStack
+        when="{$pathname === '/transcript'}"
+        width="fit-content"
+        gap="$space-1"
+        horizontalAlignment="center">
+        <Button size="xs" variant="outlined" label="⤒"
+          tooltip="Top of transcript"
+          onClick="window.__bramTranscriptScroll('top')" />
+        <Button size="xs" variant="outlined" label="▲"
+          enabled="{!!(youNavFeed.value &amp;&amp; youNavFeed.value.canPrev)}"
+          tooltip="Previous of your messages"
+          onClick="window.__bramTranscriptYouStep('prev')" />
+        <Button size="xs" variant="outlined" label="▼"
+          enabled="{!!(youNavFeed.value &amp;&amp; youNavFeed.value.canNext)}"
+          tooltip="Next of your messages"
+          onClick="window.__bramTranscriptYouStep('next')" />
+        <Button size="xs" variant="outlined" label="⤓"
+          tooltip="Bottom of transcript, and follow new output"
+          onClick="window.__bramTranscriptScroll('bottom')" />
+      </VStack>
     </HStack>
+    </VStack>
   </Form>
+  <!-- issue-407: live dictation. Each partial is written into composerBox
+       (window.__bramVoiceShowLive); the delivered transcript restores the
+       pre-dictation text before appending. -->
+  <!-- transcript-you-message-nav: enablement for the ▲/▼ beside the box. -->
+  <PushSource id="youNavFeed" initial="{null}"
+    subscribe="{window.bramSubscribeYouNav()}" />
+  <PushSource
+    id="voicePartial"
+    initial="{null}"
+    subscribe="{window.bramSubscribeVoicePartial()}" />
+  <ChangeListener
+    listenTo="{voicePartial.value &amp;&amp; voicePartial.value.at}"
+    onDidChange="() => window.__bramVoiceShowLive(composerBox, voicePartial.value, 'message-agent')" />
   <PastedImageStrip target="message-agent" />
 </Component>

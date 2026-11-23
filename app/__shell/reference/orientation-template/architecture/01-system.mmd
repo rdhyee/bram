@@ -1,0 +1,12 @@
+flowchart TD
+  user[You]
+  app[The app]
+  store[(Where state lives)]
+
+  user -->|uses| app
+  app -->|reads and writes| store
+
+%% Hover text for boxes and arrow labels, keyed by the label exactly as drawn.
+%% Format: tip: <label> :: <short text>. Longer detail: ## <label> sections in 01-system.md.
+%% tip: You :: Who this is for. Replace every box and arrow in this example.
+%% tip: uses :: An arrow is something that happens. Its detail says who or what makes it happen, and whether anyone has to remember to.
